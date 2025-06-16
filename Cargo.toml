@@ -1,12 +1,13 @@
 [package]
 name = "lumalla"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [workspace]
 members = [
-    "crates/wayland-protocol",
-    "crates/wayland-protocol-macros",
+    "crates/lumalla_shared",
+    "crates/wayland_protocol",
+    "crates/wayland_protocol_macros",
 ]
 
 [workspace.dependencies]

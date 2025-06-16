@@ -20,6 +20,7 @@ pub enum ClientEvent {
     Disconnected { client_id: ClientId },
 }
 
+#[derive(Debug)]
 pub struct ClientConnection {
     stream: UnixStream,
     client_id: ClientId,
@@ -84,7 +85,7 @@ impl ClientConnection {
                 }
             }
         }
-        
+
         Ok(())
     }
 }
@@ -107,7 +108,7 @@ impl EventSource for ClientConnection {
         if readiness.readable {
             self.read_data(callback)?;
         }
-        
+
         Ok(PostAction::Continue)
     }
 
@@ -116,7 +117,8 @@ impl EventSource for ClientConnection {
         poll: &mut Poll,
         token_factory: &mut TokenFactory,
     ) -> calloop::Result<()> {
-        poll.register(&self.stream, calloop::Interest::READ, calloop::Mode::Level, token_factory.token())?;
+        // SAFETY: Stream is unregistered
+        unsafe { poll.register(&self.stream, calloop::Interest::READ, calloop::Mode::Level, token_factory.token()) }?;
         Ok(())
     }
 
@@ -133,4 +135,4 @@ impl EventSource for ClientConnection {
         poll.unregister(&self.stream)?;
         Ok(())
     }
-} 
+}
