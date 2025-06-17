@@ -2,6 +2,10 @@
 name = "lumalla"
 version = "0.1.0"
 edition = "2024"
+description = "Window manager focused on configurability"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lumalla/lumalla"
+include = ["src/**/*", "LICENSE-*", "README.md"]
 
 [workspace]
 members = [
@@ -21,6 +25,6 @@ env_logger = { version = "0.11.8", features = ["kv"] }
 anyhow = "1.0.72"
 
 [dependencies]
-lumalla_shared = { path = "./crates/lumalla_shared" }
+lumalla_shared = { path = "./crates/lumalla_shared", version = "^0.1.0" }
 env_logger = { workspace = true }
 log = { workspace = true }
