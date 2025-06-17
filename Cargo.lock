@@ -225,10 +225,11 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "log",
+ "lumalla_shared",
 ]
 
 [[package]]
-name = "lumally_shared"
+name = "lumalla_shared"
 version = "0.1.0"
 
 [[package]]

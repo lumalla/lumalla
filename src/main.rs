@@ -1,6 +1,13 @@
+use std::env::args;
+
 use env_logger::{Builder, Target};
+use lumalla_shared::GlobalArgs;
 
 fn main() {
+    let Some(_) = GlobalArgs::parse(args()) else {
+        return;
+    };
+
     init_logger();
 }
 

@@ -21,5 +21,6 @@ env_logger = { version = "0.11.8", features = ["kv"] }
 anyhow = "1.0.72"
 
 [dependencies]
+lumalla_shared = { path = "./crates/lumalla_shared" }
 env_logger = { workspace = true }
 log = { workspace = true }
