@@ -6,8 +6,8 @@ edition = "2024"
 [workspace]
 members = [
     "crates/lumalla_shared",
-    "crates/wayland_protocol",
-    "crates/wayland_protocol_macros",
+    "crates/lumalla_wayland_protocol",
+    "crates/lumalla_wayland_protocol_macros",
 ]
 
 [workspace.dependencies]

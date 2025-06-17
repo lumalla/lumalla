@@ -1,5 +1,5 @@
 [package]
-name = "wayland-protocol"
+name = "lumalla_wayland_protocol"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,4 +7,4 @@ edition = "2024"
 calloop = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
-wayland-protocol-macros = { path = "../wayland_protocol_macros" }
+lumalla_wayland_protocol_macros = { path = "../lumalla_wayland_protocol_macros" }

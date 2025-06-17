@@ -233,6 +233,28 @@ name = "lumalla_shared"
 version = "0.1.0"
 
 [[package]]
+name = "lumalla_wayland_protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "log",
+ "lumalla_wayland_protocol_macros",
+]
+
+[[package]]
+name = "lumalla_wayland_protocol_macros"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "proc-macro2",
+ "quick-xml",
+ "quote",
+ "serde",
+ "syn",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -431,28 +453,6 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
-
-[[package]]
-name = "wayland-protocol"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "calloop",
- "log",
- "wayland-protocol-macros",
-]
-
-[[package]]
-name = "wayland-protocol-macros"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "proc-macro2",
- "quick-xml",
- "quote",
- "serde",
- "syn",
-]
 
 [[package]]
 name = "windows-sys"
