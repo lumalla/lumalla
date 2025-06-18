@@ -6,10 +6,10 @@
   };
 
   outputs = {
-    self,
     flake-utils,
     naersk,
     nixpkgs,
+    ...
   }:
     flake-utils.lib.eachDefaultSystem (
       system: let
@@ -18,15 +18,21 @@
         };
 
         naersk' = pkgs.callPackage naersk {};
-      in rec {
-        # For `nix build` & `nix run`:
+      in {
         defaultPackage = naersk'.buildPackage {
           src = ./.;
         };
 
-        # For `nix develop`:
         devShell = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [rustc cargo rust-analyzer openssl pkg-config gh];
+          nativeBuildInputs = with pkgs; [
+            rustc
+            cargo
+            rust-analyzer
+            rustfmt
+            openssl
+            pkg-config
+          ];
+          RUST_LOG = "debug";
         };
       }
     );
