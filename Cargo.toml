@@ -18,6 +18,7 @@ members = [
 calloop = { version = "0.14.0", features = ["executor"] }
 log = { version = "0.4.27", features = [
     "kv",
+    "kv_std",
     "max_level_trace",
     "release_max_level_debug",
 ] }
@@ -29,3 +30,4 @@ lumalla_shared = { path = "./crates/lumalla_shared", version = "^0.1.0" }
 env_logger = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
+calloop = { workspace = true }

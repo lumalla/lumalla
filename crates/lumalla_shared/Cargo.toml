@@ -8,3 +8,6 @@ repository = "https://github.com/lumalla/lumalla"
 include = ["src/**/*", "LICENSE-*"]
 
 [dependencies]
+anyhow = { workspace = true }
+calloop = { workspace = true }
+log = { workspace = true }
