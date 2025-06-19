@@ -15,6 +15,7 @@ use calloop::{
 };
 use env_logger::{Builder, Target};
 use log::{error, info, warn};
+use lumalla_config::ConfigState;
 use lumalla_shared::{
     Comms, ConfigMessage, DisplayMessage, GlobalArgs, InputMessage, MainMessage, MessageRunner,
     RendererMessage,

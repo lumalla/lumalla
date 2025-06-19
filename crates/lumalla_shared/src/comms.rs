@@ -43,7 +43,7 @@ impl Comms {
     /// # Example
     /// ```
     /// # use calloop::channel::channel;
-    /// # use scape_shared::{Comms, MainMessage};
+    /// # use lumalla_shared::{Comms, MainMessage};
     /// # let (to_main, main_channel) = channel();
     /// # let (to_display, _) = channel();
     /// # let (to_renderer, _) = channel();
@@ -64,7 +64,7 @@ impl Comms {
     /// # Example
     /// ```
     /// # use calloop::channel::channel;
-    /// # use scape_shared::{Comms, DisplayMessage};
+    /// # use lumalla_shared::{Comms, DisplayMessage};
     /// # let (to_main, _) = channel();
     /// # let (to_display, display_channel) = channel();
     /// # let (to_renderer, _) = channel();
@@ -88,7 +88,7 @@ impl Comms {
     /// # Example
     /// ```
     /// # use calloop::channel::channel;
-    /// # use scape_shared::{Comms, RendererMessage};
+    /// # use lumalla_shared::{Comms, RendererMessage};
     /// # let (to_main, _) = channel();
     /// # let (to_display, _) = channel();
     /// # let (to_renderer, renderer_channel) = channel();
@@ -112,7 +112,7 @@ impl Comms {
     /// # Example
     /// ```
     /// # use calloop::channel::channel;
-    /// # use scape_shared::{Comms, InputMessage};
+    /// # use lumalla_shared::{Comms, InputMessage};
     /// # let (to_main, _) = channel();
     /// # let (to_display, _) = channel();
     /// # let (to_renderer, _) = channel();
@@ -136,7 +136,7 @@ impl Comms {
     /// # Example
     /// ```
     /// # use calloop::channel::channel;
-    /// # use scape_shared::{Comms, ConfigMessage};
+    /// # use lumalla_shared::{Comms, ConfigMessage};
     /// # let (to_main, _) = channel();
     /// # let (to_display, _) = channel();
     /// # let (to_renderer, _) = channel();
