@@ -1,6 +1,14 @@
-# Lumalla
+<div align="center">
+  <a href="https://lumalla.org">
+    <img src="assets/logo.svg" alt="Logo" width="80" height="80">
+  </a>
 
-Window manager focused on configurability.
+  <h3 align="center">Lumalla</h3>
+
+  <p align="center">
+    Window manager focused on configurability.
+  </p>
+</div>
 
 ## License
 
