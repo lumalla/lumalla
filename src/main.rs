@@ -294,7 +294,7 @@ where
     let mut runner = R::new(comms, loop_handle, args).context("Unable to create runner")?;
 
     let signal = event_loop.get_signal();
-    // Run the main loop
+    // Run the main loop f
     event_loop
         .run(None, &mut runner, |data| {
             data.on_dispatch_wait(&signal);
