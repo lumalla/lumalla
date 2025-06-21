@@ -11,6 +11,7 @@ include = ["src/**/*", "LICENSE-*", "README.md"]
 members = [
     "crates/lumalla_config",
     "crates/lumalla_display",
+    "crates/lumalla_input",
     "crates/lumalla_shared",
     "crates/lumalla_wayland_protocol",
     "crates/lumalla_wayland_protocol_macros",
@@ -19,10 +20,8 @@ members = [
 [workspace.dependencies]
 calloop = { version = "0.14.0", features = ["executor"] }
 log = { version = "0.4.27", features = [
-    "kv",
-    "kv_std",
     "max_level_trace",
-    "release_max_level_debug",
+    "release_max_level_warn",
 ] }
 env_logger = { version = "0.11.8", features = ["kv"] }
 anyhow = "1.0.72"
@@ -33,6 +32,7 @@ notify = "6.1"
 [dependencies]
 lumalla_config = { path = "./crates/lumalla_config", version = "^0.1.0" }
 lumalla_display = { path = "./crates/lumalla_display", version = "^0.1.0" }
+lumalla_input = { path = "./crates/lumalla_input", version = "^0.1.0" }
 lumalla_shared = { path = "./crates/lumalla_shared", version = "^0.1.0" }
 env_logger = { workspace = true }
 log = { workspace = true }

@@ -17,6 +17,7 @@ use env_logger::{Builder, Target};
 use log::{error, info, warn};
 use lumalla_config::ConfigState;
 use lumalla_display::DisplayState;
+use lumalla_input::InputState;
 use lumalla_shared::{
     Comms, ConfigMessage, DisplayMessage, GlobalArgs, InputMessage, MainMessage, MessageRunner,
     RendererMessage,
@@ -130,7 +131,7 @@ fn run_app(args: Arc<GlobalArgs>) -> anyhow::Result<()> {
                             TimeoutAction::Drop
                         },
                     ) {
-                        warn!(e:err; "Unable to insert timer to force shutdown. Shutting down now");
+                        warn!("Unable to insert timer to force shutdown ({e}). Shutting down now");
                         data.force_shutting_down = true;
                     }
                 }
