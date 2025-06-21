@@ -377,6 +377,7 @@ dependencies = [
  "lumalla_config",
  "lumalla_display",
  "lumalla_input",
+ "lumalla_rederer",
  "lumalla_shared",
 ]
 
@@ -405,6 +406,16 @@ dependencies = [
 
 [[package]]
 name = "lumalla_input"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "log",
+ "lumalla_shared",
+]
+
+[[package]]
+name = "lumalla_rederer"
 version = "0.1.0"
 dependencies = [
  "anyhow",

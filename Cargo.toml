@@ -12,6 +12,7 @@ members = [
     "crates/lumalla_config",
     "crates/lumalla_display",
     "crates/lumalla_input",
+    "crates/lumalla_rederer",
     "crates/lumalla_shared",
     "crates/lumalla_wayland_protocol",
     "crates/lumalla_wayland_protocol_macros",
@@ -33,6 +34,7 @@ notify = "6.1"
 lumalla_config = { path = "./crates/lumalla_config", version = "^0.1.0" }
 lumalla_display = { path = "./crates/lumalla_display", version = "^0.1.0" }
 lumalla_input = { path = "./crates/lumalla_input", version = "^0.1.0" }
+lumalla_rederer = { path = "./crates/lumalla_rederer", version = "^0.1.0" }
 lumalla_shared = { path = "./crates/lumalla_shared", version = "^0.1.0" }
 env_logger = { workspace = true }
 log = { workspace = true }

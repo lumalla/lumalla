@@ -18,6 +18,7 @@ use log::{error, info, warn};
 use lumalla_config::ConfigState;
 use lumalla_display::DisplayState;
 use lumalla_input::InputState;
+use lumalla_rederer::RendererState;
 use lumalla_shared::{
     Comms, ConfigMessage, DisplayMessage, GlobalArgs, InputMessage, MainMessage, MessageRunner,
     RendererMessage,
@@ -148,7 +149,7 @@ fn run_app(args: Arc<GlobalArgs>) -> anyhow::Result<()> {
         to_main.clone(),
         String::from("config"),
         config_channel,
-        args,
+        args.clone(),
     )
     .context("Unable to run config thread")?;
     // Spawn the input thread
@@ -157,7 +158,7 @@ fn run_app(args: Arc<GlobalArgs>) -> anyhow::Result<()> {
         to_main.clone(),
         String::from("input"),
         input_channel,
-        args,
+        args.clone(),
     )
     .context("Unable to run input thread")?;
     // Spawn the renderer thread
@@ -166,7 +167,7 @@ fn run_app(args: Arc<GlobalArgs>) -> anyhow::Result<()> {
         to_main.clone(),
         String::from("renderer"),
         renderer_channel,
-        args,
+        args.clone(),
     )
     .context("Unable to run renderer thread")?;
     // Spawn the display thread
