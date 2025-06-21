@@ -29,6 +29,7 @@ anyhow = "1.0.72"
 mlua = { version = "0.10.0", features = ["lua54", "vendored"] }
 xdg = "2.5"
 notify = "6.1"
+signal-hook = "0.3"
 
 [dependencies]
 lumalla_config = { path = "./crates/lumalla_config", version = "^0.1.0" }
@@ -40,3 +41,4 @@ env_logger = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
 calloop = { workspace = true }
+signal-hook = { workspace = true }

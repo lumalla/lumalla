@@ -23,6 +23,7 @@ use lumalla_shared::{
     Comms, ConfigMessage, DisplayMessage, GlobalArgs, InputMessage, MainMessage, MessageRunner,
     RendererMessage,
 };
+use signal_hook::{consts::SIGINT, iterator::Signals};
 
 fn main() -> anyhow::Result<()> {
     let Some(global_args) = GlobalArgs::parse(args()) else {
@@ -35,7 +36,6 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn init_logger(log_file: Option<&str>) -> anyhow::Result<()> {
-    println!("Logging initialized {:?}", log_file);
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -112,6 +112,8 @@ fn run_app(args: Arc<GlobalArgs>) -> anyhow::Result<()> {
     let mut event_loop = EventLoop::<MainData>::try_new().context("Unable to create event loop")?;
     let signal = event_loop.get_signal();
     let loop_handle = event_loop.handle();
+
+    handle_signals(to_main.clone());
 
     if let Err(e) = loop_handle.insert_source(main_channel, |event, _, data| match event {
         calloop::channel::Event::Msg(msg) => match msg {
@@ -302,6 +304,35 @@ where
         .context("Unable to run loop")?;
 
     Ok(())
+}
+
+/// Handles signals sent to the process, such as SIGINT (Ctrl+C).
+/// When the signal is received, the main thread is notified to initiate a graceful shutdown.
+fn handle_signals(to_main: Sender<MainMessage>) {
+    thread::spawn(move || {
+        let mut signals = match Signals::new([SIGINT]) {
+            Ok(signals) => signals,
+            Err(e) => {
+                error!("Failed to register signal handler: {e}");
+                return;
+            }
+        };
+
+        for signal in signals.forever() {
+            match signal {
+                SIGINT => {
+                    info!("Received SIGINT signal (Ctrl+C), initiating graceful shutdown");
+                    if let Err(e) = to_main.send(MainMessage::Shutdown) {
+                        error!("Failed to send shutdown message: {e}");
+                    }
+                    break;
+                }
+                _ => {
+                    warn!("Received unexpected signal: {signal}");
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
