@@ -1,10 +1,12 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use proc_macro::TokenStream;
 use quick_xml::de::from_str;
 use quote::quote;
 use schema::{Interface, Protocol};
 use std::{fs, path::Path};
-use syn::{parse_macro_input, LitStr};
+use syn::{LitStr, parse_macro_input, parse_str};
 
 mod schema;
 
@@ -93,8 +95,14 @@ fn generate_interface_code(interface: Interface) -> proc_macro2::TokenStream {
                 proc_macro2::Span::call_site(),
             );
             let entries = enum_def.entry.iter().map(|entry| {
-                let entry_name =
-                    syn::Ident::new(&entry.name.to_uppercase(), proc_macro2::Span::call_site());
+                let entry_name_uppercase = &entry.name.to_uppercase();
+                let entry_name = match parse_str(entry_name_uppercase) {
+                    Ok(ident) => ident,
+                    Err(_) => syn::Ident::new(
+                        &format!("_{entry_name_uppercase}"),
+                        proc_macro2::Span::call_site(),
+                    ),
+                };
                 let value = entry.value.parse::<u32>().unwrap_or(0);
                 quote! { #entry_name = #value }
             });
@@ -199,13 +207,6 @@ fn generate_interface_code(interface: Interface) -> proc_macro2::TokenStream {
 }
 
 /// Generate Wayland protocol structs from an XML file
-///
-/// # Example
-/// ```rust
-/// use wayland_protocol_macros::wayland_protocol;
-///
-/// wayland_protocol!("path/to/wayland.xml");
-/// ```
 #[proc_macro]
 pub fn wayland_protocol(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as LitStr);

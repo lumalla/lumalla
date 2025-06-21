@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
 use log::{debug, error, info};
@@ -6,6 +8,8 @@ use std::{fs, io, os::unix::net::UnixListener, path::Path};
 mod client;
 mod protocols;
 pub use client::{ClientConnection, ClientEvent, ClientId};
+
+type ObjectId = u32;
 
 #[repr(C)]
 struct MessageHeader {

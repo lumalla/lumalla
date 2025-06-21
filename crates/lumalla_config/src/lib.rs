@@ -12,7 +12,7 @@ mod zone;
 
 use std::{collections::HashMap, fs, sync::Arc};
 
-use callback::CallbackState;
+pub use callback::CallbackState;
 use calloop::{LoopHandle, LoopSignal};
 use config_watcher::ConfigWatcher;
 use log::{error, warn};

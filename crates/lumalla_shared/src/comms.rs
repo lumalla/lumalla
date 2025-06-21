@@ -143,7 +143,7 @@ impl Comms {
     /// # let (to_input, _) = channel();
     /// # let (to_config, config_channel) = channel();
     /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config);
-    /// comms.input(ConfigMessage::Shutdown);
+    /// comms.config(ConfigMessage::Shutdown);
     /// assert!(matches!(config_channel.recv().unwrap(), ConfigMessage::Shutdown));
     /// ```
     pub fn config(&self, message: ConfigMessage) {
