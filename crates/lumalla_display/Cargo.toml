@@ -1,0 +1,14 @@
+[package]
+name = "lumalla_display"
+version = "0.1.0"
+edition = "2024"
+description = "Display handling library for lumalla"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lumalla/lumalla"
+include = ["src/**/*", "LICENSE-*"]
+
+[dependencies]
+lumalla_shared = { path = "../lumalla_shared" }
+anyhow = { workspace = true }
+calloop = { workspace = true }
+log = { workspace = true }

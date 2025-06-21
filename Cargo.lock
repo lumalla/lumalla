@@ -394,6 +394,7 @@ dependencies = [
  "env_logger",
  "log",
  "lumalla_config",
+ "lumalla_display",
  "lumalla_shared",
 ]
 
@@ -408,6 +409,16 @@ dependencies = [
  "mlua",
  "notify",
  "xdg",
+]
+
+[[package]]
+name = "lumalla_display"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "log",
+ "lumalla_shared",
 ]
 
 [[package]]
