@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::{CallbackRef, Mods};
 
 /// Represents the messages that can be sent to the input thread
+#[derive(Debug)]
 pub enum InputMessage {
     /// Requests the input thread to shut down
     Shutdown,

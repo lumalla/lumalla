@@ -1,24 +1,19 @@
-use std::path::PathBuf;
+use std::path::Path;
 
-use calloop::{
-    EventSource,
-    channel::{Channel, ChannelError, sync_channel},
-};
+use anyhow::Context;
 use log::error;
+use lumalla_shared::{ConfigMessage, MessageSender};
 use notify::{
     EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind, recommended_watcher,
 };
 
 pub struct ConfigWatcher {
-    channel: Channel<PathBuf>,
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
 }
 
 impl ConfigWatcher {
-    pub fn new(path: PathBuf) -> Self {
-        let (sender, channel) = sync_channel(64);
-
-        let mut watcher =
+    pub fn new(message_sender: MessageSender<ConfigMessage>) -> anyhow::Result<Self> {
+        let watcher =
             recommended_watcher(move |event_res: Result<notify::Event, notify::Error>| {
                 match &event_res {
                     Ok(event) => {
@@ -31,7 +26,12 @@ impl ConfigWatcher {
                         }
 
                         for path in &event.paths {
-                            sender.send(path.to_owned()).unwrap();
+                            if let Err(e) =
+                                message_sender.send(ConfigMessage::LoadConfig(path.to_owned()))
+                            {
+                                error!("Failed to send config change notification: {e}");
+                                return;
+                            }
                         }
                     }
                     Err(err) => {
@@ -39,58 +39,14 @@ impl ConfigWatcher {
                     }
                 }
             })
-            .unwrap();
+            .context("Failed to create file watcher")?;
 
-        if let Err(err) = watcher.watch(path.as_path(), RecursiveMode::NonRecursive) {
-            error!("Unable to setup config file change watcher: {err}");
-        }
-
-        Self {
-            channel,
-            _watcher: watcher,
-        }
-    }
-}
-
-impl EventSource for ConfigWatcher {
-    type Event = PathBuf;
-    type Metadata = ();
-    type Ret = ();
-    type Error = ChannelError;
-
-    fn process_events<F>(
-        &mut self,
-        readiness: calloop::Readiness,
-        token: calloop::Token,
-        mut callback: F,
-    ) -> Result<calloop::PostAction, Self::Error>
-    where
-        F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
-    {
-        self.channel
-            .process_events(readiness, token, |event, ()| match event {
-                calloop::channel::Event::Msg(msg) => callback(msg, &mut ()),
-                calloop::channel::Event::Closed => {}
-            })
+        Ok(Self { watcher })
     }
 
-    fn register(
-        &mut self,
-        poll: &mut calloop::Poll,
-        token_factory: &mut calloop::TokenFactory,
-    ) -> Result<(), calloop::Error> {
-        self.channel.register(poll, token_factory)
-    }
-
-    fn reregister(
-        &mut self,
-        poll: &mut calloop::Poll,
-        token_factory: &mut calloop::TokenFactory,
-    ) -> Result<(), calloop::Error> {
-        self.channel.reregister(poll, token_factory)
-    }
-
-    fn unregister(&mut self, poll: &mut calloop::Poll) -> Result<(), calloop::Error> {
-        self.channel.unregister(poll)
+    pub fn watch(&mut self, path: &Path) -> anyhow::Result<()> {
+        self.watcher
+            .watch(path, RecursiveMode::NonRecursive)
+            .context("Failed to watch config file")
     }
 }

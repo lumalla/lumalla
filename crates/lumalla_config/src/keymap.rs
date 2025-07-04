@@ -1,27 +1,25 @@
-use calloop::LoopHandle;
 use log::warn;
-use lumalla_shared::{InputMessage, Mods};
+use lumalla_shared::{Comms, InputMessage, Mods};
 use mlua::{
     FromLua, Function as LuaFunction, Lua, Result as LuaResult, Table as LuaTable,
     Value as LuaValue,
 };
 
-use crate::ConfigState;
+use crate::CallbackState;
 
 pub(crate) fn init(
     lua: &Lua,
     module: &LuaTable,
-    loop_handle: LoopHandle<'static, ConfigState>,
+    comms: Comms,
+    callback_state: CallbackState,
 ) -> LuaResult<()> {
     module.set(
         "map_key",
         lua.create_function(move |_, spawn: ConfigKeymap| {
-            loop_handle.insert_idle(move |state| {
-                state.comms.input(InputMessage::Keymap {
-                    key_name: spawn.key,
-                    mods: spawn.mods,
-                    callback: state.callback_state.register_callback(spawn.callback),
-                });
+            comms.input(InputMessage::Keymap {
+                key_name: spawn.key,
+                mods: spawn.mods,
+                callback: callback_state.register_callback(spawn.callback),
             });
             Ok(())
         })?,

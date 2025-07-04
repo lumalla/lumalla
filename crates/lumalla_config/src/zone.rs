@@ -1,34 +1,21 @@
-use calloop::LoopHandle;
-use lumalla_shared::{DisplayMessage, Zone};
+use lumalla_shared::{Comms, DisplayMessage, Zone};
 use mlua::{
     Error as LuaError, FromLua, Lua, Result as LuaResult, Table as LuaTable, Value as LuaValue,
 };
 
-use crate::ConfigState;
-
-pub(crate) fn init(
-    lua: &Lua,
-    module: &LuaTable,
-    loop_handle: LoopHandle<'static, ConfigState>,
-) -> LuaResult<()> {
-    init_set_zones(lua, module, loop_handle.clone())?;
-    init_move_current_window_to_zone(lua, module, loop_handle)?;
+pub(crate) fn init(lua: &Lua, module: &LuaTable, comms: Comms) -> LuaResult<()> {
+    init_set_zones(lua, module, comms.clone())?;
+    init_move_current_window_to_zone(lua, module, comms)?;
     Ok(())
 }
 
-fn init_set_zones(
-    lua: &Lua,
-    module: &LuaTable,
-    loop_handle: LoopHandle<'static, ConfigState>,
-) -> LuaResult<()> {
+fn init_set_zones(lua: &Lua, module: &LuaTable, comms: Comms) -> LuaResult<()> {
     module.set(
         "set_zones",
         lua.create_function(move |_, zones: Vec<ConfigZone>| {
-            loop_handle.insert_idle(move |state| {
-                state.comms.display(DisplayMessage::SetZones(
-                    zones.into_iter().map(Into::into).collect(),
-                ));
-            });
+            comms.display(DisplayMessage::SetZones(
+                zones.into_iter().map(Into::into).collect(),
+            ));
             Ok(())
         })?,
     )?;
@@ -36,19 +23,11 @@ fn init_set_zones(
     Ok(())
 }
 
-fn init_move_current_window_to_zone(
-    lua: &Lua,
-    module: &LuaTable,
-    loop_handle: LoopHandle<'static, ConfigState>,
-) -> LuaResult<()> {
+fn init_move_current_window_to_zone(lua: &Lua, module: &LuaTable, comms: Comms) -> LuaResult<()> {
     module.set(
         "move_current_window_to_zone",
         lua.create_function(move |_, zone_name: String| {
-            loop_handle.insert_idle(move |state| {
-                state
-                    .comms
-                    .display(DisplayMessage::MoveCurrentWindowToZone(zone_name))
-            });
+            comms.display(DisplayMessage::MoveCurrentWindowToZone(zone_name));
             Ok(())
         })?,
     )?;

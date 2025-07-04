@@ -1,6 +1,7 @@
 use std::{os::fd::OwnedFd, path::PathBuf};
 
 /// Represents the messages that can be sent to the renderer thread
+#[derive(Debug)]
 pub enum RendererMessage {
     /// Requests the renderer thread to shut down
     Shutdown,

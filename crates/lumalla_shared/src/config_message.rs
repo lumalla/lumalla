@@ -1,3 +1,5 @@
+use std::{collections::HashMap, path::PathBuf};
+
 use crate::{CallbackRef, Output};
 
 /// Represents the messages that can be sent to the config thread
@@ -22,4 +24,15 @@ pub enum ConfigMessage {
     },
     /// Spawn a process with the given command and arguments
     Spawn(String, Vec<String>),
+    /// Set the on startup callback
+    SetOnStartup(CallbackRef),
+    /// Set the on connector change callback
+    SetOnConnectorChange(CallbackRef),
+    /// Set the layout
+    SetLayout {
+        /// The spaces of the layout
+        spaces: HashMap<String, Vec<(String, i32, i32)>>,
+    },
+    /// Load config from the given path
+    LoadConfig(PathBuf),
 }

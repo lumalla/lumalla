@@ -10,29 +10,37 @@ mod spawn;
 mod window;
 mod zone;
 
-use std::{collections::HashMap, fs, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    sync::{Arc, mpsc},
+};
 
+use anyhow::Context;
 pub use callback::CallbackState;
-use calloop::{LoopHandle, LoopSignal};
 use config_watcher::ConfigWatcher;
 use log::{error, warn};
 use lumalla_shared::{
-    CallbackRef, Comms, ConfigMessage, DisplayMessage, GlobalArgs, InputMessage, MainMessage,
-    MessageRunner, Mods, Output,
+    CallbackRef, Comms, ConfigMessage, DisplayMessage, GlobalArgs, InputMessage,
+    MESSAGE_CHANNEL_TOKEN, MainMessage, MessageRunner, Mods, Output,
 };
+use mio::{Events, Poll};
 use mlua::{Function as LuaFunction, Lua, Result as LuaResult, Table as LuaTable};
 
 /// Holds the state of the config module
 pub struct ConfigState {
     comms: Comms,
     shutting_down: bool,
-    loop_handle: LoopHandle<'static, ConfigState>,
+    channel: mpsc::Receiver<ConfigMessage>,
+    event_loop: Poll,
     lua: Lua,
     callback_state: CallbackState,
     on_startup: Option<CallbackRef>,
     on_connector_change: Option<CallbackRef>,
     outputs: HashMap<String, Output>,
     extra_env: HashMap<String, String>,
+    config_watcher: ConfigWatcher,
 }
 
 impl MessageRunner for ConfigState {
@@ -40,25 +48,64 @@ impl MessageRunner for ConfigState {
 
     fn new(
         comms: Comms,
-        loop_handle: LoopHandle<'static, Self>,
+        event_loop: Poll,
+        channel: mpsc::Receiver<Self::Message>,
         args: Arc<GlobalArgs>,
     ) -> anyhow::Result<Self> {
+        let config_watcher =
+            ConfigWatcher::new(comms.config_sender()).context("Failed to create config watcher")?;
         let mut state = Self {
             comms,
             shutting_down: false,
-            loop_handle,
+            channel,
+            event_loop,
             lua: Lua::new(),
-            callback_state: CallbackState::new(),
+            callback_state: Default::default(),
             on_startup: None,
             on_connector_change: None,
             outputs: HashMap::new(),
             extra_env: HashMap::new(),
+            config_watcher,
         };
-        state.load_user_config(args)?;
+        state.load_user_config(args, state.callback_state.clone())?;
 
         Ok(state)
     }
 
+    fn run(&mut self) -> anyhow::Result<()> {
+        let mut events = Events::with_capacity(128);
+        loop {
+            if let Err(err) = self.event_loop.poll(&mut events, None) {
+                error!("Unable to poll event loop: {err}");
+            }
+
+            for event in events.iter() {
+                match event.token() {
+                    MESSAGE_CHANNEL_TOKEN => {
+                        // Handle messages
+                        while let Ok(msg) = self.channel.try_recv() {
+                            if let Err(err) = self.handle_message(msg) {
+                                error!("Unable to handle message: {err}");
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            // Stop the loop if we're shutting down
+            if self.shutting_down {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+const LUA_MODULE_NAME: &str = "lumalla";
+
+impl ConfigState {
     fn handle_message(&mut self, message: ConfigMessage) -> anyhow::Result<()> {
         match message {
             ConfigMessage::Shutdown => {
@@ -89,31 +136,79 @@ impl MessageRunner for ConfigState {
             ConfigMessage::Spawn(command, args) => {
                 self.spawn(&command, &args);
             }
+            ConfigMessage::SetOnStartup(callback) => {
+                if let Some(on_startup) = self.on_startup {
+                    self.callback_state.forget_callback(on_startup);
+                }
+                self.on_startup = Some(callback);
+            }
+            ConfigMessage::SetOnConnectorChange(callback) => {
+                if let Some(on_connector_change) = self.on_connector_change {
+                    self.callback_state.forget_callback(on_connector_change);
+                }
+                self.on_connector_change = Some(callback);
+            }
+            ConfigMessage::SetLayout { spaces } => {
+                self.comms.display(DisplayMessage::SetLayout {
+                    spaces: spaces
+                        .into_iter()
+                        .map(|(name, outputs)| {
+                            (
+                                name,
+                                outputs
+                                    .into_iter()
+                                    .filter_map(|config_output| {
+                                        let Some(output) = self.outputs.get(&config_output.0)
+                                        else {
+                                            warn!("Output not found: {}", config_output.0);
+                                            return None;
+                                        };
+                                        let mut output = output.clone();
+                                        output.set_location(config_output.1, config_output.2);
+
+                                        Some(output)
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+            ConfigMessage::LoadConfig(path) => {
+                self.load_config(&path)?;
+            }
         }
 
         Ok(())
     }
 
-    fn on_dispatch_wait(&mut self, signal: &LoopSignal) {
-        if self.shutting_down {
-            signal.stop();
-        }
+    /// Reload config from a file path
+    fn load_config(&mut self, path: &Path) -> anyhow::Result<()> {
+        // TODO: do this read async
+        let user_config = fs::read(path)?;
+        let config = self.lua.load(&user_config);
+        config
+            .exec()
+            .map_err(|err| anyhow::anyhow!("Unable to run config: {err}"))?;
+        self.config_watcher.watch(path.as_ref())?;
+        Ok(())
     }
-}
 
-const LUA_MODULE_NAME: &str = "lumalla";
-
-impl ConfigState {
     /// Initialize the lua state and starts requires some lua modules
-    fn load_user_config(&mut self, args: Arc<GlobalArgs>) -> anyhow::Result<()> {
-        let loop_handle = self.loop_handle.clone();
+    fn load_user_config(
+        &mut self,
+        args: Arc<GlobalArgs>,
+        callback_state: CallbackState,
+    ) -> anyhow::Result<()> {
+        let comms = self.comms.clone();
+        let cb_state = callback_state.clone();
         let _: LuaTable = self
             .lua
             .load_from_function(
                 LUA_MODULE_NAME,
                 self.lua
                     .create_function(move |lua: &Lua, _modname: String| {
-                        init_base_module(lua, loop_handle.clone())
+                        init_base_module(lua, comms.clone(), cb_state.clone())
                     })
                     .map_err(|err| anyhow::anyhow!("Unable to initialize base module: {err}"))?,
             )
@@ -132,30 +227,12 @@ impl ConfigState {
 
     fn run_and_watch_user_config(&mut self, args: Arc<GlobalArgs>) -> anyhow::Result<()> {
         if let Some(config_path) = &args.config {
-            let user_config = fs::read(config_path.as_str())?;
-            let config = self.lua.load(&user_config);
-            config
-                .exec()
-                .map_err(|err| anyhow::anyhow!("Unable to run config: {err}"))?;
+            self.load_config(config_path.as_ref())?;
         } else {
             let xdg_dirs = xdg::BaseDirectories::with_prefix("lumalla").unwrap();
             for path in xdg_dirs.list_config_files("") {
-                let user_config = fs::read(path)?;
-                let config = self.lua.load(&user_config);
-                config
-                    .exec()
-                    .map_err(|err| anyhow::anyhow!("Unable to run config: {err}"))?;
+                self.load_config(path.as_ref())?;
             }
-            self.loop_handle
-                .insert_source(
-                    ConfigWatcher::new(xdg_dirs.get_config_home()),
-                    |path, _, state| {
-                        let user_config = fs::read(path).unwrap();
-                        let config = state.lua.load(&user_config);
-                        config.exec().unwrap();
-                    },
-                )
-                .unwrap();
         }
 
         Ok(())
@@ -170,7 +247,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "backspace",
-                create_shutdown_callback(&self.lua, self.loop_handle.clone())?,
+                create_shutdown_callback(&self.lua, self.comms.clone())?,
             ),
             (
                 Mods {
@@ -179,7 +256,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f1",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 1)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 1)?,
             ),
             (
                 Mods {
@@ -188,7 +265,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f2",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 2)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 2)?,
             ),
             (
                 Mods {
@@ -197,7 +274,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f3",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 3)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 3)?,
             ),
             (
                 Mods {
@@ -206,7 +283,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f4",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 4)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 4)?,
             ),
             (
                 Mods {
@@ -215,7 +292,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f5",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 5)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 5)?,
             ),
             (
                 Mods {
@@ -224,7 +301,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f6",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 6)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 6)?,
             ),
             (
                 Mods {
@@ -233,7 +310,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f7",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 7)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 7)?,
             ),
             (
                 Mods {
@@ -242,7 +319,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f8",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 8)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 8)?,
             ),
             (
                 Mods {
@@ -251,7 +328,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f9",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 9)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 9)?,
             ),
             (
                 Mods {
@@ -260,7 +337,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f10",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 10)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 10)?,
             ),
             (
                 Mods {
@@ -269,7 +346,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f11",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 11)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 11)?,
             ),
             (
                 Mods {
@@ -278,7 +355,7 @@ impl ConfigState {
                     ..Default::default()
                 },
                 "f12",
-                create_vt_callback(&self.lua, self.loop_handle.clone(), 12)?,
+                create_vt_callback(&self.lua, self.comms.clone(), 12)?,
             ),
         ];
 
@@ -296,74 +373,60 @@ impl ConfigState {
 
 /// Initialize the base lua module which is used by the user config to interact with the
 /// window manager in a script-able and convenient way.
-fn init_base_module(lua: &Lua, lh: LoopHandle<'static, ConfigState>) -> LuaResult<LuaTable> {
+fn init_base_module(lua: &Lua, comms: Comms, callback_state: CallbackState) -> LuaResult<LuaTable> {
     let module = lua.create_table()?;
-    let loop_handle = lh.clone();
+
+    let c = comms.clone();
+    let cb_state = callback_state.clone();
     module.set(
         "on_startup",
         lua.create_function(move |_, callback: LuaFunction| {
-            loop_handle.insert_idle(move |state| {
-                if let Some(on_startup) = state.on_startup {
-                    state.callback_state.forget_callback(on_startup);
-                }
-                state.on_startup = Some(state.callback_state.register_callback(callback));
-            });
-            Ok(())
-        })?,
-    )?;
-    let loop_handle = lh.clone();
-    module.set(
-        "toggle_debug_ui",
-        lua.create_function(move |_, ()| {
-            loop_handle.insert_idle(move |state| {
-                state.comms.display(DisplayMessage::ToggleDebugUi);
-            });
-            Ok(())
-        })?,
-    )?;
-    module.set("quit", create_shutdown_callback(lua, lh.clone())?)?;
-    module.set("shutdown", create_shutdown_callback(lua, lh.clone())?)?;
-    let loop_handle = lh.clone();
-    module.set(
-        "start_video_stream",
-        lua.create_function(move |_, ()| {
-            loop_handle.insert_idle(move |state| {
-                state.comms.display(DisplayMessage::StartVideoStream);
-            });
+            let callback = cb_state.register_callback(callback);
+            c.config(ConfigMessage::SetOnStartup(callback));
             Ok(())
         })?,
     )?;
 
-    keymap::init(lua, &module, lh.clone())?;
-    output::init(lua, &module, lh.clone())?;
-    spawn::init(lua, &module, lh.clone())?;
-    zone::init(lua, &module, lh.clone())?;
-    window::init(lua, &module, lh.clone())?;
+    let c = comms.clone();
+    module.set(
+        "toggle_debug_ui",
+        lua.create_function(move |_, ()| {
+            c.display(DisplayMessage::ToggleDebugUi);
+            Ok(())
+        })?,
+    )?;
+
+    module.set("quit", create_shutdown_callback(lua, comms.clone())?)?;
+    module.set("shutdown", create_shutdown_callback(lua, comms.clone())?)?;
+
+    let c = comms.clone();
+    module.set(
+        "start_video_stream",
+        lua.create_function(move |_, ()| {
+            c.display(DisplayMessage::StartVideoStream);
+            Ok(())
+        })?,
+    )?;
+
+    keymap::init(lua, &module, comms.clone(), callback_state.clone())?;
+    output::init(lua, &module, comms.clone(), callback_state.clone())?;
+    spawn::init(lua, &module, comms.clone())?;
+    zone::init(lua, &module, comms.clone())?;
+    window::init(lua, &module, comms)?;
 
     Ok(module)
 }
 
-fn create_shutdown_callback(
-    lua: &Lua,
-    loop_handle: LoopHandle<'static, ConfigState>,
-) -> LuaResult<LuaFunction> {
+fn create_shutdown_callback(lua: &Lua, comms: Comms) -> LuaResult<LuaFunction> {
     lua.create_function(move |_, ()| {
-        loop_handle.insert_idle(move |state| {
-            state.comms.main(MainMessage::Shutdown);
-        });
+        comms.main(MainMessage::Shutdown);
         Ok(())
     })
 }
 
-fn create_vt_callback(
-    lua: &Lua,
-    loop_handle: LoopHandle<'static, ConfigState>,
-    vt: i32,
-) -> LuaResult<LuaFunction> {
+fn create_vt_callback(lua: &Lua, comms: Comms, vt: i32) -> LuaResult<LuaFunction> {
     lua.create_function(move |_, ()| {
-        loop_handle.insert_idle(move |state| {
-            state.comms.display(DisplayMessage::VtSwitch(vt));
-        });
+        comms.display(DisplayMessage::VtSwitch(vt));
         Ok(())
     })
 }

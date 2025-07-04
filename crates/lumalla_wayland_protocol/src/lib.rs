@@ -1,160 +1,100 @@
-#![allow(dead_code)]
-
-use anyhow::{Context, Result};
-use calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
-use log::{debug, error, info};
-use std::{fs, io, os::unix::net::UnixListener, path::Path};
+use anyhow::Context;
+use log::{debug, error};
+use mio::{event::Source, unix::SourceFd};
+use std::{
+    fs, io,
+    os::{fd::AsRawFd, unix::net::UnixListener},
+    path::Path,
+};
 
 mod client;
+mod header;
 mod protocols;
-pub use client::{ClientConnection, ClientEvent, ClientId};
+mod registry;
+pub use client::{Buffer, ClientConnection, ClientEvent, ClientId};
+pub use header::MessageHeader;
 
 type ObjectId = u32;
-
-#[repr(C)]
-struct MessageHeader {
-    object_id: ObjectId,
-    opcode: u16,
-    size: u16,
-}
-
-#[derive(Debug)]
-pub enum WaylandEvent {
-    ClientConnected(ClientConnection),
-}
+type Opcode = u16;
 
 pub struct Wayland {
-    socket_path: String,
-    listener: Option<UnixListener>,
+    listener: UnixListener,
     next_client_id: ClientId,
+    socket_path: String,
 }
 
 impl Wayland {
-    pub fn new(socket_path: impl Into<String>) -> Self {
-        Self {
-            socket_path: socket_path.into(),
-            listener: None,
-            next_client_id: 1,
-        }
-    }
-
-    pub fn bind(&mut self) -> Result<()> {
+    pub fn new(socket_path: String) -> anyhow::Result<Self> {
         // Remove existing socket if it exists
-        if Path::new(&self.socket_path).exists() {
-            fs::remove_file(&self.socket_path).context("Failed to remove existing socket")?;
+        if Path::new(&socket_path).exists() {
+            fs::remove_file(&socket_path).context("Failed to remove existing socket")?;
         }
 
         // Create Unix domain socket
-        let listener = UnixListener::bind(&self.socket_path).context("Failed to bind to socket")?;
+        let listener = UnixListener::bind(&socket_path).context("Failed to bind to socket")?;
 
         // Set socket to non-blocking mode
         listener
             .set_nonblocking(true)
             .context("Failed to set socket to non-blocking mode")?;
 
-        self.listener = Some(listener);
-        info!("Wayland socket bound to {}", self.socket_path);
-        Ok(())
+        Ok(Self {
+            listener,
+            next_client_id: 1,
+            socket_path,
+        })
     }
 
-    fn handle_new_clients<F>(&mut self, mut callback: F) -> io::Result<()>
-    where
-        F: FnMut(WaylandEvent, &mut ()),
-    {
-        if let Some(ref listener) = self.listener {
-            loop {
-                match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        let client_id = self.next_client_id;
-                        self.next_client_id += 1;
+    pub fn next_client<F>(&mut self) -> Option<ClientConnection> {
+        match self.listener.accept() {
+            Ok((stream, _addr)) => {
+                let client_id = self.next_client_id;
+                self.next_client_id += 1;
 
-                        match ClientConnection::new(stream, client_id) {
-                            Ok(client) => {
-                                debug!("New client connected with ID: {}", client_id);
-                                callback(WaylandEvent::ClientConnected(client), &mut ());
-                            }
-                            Err(e) => {
-                                error!("Failed to create client connection: {}", e);
-                                return Err(e);
-                            }
-                        }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // No more clients to accept
-                        break;
+                match ClientConnection::new(stream, client_id) {
+                    Ok(client) => {
+                        debug!("New client connected with ID: {}", client_id);
+                        Some(client)
                     }
                     Err(e) => {
-                        error!("Failed to accept client: {}", e);
-                        return Err(e);
+                        error!("Failed to create client connection: {}", e);
+                        None
                     }
                 }
             }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // No more clients to accept
+                None
+            }
+            Err(e) => {
+                error!("Failed to accept client: {}", e);
+                None
+            }
         }
-        Ok(())
     }
 }
 
-impl EventSource for Wayland {
-    type Event = WaylandEvent;
-    type Metadata = ();
-    type Ret = ();
-    type Error = io::Error;
-
-    fn process_events<F>(
-        &mut self,
-        readiness: Readiness,
-        _token: Token,
-        callback: F,
-    ) -> Result<PostAction, Self::Error>
-    where
-        F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
-    {
-        if readiness.readable {
-            self.handle_new_clients(callback)?;
-        }
-        Ok(PostAction::Continue)
-    }
-
+impl Source for Wayland {
     fn register(
         &mut self,
-        poll: &mut Poll,
-        token_factory: &mut TokenFactory,
-    ) -> calloop::Result<()> {
-        if let Some(ref listener) = self.listener {
-            unsafe {
-                // SAFETY: The listener is unregistered
-                poll.register(
-                    listener,
-                    calloop::Interest::READ,
-                    calloop::Mode::Level,
-                    token_factory.token(),
-                )?;
-            }
-        }
-        Ok(())
+        registry: &mio::Registry,
+        token: mio::Token,
+        interests: mio::Interest,
+    ) -> io::Result<()> {
+        SourceFd(&self.listener.as_raw_fd()).register(registry, token, interests)
     }
 
     fn reregister(
         &mut self,
-        poll: &mut Poll,
-        token_factory: &mut TokenFactory,
-    ) -> calloop::Result<()> {
-        if let Some(ref listener) = self.listener {
-            poll.reregister(
-                listener,
-                calloop::Interest::READ,
-                calloop::Mode::Level,
-                token_factory.token(),
-            )?;
-        }
-        Ok(())
+        registry: &mio::Registry,
+        token: mio::Token,
+        interests: mio::Interest,
+    ) -> io::Result<()> {
+        SourceFd(&self.listener.as_raw_fd()).reregister(registry, token, interests)
     }
 
-    fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
-        if let Some(listener) = &self.listener {
-            poll.unregister(listener)?;
-        }
-        Ok(())
+    fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()> {
+        SourceFd(&self.listener.as_raw_fd()).deregister(registry)
     }
 }
 

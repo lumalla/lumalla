@@ -1,33 +1,20 @@
-use calloop::LoopHandle;
-use lumalla_shared::{DisplayMessage, WindowRule};
+use lumalla_shared::{Comms, DisplayMessage, WindowRule};
 use mlua::{
     Error as LuaError, FromLua, Lua, Result as LuaResult, Table as LuaTable, Value as LuaValue,
 };
 
-use crate::ConfigState;
-
-pub(crate) fn init(
-    lua: &Lua,
-    module: &LuaTable,
-    loop_handle: LoopHandle<'static, ConfigState>,
-) -> LuaResult<()> {
-    init_add_window_rule(lua, module, loop_handle.clone())?;
-    init_close_current_window(lua, module, loop_handle)?;
+pub(crate) fn init(lua: &Lua, module: &LuaTable, comms: Comms) -> LuaResult<()> {
+    init_add_window_rule(lua, module, comms.clone())?;
+    init_close_current_window(lua, module, comms)?;
 
     Ok(())
 }
 
-fn init_close_current_window(
-    lua: &Lua,
-    module: &LuaTable,
-    loop_handle: LoopHandle<'static, ConfigState>,
-) -> LuaResult<()> {
+fn init_close_current_window(lua: &Lua, module: &LuaTable, comms: Comms) -> LuaResult<()> {
     module.set(
         "close_current_window",
         lua.create_function(move |_, ()| {
-            loop_handle.insert_idle(move |state| {
-                state.comms.display(DisplayMessage::CloseCurrentWindow);
-            });
+            comms.display(DisplayMessage::CloseCurrentWindow);
             Ok(())
         })?,
     )?;
@@ -35,19 +22,11 @@ fn init_close_current_window(
     Ok(())
 }
 
-fn init_add_window_rule(
-    lua: &Lua,
-    module: &LuaTable,
-    loop_handle: LoopHandle<'static, ConfigState>,
-) -> LuaResult<()> {
+fn init_add_window_rule(lua: &Lua, module: &LuaTable, comms: Comms) -> LuaResult<()> {
     module.set(
         "add_window_rule",
         lua.create_function(move |_, window_rule: ConfigWindowRule| {
-            loop_handle.insert_idle(move |state| {
-                state
-                    .comms
-                    .display(DisplayMessage::AddWindowRule(window_rule.into()));
-            });
+            comms.display(DisplayMessage::AddWindowRule(window_rule.into()));
             Ok(())
         })?,
     )?;

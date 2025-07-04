@@ -1,23 +1,22 @@
 use std::collections::HashMap;
 
-use calloop::LoopHandle;
-use log::warn;
-use lumalla_shared::{DisplayMessage, Output};
+use lumalla_shared::{Comms, ConfigMessage, Output};
 use mlua::{
     Error as LuaError, FromLua, Function as LuaFunction, IntoLua, Lua, Result as LuaResult,
     Table as LuaTable, Value as LuaValue,
 };
 
-use crate::ConfigState;
+use crate::{CallbackState, ConfigState};
 
 /// Set the output functions on the base module
 pub(crate) fn init(
     lua: &Lua,
     module: &LuaTable,
-    loop_handle: LoopHandle<'static, ConfigState>,
+    comms: Comms,
+    callback_state: CallbackState,
 ) -> LuaResult<()> {
-    init_on_connector_change(lua, module, loop_handle.clone())?;
-    init_set_layout(lua, module, loop_handle)?;
+    init_on_connector_change(lua, module, comms.clone(), callback_state)?;
+    init_set_layout(lua, module, comms)?;
 
     Ok(())
 }
@@ -25,14 +24,14 @@ pub(crate) fn init(
 fn init_on_connector_change(
     lua: &Lua,
     module: &LuaTable,
-    loop_handle: LoopHandle<'static, ConfigState>,
+    comms: Comms,
+    callback_state: CallbackState,
 ) -> LuaResult<()> {
     module.set(
         "on_connector_change",
         lua.create_function(move |_, callback: LuaFunction| {
-            loop_handle.insert_idle(move |state| {
-                state.on_connector_change = Some(state.callback_state.register_callback(callback));
-            });
+            let callback = callback_state.register_callback(callback);
+            comms.config(ConfigMessage::SetOnConnectorChange(callback));
             Ok(())
         })?,
     )?;
@@ -40,40 +39,26 @@ fn init_on_connector_change(
     Ok(())
 }
 
-fn init_set_layout(
-    lua: &Lua,
-    module: &LuaTable,
-    loop_handle: LoopHandle<'static, ConfigState>,
-) -> LuaResult<()> {
+fn init_set_layout(lua: &Lua, module: &LuaTable, comms: Comms) -> LuaResult<()> {
     module.set(
         "set_layout",
         lua.create_function(move |_, layout: ConfigLayout| {
-            loop_handle.insert_idle(move |state| {
-                state.comms.display(DisplayMessage::SetLayout {
-                    spaces: layout
-                        .spaces
-                        .into_iter()
-                        .map(|(name, outputs)| {
-                            (
-                                name,
-                                outputs
-                                    .into_iter()
-                                    .filter_map(|config_output| {
-                                        let Some(output) = state.outputs.get(&config_output.name)
-                                        else {
-                                            warn!("Output not found: {}", config_output.name);
-                                            return None;
-                                        };
-                                        let mut output = output.clone();
-                                        output.set_location(config_output.x, config_output.y);
-
-                                        Some(output)
-                                    })
-                                    .collect(),
-                            )
-                        })
-                        .collect(),
-                });
+            comms.config(ConfigMessage::SetLayout {
+                spaces: layout
+                    .spaces
+                    .into_iter()
+                    .map(|(name, outputs)| {
+                        (
+                            name,
+                            outputs
+                                .into_iter()
+                                .map(|config_output| {
+                                    (config_output.name, config_output.x, config_output.y)
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
             });
             Ok(())
         })?,

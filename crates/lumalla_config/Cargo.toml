@@ -10,7 +10,7 @@ include = ["src/**/*", "LICENSE-*"]
 [dependencies]
 lumalla_shared = { path = "../lumalla_shared" }
 anyhow = { workspace = true }
-calloop = { workspace = true }
+mio = { workspace = true }
 log = { workspace = true }
 mlua = { workspace = true }
 xdg = { workspace = true }

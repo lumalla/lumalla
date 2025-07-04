@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::{Action, Output, WindowRule, Zone};
 
 /// Represents the messages that can be sent to the display thread
+#[derive(Debug)]
 pub enum DisplayMessage {
     /// Requests the display thread to shut down
     Shutdown,
