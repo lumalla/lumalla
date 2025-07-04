@@ -9,5 +9,5 @@ include = ["src/**/*", "LICENSE-*"]
 
 [dependencies]
 anyhow = { workspace = true }
-calloop = { workspace = true }
+mio = { workspace = true }
 log = { workspace = true }

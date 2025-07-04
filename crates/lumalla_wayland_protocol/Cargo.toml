@@ -8,7 +8,7 @@ repository = "https://github.com/lumalla/lumalla"
 include = ["src/**/*", "LICENSE-*"]
 
 [dependencies]
-calloop = { workspace = true }
+mio = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
 lumalla_wayland_protocol_macros = { path = "../lumalla_wayland_protocol_macros" }

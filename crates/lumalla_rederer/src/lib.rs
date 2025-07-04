@@ -1,25 +1,36 @@
-use calloop::{LoopHandle, LoopSignal};
-use lumalla_shared::{MessageRunner, RendererMessage};
+use std::sync::Arc;
 
-pub struct RendererState {}
+use anyhow::Context;
+use calloop::{LoopSignal, PostAction};
+use log::warn;
+use lumalla_shared::{Comms, GlobalArgs, MessageRunner, MioLoopHandle, MioLoopSignal, RendererMessage};
 
-impl MessageRunner for RendererState {
+pub struct RendererRunner {
+    comms: Comms,
+    loop_handle: MioLoopHandle,
+}
+
+impl MessageRunner for RendererRunner {
     type Message = RendererMessage;
 
     fn new(
-        _comms: lumalla_shared::Comms,
-        _loop_handle: LoopHandle<'static, Self>,
-        _args: std::sync::Arc<lumalla_shared::GlobalArgs>,
-    ) -> anyhow::Result<Self>
-    where
-        Self: Sized,
-    {
-        Ok(Self {})
+        comms: Comms,
+        loop_handle: MioLoopHandle,
+        args: Arc<GlobalArgs>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self { comms, loop_handle })
     }
 
-    fn handle_message(&mut self, _message: Self::Message) -> anyhow::Result<()> {
+    fn handle_message(&mut self, message: RendererMessage) -> anyhow::Result<()> {
+        match message {
+            RendererMessage::Shutdown => {
+                warn!("Renderer module shutting down");
+            }
+        }
         Ok(())
     }
 
-    fn on_dispatch_wait(&mut self, _signal: &LoopSignal) {}
+    fn on_dispatch_wait(&mut self, _signal: &MioLoopSignal) {
+        // Nothing to do during wait
+    }
 }

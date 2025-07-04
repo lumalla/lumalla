@@ -11,6 +11,12 @@ pub struct CallbackState {
     callback_counter: usize,
 }
 
+impl Default for CallbackState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CallbackState {
     /// Create a new instance of the callback state.
     pub fn new() -> Self {
@@ -73,6 +79,21 @@ impl CallbackState {
         callback
             .call::<RESULT>(args)
             .map_err(|err| anyhow::anyhow!("Error while running lua callback: {err}"))
+    }
+
+    /// Get the callback with the given callback reference
+    ///
+    /// # Example
+    /// ```
+    /// # use lumalla_config::CallbackState;
+    /// # let mut callback_state = CallbackState::new();
+    /// # let lua = mlua::Lua::new();
+    /// let callback = lua.create_function(|_, ()| Ok(())).expect("Failed to create callback");
+    /// let callback_ref = callback_state.register_callback(callback);
+    /// assert_eq!(callback_state.get_callback(callback_ref), Some(&callback));
+    /// ```
+    pub fn get_callback(&self, callback_ref: CallbackRef) -> Option<LuaFunction> {
+        self.callbacks.get(&callback_ref)
     }
 
     /// Forgets the given callback

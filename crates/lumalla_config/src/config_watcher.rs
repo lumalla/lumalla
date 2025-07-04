@@ -1,23 +1,25 @@
-use std::path::PathBuf;
-
-use calloop::{
-    EventSource,
-    channel::{Channel, ChannelError, sync_channel},
+use std::{
+    path::PathBuf,
+    sync::{Arc, mpsc},
 };
+
 use log::error;
+use mio::{Token, Waker};
 use notify::{
     EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind, recommended_watcher,
 };
 
 pub struct ConfigWatcher {
-    channel: Channel<PathBuf>,
+    receiver: mpsc::Receiver<PathBuf>,
+    waker: Arc<Waker>,
     _watcher: RecommendedWatcher,
 }
 
 impl ConfigWatcher {
-    pub fn new(path: PathBuf) -> Self {
-        let (sender, channel) = sync_channel(64);
+    pub fn new(path: PathBuf, waker: Arc<Waker>) -> Self {
+        let (sender, receiver) = mpsc::channel();
 
+        let waker_clone = waker.clone();
         let mut watcher =
             recommended_watcher(move |event_res: Result<notify::Event, notify::Error>| {
                 match &event_res {
@@ -31,7 +33,15 @@ impl ConfigWatcher {
                         }
 
                         for path in &event.paths {
-                            sender.send(path.to_owned()).unwrap();
+                            if let Err(e) = sender.send(path.to_owned()) {
+                                error!("Failed to send config change notification: {e}");
+                                return;
+                            }
+                        }
+
+                        // Wake up the event loop
+                        if let Err(e) = waker_clone.wake() {
+                            error!("Failed to wake event loop: {e}");
                         }
                     }
                     Err(err) => {
@@ -46,51 +56,19 @@ impl ConfigWatcher {
         }
 
         Self {
-            channel,
+            receiver,
+            waker,
             _watcher: watcher,
         }
     }
-}
 
-impl EventSource for ConfigWatcher {
-    type Event = PathBuf;
-    type Metadata = ();
-    type Ret = ();
-    type Error = ChannelError;
-
-    fn process_events<F>(
-        &mut self,
-        readiness: calloop::Readiness,
-        token: calloop::Token,
-        mut callback: F,
-    ) -> Result<calloop::PostAction, Self::Error>
-    where
-        F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
-    {
-        self.channel
-            .process_events(readiness, token, |event, ()| match event {
-                calloop::channel::Event::Msg(msg) => callback(msg, &mut ()),
-                calloop::channel::Event::Closed => {}
-            })
+    /// Try to receive file change events
+    pub fn try_recv(&self) -> Result<PathBuf, mpsc::TryRecvError> {
+        self.receiver.try_recv()
     }
 
-    fn register(
-        &mut self,
-        poll: &mut calloop::Poll,
-        token_factory: &mut calloop::TokenFactory,
-    ) -> Result<(), calloop::Error> {
-        self.channel.register(poll, token_factory)
-    }
-
-    fn reregister(
-        &mut self,
-        poll: &mut calloop::Poll,
-        token_factory: &mut calloop::TokenFactory,
-    ) -> Result<(), calloop::Error> {
-        self.channel.reregister(poll, token_factory)
-    }
-
-    fn unregister(&mut self, poll: &mut calloop::Poll) -> Result<(), calloop::Error> {
-        self.channel.unregister(poll)
+    /// Get the waker associated with this config watcher
+    pub fn waker(&self) -> Arc<Waker> {
+        self.waker.clone()
     }
 }

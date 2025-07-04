@@ -1,26 +1,36 @@
-use calloop::{LoopHandle, LoopSignal};
-use lumalla_shared::{InputMessage, MessageRunner};
+use std::sync::Arc;
 
-/// Holds the state of the input module
-pub struct InputState {}
+use anyhow::Context;
+use calloop::{LoopSignal, PostAction};
+use log::warn;
+use lumalla_shared::{Comms, GlobalArgs, InputMessage, MessageRunner, MioLoopHandle, MioLoopSignal};
 
-impl MessageRunner for InputState {
+pub struct InputRunner {
+    comms: Comms,
+    loop_handle: MioLoopHandle,
+}
+
+impl MessageRunner for InputRunner {
     type Message = InputMessage;
 
     fn new(
-        _comms: lumalla_shared::Comms,
-        _loop_handle: LoopHandle<'static, Self>,
-        _args: std::sync::Arc<lumalla_shared::GlobalArgs>,
-    ) -> anyhow::Result<Self>
-    where
-        Self: Sized,
-    {
-        Ok(Self {})
+        comms: Comms,
+        loop_handle: MioLoopHandle,
+        args: Arc<GlobalArgs>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self { comms, loop_handle })
     }
 
-    fn handle_message(&mut self, _message: Self::Message) -> anyhow::Result<()> {
+    fn handle_message(&mut self, message: InputMessage) -> anyhow::Result<()> {
+        match message {
+            InputMessage::Shutdown => {
+                warn!("Input module shutting down");
+            }
+        }
         Ok(())
     }
 
-    fn on_dispatch_wait(&mut self, _signal: &LoopSignal) {}
+    fn on_dispatch_wait(&mut self, _signal: &MioLoopSignal) {
+        // Nothing to do during wait
+    }
 }

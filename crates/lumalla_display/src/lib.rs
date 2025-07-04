@@ -1,26 +1,36 @@
-use calloop::{LoopHandle, LoopSignal};
-use lumalla_shared::{DisplayMessage, MessageRunner};
+use std::sync::Arc;
 
-/// Holds the state of the display module
-pub struct DisplayState {}
+use anyhow::Context;
+use calloop::{LoopSignal, PostAction};
+use log::warn;
+use lumalla_shared::{Comms, DisplayMessage, GlobalArgs, MessageRunner, MioLoopHandle, MioLoopSignal};
 
-impl MessageRunner for DisplayState {
+pub struct DisplayRunner {
+    comms: Comms,
+    loop_handle: MioLoopHandle,
+}
+
+impl MessageRunner for DisplayRunner {
     type Message = DisplayMessage;
 
     fn new(
-        _comms: lumalla_shared::Comms,
-        _loop_handle: LoopHandle<'static, Self>,
-        _args: std::sync::Arc<lumalla_shared::GlobalArgs>,
-    ) -> anyhow::Result<Self>
-    where
-        Self: Sized,
-    {
-        Ok(Self {})
+        comms: Comms,
+        loop_handle: MioLoopHandle,
+        args: Arc<GlobalArgs>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self { comms, loop_handle })
     }
 
-    fn handle_message(&mut self, _message: Self::Message) -> anyhow::Result<()> {
+    fn handle_message(&mut self, message: DisplayMessage) -> anyhow::Result<()> {
+        match message {
+            DisplayMessage::Shutdown => {
+                warn!("Display module shutting down");
+            }
+        }
         Ok(())
     }
 
-    fn on_dispatch_wait(&mut self, _signal: &LoopSignal) {}
+    fn on_dispatch_wait(&mut self, _signal: &MioLoopSignal) {
+        // Nothing to do during wait
+    }
 }

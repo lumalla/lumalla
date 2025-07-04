@@ -14,12 +14,12 @@ mod zone;
 
 pub use action::{Action, CallbackRef};
 pub use args::GlobalArgs;
-pub use comms::Comms;
+pub use comms::{Comms, MessageSender, message_loop_with_channel};
 pub use config_message::ConfigMessage;
 pub use display_message::DisplayMessage;
 pub use input_message::InputMessage;
 pub use main_message::MainMessage;
-pub use message_runner::MessageRunner;
+pub use message_runner::{MESSAGE_CHANNEL_TOKEN, MessageRunner};
 pub use mods::Mods;
 pub use output::Output;
 pub use renderer_message::RendererMessage;

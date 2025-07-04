@@ -1,22 +1,17 @@
-#![allow(dead_code)]
-
 use anyhow::{Context, Result};
 use calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
 use log::{debug, error, info};
 use std::{fs, io, os::unix::net::UnixListener, path::Path};
 
 mod client;
+mod header;
 mod protocols;
-pub use client::{ClientConnection, ClientEvent, ClientId};
+mod registry;
+pub use client::{Buffer, ClientConnection, ClientEvent, ClientId};
+pub use header::MessageHeader;
 
 type ObjectId = u32;
-
-#[repr(C)]
-struct MessageHeader {
-    object_id: ObjectId,
-    opcode: u16,
-    size: u16,
-}
+type Opcode = u16;
 
 #[derive(Debug)]
 pub enum WaylandEvent {
