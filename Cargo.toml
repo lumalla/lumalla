@@ -26,7 +26,7 @@ log = { version = "0.4.27", features = [
 ] }
 env_logger = { version = "0.11.8", features = ["kv"] }
 anyhow = "1.0.72"
-mlua = { version = "0.10.0", features = ["lua54", "vendored"] }
+mlua = { version = "0.11.0", features = ["lua54", "vendored"] }
 xdg = "2.5"
 notify = "8.0"
 signal-hook = "0.3"
