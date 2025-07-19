@@ -9,7 +9,7 @@ use std::{
 
 mod client;
 mod header;
-mod protocols;
+pub mod protocols;
 mod registry;
 pub use client::{Buffer, ClientConnection, ClientEvent, ClientId};
 pub use header::MessageHeader;

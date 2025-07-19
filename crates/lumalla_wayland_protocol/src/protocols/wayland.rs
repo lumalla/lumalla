@@ -15,6 +15,42 @@ pub trait WlDisplay {
     }
 }
 
+pub struct WlDisplayErrorObjectId {
+    buffer: (),
+}
+
+impl WlDisplayErrorObjectId {
+    pub fn object_id(self) -> WlDisplayErrorCode {
+        // buffer write
+        WlDisplayErrorCode { buffer: () }
+    }
+}
+
+pub struct WlDisplayErrorCode {
+    buffer: (),
+}
+
+impl WlDisplayErrorCode {
+    pub fn code(self) -> WlDisplayErrorMessage {
+        // buffer write
+        WlDisplayErrorMessage { buffer: () }
+    }
+}
+
+pub struct WlDisplayErrorMessage {
+    buffer: (),
+}
+
+impl WlDisplayErrorMessage {
+    pub fn message(self) {
+        // buffer write
+    }
+}
+
+fn wl_display_error(object_id: ObjectId, buffer: ()) -> WlDisplayErrorObjectId {
+    WlDisplayErrorObjectId { buffer }
+}
+
 #[derive(Debug)]
 pub struct Sync {
     pub callback: ObjectId,
