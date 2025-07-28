@@ -202,15 +202,11 @@ impl ConfigState {
     ) -> anyhow::Result<()> {
         let comms = self.comms.clone();
         let cb_state = callback_state.clone();
-        let _: LuaTable = self
-            .lua
-            .load_from_function(
+        self.lua
+            .register_module(
                 LUA_MODULE_NAME,
-                self.lua
-                    .create_function(move |lua: &Lua, _modname: String| {
-                        init_base_module(lua, comms.clone(), cb_state.clone())
-                    })
-                    .map_err(|err| anyhow::anyhow!("Unable to initialize base module: {err}"))?,
+                init_base_module(&self.lua, comms.clone(), cb_state.clone())
+                    .map_err(|err| anyhow::anyhow!("Unable to create config module: {err}"))?,
             )
             .map_err(|err| anyhow::anyhow!("Unable to initialize base module: {err}"))?;
 

@@ -1,5 +1,6 @@
 use crate::{ObjectId, Opcode};
 
+#[derive(Debug)]
 #[repr(C)]
 pub struct MessageHeader {
     pub object_id: ObjectId,

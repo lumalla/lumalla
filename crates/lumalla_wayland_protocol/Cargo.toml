@@ -12,3 +12,4 @@ mio = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
 lumalla_wayland_protocol_macros = { path = "../lumalla_wayland_protocol_macros" }
+nix = { workspace = true }

@@ -7,11 +7,12 @@ use std::{
     path::Path,
 };
 
+mod buffer;
 mod client;
 mod header;
 pub mod protocols;
 mod registry;
-pub use client::{Buffer, ClientConnection, ClientEvent, ClientId};
+pub use client::{ClientConnection, ClientEvent, ClientId};
 pub use header::MessageHeader;
 
 type ObjectId = u32;

@@ -1,6 +1,9 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, VecDeque},
+    os::fd::RawFd,
+};
 
-use crate::{ObjectId, Opcode, protocols::WlDisplay};
+use crate::{ObjectId, Opcode, client::Ctx, protocols::WlDisplay};
 
 type InterfaceIndex = usize;
 
@@ -32,8 +35,9 @@ pub trait RequestHandler {
         &mut self,
         handler: InterfaceIndex,
         opcode: Opcode,
-        registry: &mut Registry,
+        ctx: Ctx,
         data: &[u8],
+        fds: &mut VecDeque<RawFd>,
     ) -> bool;
 }
 
@@ -45,11 +49,12 @@ where
         &mut self,
         handler: InterfaceIndex,
         opcode: Opcode,
-        registry: &mut Registry,
+        ctx: Ctx,
         data: &[u8],
+        _fds: &mut VecDeque<RawFd>,
     ) -> bool {
         match handler {
-            WL_DISPLAY => WlDisplay::handle_request(self, opcode, registry, data),
+            WL_DISPLAY => WlDisplay::handle_request(self, opcode, ctx, data),
             _ => false,
         }
     }
