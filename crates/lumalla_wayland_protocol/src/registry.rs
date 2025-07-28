@@ -3,7 +3,12 @@ use std::{
     os::fd::RawFd,
 };
 
-use crate::{ObjectId, Opcode, client::Ctx, protocols::WlDisplay};
+use crate::{
+    ObjectId,
+    buffer::MessageHeader,
+    client::Ctx,
+    protocols::{WlDisplay, wayland::WL_DISPLAY_ERROR_INVALID_METHOD},
+};
 
 type InterfaceIndex = usize;
 
@@ -34,11 +39,11 @@ pub trait RequestHandler {
     fn handle_request(
         &mut self,
         handler: InterfaceIndex,
-        opcode: Opcode,
-        ctx: Ctx,
+        ctx: &mut Ctx,
+        header: &MessageHeader,
         data: &[u8],
         fds: &mut VecDeque<RawFd>,
-    ) -> bool;
+    ) -> anyhow::Result<()>;
 }
 
 impl<T> RequestHandler for T
@@ -48,14 +53,21 @@ where
     fn handle_request(
         &mut self,
         handler: InterfaceIndex,
-        opcode: Opcode,
-        ctx: Ctx,
+        ctx: &mut Ctx,
+        header: &MessageHeader,
         data: &[u8],
         _fds: &mut VecDeque<RawFd>,
-    ) -> bool {
+    ) -> anyhow::Result<()> {
         match handler {
-            WL_DISPLAY => WlDisplay::handle_request(self, opcode, ctx, data),
-            _ => false,
+            WL_DISPLAY => WlDisplay::handle_request(self, ctx, header, data),
+            _ => {
+                ctx.writer
+                    .wl_display_error(header.object_id)?
+                    .object_id(header.object_id)
+                    .code(WL_DISPLAY_ERROR_INVALID_METHOD)
+                    .message("Invalid method");
+                anyhow::bail!("Invalid method");
+            }
         }
     }
 }

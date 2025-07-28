@@ -9,11 +9,9 @@ use std::{
 
 mod buffer;
 mod client;
-mod header;
 pub mod protocols;
 mod registry;
 pub use client::{ClientConnection, ClientEvent, ClientId};
-pub use header::MessageHeader;
 
 type ObjectId = u32;
 type Opcode = u16;

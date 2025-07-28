@@ -1,4 +1,4 @@
-use log::{debug, error};
+use log::debug;
 use mio::{event::Source, unix::SourceFd};
 use std::{
     io::{self},
@@ -7,6 +7,7 @@ use std::{
 
 use crate::{
     buffer::{ReadResult, Reader, Writer},
+    protocols::wayland::WL_DISPLAY_ERROR_INVALID_OBJECT,
     registry::{Registry, RequestHandler},
 };
 
@@ -65,11 +66,10 @@ impl ClientConnection {
     }
 
     #[must_use]
-    pub fn handle_messages(&mut self, handler: &mut impl RequestHandler) -> bool {
+    pub fn handle_messages(&mut self, handler: &mut impl RequestHandler) -> anyhow::Result<()> {
         match self.reader.read() {
             ReadResult::EndOfStream => {
-                debug!("Client {} disconnected", self.client_id);
-                return false;
+                anyhow::bail!("Client {} disconnected", self.client_id);
             }
             ReadResult::NoMoreData => {
                 debug!("Client {} did not read any data", self.client_id);
@@ -78,32 +78,37 @@ impl ClientConnection {
                 while let Some((header, data, fds)) = self.reader.next() {
                     let Some(interface_index) = self.registry.interface_index(header.object_id)
                     else {
-                        error!(
+                        self.writer
+                            .wl_display_error(header.object_id)?
+                            .object_id(header.object_id)
+                            .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                            .message("Invalid object ID");
+                        anyhow::bail!(
                             "Received request for unknown object ID {}. Disconnecting client {}",
-                            header.object_id, self.client_id
+                            header.object_id,
+                            self.client_id
                         );
-                        return false;
                     };
-                    let success = handler.handle_request(
+                    let result = handler.handle_request(
                         interface_index,
-                        header.opcode,
-                        Ctx {
+                        &mut Ctx {
                             registry: &mut self.registry,
                             writer: &mut self.writer,
                         },
+                        header,
                         data,
                         fds,
                     );
                     let message_size = header.size as usize;
                     self.reader.message_handled(message_size);
-                    if !success {
-                        return false;
+                    if result.is_err() {
+                        return result;
                     }
                 }
             }
         }
 
-        true
+        Ok(())
     }
 }
 

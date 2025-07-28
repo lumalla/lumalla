@@ -4,12 +4,20 @@ use log::{debug, error};
 use nix::{
     errno::Errno,
     libc::{
-        CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_NXTHDR, SCM_RIGHTS, SOL_SOCKET, cmsghdr, iovec,
-        msghdr, recvmsg, sendmsg,
+        CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_NXTHDR, MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET,
+        cmsghdr, iovec, msghdr, recvmsg, sendmsg,
     },
 };
 
-use crate::MessageHeader;
+use crate::{ObjectId, Opcode};
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct MessageHeader {
+    pub object_id: ObjectId,
+    pub size: u16,
+    pub opcode: Opcode,
+}
 
 const MAX_MESSAGE_SIZE: usize = u16::MAX as usize;
 const BUFFER_SIZE: usize = MAX_MESSAGE_SIZE * 2;
@@ -28,7 +36,7 @@ pub struct Reader {
     cmsg_buffer: Box<CmsgBuffer>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ReadResult {
     ReadData,
     NoMoreData,
@@ -63,12 +71,12 @@ impl Reader {
             msg_controllen: self.cmsg_buffer.len(),
             msg_flags: 0,
         };
-        // TODO: check if there are any useful flags
         let received_bytes = unsafe { recvmsg(self.fd, &mut msghdr as *mut _, 0) };
         match received_bytes {
             0 => ReadResult::EndOfStream,
             -1 => match Errno::last() {
-                Errno::EWOULDBLOCK => ReadResult::NoMoreData,
+                #[allow(unreachable_patterns)] // On some platforms these may have different values
+                Errno::EWOULDBLOCK | Errno::EAGAIN => ReadResult::NoMoreData,
                 err => {
                     error!("Error reading from socket: {}", err);
                     ReadResult::EndOfStream
@@ -140,6 +148,7 @@ pub struct Writer {
     bytes_in_buffer: usize,
     fds: Box<CmsgBuffer>,
     bytes_in_fds: usize,
+    message_length_index: usize,
 }
 
 // TODO: change the writer to unchecked copies
@@ -151,11 +160,34 @@ impl Writer {
             bytes_in_buffer: 0,
             fds: unsafe { Box::new_uninit().assume_init() },
             bytes_in_fds: mem::size_of::<cmsghdr>(),
+            message_length_index: 0,
         };
         let cmsghdr = unsafe { &mut *(writer.fds.as_mut_ptr() as *mut cmsghdr) };
         cmsghdr.cmsg_level = SOL_SOCKET;
         cmsghdr.cmsg_type = SCM_RIGHTS;
         writer
+    }
+
+    pub fn start_message(&mut self, object_id: ObjectId, opcode: Opcode) -> anyhow::Result<()> {
+        self.flush_if_needed()?;
+        self.write_u32(object_id);
+        self.message_length_index = self.bytes_in_buffer;
+        self.write_u16(0);
+        self.write_u16(opcode);
+        Ok(())
+    }
+
+    pub fn write_message_length(&mut self) {
+        let index = self.message_length_index;
+        self.buffer[index..index + mem::size_of::<u16>()].copy_from_slice(
+            &((self.bytes_in_buffer - index + mem::size_of::<ObjectId>()) as u16).to_ne_bytes(),
+        );
+    }
+
+    pub fn write_u16(&mut self, value: u16) {
+        self.buffer[self.bytes_in_buffer..self.bytes_in_buffer + mem::size_of::<u16>()]
+            .copy_from_slice(&value.to_ne_bytes());
+        self.bytes_in_buffer += mem::size_of::<u16>();
     }
 
     pub fn write_i32(&mut self, value: i32) {
@@ -201,7 +233,7 @@ impl Writer {
     }
 
     #[must_use]
-    pub fn flush_if_needed(&mut self) -> bool {
+    pub fn flush_if_needed(&mut self) -> anyhow::Result<()> {
         if self.bytes_in_buffer >= MAX_MESSAGE_SIZE ||
             // This is just a guard against sending too many FDs in a single message,
             // since a single message should not contain more than 100 FDs
@@ -209,12 +241,16 @@ impl Writer {
         {
             self.flush()
         } else {
-            true
+            Ok(())
         }
     }
 
     #[must_use]
-    fn flush(&mut self) -> bool {
+    fn flush(&mut self) -> anyhow::Result<()> {
+        if self.bytes_in_buffer == 0 {
+            return Ok(());
+        }
+
         let cmsghdr = unsafe { &mut *(self.fds.as_mut_ptr() as *mut cmsghdr) };
         cmsghdr.cmsg_len = self.bytes_in_fds;
         let msg = msghdr {
@@ -229,11 +265,9 @@ impl Writer {
             msg_controllen: self.bytes_in_fds,
             msg_flags: 0,
         };
-        // TODO: check if there are any useful flags
-        let result = unsafe { sendmsg(self.fd, &msg as *const _, 0) };
+        let result = unsafe { sendmsg(self.fd, &msg as *const _, MSG_NOSIGNAL) };
         if result < 0 {
-            error!("Error sending message: {}", Errno::last());
-            return false;
+            anyhow::bail!("Error sending message: {}", Errno::last());
         }
 
         if self.bytes_in_buffer > MAX_MESSAGE_SIZE {
@@ -243,7 +277,7 @@ impl Writer {
             self.bytes_in_buffer = 0;
         }
         self.bytes_in_fds = mem::size_of::<cmsghdr>();
-        true
+        Ok(())
     }
 }
 
@@ -253,4 +287,80 @@ pub fn fixed_to_f32(value: i32) -> f32 {
 
 pub fn f32_to_fixed(value: f32) -> i32 {
     (value * 256.0).round() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::{fd::AsRawFd, unix::net::UnixStream};
+
+    use super::*;
+
+    #[test]
+    fn read_and_write_unix_stream() {
+        let socket = UnixStream::pair().unwrap();
+        let mut reader = Reader::new(socket.0.as_raw_fd());
+        let mut writer = Writer::new(socket.1.as_raw_fd());
+
+        let str = "Hello, world!";
+        writer.start_message(1, 2).unwrap();
+        writer.write_u16(10);
+        writer.write_i32(-2);
+        writer.write_u32(3);
+        writer.write_fixed(4.3);
+        writer.write_str(str);
+        writer.write_fd(socket.1.as_raw_fd());
+        writer.write_message_length();
+        writer.flush().unwrap();
+
+        assert_eq!(reader.read(), ReadResult::ReadData);
+        let (header, data, fds) = reader.next().unwrap();
+        assert_eq!(header.object_id, 1);
+        assert_eq!(header.opcode, 2);
+        assert_eq!(data.len(), 34);
+        assert_eq!(
+            header.size as usize,
+            data.len() + mem::size_of::<MessageHeader>()
+        );
+        let start_index = 0;
+        let end_index = mem::size_of::<u16>();
+        assert_eq!(data[start_index..end_index], 10u16.to_ne_bytes());
+        let start_index = end_index;
+        let end_index = start_index + mem::size_of::<i32>();
+        assert_eq!(data[start_index..end_index], (-2i32).to_ne_bytes());
+        let start_index = end_index;
+        let end_index = start_index + mem::size_of::<u32>();
+        assert_eq!(data[start_index..end_index], 3u32.to_ne_bytes());
+        let start_index = end_index;
+        let end_index = start_index + mem::size_of::<i32>();
+        assert_eq!(
+            data[start_index..end_index],
+            (f32_to_fixed(4.3).to_ne_bytes())
+        );
+        let start_index = end_index;
+        let end_index = start_index + mem::size_of::<u32>();
+        assert_eq!(
+            data[start_index..end_index],
+            (str.len() as u32).to_ne_bytes()
+        );
+        let start_index = end_index;
+        let end_index = start_index + str.bytes().len();
+        assert_eq!(&data[start_index..end_index], str.as_bytes());
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[test]
+    fn convert_f32_to_fixed_and_back() {
+        let values = [0.0, 1.0, 8.8, 27.27, 255.0, 256.0, 257.0];
+        for value in values {
+            let fixed = f32_to_fixed(value);
+            let back = fixed_to_f32(fixed);
+            assert!((value - back).abs() < 0.001);
+        }
+
+        for value in values.iter().map(|v| -v) {
+            let fixed = f32_to_fixed(value);
+            let back = fixed_to_f32(fixed);
+            assert!((value - back).abs() < 0.001);
+        }
+    }
 }
