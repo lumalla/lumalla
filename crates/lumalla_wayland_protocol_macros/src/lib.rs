@@ -245,93 +245,47 @@ fn generate_interface_code_parts(
 
     // Generate parameter structs for requests
     let empty = Vec::new();
-    let request_param_structs = interface
-        .request
-        .as_ref()
-        .unwrap_or(&empty)
-        .iter()
-        .map(|request| {
-            let struct_name = syn::Ident::new(
-                &format!(
-                    "{}{}",
-                    snake_to_pascal_case(&interface.name),
-                    snake_to_pascal_case(&request.name)
-                ),
-                proc_macro2::Span::call_site(),
-            );
-
-            let empty = Vec::new();
-            let fields = request.arg.as_ref().unwrap_or(&empty).iter().map(|arg| {
-                let field_name = syn::Ident::new(
-                    &escape_rust_keyword(&arg.name),
+    let request_param_structs =
+        interface
+            .request
+            .as_ref()
+            .unwrap_or(&empty)
+            .iter()
+            .map(|request| {
+                let struct_name = syn::Ident::new(
+                    &format!(
+                        "{}{}",
+                        snake_to_pascal_case(&interface.name),
+                        snake_to_pascal_case(&request.name)
+                    ),
                     proc_macro2::Span::call_site(),
                 );
-                let field_type = rust_type_from_wayland_type(
-                    &arg.arg_type,
-                    arg.interface.as_deref(),
-                    arg.allow_null.unwrap_or(false),
-                );
-                quote! { pub #field_name: #field_type }
-            });
 
-            // Generate accessor methods for each field
-            let accessor_methods = request.arg.as_ref().unwrap_or(&empty).iter().map(|arg| {
-                let field_name = syn::Ident::new(
-                    &escape_rust_keyword(&arg.name),
-                    proc_macro2::Span::call_site(),
-                );
-                let method_name = syn::Ident::new(
-                    &escape_rust_keyword(&arg.name),
-                    proc_macro2::Span::call_site(),
-                );
-                let field_type = rust_type_from_wayland_type(
-                    &arg.arg_type,
-                    arg.interface.as_deref(),
-                    arg.allow_null.unwrap_or(false),
-                );
+                let empty = Vec::new();
+                let args = request.arg.as_ref().unwrap_or(&empty);
 
-                // For Copy types, return by value; for non-Copy types, return by reference
-                let return_type_and_value = match arg.arg_type.as_str() {
-                    "string" => {
-                        if arg.allow_null.unwrap_or(false) {
-                            (quote! { Option<&str> }, quote! { self.#field_name.as_deref() })
-                        } else {
-                            (quote! { &str }, quote! { &self.#field_name })
-                        }
-                    }
-                    "array" => {
-                        if arg.allow_null.unwrap_or(false) {
-                            (quote! { Option<&[u8]> }, quote! { self.#field_name.as_deref() })
-                        } else {
-                            (quote! { &[u8] }, quote! { &self.#field_name })
-                        }
-                    }
-                    _ => {
-                        // For numeric types and ObjectId, return by value (Copy types)
-                        (field_type.clone(), quote! { self.#field_name })
-                    }
+                // Generate accessor methods for each field
+                let accessor_methods = if args.is_empty() {
+                    vec![]
+                } else {
+                    generate_accessor_methods(args)
                 };
 
-                let (return_type, return_value) = return_type_and_value;
-
                 quote! {
-                    pub fn #method_name(&self) -> #return_type {
-                        #return_value
+                    #[derive(Debug)]
+                    pub struct #struct_name<'a> {
+                        data: &'a [u8],
+                    }
+
+                    impl<'a> #struct_name<'a> {
+                        pub fn new(data: &'a [u8]) -> Self {
+                            Self { data }
+                        }
+
+                        #(#accessor_methods)*
                     }
                 }
             });
-
-            quote! {
-                #[derive(Debug)]
-                pub struct #struct_name {
-                    #(#fields,)*
-                }
-
-                impl #struct_name {
-                    #(#accessor_methods)*
-                }
-            }
-        });
 
     // Generate interface trait
     let empty = Vec::new();
@@ -355,7 +309,7 @@ fn generate_interface_code_parts(
             );
 
             quote! {
-                fn #method_name(&mut self, ctx: &Ctx, object_id: ObjectId, params: &#param_type);
+                fn #method_name(&mut self, ctx: &Ctx, object_id: ObjectId, params: &#param_type<'_>);
             }
         });
 
@@ -383,9 +337,7 @@ fn generate_interface_code_parts(
             let opcode_lit = (opcode + 1) as u16; // Opcodes start from 1
 
             quote! {
-                #opcode_lit => self.#method_name(ctx, header.object_id, unsafe {
-                    &*(data.as_ptr() as *const #param_type)
-                }),
+                #opcode_lit => self.#method_name(ctx, header.object_id, &#param_type::new(data)),
             }
         });
 
@@ -593,4 +545,268 @@ fn generate_interface_code_parts(
     };
 
     (interface_code, writer_methods, builder_structs)
+}
+
+fn generate_accessor_methods(args: &[schema::RequestArg]) -> Vec<proc_macro2::TokenStream> {
+    let mut methods = Vec::new();
+
+    for (index, arg) in args.iter().enumerate() {
+        let method_name = syn::Ident::new(
+            &escape_rust_keyword(&arg.name),
+            proc_macro2::Span::call_site(),
+        );
+
+        // Generate offset calculation for this field
+        let offset_calculation = generate_field_offset_calculation(args, index);
+
+        let (return_type, parse_logic) = match arg.arg_type.as_str() {
+            "uint" => (
+                quote! { u32 },
+                quote! {
+                    let offset = #offset_calculation;
+                    if offset + 4 <= self.data.len() {
+                        u32::from_ne_bytes([
+                            self.data[offset],
+                            self.data[offset + 1],
+                            self.data[offset + 2],
+                            self.data[offset + 3]
+                        ])
+                    } else {
+                        0
+                    }
+                },
+            ),
+            "int" => (
+                quote! { i32 },
+                quote! {
+                    let offset = #offset_calculation;
+                    if offset + 4 <= self.data.len() {
+                        i32::from_ne_bytes([
+                            self.data[offset],
+                            self.data[offset + 1],
+                            self.data[offset + 2],
+                            self.data[offset + 3]
+                        ])
+                    } else {
+                        0
+                    }
+                },
+            ),
+            "fixed" => (
+                quote! { i32 },
+                quote! {
+                    let offset = #offset_calculation;
+                    if offset + 4 <= self.data.len() {
+                        i32::from_ne_bytes([
+                            self.data[offset],
+                            self.data[offset + 1],
+                            self.data[offset + 2],
+                            self.data[offset + 3]
+                        ])
+                    } else {
+                        0
+                    }
+                },
+            ),
+            "object" | "new_id" => (
+                quote! { ObjectId },
+                quote! {
+                    let offset = #offset_calculation;
+                    if offset + 4 <= self.data.len() {
+                        u32::from_ne_bytes([
+                            self.data[offset],
+                            self.data[offset + 1],
+                            self.data[offset + 2],
+                            self.data[offset + 3]
+                        ])
+                    } else {
+                        0
+                    }
+                },
+            ),
+            "string" => {
+                if arg.allow_null.unwrap_or(false) {
+                    (
+                        quote! { Option<&str> },
+                        quote! {
+                            let offset = #offset_calculation;
+                            if offset + 4 <= self.data.len() {
+                                let len = u32::from_ne_bytes([
+                                    self.data[offset],
+                                    self.data[offset + 1],
+                                    self.data[offset + 2],
+                                    self.data[offset + 3]
+                                ]) as usize;
+
+                                if len == 0 {
+                                    None
+                                } else {
+                                    let start = offset + 4;
+                                    let end = start + len.saturating_sub(1); // Subtract 1 for null terminator
+                                    if end <= self.data.len() {
+                                        std::str::from_utf8(&self.data[start..end]).ok()
+                                    } else {
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                } else {
+                    (
+                        quote! { &str },
+                        quote! {
+                            let offset = #offset_calculation;
+                            if offset + 4 <= self.data.len() {
+                                let len = u32::from_ne_bytes([
+                                    self.data[offset],
+                                    self.data[offset + 1],
+                                    self.data[offset + 2],
+                                    self.data[offset + 3]
+                                ]) as usize;
+
+                                let start = offset + 4;
+                                let end = start + len.saturating_sub(1); // Subtract 1 for null terminator
+                                if end <= self.data.len() {
+                                    std::str::from_utf8(&self.data[start..end]).unwrap_or("")
+                                } else {
+                                    ""
+                                }
+                            } else {
+                                ""
+                            }
+                        },
+                    )
+                }
+            }
+            "array" => {
+                if arg.allow_null.unwrap_or(false) {
+                    (
+                        quote! { Option<&[u8]> },
+                        quote! {
+                            let offset = #offset_calculation;
+                            if offset + 4 <= self.data.len() {
+                                let len = u32::from_ne_bytes([
+                                    self.data[offset],
+                                    self.data[offset + 1],
+                                    self.data[offset + 2],
+                                    self.data[offset + 3]
+                                ]) as usize;
+
+                                if len == 0 {
+                                    None
+                                } else {
+                                    let start = offset + 4;
+                                    let end = start + len;
+                                    if end <= self.data.len() {
+                                        Some(&self.data[start..end])
+                                    } else {
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                } else {
+                    (
+                        quote! { &[u8] },
+                        quote! {
+                            let offset = #offset_calculation;
+                            if offset + 4 <= self.data.len() {
+                                let len = u32::from_ne_bytes([
+                                    self.data[offset],
+                                    self.data[offset + 1],
+                                    self.data[offset + 2],
+                                    self.data[offset + 3]
+                                ]) as usize;
+
+                                let start = offset + 4;
+                                let end = start + len;
+                                if end <= self.data.len() {
+                                    &self.data[start..end]
+                                } else {
+                                    &[]
+                                }
+                            } else {
+                                &[]
+                            }
+                        },
+                    )
+                }
+            }
+            "fd" => (
+                quote! { std::os::unix::io::RawFd },
+                quote! {
+                    let offset = #offset_calculation;
+                    if offset + 4 <= self.data.len() {
+                        i32::from_ne_bytes([
+                            self.data[offset],
+                            self.data[offset + 1],
+                            self.data[offset + 2],
+                            self.data[offset + 3]
+                        ])
+                    } else {
+                        -1
+                    }
+                },
+            ),
+            _ => (quote! { () }, quote! { () }),
+        };
+
+        methods.push(quote! {
+            pub fn #method_name(&self) -> #return_type {
+                #parse_logic
+            }
+        });
+    }
+
+    methods
+}
+
+fn generate_field_offset_calculation(
+    args: &[schema::RequestArg],
+    target_index: usize,
+) -> proc_macro2::TokenStream {
+    if target_index == 0 {
+        return quote! { 0 };
+    }
+
+    let mut calculation = quote! { 0 };
+
+    for i in 0..target_index {
+        let arg = &args[i];
+        match arg.arg_type.as_str() {
+            "uint" | "int" | "fixed" | "object" | "new_id" | "fd" => {
+                calculation = quote! { #calculation + 4 };
+            }
+            "string" | "array" => {
+                // Variable length: 4 bytes for length + actual length + padding to 4-byte boundary
+                calculation = quote! {
+                    {
+                        let current_offset = #calculation;
+                        if current_offset + 4 <= self.data.len() {
+                            let len = u32::from_ne_bytes([
+                                self.data[current_offset],
+                                self.data[current_offset + 1],
+                                self.data[current_offset + 2],
+                                self.data[current_offset + 3]
+                            ]) as usize;
+                            current_offset + 4 + ((len + 3) & !3) // 4 for length + length padded to 4-byte boundary
+                        } else {
+                            current_offset + 4
+                        }
+                    }
+                };
+            }
+            _ => {
+                calculation = quote! { #calculation + 4 };
+            }
+        }
+    }
+
+    calculation
 }
