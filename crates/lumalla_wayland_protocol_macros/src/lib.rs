@@ -20,6 +20,49 @@ fn parse_wayland_xml(xml_path: &str) -> Result<Protocol> {
     Ok(protocol)
 }
 
+fn generate_doc_comment(
+    summary: Option<&str>,
+    description: Option<&str>,
+) -> proc_macro2::TokenStream {
+    let mut doc_lines = Vec::new();
+
+    if let Some(summary) = summary {
+        if !summary.trim().is_empty() {
+            doc_lines.push(format!(" {}", summary.trim()));
+        }
+    }
+
+    if let Some(description) = description {
+        let desc_text = description.trim();
+        if !desc_text.is_empty() {
+            if !doc_lines.is_empty() {
+                doc_lines.push(" ".to_string()); // Empty line separator
+            }
+            // Split description into lines and add proper indentation
+            for line in desc_text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    doc_lines.push(" ".to_string());
+                } else {
+                    doc_lines.push(format!(" {}", trimmed));
+                }
+            }
+        }
+    }
+
+    if doc_lines.is_empty() {
+        return quote! {};
+    }
+
+    let doc_attrs = doc_lines.iter().map(|line| {
+        quote! { #[doc = #line] }
+    });
+
+    quote! {
+        #(#doc_attrs)*
+    }
+}
+
 fn rust_type_from_wayland_type_for_method(
     wayland_type: &str,
     _interface: Option<&str>,
@@ -142,8 +185,20 @@ pub fn wayland_protocol(input: TokenStream) -> TokenStream {
     });
 
     let protocol_supertrait = if !interface_trait_names.is_empty() {
+        // Generate protocol documentation
+        let protocol_doc = generate_doc_comment(
+            Some(&format!(
+                "{} protocol",
+                snake_to_pascal_case(&protocol.name)
+            )),
+            Some(&format!(
+                "Supertrait combining all interfaces in the {} protocol.",
+                protocol.name
+            )),
+        );
+
         quote! {
-            /// Supertrait combining all interfaces in this protocol
+            #protocol_doc
             pub trait #protocol_trait_name: #(#interface_bounds)+* {}
         }
     } else {
@@ -205,7 +260,17 @@ fn generate_interface_code_parts(
             interface.name.to_uppercase(),
             enum_def.name.to_uppercase()
         );
-        enum_def
+
+        // Generate enum documentation
+        let enum_doc = generate_doc_comment(
+            enum_def.description.as_ref().map(|d| d.summary.as_str()),
+            enum_def
+                .description
+                .as_ref()
+                .and_then(|d| d.text.as_deref()),
+        );
+
+        let constants = enum_def
             .entry
             .iter()
             .map(move |entry| {
@@ -214,9 +279,33 @@ fn generate_interface_code_parts(
                     proc_macro2::Span::call_site(),
                 );
                 let value = entry.value.parse::<u32>().unwrap_or(0);
-                quote! { pub const #const_name: u32 = #value; }
+
+                // Generate entry documentation
+                let entry_doc = generate_doc_comment(
+                    entry.summary.as_deref(),
+                    None, // Entries don't typically have detailed descriptions
+                );
+
+                quote! {
+                    #entry_doc
+                    pub const #const_name: u32 = #value;
+                }
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+
+        // Add a comment for the enum group
+        let enum_comment = if !enum_doc.is_empty() {
+            quote! {
+                #enum_doc
+                // Enum: #enum_def.name
+            }
+        } else {
+            quote! {
+                // Enum: #enum_def.name
+            }
+        };
+
+        std::iter::once(enum_comment).chain(constants.into_iter())
     });
 
     // Generate parameter structs for requests
@@ -242,6 +331,12 @@ fn generate_interface_code_parts(
 
                 // Check if this request has any file descriptors
                 let has_fds = args.iter().any(|arg| arg.arg_type == "fd");
+
+                // Generate documentation for the request
+                let request_doc = generate_doc_comment(
+                    Some(&request.description.summary),
+                    request.description.text.as_deref()
+                );
 
                 // Generate accessor methods for each field
                 let accessor_methods = if args.is_empty() {
@@ -306,6 +401,7 @@ fn generate_interface_code_parts(
                 };
 
                 quote! {
+                    #request_doc
                     #[derive(Debug)]
                     pub struct #struct_name<'a> {
                         #struct_fields
@@ -340,7 +436,14 @@ fn generate_interface_code_parts(
                 proc_macro2::Span::call_site(),
             );
 
+            // Generate method documentation
+            let method_doc = generate_doc_comment(
+                Some(&request.description.summary),
+                request.description.text.as_deref()
+            );
+
             quote! {
+                #method_doc
                 fn #method_name(&mut self, ctx: &Ctx, object_id: ObjectId, params: &#param_type<'_>);
             }
         });
@@ -397,7 +500,14 @@ fn generate_interface_code_parts(
             }
         };
 
+        // Generate interface documentation
+        let interface_doc = generate_doc_comment(
+            Some(&interface.description.summary),
+            interface.description.text.as_deref(),
+        );
+
         quote! {
+            #interface_doc
             pub trait #interface_name {
                 #(#trait_methods)*
 
@@ -587,6 +697,12 @@ fn generate_accessor_methods(args: &[schema::RequestArg]) -> Vec<proc_macro2::To
         let method_name = syn::Ident::new(
             &escape_rust_keyword(&arg.name),
             proc_macro2::Span::call_site(),
+        );
+
+        // Generate method documentation from argument summary
+        let arg_doc = generate_doc_comment(
+            Some(&arg.summary),
+            None, // Arguments don't have detailed descriptions
         );
 
         let (return_type, parse_logic) = match arg.arg_type.as_str() {
@@ -792,6 +908,7 @@ fn generate_accessor_methods(args: &[schema::RequestArg]) -> Vec<proc_macro2::To
         };
 
         methods.push(quote! {
+            #arg_doc
             pub fn #method_name(&self) -> #return_type {
                 #parse_logic
             }
