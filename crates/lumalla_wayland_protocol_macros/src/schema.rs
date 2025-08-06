@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Protocol {
     #[serde(rename = "@name")]
     pub name: String,
@@ -10,7 +10,7 @@ pub struct Protocol {
     pub interface: Vec<Interface>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Interface {
     #[serde(rename = "@name")]
     pub name: String,
@@ -25,7 +25,7 @@ pub struct Interface {
     pub interface_enum: Option<Vec<Enum>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct InterfaceDescription {
     #[serde(rename = "@summary")]
     pub summary: String,
@@ -33,7 +33,7 @@ pub struct InterfaceDescription {
     pub text: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Request {
     #[serde(rename = "@name")]
     pub name: String,
@@ -47,7 +47,7 @@ pub struct Request {
     pub arg: Option<Vec<RequestArg>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct RequestDescription {
     #[serde(rename = "@summary")]
     pub summary: String,
@@ -55,7 +55,7 @@ pub struct RequestDescription {
     pub text: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct RequestArg {
     #[serde(rename = "@name")]
     pub name: String,
@@ -71,7 +71,7 @@ pub struct RequestArg {
     pub allow_null: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Event {
     #[serde(rename = "@name")]
     pub name: String,
@@ -87,7 +87,7 @@ pub struct Event {
     pub arg: Option<Vec<EventArg>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct EventDescription {
     #[serde(rename = "@summary")]
     pub summary: String,
@@ -95,7 +95,7 @@ pub struct EventDescription {
     pub text: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct EventArg {
     #[serde(rename = "@name")]
     pub name: String,
@@ -111,7 +111,7 @@ pub struct EventArg {
     pub interface: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Enum {
     #[serde(rename = "@name")]
     pub name: String,
@@ -125,7 +125,7 @@ pub struct Enum {
     pub entry: Vec<Entry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct EnumDescription {
     #[serde(rename = "@summary")]
     pub summary: String,
@@ -133,7 +133,7 @@ pub struct EnumDescription {
     pub text: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Entry {
     #[serde(rename = "@name")]
     pub name: String,

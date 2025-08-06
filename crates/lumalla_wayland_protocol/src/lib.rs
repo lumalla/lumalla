@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-mod buffer;
+pub mod buffer;
 mod client;
 pub mod protocols;
 mod registry;
