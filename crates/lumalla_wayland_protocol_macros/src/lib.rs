@@ -20,30 +20,6 @@ fn parse_wayland_xml(xml_path: &str) -> Result<Protocol> {
     Ok(protocol)
 }
 
-fn rust_type_from_wayland_type(
-    wayland_type: &str,
-    _interface: Option<&str>,
-    allow_null: bool,
-) -> proc_macro2::TokenStream {
-    let base_type = match wayland_type {
-        "int" => quote! { i32 },
-        "uint" => quote! { u32 },
-        "fixed" => quote! { i32 },     // Wayland fixed-point number
-        "string" => quote! { String }, // Use String for struct fields to avoid lifetime issues
-        "object" => quote! { ObjectId },
-        "new_id" => quote! { ObjectId },
-        "array" => quote! { Vec<u8> },
-        "fd" => quote! { std::os::unix::io::RawFd },
-        _ => quote! { () }, // Unknown type
-    };
-
-    if allow_null {
-        quote! { Option<#base_type> }
-    } else {
-        base_type
-    }
-}
-
 fn rust_type_from_wayland_type_for_method(
     wayland_type: &str,
     _interface: Option<&str>,
@@ -264,6 +240,9 @@ fn generate_interface_code_parts(
                 let empty = Vec::new();
                 let args = request.arg.as_ref().unwrap_or(&empty);
 
+                // Check if this request has any file descriptors
+                let has_fds = args.iter().any(|arg| arg.arg_type == "fd");
+
                 // Generate accessor methods for each field
                 let accessor_methods = if args.is_empty() {
                     vec![]
@@ -271,16 +250,69 @@ fn generate_interface_code_parts(
                     generate_accessor_methods(args)
                 };
 
+                // Generate constructor
+                let constructor = if has_fds {
+                    // Generate FD field assignments
+                    let fd_assignments = args.iter()
+                        .filter(|arg| arg.arg_type == "fd")
+                        .map(|arg| {
+                            let field_name = syn::Ident::new(
+                                &escape_rust_keyword(&arg.name),
+                                proc_macro2::Span::call_site(),
+                            );
+                            quote! {
+                                #field_name: fds.pop_front().unwrap_or(-1)
+                            }
+                        });
+
+                    quote! {
+                        pub fn new(data: &'a [u8], fds: &mut std::collections::VecDeque<std::os::unix::io::RawFd>) -> Self {
+                            Self {
+                                data,
+                                #(#fd_assignments,)*
+                            }
+                        }
+                    }
+                } else {
+                    quote! {
+                        pub fn new(data: &'a [u8], _fds: &mut std::collections::VecDeque<std::os::unix::io::RawFd>) -> Self {
+                            Self { data }
+                        }
+                    }
+                };
+
+                // Generate struct fields
+                let struct_fields = if has_fds {
+                    let fd_fields = args.iter()
+                        .filter(|arg| arg.arg_type == "fd")
+                        .map(|arg| {
+                            let field_name = syn::Ident::new(
+                                &escape_rust_keyword(&arg.name),
+                                proc_macro2::Span::call_site(),
+                            );
+                            quote! {
+                                #field_name: std::os::unix::io::RawFd
+                            }
+                        });
+
+                    quote! {
+                        data: &'a [u8],
+                        #(#fd_fields,)*
+                    }
+                } else {
+                    quote! {
+                        data: &'a [u8],
+                    }
+                };
+
                 quote! {
                     #[derive(Debug)]
                     pub struct #struct_name<'a> {
-                        data: &'a [u8],
+                        #struct_fields
                     }
 
                     impl<'a> #struct_name<'a> {
-                        pub fn new(data: &'a [u8]) -> Self {
-                            Self { data }
-                        }
+                        #constructor
 
                         #(#accessor_methods)*
                     }
@@ -337,7 +369,7 @@ fn generate_interface_code_parts(
             let opcode_lit = (opcode + 1) as u16; // Opcodes start from 1
 
             quote! {
-                #opcode_lit => self.#method_name(ctx, header.object_id, &#param_type::new(data)),
+                #opcode_lit => self.#method_name(ctx, header.object_id, &#param_type::new(data, fds)),
             }
         });
 
@@ -374,6 +406,7 @@ fn generate_interface_code_parts(
                     ctx: &mut Ctx,
                     header: &MessageHeader,
                     data: &[u8],
+                    fds: &mut std::collections::VecDeque<std::os::unix::io::RawFd>,
                 ) -> anyhow::Result<()> {
                     match header.opcode {
                         #(#request_match_arms)*
@@ -556,205 +589,206 @@ fn generate_accessor_methods(args: &[schema::RequestArg]) -> Vec<proc_macro2::To
             proc_macro2::Span::call_site(),
         );
 
-        // Generate offset calculation for this field
-        let offset_calculation = generate_field_offset_calculation(args, index);
-
         let (return_type, parse_logic) = match arg.arg_type.as_str() {
-            "uint" => (
-                quote! { u32 },
-                quote! {
-                    let offset = #offset_calculation;
-                    if offset + 4 <= self.data.len() {
-                        u32::from_ne_bytes([
-                            self.data[offset],
-                            self.data[offset + 1],
-                            self.data[offset + 2],
-                            self.data[offset + 3]
-                        ])
-                    } else {
-                        0
-                    }
-                },
-            ),
-            "int" => (
-                quote! { i32 },
-                quote! {
-                    let offset = #offset_calculation;
-                    if offset + 4 <= self.data.len() {
-                        i32::from_ne_bytes([
-                            self.data[offset],
-                            self.data[offset + 1],
-                            self.data[offset + 2],
-                            self.data[offset + 3]
-                        ])
-                    } else {
-                        0
-                    }
-                },
-            ),
-            "fixed" => (
-                quote! { i32 },
-                quote! {
-                    let offset = #offset_calculation;
-                    if offset + 4 <= self.data.len() {
-                        i32::from_ne_bytes([
-                            self.data[offset],
-                            self.data[offset + 1],
-                            self.data[offset + 2],
-                            self.data[offset + 3]
-                        ])
-                    } else {
-                        0
-                    }
-                },
-            ),
-            "object" | "new_id" => (
-                quote! { ObjectId },
-                quote! {
-                    let offset = #offset_calculation;
-                    if offset + 4 <= self.data.len() {
-                        u32::from_ne_bytes([
-                            self.data[offset],
-                            self.data[offset + 1],
-                            self.data[offset + 2],
-                            self.data[offset + 3]
-                        ])
-                    } else {
-                        0
-                    }
-                },
-            ),
-            "string" => {
-                if arg.allow_null.unwrap_or(false) {
-                    (
-                        quote! { Option<&str> },
+            "fd" => {
+                let field_name = syn::Ident::new(
+                    &escape_rust_keyword(&arg.name),
+                    proc_macro2::Span::call_site(),
+                );
+                (
+                    quote! { std::os::unix::io::RawFd },
+                    quote! {
+                        self.#field_name
+                    },
+                )
+            }
+            _ => {
+                // Generate offset calculation for non-FD fields (excluding FDs from data parsing)
+                let offset_calculation =
+                    generate_field_offset_calculation_excluding_fds(args, index);
+
+                match arg.arg_type.as_str() {
+                    "uint" => (
+                        quote! { u32 },
                         quote! {
                             let offset = #offset_calculation;
                             if offset + 4 <= self.data.len() {
-                                let len = u32::from_ne_bytes([
+                                u32::from_ne_bytes([
                                     self.data[offset],
                                     self.data[offset + 1],
                                     self.data[offset + 2],
                                     self.data[offset + 3]
-                                ]) as usize;
+                                ])
+                            } else {
+                                0
+                            }
+                        },
+                    ),
+                    "int" => (
+                        quote! { i32 },
+                        quote! {
+                            let offset = #offset_calculation;
+                            if offset + 4 <= self.data.len() {
+                                i32::from_ne_bytes([
+                                    self.data[offset],
+                                    self.data[offset + 1],
+                                    self.data[offset + 2],
+                                    self.data[offset + 3]
+                                ])
+                            } else {
+                                0
+                            }
+                        },
+                    ),
+                    "fixed" => (
+                        quote! { i32 },
+                        quote! {
+                            let offset = #offset_calculation;
+                            if offset + 4 <= self.data.len() {
+                                i32::from_ne_bytes([
+                                    self.data[offset],
+                                    self.data[offset + 1],
+                                    self.data[offset + 2],
+                                    self.data[offset + 3]
+                                ])
+                            } else {
+                                0
+                            }
+                        },
+                    ),
+                    "object" | "new_id" => (
+                        quote! { ObjectId },
+                        quote! {
+                            let offset = #offset_calculation;
+                            if offset + 4 <= self.data.len() {
+                                u32::from_ne_bytes([
+                                    self.data[offset],
+                                    self.data[offset + 1],
+                                    self.data[offset + 2],
+                                    self.data[offset + 3]
+                                ])
+                            } else {
+                                0
+                            }
+                        },
+                    ),
+                    "string" => {
+                        if arg.allow_null.unwrap_or(false) {
+                            (
+                                quote! { Option<&str> },
+                                quote! {
+                                    let offset = #offset_calculation;
+                                    if offset + 4 <= self.data.len() {
+                                        let len = u32::from_ne_bytes([
+                                            self.data[offset],
+                                            self.data[offset + 1],
+                                            self.data[offset + 2],
+                                            self.data[offset + 3]
+                                        ]) as usize;
 
-                                if len == 0 {
-                                    None
-                                } else {
-                                    let start = offset + 4;
-                                    let end = start + len.saturating_sub(1); // Subtract 1 for null terminator
-                                    if end <= self.data.len() {
-                                        std::str::from_utf8(&self.data[start..end]).ok()
+                                        if len == 0 {
+                                            None
+                                        } else {
+                                            let start = offset + 4;
+                                            let end = start + len.saturating_sub(1); // Subtract 1 for null terminator
+                                            if end <= self.data.len() {
+                                                std::str::from_utf8(&self.data[start..end]).ok()
+                                            } else {
+                                                None
+                                            }
+                                        }
                                     } else {
                                         None
                                     }
-                                }
-                            } else {
-                                None
-                            }
-                        },
-                    )
-                } else {
-                    (
-                        quote! { &str },
-                        quote! {
-                            let offset = #offset_calculation;
-                            if offset + 4 <= self.data.len() {
-                                let len = u32::from_ne_bytes([
-                                    self.data[offset],
-                                    self.data[offset + 1],
-                                    self.data[offset + 2],
-                                    self.data[offset + 3]
-                                ]) as usize;
+                                },
+                            )
+                        } else {
+                            (
+                                quote! { &str },
+                                quote! {
+                                    let offset = #offset_calculation;
+                                    if offset + 4 <= self.data.len() {
+                                        let len = u32::from_ne_bytes([
+                                            self.data[offset],
+                                            self.data[offset + 1],
+                                            self.data[offset + 2],
+                                            self.data[offset + 3]
+                                        ]) as usize;
 
-                                let start = offset + 4;
-                                let end = start + len.saturating_sub(1); // Subtract 1 for null terminator
-                                if end <= self.data.len() {
-                                    std::str::from_utf8(&self.data[start..end]).unwrap_or("")
-                                } else {
-                                    ""
-                                }
-                            } else {
-                                ""
-                            }
-                        },
-                    )
-                }
-            }
-            "array" => {
-                if arg.allow_null.unwrap_or(false) {
-                    (
-                        quote! { Option<&[u8]> },
-                        quote! {
-                            let offset = #offset_calculation;
-                            if offset + 4 <= self.data.len() {
-                                let len = u32::from_ne_bytes([
-                                    self.data[offset],
-                                    self.data[offset + 1],
-                                    self.data[offset + 2],
-                                    self.data[offset + 3]
-                                ]) as usize;
+                                        let start = offset + 4;
+                                        let end = start + len.saturating_sub(1); // Subtract 1 for null terminator
+                                        if end <= self.data.len() {
+                                            std::str::from_utf8(&self.data[start..end]).unwrap_or("")
+                                        } else {
+                                            ""
+                                        }
+                                    } else {
+                                        ""
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    "array" => {
+                        if arg.allow_null.unwrap_or(false) {
+                            (
+                                quote! { Option<&[u8]> },
+                                quote! {
+                                    let offset = #offset_calculation;
+                                    if offset + 4 <= self.data.len() {
+                                        let len = u32::from_ne_bytes([
+                                            self.data[offset],
+                                            self.data[offset + 1],
+                                            self.data[offset + 2],
+                                            self.data[offset + 3]
+                                        ]) as usize;
 
-                                if len == 0 {
-                                    None
-                                } else {
-                                    let start = offset + 4;
-                                    let end = start + len;
-                                    if end <= self.data.len() {
-                                        Some(&self.data[start..end])
+                                        if len == 0 {
+                                            None
+                                        } else {
+                                            let start = offset + 4;
+                                            let end = start + len;
+                                            if end <= self.data.len() {
+                                                Some(&self.data[start..end])
+                                            } else {
+                                                None
+                                            }
+                                        }
                                     } else {
                                         None
                                     }
-                                }
-                            } else {
-                                None
-                            }
-                        },
-                    )
-                } else {
-                    (
-                        quote! { &[u8] },
-                        quote! {
-                            let offset = #offset_calculation;
-                            if offset + 4 <= self.data.len() {
-                                let len = u32::from_ne_bytes([
-                                    self.data[offset],
-                                    self.data[offset + 1],
-                                    self.data[offset + 2],
-                                    self.data[offset + 3]
-                                ]) as usize;
+                                },
+                            )
+                        } else {
+                            (
+                                quote! { &[u8] },
+                                quote! {
+                                    let offset = #offset_calculation;
+                                    if offset + 4 <= self.data.len() {
+                                        let len = u32::from_ne_bytes([
+                                            self.data[offset],
+                                            self.data[offset + 1],
+                                            self.data[offset + 2],
+                                            self.data[offset + 3]
+                                        ]) as usize;
 
-                                let start = offset + 4;
-                                let end = start + len;
-                                if end <= self.data.len() {
-                                    &self.data[start..end]
-                                } else {
-                                    &[]
-                                }
-                            } else {
-                                &[]
-                            }
-                        },
-                    )
+                                        let start = offset + 4;
+                                        let end = start + len;
+                                        if end <= self.data.len() {
+                                            &self.data[start..end]
+                                        } else {
+                                            &[]
+                                        }
+                                    } else {
+                                        &[]
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    _ => (quote! { () }, quote! { () }),
                 }
             }
-            "fd" => (
-                quote! { std::os::unix::io::RawFd },
-                quote! {
-                    let offset = #offset_calculation;
-                    if offset + 4 <= self.data.len() {
-                        i32::from_ne_bytes([
-                            self.data[offset],
-                            self.data[offset + 1],
-                            self.data[offset + 2],
-                            self.data[offset + 3]
-                        ])
-                    } else {
-                        -1
-                    }
-                },
-            ),
-            _ => (quote! { () }, quote! { () }),
         };
 
         methods.push(quote! {
@@ -781,6 +815,54 @@ fn generate_field_offset_calculation(
         let arg = &args[i];
         match arg.arg_type.as_str() {
             "uint" | "int" | "fixed" | "object" | "new_id" | "fd" => {
+                calculation = quote! { #calculation + 4 };
+            }
+            "string" | "array" => {
+                // Variable length: 4 bytes for length + actual length + padding to 4-byte boundary
+                calculation = quote! {
+                    {
+                        let current_offset = #calculation;
+                        if current_offset + 4 <= self.data.len() {
+                            let len = u32::from_ne_bytes([
+                                self.data[current_offset],
+                                self.data[current_offset + 1],
+                                self.data[current_offset + 2],
+                                self.data[current_offset + 3]
+                            ]) as usize;
+                            current_offset + 4 + ((len + 3) & !3) // 4 for length + length padded to 4-byte boundary
+                        } else {
+                            current_offset + 4
+                        }
+                    }
+                };
+            }
+            _ => {
+                calculation = quote! { #calculation + 4 };
+            }
+        }
+    }
+
+    calculation
+}
+
+fn generate_field_offset_calculation_excluding_fds(
+    args: &[schema::RequestArg],
+    target_index: usize,
+) -> proc_macro2::TokenStream {
+    if target_index == 0 {
+        return quote! { 0 };
+    }
+
+    let mut calculation = quote! { 0 };
+
+    for i in 0..target_index {
+        let arg = &args[i];
+        match arg.arg_type.as_str() {
+            "fd" => {
+                // FDs don't appear in the data, so skip them
+                continue;
+            }
+            "uint" | "int" | "fixed" | "object" | "new_id" => {
                 calculation = quote! { #calculation + 4 };
             }
             "string" | "array" => {

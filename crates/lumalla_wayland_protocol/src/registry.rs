@@ -56,10 +56,10 @@ where
         ctx: &mut Ctx,
         header: &MessageHeader,
         data: &[u8],
-        _fds: &mut VecDeque<RawFd>,
+        fds: &mut VecDeque<RawFd>,
     ) -> anyhow::Result<()> {
         match handler {
-            WL_DISPLAY => WlDisplay::handle_request(self, ctx, header, data),
+            WL_DISPLAY => WlDisplay::handle_request(self, ctx, header, data, fds),
             _ => {
                 ctx.writer
                     .wl_display_error(header.object_id)?
