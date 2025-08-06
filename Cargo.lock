@@ -329,6 +329,7 @@ dependencies = [
  "anyhow",
  "log",
  "lumalla_shared",
+ "lumalla_wayland_protocol",
  "mio",
 ]
 

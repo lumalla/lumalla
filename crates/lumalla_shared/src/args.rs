@@ -5,6 +5,8 @@ pub struct GlobalArgs {
     pub log_file: Option<String>,
     /// Path to lua config file
     pub config: Option<String>,
+    /// Path to wayland socket
+    pub socket_path: Option<String>,
 }
 
 impl GlobalArgs {
@@ -33,6 +35,11 @@ impl GlobalArgs {
                         global_args.config = Some(config);
                     }
                 }
+                "--socket-path" | "-s" => {
+                    if let Some(socket_path) = args.next() {
+                        global_args.socket_path = Some(socket_path);
+                    }
+                }
                 unknown => {
                     eprintln!("Unknown argument: {}", unknown);
                     print_help(&program_name);
@@ -51,4 +58,5 @@ fn print_help(program_name: &str) {
     println!("  -h, --help             Print this help message and exit");
     println!("  -l, --log-file <FILE>  Path to log file");
     println!("  -c, --config <FILE>    Path to lua config file");
+    println!("  -s, --socket-path <PATH>");
 }

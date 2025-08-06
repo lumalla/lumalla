@@ -128,19 +128,51 @@ pub fn wayland_protocol(input: TokenStream) -> TokenStream {
     let interface_data: Vec<_> = protocol
         .interface
         .into_iter()
-        .map(|interface| generate_interface_code_parts(interface))
+        .map(|interface| {
+            let has_requests = !interface.request.as_ref().unwrap_or(&Vec::new()).is_empty();
+            let trait_name = if has_requests {
+                Some(snake_to_pascal_case(&interface.name))
+            } else {
+                None
+            };
+            let result = generate_interface_code_parts(interface);
+            (result, trait_name)
+        })
         .collect();
 
-    // Now extract the parts
-    let interfaces: Vec<_> = interface_data
-        .iter()
-        .map(|(interface_code, _, _)| interface_code.clone())
-        .collect();
+    // Extract interface trait names and code parts
+    let mut interface_trait_names = Vec::new();
+    let mut interface_codes = Vec::new();
 
-    for (_, writer_methods, builder_structs) in interface_data {
+    for ((interface_code, writer_methods, builder_structs), trait_name) in interface_data {
+        interface_codes.push(interface_code);
         all_writer_methods.extend(writer_methods);
         all_builder_structs.extend(builder_structs);
+
+        if let Some(name) = trait_name {
+            interface_trait_names.push(name);
+        }
     }
+
+    // Generate protocol supertrait
+    let protocol_trait_name = syn::Ident::new(
+        &format!("{}Protocol", snake_to_pascal_case(&protocol.name)),
+        proc_macro2::Span::call_site(),
+    );
+
+    let interface_bounds = interface_trait_names.iter().map(|name| {
+        let trait_ident = syn::Ident::new(name, proc_macro2::Span::call_site());
+        quote! { #trait_ident }
+    });
+
+    let protocol_supertrait = if !interface_trait_names.is_empty() {
+        quote! {
+            /// Supertrait combining all interfaces in this protocol
+            pub trait #protocol_trait_name: #(#interface_bounds)+* {}
+        }
+    } else {
+        quote! {}
+    };
 
     // Generate single Writer impl block
     let writer_impl = if !all_writer_methods.is_empty() {
@@ -154,7 +186,16 @@ pub fn wayland_protocol(input: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
-        #(#interfaces)*
+        use anyhow::Context;
+        use crate::{
+            ObjectId,
+            buffer::{MessageHeader, Writer},
+            client::Ctx,
+        };
+
+        #(#interface_codes)*
+
+        #protocol_supertrait
 
         // Builder structs
         #(#all_builder_structs)*
@@ -204,43 +245,93 @@ fn generate_interface_code_parts(
 
     // Generate parameter structs for requests
     let empty = Vec::new();
-    let request_param_structs =
-        interface
-            .request
-            .as_ref()
-            .unwrap_or(&empty)
-            .iter()
-            .map(|request| {
-                let struct_name = syn::Ident::new(
-                    &format!(
-                        "{}{}",
-                        snake_to_pascal_case(&interface.name),
-                        snake_to_pascal_case(&request.name)
-                    ),
+    let request_param_structs = interface
+        .request
+        .as_ref()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|request| {
+            let struct_name = syn::Ident::new(
+                &format!(
+                    "{}{}",
+                    snake_to_pascal_case(&interface.name),
+                    snake_to_pascal_case(&request.name)
+                ),
+                proc_macro2::Span::call_site(),
+            );
+
+            let empty = Vec::new();
+            let fields = request.arg.as_ref().unwrap_or(&empty).iter().map(|arg| {
+                let field_name = syn::Ident::new(
+                    &escape_rust_keyword(&arg.name),
                     proc_macro2::Span::call_site(),
                 );
+                let field_type = rust_type_from_wayland_type(
+                    &arg.arg_type,
+                    arg.interface.as_deref(),
+                    arg.allow_null.unwrap_or(false),
+                );
+                quote! { pub #field_name: #field_type }
+            });
 
-                let empty = Vec::new();
-                let fields = request.arg.as_ref().unwrap_or(&empty).iter().map(|arg| {
-                    let field_name = syn::Ident::new(
-                        &escape_rust_keyword(&arg.name),
-                        proc_macro2::Span::call_site(),
-                    );
-                    let field_type = rust_type_from_wayland_type(
-                        &arg.arg_type,
-                        arg.interface.as_deref(),
-                        arg.allow_null.unwrap_or(false),
-                    );
-                    quote! { pub #field_name: #field_type }
-                });
+            // Generate accessor methods for each field
+            let accessor_methods = request.arg.as_ref().unwrap_or(&empty).iter().map(|arg| {
+                let field_name = syn::Ident::new(
+                    &escape_rust_keyword(&arg.name),
+                    proc_macro2::Span::call_site(),
+                );
+                let method_name = syn::Ident::new(
+                    &escape_rust_keyword(&arg.name),
+                    proc_macro2::Span::call_site(),
+                );
+                let field_type = rust_type_from_wayland_type(
+                    &arg.arg_type,
+                    arg.interface.as_deref(),
+                    arg.allow_null.unwrap_or(false),
+                );
+
+                // For Copy types, return by value; for non-Copy types, return by reference
+                let return_type_and_value = match arg.arg_type.as_str() {
+                    "string" => {
+                        if arg.allow_null.unwrap_or(false) {
+                            (quote! { Option<&str> }, quote! { self.#field_name.as_deref() })
+                        } else {
+                            (quote! { &str }, quote! { &self.#field_name })
+                        }
+                    }
+                    "array" => {
+                        if arg.allow_null.unwrap_or(false) {
+                            (quote! { Option<&[u8]> }, quote! { self.#field_name.as_deref() })
+                        } else {
+                            (quote! { &[u8] }, quote! { &self.#field_name })
+                        }
+                    }
+                    _ => {
+                        // For numeric types and ObjectId, return by value (Copy types)
+                        (field_type.clone(), quote! { self.#field_name })
+                    }
+                };
+
+                let (return_type, return_value) = return_type_and_value;
 
                 quote! {
-                    #[derive(Debug)]
-                    pub struct #struct_name {
-                        #(#fields,)*
+                    pub fn #method_name(&self) -> #return_type {
+                        #return_value
                     }
                 }
             });
+
+            quote! {
+                #[derive(Debug)]
+                pub struct #struct_name {
+                    #(#fields,)*
+                }
+
+                impl #struct_name {
+                    #(#accessor_methods)*
+                }
+            }
+        });
 
     // Generate interface trait
     let empty = Vec::new();

@@ -11,9 +11,9 @@ pub mod buffer;
 mod client;
 pub mod protocols;
 mod registry;
-pub use client::{ClientConnection, ClientEvent, ClientId};
+pub use client::{ClientConnection, ClientEvent, ClientId, Ctx};
 
-type ObjectId = u32;
+pub type ObjectId = u32;
 type Opcode = u16;
 
 pub struct Wayland {
@@ -44,7 +44,7 @@ impl Wayland {
         })
     }
 
-    pub fn next_client<F>(&mut self) -> Option<ClientConnection> {
+    pub fn next_client(&mut self) -> Option<ClientConnection> {
         match self.listener.accept() {
             Ok((stream, _addr)) => {
                 let client_id = self.next_client_id;
@@ -70,6 +70,10 @@ impl Wayland {
                 None
             }
         }
+    }
+
+    pub fn socket_path(&self) -> &str {
+        &self.socket_path
     }
 }
 

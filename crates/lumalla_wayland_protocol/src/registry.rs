@@ -7,7 +7,7 @@ use crate::{
     ObjectId,
     buffer::MessageHeader,
     client::Ctx,
-    protocols::{WlDisplay, wayland::WL_DISPLAY_ERROR_INVALID_METHOD},
+    protocols::{WaylandProtocol, WlDisplay, wayland::WL_DISPLAY_ERROR_INVALID_METHOD},
 };
 
 type InterfaceIndex = usize;
@@ -48,7 +48,7 @@ pub trait RequestHandler {
 
 impl<T> RequestHandler for T
 where
-    T: WlDisplay,
+    T: WaylandProtocol,
 {
     fn handle_request(
         &mut self,

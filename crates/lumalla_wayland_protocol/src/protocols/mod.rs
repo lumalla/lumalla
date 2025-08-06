@@ -1,3 +1,3 @@
 pub mod wayland;
 
-pub use wayland::WlDisplay;
+pub use wayland::{WaylandProtocol, WlDisplay};
