@@ -6,7 +6,11 @@ use std::{
 use anyhow::Context;
 use log::{debug, error, info, warn};
 use lumalla_shared::{Comms, DisplayMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner};
-use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland};
+use lumalla_wayland_protocol::{
+    ClientConnection, ClientId, ObjectId, Wayland,
+    protocols::wayland::{WL_COMPOSITOR_NAME, WL_COMPOSITOR_VERSION},
+    registry::InterfaceIndex,
+};
 use mio::{Interest, Poll, Token};
 
 mod protocols;
@@ -21,6 +25,7 @@ pub struct DisplayState {
     shutting_down: bool,
     args: Arc<GlobalArgs>,
     globals: Globals,
+    surfaces: HashMap<(ClientId, ObjectId), SurfaceState>,
 }
 
 impl DisplayState {
@@ -54,6 +59,7 @@ impl MessageRunner for DisplayState {
             shutting_down: false,
             args,
             globals: Globals::default(),
+            surfaces: HashMap::new(),
         })
     }
 
@@ -154,19 +160,52 @@ impl DisplayState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Globals {
-    globals: HashMap<u32, (&'static str, u32)>,
+    globals: HashMap<u32, Global>,
     next_id: u32,
 }
 
-impl Globals {
-    fn register(&mut self, interface: &'static str, version: u32) {
-        self.globals.insert(self.next_id, (interface, version));
-        self.next_id += 1;
-    }
+#[derive(Debug)]
+struct Global {
+    name: &'static str,
+    version: u32,
+    interface_index: InterfaceIndex,
+}
 
-    fn iter(&self) -> impl Iterator<Item = (&u32, &(&'static str, u32))> {
-        self.globals.iter()
+impl Default for Globals {
+    fn default() -> Self {
+        let mut globals = Self {
+            globals: HashMap::new(),
+            next_id: 1,
+        };
+        globals.register(InterfaceIndex::WlCompositor);
+        globals
     }
 }
+
+impl Globals {
+    fn register(&mut self, interface_index: InterfaceIndex) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.globals.insert(
+            id,
+            Global {
+                name: interface_index.interface_name(),
+                version: interface_index.interface_version(),
+                interface_index,
+            },
+        );
+        id
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&u32, &Global)> {
+        self.globals.iter()
+    }
+
+    fn get(&self, id: u32) -> Option<&Global> {
+        self.globals.get(&id)
+    }
+}
+
+struct SurfaceState {}

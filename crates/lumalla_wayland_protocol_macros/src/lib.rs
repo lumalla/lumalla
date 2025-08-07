@@ -260,6 +260,25 @@ fn generate_interface_code_parts(
     // Clone interface_enum to avoid borrow conflicts
     let interface_enums = interface.interface_enum.clone().unwrap_or_default();
 
+    // Generate interface name and version constants
+    let interface_name_constant = syn::Ident::new(
+        &format!("{}_NAME", interface.name.to_uppercase()),
+        proc_macro2::Span::call_site(),
+    );
+    let interface_version_constant = syn::Ident::new(
+        &format!("{}_VERSION", interface.name.to_uppercase()),
+        proc_macro2::Span::call_site(),
+    );
+    let interface_name_value = &interface.name;
+    let interface_version_value = interface.version.parse::<u32>().unwrap_or(1);
+
+    let interface_constants = quote! {
+        /// Interface name constant
+        pub const #interface_name_constant: &str = #interface_name_value;
+        /// Interface version constant
+        pub const #interface_version_constant: u32 = #interface_version_value;
+    };
+
     // Generate constants for enums
     let enum_constants = interface_enums.iter().flat_map(|enum_def| {
         let enum_prefix = format!(
@@ -689,7 +708,10 @@ fn generate_interface_code_parts(
     }
 
     let interface_code = quote! {
-        // Constants
+        // Interface constants
+        #interface_constants
+
+        // Enum constants
         #(#enum_constants)*
 
         // Parameter structs

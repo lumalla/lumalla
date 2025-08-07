@@ -1,7 +1,8 @@
+use log::debug;
 use lumalla_wayland_protocol::{
     Ctx, ObjectId,
     protocols::{WaylandProtocol, WlDisplay, wayland::*},
-    registry::II_WL_DISPLAY,
+    registry::InterfaceIndex,
 };
 
 use crate::DisplayState;
@@ -25,20 +26,26 @@ impl WlDisplay for DisplayState {
         params: &WlDisplayGetRegistry<'_>,
     ) {
         ctx.registry
-            .register_object(params.registry(), II_WL_DISPLAY);
-        for (&name, &(interface, version)) in self.globals.iter() {
+            .register_object(params.registry(), InterfaceIndex::WlRegistry);
+        for (&name, global) in self.globals.iter() {
             ctx.writer
                 .wl_registry_global(params.registry())
                 .name(name)
-                .interface(interface)
-                .version(version);
+                .interface(global.interface_index.interface_name())
+                .version(global.interface_index.interface_version());
         }
     }
 }
 
 impl WlRegistry for DisplayState {
-    fn bind(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlRegistryBind<'_>) {
-        todo!()
+    fn bind(&mut self, ctx: &mut Ctx, _object_id: ObjectId, params: &WlRegistryBind<'_>) {
+        let Some(global) = self.globals.get(params.name()) else {
+            debug!("Received bind request for unknown global {}", params.name());
+            return;
+        };
+        // TODO: Do we need to care what version the global is bound to?
+        ctx.registry
+            .register_object(params.id().0, global.interface_index);
     }
 }
 
@@ -46,19 +53,21 @@ impl WlCompositor for DisplayState {
     fn create_surface(
         &mut self,
         ctx: &mut Ctx,
-        object_id: ObjectId,
+        _object_id: ObjectId,
         params: &WlCompositorCreateSurface<'_>,
     ) {
-        todo!()
+        ctx.registry
+            .register_object(params.id(), InterfaceIndex::WlSurface);
     }
 
     fn create_region(
         &mut self,
         ctx: &mut Ctx,
-        object_id: ObjectId,
+        _object_id: ObjectId,
         params: &WlCompositorCreateRegion<'_>,
     ) {
-        todo!()
+        ctx.registry
+            .register_object(params.id(), InterfaceIndex::WlRegion);
     }
 }
 
