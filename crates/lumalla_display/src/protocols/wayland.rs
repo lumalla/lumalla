@@ -9,11 +9,13 @@ use crate::DisplayState;
 impl WaylandProtocol for DisplayState {}
 
 impl WlDisplay for DisplayState {
-    fn sync(&mut self, ctx: &mut Ctx, _object_id: ObjectId, params: &WlDisplaySync<'_>) {
+    fn sync(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlDisplaySync<'_>) {
         ctx.writer
             .wl_callback_done(params.callback())
             .callback_data(0);
-        ctx.writer.wl_display_delete_id(params.callback());
+        ctx.writer
+            .wl_display_delete_id(object_id)
+            .id(params.callback());
     }
 
     fn get_registry(
@@ -24,6 +26,13 @@ impl WlDisplay for DisplayState {
     ) {
         ctx.registry
             .register_object(params.registry(), II_WL_DISPLAY);
+        for (&name, &(interface, version)) in self.globals.iter() {
+            ctx.writer
+                .wl_registry_global(params.registry())
+                .name(name)
+                .interface(interface)
+                .version(version);
+        }
     }
 }
 

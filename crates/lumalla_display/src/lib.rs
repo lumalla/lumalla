@@ -20,7 +20,7 @@ pub struct DisplayState {
     channel: mpsc::Receiver<DisplayMessage>,
     shutting_down: bool,
     args: Arc<GlobalArgs>,
-    globals: ,
+    globals: Globals,
 }
 
 impl DisplayState {
@@ -53,6 +53,7 @@ impl MessageRunner for DisplayState {
             channel,
             shutting_down: false,
             args,
+            globals: Globals::default(),
         })
     }
 
@@ -150,5 +151,22 @@ impl DisplayState {
             }
             anyhow::bail!("Failed to create Wayland display");
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Globals {
+    globals: HashMap<u32, (&'static str, u32)>,
+    next_id: u32,
+}
+
+impl Globals {
+    fn register(&mut self, interface: &'static str, version: u32) {
+        self.globals.insert(self.next_id, (interface, version));
+        self.next_id += 1;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&u32, &(&'static str, u32))> {
+        self.globals.iter()
     }
 }

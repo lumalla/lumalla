@@ -65,16 +65,23 @@ fn generate_doc_comment(
 
 fn rust_type_from_wayland_type_for_method(
     wayland_type: &str,
-    _interface: Option<&str>,
+    interface: Option<&str>,
     allow_null: bool,
 ) -> proc_macro2::TokenStream {
     let base_type = match wayland_type {
         "int" => quote! { i32 },
         "uint" => quote! { u32 },
-        "fixed" => quote! { i32 },   // Wayland fixed-point number
-        "string" => quote! { &str }, // Use &str for method parameters
+        "fixed" => quote! { i32 }, // Wayland fixed-point number
+        "string" => quote! { &str },
         "object" => quote! { ObjectId },
-        "new_id" => quote! { ObjectId },
+        "new_id" => {
+            if interface.is_some() {
+                quote! { ObjectId }
+            } else {
+                // new_id without specified interface returns (ObjectId, interface_name, version)
+                quote! { (ObjectId, &str, u32) }
+            }
+        }
         "array" => quote! { &[u8] },
         "fd" => quote! { std::os::unix::io::RawFd },
         _ => quote! { () }, // Unknown type
@@ -576,6 +583,7 @@ fn generate_interface_code_parts(
 
             writer_methods.push(quote! {
                 #[inline]
+                #[must_use]
                 pub fn #method_name(
                     &mut self,
                     object_id: ObjectId,
@@ -664,6 +672,7 @@ fn generate_interface_code_parts(
 
                         impl<'client> #current_builder_name<'client> {
                             #[inline]
+                            #[must_use]
                             pub fn #arg_name(self, #arg_name: #arg_type) -> #next_builder_name<'client> {
                                 self.writer.#write_method(#param_conversion);
                                 #next_builder_name {
@@ -775,7 +784,7 @@ fn generate_accessor_methods(args: &[schema::RequestArg]) -> Vec<proc_macro2::To
                             }
                         },
                     ),
-                    "object" | "new_id" => (
+                    "object" => (
                         quote! { ObjectId },
                         quote! {
                             let offset = #offset_calculation;
@@ -791,6 +800,84 @@ fn generate_accessor_methods(args: &[schema::RequestArg]) -> Vec<proc_macro2::To
                             }
                         },
                     ),
+                    "new_id" => {
+                        if arg.interface.is_some() {
+                            // new_id with specified interface - just parse the object ID
+                            (
+                                quote! { ObjectId },
+                                quote! {
+                                    let offset = #offset_calculation;
+                                    if offset + 4 <= self.data.len() {
+                                        u32::from_ne_bytes([
+                                            self.data[offset],
+                                            self.data[offset + 1],
+                                            self.data[offset + 2],
+                                            self.data[offset + 3]
+                                        ])
+                                    } else {
+                                        0
+                                    }
+                                },
+                            )
+                        } else {
+                            // new_id without specified interface - parse interface name, version, and object ID
+                            (
+                                quote! { (ObjectId, &str, u32) },
+                                quote! {
+                                    let offset = #offset_calculation;
+                                    if offset + 12 <= self.data.len() {
+                                        // Parse interface name (string)
+                                        let interface_name_len = u32::from_ne_bytes([
+                                            self.data[offset],
+                                            self.data[offset + 1],
+                                            self.data[offset + 2],
+                                            self.data[offset + 3]
+                                        ]) as usize;
+
+                                        let interface_name_start = offset + 4;
+                                        let interface_name_end = interface_name_start + interface_name_len.saturating_sub(1);
+                                        let interface_name = if interface_name_end <= self.data.len() {
+                                            std::str::from_utf8(&self.data[interface_name_start..interface_name_end]).unwrap_or("")
+                                        } else {
+                                            ""
+                                        };
+
+                                        // Calculate offset after interface name (with padding)
+                                        let version_offset = interface_name_start + ((interface_name_len + 3) & !3);
+
+                                        // Parse version (uint)
+                                        let version = if version_offset + 4 <= self.data.len() {
+                                            u32::from_ne_bytes([
+                                                self.data[version_offset],
+                                                self.data[version_offset + 1],
+                                                self.data[version_offset + 2],
+                                                self.data[version_offset + 3]
+                                            ])
+                                        } else {
+                                            0
+                                        };
+
+                                        // Parse object ID (uint)
+                                        let object_id_offset = version_offset + 4;
+                                        let object_id = if object_id_offset + 4 <= self.data.len() {
+                                            u32::from_ne_bytes([
+                                                self.data[object_id_offset],
+                                                self.data[object_id_offset + 1],
+                                                self.data[object_id_offset + 2],
+                                                self.data[object_id_offset + 3]
+                                            ])
+                                        } else {
+                                            0
+                                        };
+
+                                        (object_id, interface_name, version)
+                                    } else {
+                                        (0, "", 0)
+                                    }
+                                },
+                            )
+                        }
+                    }
                     "string" => {
                         if arg.allow_null.unwrap_or(false) {
                             (
@@ -983,8 +1070,36 @@ fn generate_field_offset_calculation_excluding_fds(
                 // FDs don't appear in the data, so skip them
                 continue;
             }
-            "uint" | "int" | "fixed" | "object" | "new_id" => {
+            "uint" | "int" | "fixed" | "object" => {
                 calculation = quote! { #calculation + 4 };
+            }
+            "new_id" => {
+                // new_id without interface specified includes interface name + version + id
+                if arg.interface.is_none() {
+                    calculation = quote! {
+                        {
+                            let current_offset = #calculation;
+                            // Interface name (string): 4 bytes length + string + padding
+                            if current_offset + 4 <= self.data.len() {
+                                let interface_name_len = u32::from_ne_bytes([
+                                    self.data[current_offset],
+                                    self.data[current_offset + 1],
+                                    self.data[current_offset + 2],
+                                    self.data[current_offset + 3]
+                                ]) as usize;
+                                let after_interface_name = current_offset + 4 + ((interface_name_len + 3) & !3);
+                                // Version (uint): 4 bytes
+                                // Object ID (uint): 4 bytes
+                                after_interface_name + 8
+                            } else {
+                                current_offset + 12 // Fallback: 4 + 4 + 4
+                            }
+                        }
+                    };
+                } else {
+                    // new_id with specified interface is just 4 bytes (object ID)
+                    calculation = quote! { #calculation + 4 };
+                }
             }
             "string" | "array" => {
                 // Variable length: 4 bytes for length + actual length + padding to 4-byte boundary
