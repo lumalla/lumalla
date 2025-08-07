@@ -65,7 +65,6 @@ impl ClientConnection {
         &mut self.stream
     }
 
-    #[must_use]
     pub fn handle_messages(&mut self, handler: &mut impl RequestHandler) -> anyhow::Result<()> {
         match self.reader.read() {
             ReadResult::EndOfStream => {
@@ -79,7 +78,7 @@ impl ClientConnection {
                     let Some(interface_index) = self.registry.interface_index(header.object_id)
                     else {
                         self.writer
-                            .wl_display_error(header.object_id)?
+                            .wl_display_error(header.object_id)
                             .object_id(header.object_id)
                             .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
                             .message("Invalid object ID");
@@ -109,6 +108,14 @@ impl ClientConnection {
         }
 
         Ok(())
+    }
+
+    pub fn flush(&mut self) -> anyhow::Result<()> {
+        if let Some(err) = self.writer.last_err() {
+            return Err(err);
+        }
+
+        self.writer.flush()
     }
 }
 

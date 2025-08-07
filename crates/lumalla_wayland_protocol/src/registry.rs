@@ -17,21 +17,39 @@ const MIN_SERVER_OBJECT_ID: ObjectId = 0xFF000000;
 #[derive(Debug)]
 pub struct Registry {
     objects: HashMap<ObjectId, InterfaceIndex>,
-    _next_object_id: ObjectId,
-    _freed_object_ids: Vec<ObjectId>,
+    next_object_id: ObjectId,
+    freed_object_ids: Vec<ObjectId>,
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self {
             objects: HashMap::new(),
-            _next_object_id: MIN_SERVER_OBJECT_ID,
-            _freed_object_ids: Vec::new(),
+            next_object_id: MIN_SERVER_OBJECT_ID,
+            freed_object_ids: Vec::new(),
         }
     }
 
     pub fn interface_index(&self, object_id: ObjectId) -> Option<InterfaceIndex> {
         self.objects.get(&object_id).copied()
+    }
+
+    pub fn register_object(&mut self, object_id: ObjectId, interface_index: InterfaceIndex) {
+        self.objects.insert(object_id, interface_index);
+    }
+
+    pub fn create_object(&mut self, interface_index: InterfaceIndex) -> ObjectId {
+        let object_id = self.next_object_id();
+        self.objects.insert(object_id, interface_index);
+        object_id
+    }
+
+    fn next_object_id(&mut self) -> ObjectId {
+        self.freed_object_ids.pop().unwrap_or_else(|| {
+            let object_id = self.next_object_id;
+            self.next_object_id += 1;
+            object_id
+        })
     }
 }
 
@@ -59,10 +77,10 @@ where
         fds: &mut VecDeque<RawFd>,
     ) -> anyhow::Result<()> {
         match handler {
-            WL_DISPLAY => WlDisplay::handle_request(self, ctx, header, data, fds),
+            II_WL_DISPLAY => WlDisplay::handle_request(self, ctx, header, data, fds),
             _ => {
                 ctx.writer
-                    .wl_display_error(header.object_id)?
+                    .wl_display_error(header.object_id)
                     .object_id(header.object_id)
                     .code(WL_DISPLAY_ERROR_INVALID_METHOD)
                     .message("Invalid method");
@@ -72,4 +90,4 @@ where
     }
 }
 
-const WL_DISPLAY: InterfaceIndex = 0;
+pub const II_WL_DISPLAY: InterfaceIndex = 0;

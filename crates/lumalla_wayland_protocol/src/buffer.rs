@@ -149,6 +149,7 @@ pub struct Writer {
     fds: Box<CmsgBuffer>,
     bytes_in_fds: usize,
     message_length_index: usize,
+    last_err: Option<anyhow::Error>,
 }
 
 // TODO: change the writer to unchecked copies
@@ -161,6 +162,7 @@ impl Writer {
             fds: unsafe { Box::new_uninit().assume_init() },
             bytes_in_fds: mem::size_of::<cmsghdr>(),
             message_length_index: 0,
+            last_err: None,
         };
         let cmsghdr = unsafe { &mut *(writer.fds.as_mut_ptr() as *mut cmsghdr) };
         cmsghdr.cmsg_level = SOL_SOCKET;
@@ -168,15 +170,26 @@ impl Writer {
         writer
     }
 
-    pub fn start_message(&mut self, object_id: ObjectId, opcode: Opcode) -> anyhow::Result<()> {
-        self.flush_if_needed()?;
+    pub fn last_err(&mut self) -> Option<anyhow::Error> {
+        self.last_err.take()
+    }
+
+    #[inline]
+    pub fn start_message(&mut self, object_id: ObjectId, opcode: Opcode) {
+        if self.last_err.is_some() {
+            return;
+        }
+        if let Err(err) = self.flush_if_needed() {
+            self.last_err = Some(err);
+            return;
+        }
         self.write_u32(object_id);
         self.message_length_index = self.bytes_in_buffer;
         self.write_u16(0);
         self.write_u16(opcode);
-        Ok(())
     }
 
+    #[inline]
     pub fn write_message_length(&mut self) {
         let index = self.message_length_index;
         self.buffer[index..index + mem::size_of::<u16>()].copy_from_slice(
@@ -184,24 +197,28 @@ impl Writer {
         );
     }
 
+    #[inline]
     pub fn write_u16(&mut self, value: u16) {
         self.buffer[self.bytes_in_buffer..self.bytes_in_buffer + mem::size_of::<u16>()]
             .copy_from_slice(&value.to_ne_bytes());
         self.bytes_in_buffer += mem::size_of::<u16>();
     }
 
+    #[inline]
     pub fn write_i32(&mut self, value: i32) {
         self.buffer[self.bytes_in_buffer..self.bytes_in_buffer + mem::size_of::<i32>()]
             .copy_from_slice(&value.to_ne_bytes());
         self.bytes_in_buffer += mem::size_of::<i32>();
     }
 
+    #[inline]
     pub fn write_u32(&mut self, value: u32) {
         self.buffer[self.bytes_in_buffer..self.bytes_in_buffer + mem::size_of::<u32>()]
             .copy_from_slice(&value.to_ne_bytes());
         self.bytes_in_buffer += mem::size_of::<u32>();
     }
 
+    #[inline]
     pub fn write_fixed(&mut self, value: f32) {
         let fixed = f32_to_fixed(value);
         self.buffer[self.bytes_in_buffer..self.bytes_in_buffer + mem::size_of::<i32>()]
@@ -209,6 +226,7 @@ impl Writer {
         self.bytes_in_buffer += mem::size_of::<f32>();
     }
 
+    #[inline]
     pub fn write_str(&mut self, value: &str) {
         let bytes = value.as_bytes();
         let bytes = &bytes[0..bytes.len().min(MAX_STRING_LENGTH)];
@@ -225,6 +243,7 @@ impl Writer {
             str_index_end + (mem::size_of::<u32>() - len % mem::size_of::<u32>());
     }
 
+    #[inline]
     pub fn write_fd(&mut self, fd: RawFd) {
         let fd_index_start = self.bytes_in_fds;
         let fd_index_end = fd_index_start + mem::size_of::<RawFd>();
@@ -232,7 +251,7 @@ impl Writer {
         self.bytes_in_fds += size_of::<RawFd>();
     }
 
-    #[must_use]
+    #[inline]
     pub fn flush_if_needed(&mut self) -> anyhow::Result<()> {
         if self.bytes_in_buffer >= MAX_MESSAGE_SIZE ||
             // This is just a guard against sending too many FDs in a single message,
@@ -245,8 +264,8 @@ impl Writer {
         }
     }
 
-    #[must_use]
-    fn flush(&mut self) -> anyhow::Result<()> {
+    #[inline]
+    pub fn flush(&mut self) -> anyhow::Result<()> {
         if self.bytes_in_buffer == 0 {
             return Ok(());
         }
@@ -281,10 +300,12 @@ impl Writer {
     }
 }
 
+#[inline]
 pub fn fixed_to_f32(value: i32) -> f32 {
     value as f32 / 256.0
 }
 
+#[inline]
 pub fn f32_to_fixed(value: f32) -> i32 {
     (value * 256.0).round() as i32
 }
@@ -302,7 +323,7 @@ mod tests {
         let mut writer = Writer::new(socket.1.as_raw_fd());
 
         let str = "Hello, world!";
-        writer.start_message(1, 2).unwrap();
+        writer.start_message(1, 2);
         writer.write_u16(10);
         writer.write_i32(-2);
         writer.write_u32(3);

@@ -10,7 +10,7 @@ use std::{
 pub mod buffer;
 mod client;
 pub mod protocols;
-mod registry;
+pub mod registry;
 pub use client::{ClientConnection, ClientEvent, ClientId, Ctx};
 
 pub type ObjectId = u32;

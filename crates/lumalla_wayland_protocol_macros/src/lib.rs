@@ -361,6 +361,7 @@ fn generate_interface_code_parts(
                         });
 
                     quote! {
+                        #[inline]
                         pub fn new(data: &'a [u8], fds: &mut std::collections::VecDeque<std::os::unix::io::RawFd>) -> Self {
                             Self {
                                 data,
@@ -370,6 +371,7 @@ fn generate_interface_code_parts(
                     }
                 } else {
                     quote! {
+                        #[inline]
                         pub fn new(data: &'a [u8], _fds: &mut std::collections::VecDeque<std::os::unix::io::RawFd>) -> Self {
                             Self { data }
                         }
@@ -444,7 +446,7 @@ fn generate_interface_code_parts(
 
             quote! {
                 #method_doc
-                fn #method_name(&mut self, ctx: &Ctx, object_id: ObjectId, params: &#param_type<'_>);
+                fn #method_name(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &#param_type<'_>);
             }
         });
 
@@ -489,7 +491,7 @@ fn generate_interface_code_parts(
             );
             quote! {
                 ctx.writer
-                    .wl_display_error(header.object_id)?
+                    .wl_display_error(header.object_id)
                     .object_id(header.object_id)
                     .code(#error_constant)
                     .message("Invalid method");
@@ -554,11 +556,10 @@ fn generate_interface_code_parts(
         if args.is_empty() {
             // Simple case: no arguments
             writer_methods.push(quote! {
-                pub fn #method_name(&mut self, object_id: ObjectId) -> anyhow::Result<()> {
-                    self.start_message(object_id, #opcode_lit)
-                        .context("Failed to start message")?;
+                #[inline]
+                pub fn #method_name(&mut self, object_id: ObjectId) {
+                    self.start_message(object_id, #opcode_lit);
                     self.write_message_length();
-                    Ok(())
                 }
             });
         } else {
@@ -574,13 +575,13 @@ fn generate_interface_code_parts(
             );
 
             writer_methods.push(quote! {
+                #[inline]
                 pub fn #method_name(
                     &mut self,
                     object_id: ObjectId,
-                ) -> anyhow::Result<#first_builder_name<'_>> {
-                    self.start_message(object_id, #opcode_lit)
-                        .context("Failed to start message")?;
-                    Ok(#first_builder_name { writer: self })
+                ) -> #first_builder_name<'_> {
+                    self.start_message(object_id, #opcode_lit);
+                    #first_builder_name { writer: self }
                 }
             });
 
@@ -636,6 +637,7 @@ fn generate_interface_code_parts(
                         }
 
                         impl<'client> #current_builder_name<'client> {
+                            #[inline]
                             pub fn #arg_name(self, #arg_name: #arg_type) {
                                 self.writer.#write_method(#param_conversion);
                                 self.writer.write_message_length();
@@ -661,6 +663,7 @@ fn generate_interface_code_parts(
                         }
 
                         impl<'client> #current_builder_name<'client> {
+                            #[inline]
                             pub fn #arg_name(self, #arg_name: #arg_type) -> #next_builder_name<'client> {
                                 self.writer.#write_method(#param_conversion);
                                 #next_builder_name {
@@ -909,6 +912,7 @@ fn generate_accessor_methods(args: &[schema::RequestArg]) -> Vec<proc_macro2::To
 
         methods.push(quote! {
             #arg_doc
+            #[inline]
             pub fn #method_name(&self) -> #return_type {
                 #parse_logic
             }

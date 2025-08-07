@@ -20,6 +20,7 @@ pub struct DisplayState {
     channel: mpsc::Receiver<DisplayMessage>,
     shutting_down: bool,
     args: Arc<GlobalArgs>,
+    globals: ,
 }
 
 impl DisplayState {
@@ -105,6 +106,8 @@ impl MessageRunner for DisplayState {
                         if let Some(client) = connected_clients.get_mut(&client_id) {
                             if let Err(err) = client.handle_messages(self) {
                                 error!("Unable to handle messages for client {}: {err}", client_id);
+                                // Flush any remaining messages
+                                client.flush();
                                 if let Err(err) = self.event_loop.registry().deregister(client) {
                                     error!("Unable to deregister client {}: {err}", client_id);
                                 }
@@ -115,6 +118,10 @@ impl MessageRunner for DisplayState {
                         }
                     }
                 }
+            }
+
+            for (_, client) in connected_clients.iter_mut() {
+                client.flush();
             }
 
             if self.shutting_down {
