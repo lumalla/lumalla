@@ -331,6 +331,7 @@ dependencies = [
  "lumalla_shared",
  "lumalla_wayland_protocol",
  "mio",
+ "nix",
 ]
 
 [[package]]

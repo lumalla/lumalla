@@ -2,7 +2,7 @@ use log::debug;
 use lumalla_wayland_protocol::{
     Ctx, ObjectId,
     protocols::{WaylandProtocol, WlDisplay, wayland::*},
-    registry::InterfaceIndex,
+    registry::{DISPLAY_OBJECT_ID, InterfaceIndex},
 };
 
 use crate::DisplayState;
@@ -46,6 +46,16 @@ impl WlRegistry for DisplayState {
         // TODO: Do we need to care what version the global is bound to?
         ctx.registry
             .register_object(params.id().0, global.interface_index);
+
+        if params.id().1 == InterfaceIndex::WlShm.interface_name() {
+            // TODO: Get the available formats from the GPU
+            ctx.writer
+                .wl_shm_format(params.id().0)
+                .format(WL_SHM_FORMAT_RGBA8888);
+            ctx.writer
+                .wl_shm_format(params.id().0)
+                .format(WL_SHM_FORMAT_XRGB8888);
+        }
     }
 }
 
@@ -72,31 +82,78 @@ impl WlCompositor for DisplayState {
 }
 
 impl WlShm for DisplayState {
-    fn create_pool(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlShmCreatePool) {
-        todo!()
+    fn create_pool(&mut self, ctx: &mut Ctx, _object_id: ObjectId, params: &WlShmCreatePool) {
+        ctx.registry
+            .register_object(params.id(), InterfaceIndex::WlShmPool);
+        if self.shm_manager.create_pool(
+            ctx.client_id,
+            params.id(),
+            params.fd(),
+            params.size() as usize,
+        ) {
+            debug!("Failed to mmap shared memory from client {}", ctx.client_id);
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(params.id())
+                .code(WL_SHM_ERROR_INVALID_FD)
+                .message("Failed to mmap shared memory");
+        }
     }
 
-    fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlShmRelease) {
-        todo!()
+    fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlShmRelease) {
+        ctx.registry.free_object(object_id, &mut ctx.writer);
     }
 }
 
 impl WlShmPool for DisplayState {
     fn create_buffer(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlShmPoolCreateBuffer<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlShmPoolCreateBuffer<'_>,
     ) {
-        todo!()
+        ctx.registry
+            .register_object(params.id(), InterfaceIndex::WlBuffer);
+        if self.shm_manager.create_buffer(
+            ctx.client_id,
+            object_id,
+            params.id(),
+            params.offset() as usize,
+            params.width() as usize,
+            params.height() as usize,
+            params.stride() as usize,
+            params.format(),
+        ) {
+            debug!("Failed to create shm_buffer from client {}", ctx.client_id);
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(object_id)
+                .code(WL_SHM_ERROR_INVALID_FD)
+                .message("Failed to create shm_buffer");
+        }
     }
 
-    fn destroy(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlShmPoolDestroy<'_>) {
-        todo!()
+    fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlShmPoolDestroy<'_>) {
+        ctx.registry.free_object(object_id, &mut ctx.writer);
+        self.shm_manager.delete_pool(ctx.client_id, object_id);
     }
 
-    fn resize(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlShmPoolResize<'_>) {
-        todo!()
+    fn resize(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlShmPoolResize<'_>) {
+        if !self
+            .shm_manager
+            .resize_pool(ctx.client_id, object_id, params.size() as usize)
+        {
+            debug!(
+                "Failed to resize shm_pool to {} from client {}",
+                params.size(),
+                ctx.client_id
+            );
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(object_id)
+                .code(WL_SHM_ERROR_INVALID_FD)
+                .message("Failed to resize shm_pool");
+        }
     }
 }
 
@@ -350,7 +407,7 @@ impl WlSurface for DisplayState {
         todo!()
     }
 
-    fn offset(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSurfaceOffset) {
+    fn offset(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSurfaceOffset) {
         todo!()
     }
 }
@@ -502,15 +559,15 @@ impl WlSubsurface for DisplayState {
 }
 
 impl WlFixes for DisplayState {
-    fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlFixesDestroy) {
+    fn destroy(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlFixesDestroy) {
         todo!()
     }
 
     fn destroy_registry(
         &mut self,
-        ctx: &mut Ctx,
-        object_id: ObjectId,
-        params: &WlFixesDestroyRegistry,
+        _ctx: &mut Ctx,
+        _object_id: ObjectId,
+        _params: &WlFixesDestroyRegistry,
     ) {
         todo!()
     }

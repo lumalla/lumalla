@@ -7,13 +7,14 @@ use anyhow::Context;
 use log::{debug, error, info, warn};
 use lumalla_shared::{Comms, DisplayMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner};
 use lumalla_wayland_protocol::{
-    ClientConnection, ClientId, ObjectId, Wayland,
-    protocols::wayland::{WL_COMPOSITOR_NAME, WL_COMPOSITOR_VERSION},
-    registry::InterfaceIndex,
+    ClientConnection, ClientId, ObjectId, Wayland, registry::InterfaceIndex,
 };
 use mio::{Interest, Poll, Token};
 
+use crate::shm::ShmManager;
+
 mod protocols;
+mod shm;
 
 pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 pub const CLIENT_TOKEN_START: Token = Token(WAYLAND_SOCKET_TOKEN.0 + 1);
@@ -26,6 +27,7 @@ pub struct DisplayState {
     args: Arc<GlobalArgs>,
     globals: Globals,
     surfaces: HashMap<(ClientId, ObjectId), SurfaceState>,
+    shm_manager: ShmManager,
 }
 
 impl DisplayState {
@@ -60,6 +62,7 @@ impl MessageRunner for DisplayState {
             args,
             globals: Globals::default(),
             surfaces: HashMap::new(),
+            shm_manager: ShmManager::default(),
         })
     }
 
@@ -180,6 +183,7 @@ impl Default for Globals {
             next_id: 1,
         };
         globals.register(InterfaceIndex::WlCompositor);
+        globals.register(InterfaceIndex::WlShm);
         globals
     }
 }

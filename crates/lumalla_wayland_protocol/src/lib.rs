@@ -11,8 +11,9 @@ pub mod buffer;
 mod client;
 pub mod protocols;
 pub mod registry;
-pub use client::{ClientConnection, ClientEvent, ClientId, Ctx};
+pub use client::{ClientConnection, ClientId, Ctx};
 
+// TODO: Make the object ID NonZeroU32
 pub type ObjectId = u32;
 type Opcode = u16;
 

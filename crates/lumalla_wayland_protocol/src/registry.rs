@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     ObjectId,
-    buffer::MessageHeader,
+    buffer::{MessageHeader, Writer},
     client::Ctx,
     protocols::{WaylandProtocol, WlDisplay, wayland::*},
 };
@@ -96,6 +96,7 @@ impl InterfaceIndex {
 }
 
 const MIN_SERVER_OBJECT_ID: ObjectId = 0xFF000000;
+pub const DISPLAY_OBJECT_ID: ObjectId = 1;
 
 #[derive(Debug)]
 pub struct Registry {
@@ -106,11 +107,13 @@ pub struct Registry {
 
 impl Registry {
     pub fn new() -> Self {
-        Self {
+        let mut registry = Self {
             objects: HashMap::new(),
             next_object_id: MIN_SERVER_OBJECT_ID,
             freed_object_ids: Vec::new(),
-        }
+        };
+        registry.register_object(DISPLAY_OBJECT_ID, InterfaceIndex::WlDisplay);
+        registry
     }
 
     pub fn interface_index(&self, object_id: ObjectId) -> Option<InterfaceIndex> {
@@ -133,6 +136,16 @@ impl Registry {
             self.next_object_id += 1;
             object_id
         })
+    }
+
+    pub fn free_object(&mut self, object_id: ObjectId, writer: &mut Writer) {
+        self.objects.remove(&object_id);
+        if object_id >= MIN_SERVER_OBJECT_ID {
+            self.freed_object_ids.push(object_id);
+        } else {
+            // The spec says that only objects created by the client should acknowledged
+            writer.wl_display_delete_id(DISPLAY_OBJECT_ID).id(object_id);
+        }
     }
 }
 

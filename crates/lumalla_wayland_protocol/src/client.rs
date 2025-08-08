@@ -16,12 +16,7 @@ pub type ClientId = u32;
 pub struct Ctx<'client> {
     pub registry: &'client mut Registry,
     pub writer: &'client mut Writer,
-}
-
-#[derive(Debug)]
-pub enum ClientEvent {
-    MessageReceived { client_id: ClientId, data: Vec<u8> },
-    Disconnected { client_id: ClientId },
+    pub client_id: ClientId,
 }
 
 #[derive(Debug)]
@@ -93,6 +88,7 @@ impl ClientConnection {
                         &mut Ctx {
                             registry: &mut self.registry,
                             writer: &mut self.writer,
+                            client_id: self.client_id,
                         },
                         header,
                         data,
