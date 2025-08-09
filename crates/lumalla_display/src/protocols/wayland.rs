@@ -128,7 +128,7 @@ impl WlShmPool for DisplayState {
             ctx.writer
                 .wl_display_error(DISPLAY_OBJECT_ID)
                 .object_id(object_id)
-                .code(WL_SHM_ERROR_INVALID_FD)
+                .code(WL_SHM_ERROR_INVALID_FORMAT)
                 .message("Failed to create shm_buffer");
         }
     }
@@ -158,8 +158,10 @@ impl WlShmPool for DisplayState {
 }
 
 impl WlBuffer for DisplayState {
-    fn destroy(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlBufferDestroy<'_>) {
-        todo!()
+    fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlBufferDestroy<'_>) {
+        ctx.registry.free_object(object_id, &mut ctx.writer);
+        self.shm_manager.delete_buffer(ctx.client_id, object_id);
+        ctx.writer.wl_buffer_release(object_id);
     }
 }
 
