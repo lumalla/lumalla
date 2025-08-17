@@ -1,13 +1,10 @@
 use std::{collections::VecDeque, mem, os::fd::RawFd, ptr};
 
-use log::{debug, error};
-use nix::{
-    errno::Errno,
-    libc::{
-        CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_NXTHDR, MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET,
-        cmsghdr, iovec, msghdr, recvmsg, sendmsg,
-    },
+use libc::{
+    CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_NXTHDR, EAGAIN, EWOULDBLOCK, MSG_NOSIGNAL, SCM_RIGHTS,
+    SOL_SOCKET, cmsghdr, iovec, msghdr, recvmsg, sendmsg,
 };
+use log::{debug, error};
 
 use crate::{ObjectId, Opcode};
 
@@ -74,9 +71,9 @@ impl Reader {
         let received_bytes = unsafe { recvmsg(self.fd, &mut msghdr as *mut _, 0) };
         match received_bytes {
             0 => ReadResult::EndOfStream,
-            -1 => match Errno::last() {
+            -1 => match unsafe { *libc::__errno_location() } {
                 #[allow(unreachable_patterns)] // On some platforms these may have different values
-                Errno::EWOULDBLOCK | Errno::EAGAIN => ReadResult::NoMoreData,
+                EWOULDBLOCK | EAGAIN => ReadResult::NoMoreData,
                 err => {
                     error!("Error reading from socket: {}", err);
                     ReadResult::EndOfStream
@@ -286,7 +283,9 @@ impl Writer {
         };
         let result = unsafe { sendmsg(self.fd, &msg as *const _, MSG_NOSIGNAL) };
         if result < 0 {
-            anyhow::bail!("Error sending message: {}", Errno::last());
+            anyhow::bail!("Error sending message: {}", unsafe {
+                *libc::__errno_location()
+            });
         }
 
         if self.bytes_in_buffer > MAX_MESSAGE_SIZE {

@@ -1,8 +1,8 @@
 use std::{collections::HashMap, ffi::c_void, os::fd::RawFd};
 
+use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, mmap, munmap};
 use log::warn;
 use lumalla_wayland_protocol::{ClientId, ObjectId};
-use nix::libc::{MAP_FAILED, MAP_SHARED, PROT_READ, mmap, munmap};
 
 #[derive(Debug, Default)]
 pub struct ShmManager {
