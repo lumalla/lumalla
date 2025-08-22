@@ -10,6 +10,28 @@
   </p>
 </div>
 
+## Architecture
+
+### Main
+
+Reads args and determines if it should start the window manager or connect to an already running instance.
+
+### Config
+
+Reads the main config file and determines how to configure the seat, input, rendering and display handling.
+
+### Input
+
+Gathers all input events and forwards them to the config/display.
+
+### Display
+
+Handles connections to the clients and organizes the window layout.
+
+### Renderer
+
+Renders the windows and other elements based on the display layout.
+
 ## License
 
 Except where noted, all code in this repository is dual-licensed under either:
