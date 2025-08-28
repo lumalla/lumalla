@@ -1,5 +1,5 @@
 [package]
-name = "lumalla_rederer"
+name = "lumalla_renderer"
 version = "0.1.0"
 edition = "2024"
 description = "Renderer handling library for lumalla"

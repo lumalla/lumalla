@@ -297,7 +297,7 @@ dependencies = [
  "lumalla_config",
  "lumalla_display",
  "lumalla_input",
- "lumalla_rederer",
+ "lumalla_renderer",
  "lumalla_shared",
  "mio",
  "signal-hook",
@@ -339,7 +339,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lumalla_rederer"
+name = "lumalla_renderer"
 version = "0.1.0"
 dependencies = [
  "anyhow",

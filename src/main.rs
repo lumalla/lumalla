@@ -13,7 +13,7 @@ use log::{error, info, warn};
 use lumalla_config::ConfigState;
 use lumalla_display::DisplayState;
 use lumalla_input::InputState;
-use lumalla_rederer::RendererState;
+use lumalla_renderer::RendererState;
 use lumalla_shared::{
     Comms, ConfigMessage, DisplayMessage, GlobalArgs, InputMessage, MESSAGE_CHANNEL_TOKEN,
     MainMessage, MessageRunner, MessageSender, RendererMessage, message_loop_with_channel,
