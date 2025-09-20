@@ -40,6 +40,7 @@
             rustfmt
             openssl
             pkg-config
+            lldb
           ];
           RUST_LOG = "debug";
         };
