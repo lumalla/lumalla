@@ -357,9 +357,9 @@ mod tests {
         assert!(main_channel.try_recv().is_err());
     }
 
-    struct PanicingTestRunner;
+    struct PanickingTestRunner;
 
-    impl MessageRunner for PanicingTestRunner {
+    impl MessageRunner for PanickingTestRunner {
         type Message = ();
 
         fn new(
@@ -393,7 +393,7 @@ mod tests {
         let args = Arc::new(GlobalArgs::default());
         let (test_event_loop, test_receiver, _) = message_loop_with_channel::<()>().unwrap();
 
-        let join_handle = run_thread::<PanicingTestRunner, _>(
+        let join_handle = run_thread::<PanickingTestRunner, _>(
             comms,
             to_main,
             String::from("test_thread"),
