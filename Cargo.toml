@@ -12,7 +12,7 @@ members = [
     "crates/lumalla_config",
     "crates/lumalla_display",
     "crates/lumalla_input",
-    "crates/lumalla_renderer",
+    "crates/lumalla_renderer", "crates/lumalla_seat",
     "crates/lumalla_shared",
     "crates/lumalla_wayland_protocol",
     "crates/lumalla_wayland_protocol_macros",

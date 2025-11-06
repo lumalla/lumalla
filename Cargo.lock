@@ -349,6 +349,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumalla_seat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "lumalla_shared",
+ "mio",
+]
+
+[[package]]
 name = "lumalla_shared"
 version = "0.1.0"
 dependencies = [
