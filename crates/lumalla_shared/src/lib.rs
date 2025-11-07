@@ -9,6 +9,7 @@ mod message_runner;
 mod mods;
 mod output;
 mod renderer_message;
+mod seat_message;
 mod window_rule;
 mod zone;
 
@@ -23,5 +24,6 @@ pub use message_runner::{MESSAGE_CHANNEL_TOKEN, MessageRunner};
 pub use mods::Mods;
 pub use output::Output;
 pub use renderer_message::RendererMessage;
+pub use seat_message::SeatMessage;
 pub use window_rule::WindowRule;
 pub use zone::Zone;

@@ -5,10 +5,15 @@ edition = "2024"
 description = "Seat handling library for lumalla"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumalla/lumalla"
-include = ["src/**/*", "LICENSE-*"]
+include = ["src/**/*", "LICENSE-*", "build.rs", "wrapper.h"]
 
 [dependencies]
 lumalla_shared = { path = "../lumalla_shared" }
 anyhow = { workspace = true }
 mio = { workspace = true }
 log = { workspace = true }
+libc = { workspace = true }
+
+[build-dependencies]
+bindgen = { workspace = true }
+pkg-config = { workspace = true }
