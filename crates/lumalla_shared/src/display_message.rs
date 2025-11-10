@@ -48,4 +48,8 @@ pub enum DisplayMessage {
         /// The spaces of the layout
         spaces: HashMap<String, Vec<Output>>,
     },
+    /// Activate the seat with the given name
+    ActivateSeat(String),
+    /// Deactivate the seat with the given name
+    DeactivateSeat(String),
 }

@@ -22,8 +22,8 @@ fn main() {
         .generate()
         .expect("Unable to generate bindings");
 
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let bindings_file = out_path.join("bindings.rs");
+    let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let bindings_file = out_path.join("libseat_bindings.rs");
     bindings
         .write_to_file(&bindings_file)
         .expect("Couldn't write bindings!");
