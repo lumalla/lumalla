@@ -11,9 +11,10 @@ use lumalla_wayland_protocol::{
 };
 use mio::{Interest, Poll, Token};
 
-use crate::shm::ShmManager;
+use crate::{seat::SeatManager, shm::ShmManager};
 
 mod protocols;
+mod seat;
 mod shm;
 
 pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
@@ -28,6 +29,7 @@ pub struct DisplayState {
     globals: Globals,
     surfaces: HashMap<(ClientId, ObjectId), SurfaceState>,
     shm_manager: ShmManager,
+    seat_manager: SeatManager,
 }
 
 impl DisplayState {
@@ -35,6 +37,9 @@ impl DisplayState {
         match message {
             DisplayMessage::Shutdown => {
                 self.shutting_down = true;
+            }
+            DisplayMessage::ActivateSeat(seat_name) => {
+                self.seat_manager.add_seat(seat_name, &mut self.globals);
             }
             message => {
                 warn!("Message not handled: {message:?}");
@@ -63,6 +68,7 @@ impl MessageRunner for DisplayState {
             globals: Globals::default(),
             surfaces: HashMap::new(),
             shm_manager: ShmManager::default(),
+            seat_manager: SeatManager::default(),
         })
     }
 
@@ -75,7 +81,7 @@ impl MessageRunner for DisplayState {
         self.event_loop
             .registry()
             .register(&mut wayland, WAYLAND_SOCKET_TOKEN, Interest::READABLE)
-            .context("Unable to listend on wayland display socket")?;
+            .context("Unable to listen on wayland display socket")?;
 
         let mut connected_clients = HashMap::<ClientId, ClientConnection>::new();
         let mut events = mio::Events::with_capacity(128);

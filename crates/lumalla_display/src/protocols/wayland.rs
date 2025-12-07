@@ -47,14 +47,23 @@ impl WlRegistry for DisplayState {
         ctx.registry
             .register_object(params.id().0, global.interface_index);
 
-        if params.id().1 == InterfaceIndex::WlShm.interface_name() {
-            // TODO: Get the available formats from the GPU
-            ctx.writer
-                .wl_shm_format(params.id().0)
-                .format(WL_SHM_FORMAT_RGBA8888);
-            ctx.writer
-                .wl_shm_format(params.id().0)
-                .format(WL_SHM_FORMAT_XRGB8888);
+        let interface_name = params.id().1;
+        match params.id().1 {
+            _ if interface_name == InterfaceIndex::WlShm.interface_name() => {
+                // TODO: Get the available formats from the GPU
+                ctx.writer
+                    .wl_shm_format(params.id().0)
+                    .format(WL_SHM_FORMAT_RGBA8888);
+                ctx.writer
+                    .wl_shm_format(params.id().0)
+                    .format(WL_SHM_FORMAT_XRGB8888);
+            }
+            _ if interface_name == InterfaceIndex::WlSeat.interface_name() => {
+                ctx.writer
+                    .wl_seat_capabilities(params.id().0)
+                    .capabilities(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+            }
+            _ => {}
         }
     }
 }
