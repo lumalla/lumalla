@@ -27,19 +27,24 @@ pub struct DisplayState {
     shutting_down: bool,
     args: Arc<GlobalArgs>,
     globals: Globals,
-    surfaces: HashMap<(ClientId, ObjectId), SurfaceState>,
+    _surfaces: HashMap<(ClientId, ObjectId), SurfaceState>,
     shm_manager: ShmManager,
     seat_manager: SeatManager,
 }
 
 impl DisplayState {
-    fn handle_message(&mut self, message: DisplayMessage) -> anyhow::Result<()> {
+    fn handle_message<'connection>(
+        &mut self,
+        message: DisplayMessage,
+        connected_clients: impl Iterator<Item = &'connection mut ClientConnection>,
+    ) -> anyhow::Result<()> {
         match message {
             DisplayMessage::Shutdown => {
                 self.shutting_down = true;
             }
             DisplayMessage::ActivateSeat(seat_name) => {
-                self.seat_manager.add_seat(seat_name, &mut self.globals);
+                self.seat_manager
+                    .add_seat(seat_name, &mut self.globals, connected_clients);
             }
             message => {
                 warn!("Message not handled: {message:?}");
@@ -66,7 +71,7 @@ impl MessageRunner for DisplayState {
             shutting_down: false,
             args,
             globals: Globals::default(),
-            surfaces: HashMap::new(),
+            _surfaces: HashMap::new(),
             shm_manager: ShmManager::default(),
             seat_manager: SeatManager::default(),
         })
@@ -94,7 +99,9 @@ impl MessageRunner for DisplayState {
                 match event.token() {
                     MESSAGE_CHANNEL_TOKEN => {
                         while let Ok(msg) = self.channel.try_recv() {
-                            if let Err(err) = self.handle_message(msg) {
+                            if let Err(err) =
+                                self.handle_message(msg, connected_clients.values_mut())
+                            {
                                 error!("Unable to handle message: {err}");
                             }
                         }
@@ -123,7 +130,9 @@ impl MessageRunner for DisplayState {
                             if let Err(err) = client.handle_messages(self) {
                                 error!("Unable to handle messages for client {}: {err}", client_id);
                                 // Flush any remaining messages
-                                client.flush();
+                                if let Err(err) = client.flush() {
+                                    error!("Unable to flush client {}: {err}", client_id);
+                                }
                                 if let Err(err) = self.event_loop.registry().deregister(client) {
                                     error!("Unable to deregister client {}: {err}", client_id);
                                 }
@@ -136,8 +145,18 @@ impl MessageRunner for DisplayState {
                 }
             }
 
-            for (_, client) in connected_clients.iter_mut() {
-                client.flush();
+            let mut clients_to_remove = Vec::new();
+            for (&client_id, client) in connected_clients.iter_mut() {
+                if let Err(err) = client.flush() {
+                    error!("Unable to flush client {}: {err}", client_id);
+                    if let Err(err) = self.event_loop.registry().deregister(client) {
+                        error!("Unable to deregister client {}: {err}", client_id);
+                    }
+                    clients_to_remove.push(client_id);
+                }
+            }
+            for client_id in clients_to_remove {
+                connected_clients.remove(&client_id);
             }
 
             if self.shutting_down {
@@ -169,16 +188,18 @@ impl DisplayState {
     }
 }
 
+type GlobalId = u32;
+
 #[derive(Debug)]
 struct Globals {
-    globals: HashMap<u32, Global>,
-    next_id: u32,
+    globals: HashMap<GlobalId, Global>,
+    next_id: GlobalId,
 }
 
 #[derive(Debug)]
 struct Global {
-    name: &'static str,
-    version: u32,
+    _name: &'static str,
+    _version: u32,
     interface_index: InterfaceIndex,
 }
 
@@ -188,24 +209,33 @@ impl Default for Globals {
             globals: HashMap::new(),
             next_id: 1,
         };
-        globals.register(InterfaceIndex::WlCompositor);
-        globals.register(InterfaceIndex::WlShm);
+        globals.register(InterfaceIndex::WlCompositor, [].into_iter());
+        globals.register(InterfaceIndex::WlShm, [].into_iter());
         globals
     }
 }
 
 impl Globals {
-    fn register(&mut self, interface_index: InterfaceIndex) -> u32 {
+    /// Registers a global with the given interface index and returns the global id.
+    /// Additionally, makes sure to broadcast the global to all connected clients.
+    fn register<'connection>(
+        &mut self,
+        interface_index: InterfaceIndex,
+        client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
+    ) -> GlobalId {
         let id = self.next_id;
         self.next_id += 1;
         self.globals.insert(
             id,
             Global {
-                name: interface_index.interface_name(),
-                version: interface_index.interface_version(),
+                _name: interface_index.interface_name(),
+                _version: interface_index.interface_version(),
                 interface_index,
             },
         );
+        for client in client_connections {
+            client.broadcast_global(id, interface_index);
+        }
         id
     }
 

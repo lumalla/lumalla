@@ -5,7 +5,7 @@ use lumalla_wayland_protocol::{
     registry::{DISPLAY_OBJECT_ID, InterfaceIndex},
 };
 
-use crate::DisplayState;
+use crate::{DisplayState, GlobalId};
 
 impl WaylandProtocol for DisplayState {}
 
@@ -39,8 +39,9 @@ impl WlDisplay for DisplayState {
 
 impl WlRegistry for DisplayState {
     fn bind(&mut self, ctx: &mut Ctx, _object_id: ObjectId, params: &WlRegistryBind<'_>) {
-        let Some(global) = self.globals.get(params.name()) else {
-            debug!("Received bind request for unknown global {}", params.name());
+        let global_id: GlobalId = params.name();
+        let Some(global) = self.globals.get(global_id) else {
+            debug!("Received bind request for unknown global {}", global_id);
             return;
         };
         // TODO: Do we need to care what version the global is bound to?
@@ -59,6 +60,9 @@ impl WlRegistry for DisplayState {
                     .format(WL_SHM_FORMAT_XRGB8888);
             }
             _ if interface_name == InterfaceIndex::WlSeat.interface_name() => {
+                ctx.writer
+                    .wl_seat_name(params.id().0)
+                    .name(self.seat_manager.get_name(global_id).unwrap_or_default());
                 ctx.writer
                     .wl_seat_capabilities(params.id().0)
                     .capabilities(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);

@@ -8,7 +8,7 @@ use std::{
 use crate::{
     buffer::{ReadResult, Reader, Writer},
     protocols::wayland::WL_DISPLAY_ERROR_INVALID_OBJECT,
-    registry::{Registry, RequestHandler},
+    registry::{InterfaceIndex, Registry, RequestHandler},
 };
 
 pub type ClientId = u32;
@@ -112,6 +112,20 @@ impl ClientConnection {
         }
 
         self.writer.flush()
+    }
+
+    pub fn broadcast_global(&mut self, global_id: u32, interface_index: InterfaceIndex) {
+        // TODO: If this is called a lot, we should probably cache the registry object ids
+        for registry_object_id in self
+            .registry
+            .iter_object_ids_of_interface(InterfaceIndex::WlRegistry)
+        {
+            self.writer
+                .wl_registry_global(registry_object_id)
+                .name(global_id)
+                .interface(interface_index.interface_name())
+                .version(interface_index.interface_version());
+        }
     }
 }
 

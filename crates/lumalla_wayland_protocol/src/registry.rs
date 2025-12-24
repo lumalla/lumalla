@@ -147,6 +147,16 @@ impl Registry {
             writer.wl_display_delete_id(DISPLAY_OBJECT_ID).id(object_id);
         }
     }
+
+    pub fn iter_object_ids_of_interface(
+        &self,
+        interface: InterfaceIndex,
+    ) -> impl Iterator<Item = ObjectId> {
+        self.objects
+            .iter()
+            .filter(move |(_, interface_index)| interface == **interface_index)
+            .map(|(object_id, _)| *object_id)
+    }
 }
 
 pub trait RequestHandler {
