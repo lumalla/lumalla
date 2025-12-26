@@ -3,6 +3,8 @@ use log::{debug, error};
 use mio::{event::Source, unix::SourceFd};
 use std::{
     fs, io,
+    num::NonZeroU32,
+    ops::Deref,
     os::{fd::AsRawFd, unix::net::UnixListener},
     path::Path,
 };
@@ -13,8 +15,36 @@ pub mod protocols;
 pub mod registry;
 pub use client::{ClientConnection, ClientId, Ctx};
 
-// TODO: Make the object ID NonZeroU32
-pub type ObjectId = u32;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
+pub struct ObjectId(NonZeroU32);
+
+impl ObjectId {
+    pub const fn new(id: NonZeroU32) -> Self {
+        Self(id)
+    }
+
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NewObjectId(ObjectId);
+
+impl NewObjectId {
+    pub const fn new(id: ObjectId) -> Self {
+        Self(id)
+    }
+}
+
+impl Deref for NewObjectId {
+    type Target = ObjectId;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 type Opcode = u16;
 
 pub struct Wayland {
@@ -40,7 +70,9 @@ impl Wayland {
 
         Ok(Self {
             listener,
-            next_client_id: 1,
+            next_client_id: ClientId::new(
+                NonZeroU32::new(1).ok_or(anyhow::anyhow!("Somehow got zero client id"))?,
+            ),
             socket_path,
         })
     }
@@ -49,11 +81,15 @@ impl Wayland {
         match self.listener.accept() {
             Ok((stream, _addr)) => {
                 let client_id = self.next_client_id;
-                self.next_client_id += 1;
+                let Some(next_client_id) = NonZeroU32::new(self.next_client_id.get() + 1) else {
+                    error!("Failed to increment client ID");
+                    return None;
+                };
+                self.next_client_id = ClientId::new(next_client_id);
 
                 match ClientConnection::new(stream, client_id) {
                     Ok(client) => {
-                        debug!("New client connected with ID: {}", client_id);
+                        debug!("New client connected with ID: {:?}", client_id);
                         Some(client)
                     }
                     Err(e) => {

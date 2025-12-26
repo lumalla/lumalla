@@ -2,6 +2,7 @@ use log::debug;
 use mio::{event::Source, unix::SourceFd};
 use std::{
     io::{self},
+    num::NonZeroU32,
     os::{fd::AsRawFd, unix::net::UnixStream},
 };
 
@@ -11,7 +12,18 @@ use crate::{
     registry::{InterfaceIndex, Registry, RequestHandler},
 };
 
-pub type ClientId = u32;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientId(NonZeroU32);
+
+impl ClientId {
+    pub fn new(id: NonZeroU32) -> Self {
+        Self(id)
+    }
+
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
 
 pub struct Ctx<'client> {
     pub registry: &'client mut Registry,
@@ -34,7 +46,7 @@ impl ClientConnection {
         stream.set_nonblocking(true)?;
 
         debug!(
-            "Created client connection with ID: {} (from {:?})",
+            "Created client connection with ID: {:?} (from {:?})",
             client_id,
             stream.peer_addr().ok()
         );
@@ -63,13 +75,13 @@ impl ClientConnection {
     pub fn handle_messages(&mut self, handler: &mut impl RequestHandler) -> anyhow::Result<()> {
         match self.reader.read() {
             ReadResult::EndOfStream => {
-                anyhow::bail!("Client {} disconnected", self.client_id);
+                anyhow::bail!("Client {:?} disconnected", self.client_id);
             }
             ReadResult::NoMoreData => {
-                debug!("Client {} did not read any data", self.client_id);
+                debug!("Client {:?} did not read any data", self.client_id);
             }
             ReadResult::ReadData => {
-                while let Some((header, data, fds)) = self.reader.next() {
+                while let Some((header, data, fds)) = self.reader.next()? {
                     let Some(interface_index) = self.registry.interface_index(header.object_id)
                     else {
                         self.writer
@@ -78,7 +90,7 @@ impl ClientConnection {
                             .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
                             .message("Invalid object ID");
                         anyhow::bail!(
-                            "Received request for unknown object ID {}. Disconnecting client {}",
+                            "Received request for unknown object ID {:?}. Disconnecting client {:?}",
                             header.object_id,
                             self.client_id
                         );

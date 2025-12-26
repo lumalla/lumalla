@@ -1,21 +1,21 @@
 use std::{
     collections::HashMap,
+    num::NonZeroU32,
     sync::{Arc, mpsc},
 };
 
 use anyhow::Context;
 use log::{debug, error, info, warn};
 use lumalla_shared::{Comms, DisplayMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner};
-use lumalla_wayland_protocol::{
-    ClientConnection, ClientId, ObjectId, Wayland, registry::InterfaceIndex,
-};
+use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland, registry::InterfaceIndex};
 use mio::{Interest, Poll, Token};
 
-use crate::{seat::SeatManager, shm::ShmManager};
+use crate::{seat::SeatManager, shm::ShmManager, surface::SurfaceManager};
 
 mod protocols;
 mod seat;
 mod shm;
+mod surface;
 
 pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 pub const CLIENT_TOKEN_START: Token = Token(WAYLAND_SOCKET_TOKEN.0 + 1);
@@ -27,7 +27,7 @@ pub struct DisplayState {
     shutting_down: bool,
     args: Arc<GlobalArgs>,
     globals: Globals,
-    _surfaces: HashMap<(ClientId, ObjectId), SurfaceState>,
+    surface_manager: SurfaceManager,
     shm_manager: ShmManager,
     seat_manager: SeatManager,
 }
@@ -71,7 +71,7 @@ impl MessageRunner for DisplayState {
             shutting_down: false,
             args,
             globals: Globals::default(),
-            _surfaces: HashMap::new(),
+            surface_manager: SurfaceManager::default(),
             shm_manager: ShmManager::default(),
             seat_manager: SeatManager::default(),
         })
@@ -109,14 +109,14 @@ impl MessageRunner for DisplayState {
                     WAYLAND_SOCKET_TOKEN => {
                         if let Some(mut client) = wayland.next_client() {
                             let client_id = client.client_id();
-                            info!("New client connected with id {}", client_id);
+                            info!("New client connected with id {:?}", client_id);
                             if let Err(err) = self.event_loop.registry().register(
                                 &mut client,
-                                Token(CLIENT_TOKEN_START.0 + client_id as usize),
+                                Token(CLIENT_TOKEN_START.0 + client_id.get() as usize),
                                 Interest::READABLE,
                             ) {
                                 error!(
-                                    "Unable to listen on client socket with client id {}: {err}",
+                                    "Unable to listen on client socket with client id {:?}: {err}",
                                     client_id
                                 );
                             } else {
@@ -125,21 +125,27 @@ impl MessageRunner for DisplayState {
                         }
                     }
                     token => {
-                        let client_id: ClientId = (token.0 - CLIENT_TOKEN_START.0) as ClientId;
+                        let client_id = ClientId::new(
+                            NonZeroU32::new((token.0 - CLIENT_TOKEN_START.0) as u32)
+                                .ok_or(anyhow::anyhow!("Created invalid client id from token"))?,
+                        );
                         if let Some(client) = connected_clients.get_mut(&client_id) {
                             if let Err(err) = client.handle_messages(self) {
-                                error!("Unable to handle messages for client {}: {err}", client_id);
+                                error!(
+                                    "Unable to handle messages for client {:?}: {err}",
+                                    client_id
+                                );
                                 // Flush any remaining messages
                                 if let Err(err) = client.flush() {
-                                    error!("Unable to flush client {}: {err}", client_id);
+                                    error!("Unable to flush client {:?}: {err}", client_id);
                                 }
                                 if let Err(err) = self.event_loop.registry().deregister(client) {
-                                    error!("Unable to deregister client {}: {err}", client_id);
+                                    error!("Unable to deregister client {:?}: {err}", client_id);
                                 }
                                 connected_clients.remove(&client_id);
                             }
                         } else {
-                            debug!("Received message for unknown client {}", client_id);
+                            debug!("Received message for unknown client {:?}", client_id);
                         }
                     }
                 }
@@ -148,9 +154,9 @@ impl MessageRunner for DisplayState {
             let mut clients_to_remove = Vec::new();
             for (&client_id, client) in connected_clients.iter_mut() {
                 if let Err(err) = client.flush() {
-                    error!("Unable to flush client {}: {err}", client_id);
+                    error!("Unable to flush client {:?}: {err}", client_id);
                     if let Err(err) = self.event_loop.registry().deregister(client) {
-                        error!("Unable to deregister client {}: {err}", client_id);
+                        error!("Unable to deregister client {:?}: {err}", client_id);
                     }
                     clients_to_remove.push(client_id);
                 }
@@ -247,5 +253,3 @@ impl Globals {
         self.globals.get(&id)
     }
 }
-
-struct SurfaceState {}

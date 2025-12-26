@@ -1,10 +1,11 @@
 use std::{
     collections::{HashMap, VecDeque},
+    num::NonZeroU32,
     os::fd::RawFd,
 };
 
 use crate::{
-    ObjectId,
+    NewObjectId, ObjectId,
     buffer::{MessageHeader, Writer},
     client::Ctx,
     protocols::{WaylandProtocol, WlDisplay, wayland::*},
@@ -95,8 +96,9 @@ impl InterfaceIndex {
     }
 }
 
-const MIN_SERVER_OBJECT_ID: ObjectId = 0xFF000000;
-pub const DISPLAY_OBJECT_ID: ObjectId = 1;
+const MIN_SERVER_OBJECT_ID: ObjectId =
+    ObjectId::new(unsafe { NonZeroU32::new_unchecked(0xFF000000) });
+pub const DISPLAY_OBJECT_ID: ObjectId = ObjectId::new(unsafe { NonZeroU32::new_unchecked(1) });
 
 #[derive(Debug)]
 pub struct Registry {
@@ -112,7 +114,10 @@ impl Registry {
             next_object_id: MIN_SERVER_OBJECT_ID,
             freed_object_ids: Vec::new(),
         };
-        registry.register_object(DISPLAY_OBJECT_ID, InterfaceIndex::WlDisplay);
+        registry.register_object(
+            NewObjectId::new(DISPLAY_OBJECT_ID),
+            InterfaceIndex::WlDisplay,
+        );
         registry
     }
 
@@ -120,22 +125,29 @@ impl Registry {
         self.objects.get(&object_id).copied()
     }
 
-    pub fn register_object(&mut self, object_id: ObjectId, interface_index: InterfaceIndex) {
-        self.objects.insert(object_id, interface_index);
+    pub fn register_object(&mut self, object_id: NewObjectId, interface_index: InterfaceIndex) {
+        self.objects.insert(*object_id, interface_index);
     }
 
-    pub fn create_object(&mut self, interface_index: InterfaceIndex) -> ObjectId {
-        let object_id = self.next_object_id();
+    pub fn create_object(&mut self, interface_index: InterfaceIndex) -> anyhow::Result<ObjectId> {
+        let object_id = self.next_object_id()?;
         self.objects.insert(object_id, interface_index);
-        object_id
+        Ok(object_id)
     }
 
-    fn next_object_id(&mut self) -> ObjectId {
-        self.freed_object_ids.pop().unwrap_or_else(|| {
-            let object_id = self.next_object_id;
-            self.next_object_id += 1;
-            object_id
-        })
+    fn next_object_id(&mut self) -> anyhow::Result<ObjectId> {
+        if let Some(object_id) = self.freed_object_ids.pop() {
+            return Ok(object_id);
+        }
+        let object_id = self.next_object_id;
+        let next_object_id = self.next_object_id.get() + 1;
+        if next_object_id == 0 {
+            anyhow::bail!("Ran out of object IDs");
+        }
+        self.next_object_id = ObjectId::new(
+            NonZeroU32::new(next_object_id).ok_or(anyhow::anyhow!("Ran out of object ids"))?,
+        );
+        Ok(object_id)
     }
 
     pub fn free_object(&mut self, object_id: ObjectId, writer: &mut Writer) {
@@ -144,7 +156,9 @@ impl Registry {
             self.freed_object_ids.push(object_id);
         } else {
             // The spec says that only objects created by the client should acknowledged
-            writer.wl_display_delete_id(DISPLAY_OBJECT_ID).id(object_id);
+            writer
+                .wl_display_delete_id(DISPLAY_OBJECT_ID)
+                .id(object_id.get());
         }
     }
 

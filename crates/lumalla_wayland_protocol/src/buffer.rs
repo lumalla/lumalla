@@ -102,23 +102,37 @@ impl Reader {
         }
     }
 
-    pub fn next(&mut self) -> Option<(&MessageHeader, &[u8], &mut VecDeque<RawFd>)> {
+    pub fn next(
+        &mut self,
+    ) -> anyhow::Result<Option<(&MessageHeader, &[u8], &mut VecDeque<RawFd>)>> {
         let available_bytes = self.bytes_in_buffer - self.current_buffer_offset;
         if available_bytes < size_of::<MessageHeader>() {
-            return None;
+            return Ok(None);
         }
 
-        let header = unsafe { &*(self.buffer.as_ptr() as *const MessageHeader) };
+        // Need to check if the object ID is all zeros, as that means the message is invalid
+        // and would violate the cast to the MessageHeader
+        if self.buffer
+            [self.current_buffer_offset..self.current_buffer_offset + size_of::<ObjectId>()]
+            .iter()
+            .all(|v| *v == 0)
+        {
+            anyhow::bail!("Invalid message received, where the object ID is all zeros");
+        }
+
+        let header = unsafe {
+            &*(self.buffer.as_ptr().add(self.current_buffer_offset) as *const MessageHeader)
+        };
         if header.size as usize > available_bytes {
-            return None;
+            return Ok(None);
         }
 
-        Some((
+        Ok(Some((
             header,
             &self.buffer[self.current_buffer_offset + size_of::<MessageHeader>()
                 ..self.current_buffer_offset + header.size as usize],
             &mut self.fds,
-        ))
+        )))
     }
 
     pub fn message_handled(&mut self, message_size: usize) {
@@ -180,7 +194,7 @@ impl Writer {
             self.last_err = Some(err);
             return;
         }
-        self.write_u32(object_id);
+        self.write_u32(object_id.get());
         self.message_length_index = self.bytes_in_buffer;
         self.write_u16(0);
         self.write_u16(opcode);
@@ -311,7 +325,10 @@ pub fn f32_to_fixed(value: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::os::{fd::AsRawFd, unix::net::UnixStream};
+    use std::{
+        num::NonZeroU32,
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
 
     use super::*;
 
@@ -322,7 +339,7 @@ mod tests {
         let mut writer = Writer::new(socket.1.as_raw_fd());
 
         let str = "Hello, world!";
-        writer.start_message(1, 2);
+        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 2);
         writer.write_u16(10);
         writer.write_i32(-2);
         writer.write_u32(3);
@@ -333,8 +350,8 @@ mod tests {
         writer.flush().unwrap();
 
         assert_eq!(reader.read(), ReadResult::ReadData);
-        let (header, data, fds) = reader.next().unwrap();
-        assert_eq!(header.object_id, 1);
+        let (header, data, fds) = reader.next().unwrap().unwrap();
+        assert_eq!(header.object_id.get(), 1);
         assert_eq!(header.opcode, 2);
         assert_eq!(data.len(), 34);
         assert_eq!(

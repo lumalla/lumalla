@@ -226,7 +226,7 @@ pub fn wayland_protocol(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         use anyhow::Context;
         use crate::{
-            ObjectId,
+            ObjectId, NewObjectId,
             buffer::{MessageHeader, Writer},
             client::Ctx,
         };
@@ -646,14 +646,21 @@ fn generate_interface_code_parts(
                     }
                     "object" | "new_id" => {
                         if arg.allow_null.unwrap_or(false) {
-                            (quote! { write_u32 }, quote! { #arg_name.unwrap_or(0) })
+                            (
+                                quote! { write_u32 },
+                                quote! { if let Some(id) = #arg_name { id.get() } else { 0 } },
+                            )
                         } else {
-                            (quote! { write_u32 }, quote! { #arg_name })
+                            (quote! { write_u32 }, quote! { #arg_name.get() })
                         }
                     }
-                    "array" => (quote! { write_u32 }, quote! { #arg_name.len() as u32 }), // Write array length for now
-                    "fd" => (quote! { write_u32 }, quote! { #arg_name as u32 }), // Cast fd to u32 for now
-                    _ => (quote! { write_u32 }, quote! { 0u32 }),                // Default fallback
+                    "fd" => (quote! { write_fd }, quote! { #arg_name as i32 }),
+                    // TODO: write array
+                    // "array" => (quote! { write_u32 }, quote! { #arg_name.len() as u32 }),
+                    _ => (
+                        quote! { write_u32 },
+                        quote! { panic!("Invalid argument type") },
+                    ),
                 };
 
                 let builder_struct_and_impl = if i == args.len() - 1 {
@@ -806,98 +813,226 @@ fn generate_accessor_methods(args: &[schema::RequestArg]) -> Vec<proc_macro2::To
                             }
                         },
                     ),
-                    "object" => (
-                        quote! { ObjectId },
-                        quote! {
-                            let offset = #offset_calculation;
-                            if offset + 4 <= self.data.len() {
-                                u32::from_ne_bytes([
-                                    self.data[offset],
-                                    self.data[offset + 1],
-                                    self.data[offset + 2],
-                                    self.data[offset + 3]
-                                ])
-                            } else {
-                                0
-                            }
-                        },
-                    ),
-                    "new_id" => {
-                        if arg.interface.is_some() {
-                            // new_id with specified interface - just parse the object ID
+                    "object" => {
+                        if arg.allow_null.unwrap_or(false) {
+                            (
+                                quote! { Option<ObjectId> },
+                                quote! {
+                                    let offset = #offset_calculation;
+                                    if offset + 4 <= self.data.len() {
+                                        let v = u32::from_ne_bytes([
+                                            self.data[offset],
+                                            self.data[offset + 1],
+                                            self.data[offset + 2],
+                                            self.data[offset + 3]
+                                        ]);
+                                        if v == 0 {
+                                            None
+                                        } else {
+                                            Some(ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(v) }))
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                },
+                            )
+                        } else {
                             (
                                 quote! { ObjectId },
                                 quote! {
                                     let offset = #offset_calculation;
                                     if offset + 4 <= self.data.len() {
-                                        u32::from_ne_bytes([
+                                        let v = u32::from_ne_bytes([
                                             self.data[offset],
                                             self.data[offset + 1],
                                             self.data[offset + 2],
                                             self.data[offset + 3]
-                                        ])
+                                        ]);
+                                        if v == 0 {
+                                            ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(u32::MAX) })
+                                        } else {
+                                            ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(v) })
+                                        }
                                     } else {
-                                        0
+                                        ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(u32::MAX) })
                                     }
                                 },
                             )
+                        }
+                    }
+                    "new_id" => {
+                        if arg.interface.is_some() {
+                            // new_id with specified interface - just parse the object ID
+                            if arg.allow_null.unwrap_or(false) {
+                                (
+                                    quote! { Option<NewObjectId> },
+                                    quote! {
+                                        let offset = #offset_calculation;
+                                        if offset + 4 <= self.data.len() {
+                                            let v = u32::from_ne_bytes([
+                                                self.data[offset],
+                                                self.data[offset + 1],
+                                                self.data[offset + 2],
+                                                self.data[offset + 3]
+                                            ]);
+                                            if v == 0 {
+                                                None
+                                            } else {
+                                                Some(NewObjectId::new(ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(v) })))
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    },
+                                )
+                            } else {
+                                (
+                                    quote! { NewObjectId },
+                                    quote! {
+                                        let offset = #offset_calculation;
+                                        if offset + 4 <= self.data.len() {
+                                            let v = u32::from_ne_bytes([
+                                                self.data[offset],
+                                                self.data[offset + 1],
+                                                self.data[offset + 2],
+                                                self.data[offset + 3]
+                                            ]);
+                                            if v == 0 {
+                                                NewObjectId::new(ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(u32::MAX) }))
+                                            } else {
+                                                NewObjectId::new(ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(v) }))
+                                            }
+                                        } else {
+                                                NewObjectId::new(ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(u32::MAX) }))
+                                        }
+                                    },
+                                )
+                            }
                         } else {
                             // new_id without specified interface - parse interface name, version, and object ID
-                            (
-                                quote! { (ObjectId, &str, u32) },
-                                quote! {
-                                    let offset = #offset_calculation;
-                                    if offset + 12 <= self.data.len() {
-                                        // Parse interface name (string)
-                                        let interface_name_len = u32::from_ne_bytes([
-                                            self.data[offset],
-                                            self.data[offset + 1],
-                                            self.data[offset + 2],
-                                            self.data[offset + 3]
-                                        ]) as usize;
+                            if arg.allow_null.unwrap_or(false) {
+                                (
+                                    quote! { (Option<NewObjectId>, &str, u32) },
+                                    quote! {
+                                        let offset = #offset_calculation;
+                                        if offset + 12 <= self.data.len() {
+                                            // Parse interface name (string)
+                                            let interface_name_len = u32::from_ne_bytes([
+                                                self.data[offset],
+                                                self.data[offset + 1],
+                                                self.data[offset + 2],
+                                                self.data[offset + 3]
+                                            ]) as usize;
 
-                                        let interface_name_start = offset + 4;
-                                        let interface_name_end = interface_name_start + interface_name_len.saturating_sub(1);
-                                        let interface_name = if interface_name_end <= self.data.len() {
-                                            std::str::from_utf8(&self.data[interface_name_start..interface_name_end]).unwrap_or("")
+                                            let interface_name_start = offset + 4;
+                                            let interface_name_end = interface_name_start + interface_name_len.saturating_sub(1);
+                                            let interface_name = if interface_name_end <= self.data.len() {
+                                                std::str::from_utf8(&self.data[interface_name_start..interface_name_end]).unwrap_or("")
+                                            } else {
+                                                ""
+                                            };
+
+                                            // Calculate offset after interface name (with padding)
+                                            let version_offset = interface_name_start + ((interface_name_len + 3) & !3);
+
+                                            // Parse version (uint)
+                                            let version = if version_offset + 4 <= self.data.len() {
+                                                u32::from_ne_bytes([
+                                                    self.data[version_offset],
+                                                    self.data[version_offset + 1],
+                                                    self.data[version_offset + 2],
+                                                    self.data[version_offset + 3]
+                                                ])
+                                            } else {
+                                                0
+                                            };
+
+                                            // Parse object ID (uint)
+                                            let object_id_offset = version_offset + 4;
+                                            let object_id = if object_id_offset + 4 <= self.data.len() {
+                                                let v = u32::from_ne_bytes([
+                                                    self.data[object_id_offset],
+                                                    self.data[object_id_offset + 1],
+                                                    self.data[object_id_offset + 2],
+                                                    self.data[object_id_offset + 3]
+                                                ]);
+                                                if v == 0 {
+                                                    None
+                                                } else {
+                                                    Some(NewObjectId::new(ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(v) })))
+                                                }
+                                            } else {
+                                                None
+                                            };
+
+                                            (object_id, interface_name, version)
                                         } else {
-                                            ""
-                                        };
+                                            (None, "", 0)
+                                        }
+                                    },
+                                )
+                            } else {
+                                (
+                                    quote! { (NewObjectId, &str, u32) },
+                                    quote! {
+                                        let offset = #offset_calculation;
+                                        if offset + 12 <= self.data.len() {
+                                            // Parse interface name (string)
+                                            let interface_name_len = u32::from_ne_bytes([
+                                                self.data[offset],
+                                                self.data[offset + 1],
+                                                self.data[offset + 2],
+                                                self.data[offset + 3]
+                                            ]) as usize;
 
-                                        // Calculate offset after interface name (with padding)
-                                        let version_offset = interface_name_start + ((interface_name_len + 3) & !3);
+                                            let interface_name_start = offset + 4;
+                                            let interface_name_end = interface_name_start + interface_name_len.saturating_sub(1);
+                                            let interface_name = if interface_name_end <= self.data.len() {
+                                                std::str::from_utf8(&self.data[interface_name_start..interface_name_end]).unwrap_or("")
+                                            } else {
+                                                ""
+                                            };
 
-                                        // Parse version (uint)
-                                        let version = if version_offset + 4 <= self.data.len() {
-                                            u32::from_ne_bytes([
-                                                self.data[version_offset],
-                                                self.data[version_offset + 1],
-                                                self.data[version_offset + 2],
-                                                self.data[version_offset + 3]
-                                            ])
+                                            // Calculate offset after interface name (with padding)
+                                            let version_offset = interface_name_start + ((interface_name_len + 3) & !3);
+
+                                            // Parse version (uint)
+                                            let version = if version_offset + 4 <= self.data.len() {
+                                                u32::from_ne_bytes([
+                                                    self.data[version_offset],
+                                                    self.data[version_offset + 1],
+                                                    self.data[version_offset + 2],
+                                                    self.data[version_offset + 3]
+                                                ])
+                                            } else {
+                                                0
+                                            };
+
+                                            // Parse object ID (uint)
+                                            let object_id_offset = version_offset + 4;
+                                            let object_id = if object_id_offset + 4 <= self.data.len() {
+                                                let v = u32::from_ne_bytes([
+                                                    self.data[object_id_offset],
+                                                    self.data[object_id_offset + 1],
+                                                    self.data[object_id_offset + 2],
+                                                    self.data[object_id_offset + 3]
+                                                ]);
+                                                if v == 0 {
+                                                    NewObjectId::new(ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(u32::MAX) }))
+                                                } else {
+                                                    NewObjectId::new(ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(v) }))
+                                                }
+                                            } else {
+                                                NewObjectId::new(ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(u32::MAX) }))
+                                            };
+
+                                            (object_id, interface_name, version)
                                         } else {
-                                            0
-                                        };
-
-                                        // Parse object ID (uint)
-                                        let object_id_offset = version_offset + 4;
-                                        let object_id = if object_id_offset + 4 <= self.data.len() {
-                                            u32::from_ne_bytes([
-                                                self.data[object_id_offset],
-                                                self.data[object_id_offset + 1],
-                                                self.data[object_id_offset + 2],
-                                                self.data[object_id_offset + 3]
-                                            ])
-                                        } else {
-                                            0
-                                        };
-
-                                        (object_id, interface_name, version)
-                                    } else {
-                                        (0, "", 0)
-                                    }
-                                },
-                            )
+                                            (NewObjectId::new(ObjectId::new (unsafe { ::std::num::NonZeroU32::new_unchecked(u32::MAX) })), "", 0)
+                                        }
+                                    },
+                                )
+                            }
                         }
                     }
                     "string" => {

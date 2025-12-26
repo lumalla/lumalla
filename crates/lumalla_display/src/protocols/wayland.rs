@@ -12,11 +12,11 @@ impl WaylandProtocol for DisplayState {}
 impl WlDisplay for DisplayState {
     fn sync(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlDisplaySync<'_>) {
         ctx.writer
-            .wl_callback_done(params.callback())
+            .wl_callback_done(*params.callback())
             .callback_data(0);
         ctx.writer
             .wl_display_delete_id(object_id)
-            .id(params.callback());
+            .id((*params.callback()).get());
     }
 
     fn get_registry(
@@ -29,7 +29,7 @@ impl WlDisplay for DisplayState {
             .register_object(params.registry(), InterfaceIndex::WlRegistry);
         for (&name, global) in self.globals.iter() {
             ctx.writer
-                .wl_registry_global(params.registry())
+                .wl_registry_global(*params.registry())
                 .name(name)
                 .interface(global.interface_index.interface_name())
                 .version(global.interface_index.interface_version());
@@ -53,18 +53,18 @@ impl WlRegistry for DisplayState {
             _ if interface_name == InterfaceIndex::WlShm.interface_name() => {
                 // TODO: Get the available formats from the GPU
                 ctx.writer
-                    .wl_shm_format(params.id().0)
+                    .wl_shm_format(*params.id().0)
                     .format(WL_SHM_FORMAT_RGBA8888);
                 ctx.writer
-                    .wl_shm_format(params.id().0)
+                    .wl_shm_format(*params.id().0)
                     .format(WL_SHM_FORMAT_XRGB8888);
             }
             _ if interface_name == InterfaceIndex::WlSeat.interface_name() => {
                 ctx.writer
-                    .wl_seat_name(params.id().0)
+                    .wl_seat_name(*params.id().0)
                     .name(self.seat_manager.get_name(global_id).unwrap_or_default());
                 ctx.writer
-                    .wl_seat_capabilities(params.id().0)
+                    .wl_seat_capabilities(*params.id().0)
                     .capabilities(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
             }
             _ => {}
@@ -81,6 +81,8 @@ impl WlCompositor for DisplayState {
     ) {
         ctx.registry
             .register_object(params.id(), InterfaceIndex::WlSurface);
+        self.surface_manager
+            .create_surface(ctx.client_id, *params.id());
     }
 
     fn create_region(
@@ -100,14 +102,17 @@ impl WlShm for DisplayState {
             .register_object(params.id(), InterfaceIndex::WlShmPool);
         if self.shm_manager.create_pool(
             ctx.client_id,
-            params.id(),
+            *params.id(),
             params.fd(),
             params.size() as usize,
         ) {
-            debug!("Failed to mmap shared memory from client {}", ctx.client_id);
+            debug!(
+                "Failed to mmap shared memory from client {:?}",
+                ctx.client_id
+            );
             ctx.writer
                 .wl_display_error(DISPLAY_OBJECT_ID)
-                .object_id(params.id())
+                .object_id(*params.id())
                 .code(WL_SHM_ERROR_INVALID_FD)
                 .message("Failed to mmap shared memory");
         }
@@ -130,14 +135,17 @@ impl WlShmPool for DisplayState {
         if self.shm_manager.create_buffer(
             ctx.client_id,
             object_id,
-            params.id(),
+            *params.id(),
             params.offset() as usize,
             params.width() as usize,
             params.height() as usize,
             params.stride() as usize,
             params.format(),
         ) {
-            debug!("Failed to create shm_buffer from client {}", ctx.client_id);
+            debug!(
+                "Failed to create shm_buffer from client {:?}",
+                ctx.client_id
+            );
             ctx.writer
                 .wl_display_error(DISPLAY_OBJECT_ID)
                 .object_id(object_id)
@@ -157,7 +165,7 @@ impl WlShmPool for DisplayState {
             .resize_pool(ctx.client_id, object_id, params.size() as usize)
         {
             debug!(
-                "Failed to resize shm_pool to {} from client {}",
+                "Failed to resize shm_pool to {} from client {:?}",
                 params.size(),
                 ctx.client_id
             );
