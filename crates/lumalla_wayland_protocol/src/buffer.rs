@@ -22,6 +22,7 @@ type Buffer = [u8; BUFFER_SIZE];
 const MAX_FDS_IN_CMSG: usize = 253;
 type CmsgBuffer = [u8; mem::size_of::<cmsghdr>() + MAX_FDS_IN_CMSG * mem::size_of::<RawFd>()];
 const MAX_STRING_LENGTH: usize = 1_024 * 2;
+const MAX_ARRAY_LENGTH: usize = MAX_STRING_LENGTH;
 
 #[derive(Debug)]
 pub struct Reader {
@@ -240,7 +241,7 @@ impl Writer {
     #[inline]
     pub fn write_str(&mut self, value: &str) {
         let bytes = value.as_bytes();
-        let bytes = &bytes[0..bytes.len().min(MAX_STRING_LENGTH)];
+        let bytes = &bytes[..bytes.len().min(MAX_STRING_LENGTH)];
         let len = bytes.len();
         let len_index_start = self.bytes_in_buffer;
         let len_index_end = self.bytes_in_buffer + mem::size_of::<u32>();
@@ -252,6 +253,22 @@ impl Writer {
         // Pad to 32-bit boundary
         self.bytes_in_buffer =
             str_index_end + (mem::size_of::<u32>() - len % mem::size_of::<u32>());
+    }
+
+    #[inline]
+    pub fn write_array(&mut self, array: &[u8]) {
+        let bytes = &array[..array.len().min(MAX_ARRAY_LENGTH)];
+        let len = bytes.len();
+        let len_index_start = self.bytes_in_buffer;
+        let len_index_end = self.bytes_in_buffer + mem::size_of::<u32>();
+        self.buffer[len_index_start..len_index_end].copy_from_slice(&(len as u32).to_ne_bytes());
+        let val_index_start = len_index_end;
+        let val_index_end = val_index_start + len;
+        self.buffer[val_index_start..val_index_end].copy_from_slice(bytes);
+        // Pad to 32-bit boundary
+        self.bytes_in_buffer = val_index_end
+            + ((mem::size_of::<u32>() - (val_index_end + 1) % mem::size_of::<u32>())
+                % mem::size_of::<u32>());
     }
 
     #[inline]
@@ -339,12 +356,14 @@ mod tests {
         let mut writer = Writer::new(socket.1.as_raw_fd());
 
         let str = "Hello, world!";
+        let array = [1, 2, 3, 4, 5];
         writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 2);
         writer.write_u16(10);
         writer.write_i32(-2);
         writer.write_u32(3);
         writer.write_fixed(4.3);
         writer.write_str(str);
+        writer.write_array(&array);
         writer.write_fd(socket.1.as_raw_fd());
         writer.write_message_length();
         writer.flush().unwrap();
@@ -353,7 +372,7 @@ mod tests {
         let (header, data, fds) = reader.next().unwrap().unwrap();
         assert_eq!(header.object_id.get(), 1);
         assert_eq!(header.opcode, 2);
-        assert_eq!(data.len(), 34);
+        assert_eq!(data.len(), 43);
         assert_eq!(
             header.size as usize,
             data.len() + mem::size_of::<MessageHeader>()
@@ -382,6 +401,20 @@ mod tests {
         let start_index = end_index;
         let end_index = start_index + str.bytes().len();
         assert_eq!(&data[start_index..end_index], str.as_bytes());
+        // Skip null terminator (1 byte) and padding to 32-bit boundary
+        // The write_str function writes: string bytes, null terminator, then padding.
+        // It sets bytes_in_buffer to end_index + (4 - len % 4), which is where the next write starts.
+        let str_len = str.bytes().len();
+        let total_after_string = mem::size_of::<u32>() - str_len % mem::size_of::<u32>();
+        let start_index = end_index + total_after_string;
+        let end_index = start_index + mem::size_of::<u32>();
+        assert_eq!(
+            data[start_index..end_index],
+            (array.len() as u32).to_ne_bytes()
+        );
+        let start_index = end_index;
+        let end_index = start_index + array.len();
+        assert_eq!(&data[start_index..end_index], array);
         assert_eq!(fds.len(), 1);
     }
 

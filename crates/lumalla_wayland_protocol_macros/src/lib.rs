@@ -71,7 +71,7 @@ fn rust_type_from_wayland_type_for_method(
     let base_type = match wayland_type {
         "int" => quote! { i32 },
         "uint" => quote! { u32 },
-        "fixed" => quote! { i32 }, // Wayland fixed-point number
+        "fixed" => quote! { f32 }, // Wayland fixed-point number
         "string" => quote! { &str },
         "object" => quote! { ObjectId },
         "new_id" => {
@@ -637,6 +637,7 @@ fn generate_interface_code_parts(
                 let (write_method, param_conversion) = match arg.arg_type.as_str() {
                     "uint" => (quote! { write_u32 }, quote! { #arg_name }),
                     "int" => (quote! { write_i32 }, quote! { #arg_name }),
+                    "fixed" => (quote! { write_fixed }, quote! { #arg_name }),
                     "string" => {
                         if arg.allow_null.unwrap_or(false) {
                             (quote! { write_str }, quote! { #arg_name.unwrap_or("") })
@@ -655,8 +656,7 @@ fn generate_interface_code_parts(
                         }
                     }
                     "fd" => (quote! { write_fd }, quote! { #arg_name as i32 }),
-                    // TODO: write array
-                    // "array" => (quote! { write_u32 }, quote! { #arg_name.len() as u32 }),
+                    "array" => (quote! { write_u32 }, quote! { #arg_name.len() as u32 }),
                     _ => (
                         quote! { write_u32 },
                         quote! { panic!("Invalid argument type") },
