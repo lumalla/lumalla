@@ -12,6 +12,7 @@ use crate::{
     registry::{InterfaceIndex, Registry, RequestHandler},
 };
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(NonZeroU32);
 

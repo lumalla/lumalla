@@ -15,6 +15,7 @@ pub mod protocols;
 pub mod registry;
 pub use client::{ClientConnection, ClientId, Ctx};
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd)]
 pub struct ObjectId(NonZeroU32);
 
