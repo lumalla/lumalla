@@ -4,11 +4,16 @@ use log::{error, warn};
 use lumalla_shared::{Comms, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner, RendererMessage};
 use mio::Poll;
 
+mod vulkan;
+
+use vulkan::VulkanContext;
+
 pub struct RendererState {
     _comms: Comms,
     event_loop: Poll,
     channel: mpsc::Receiver<RendererMessage>,
     shutting_down: bool,
+    _vulkan: VulkanContext,
 }
 
 impl RendererState {
@@ -35,11 +40,14 @@ impl MessageRunner for RendererState {
         channel: mpsc::Receiver<Self::Message>,
         _args: Arc<GlobalArgs>,
     ) -> anyhow::Result<Self> {
+        let vulkan = VulkanContext::new()?;
+
         Ok(Self {
             _comms: comms,
             event_loop,
             channel,
             shutting_down: false,
+            _vulkan: vulkan,
         })
     }
 

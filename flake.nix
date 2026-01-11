@@ -29,9 +29,11 @@
           ];
           buildInputs = with pkgs; [
             seatd
+            vulkan-loader
           ];
           PKG_CONFIG_PATH = "${pkgs.seatd.dev}/lib/pkgconfig";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib";
         };
       in {
         packages.default = naersk'.buildPackage commonBuildArgs;
@@ -60,9 +62,13 @@
           ];
           buildInputs = with pkgs; [
             seatd
+            vulkan-loader
+            vulkan-validation-layers
           ];
           PKG_CONFIG_PATH = "${pkgs.seatd.dev}/lib/pkgconfig";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib";
+          VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
           RUST_LOG = "debug";
         };
       }

@@ -12,3 +12,4 @@ lumalla_shared = { path = "../lumalla_shared" }
 anyhow = { workspace = true }
 mio = { workspace = true }
 log = { workspace = true }
+ash = "0.38"

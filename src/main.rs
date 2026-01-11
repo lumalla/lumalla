@@ -44,7 +44,7 @@ fn init_logger(log_file: Option<&str>) -> anyhow::Result<()> {
     builder.format(|buf, record| {
         writeln!(
             buf,
-            "[{:<5}] {}: {}",
+            "[{:<5}] {:<9}: {}",
             record.level(),
             thread::current().name().unwrap_or("<unnamed>"),
             record.args()
@@ -131,7 +131,7 @@ fn run_app(args: Arc<GlobalArgs>) -> anyhow::Result<()> {
         to_seat,
     );
 
-    handle_signals(to_main.clone());
+    handle_signals(to_main.clone()).context("Failed to spawn signal handler thread")?;
 
     // Spawn the config thread
     let config_join_handle = run_thread::<ConfigState, _>(
@@ -289,31 +289,35 @@ where
 
 /// Handles signals sent to the process, such as SIGINT (Ctrl+C).
 /// When the signal is received, the main thread is notified to initiate a graceful shutdown.
-fn handle_signals(to_main: MessageSender<MainMessage>) {
-    thread::spawn(move || {
-        let mut signals = match Signals::new([SIGINT]) {
-            Ok(signals) => signals,
-            Err(e) => {
-                error!("Failed to register signal handler: {e}");
-                return;
-            }
-        };
+fn handle_signals(to_main: MessageSender<MainMessage>) -> anyhow::Result<()> {
+    thread::Builder::new()
+        .name("signals".to_string())
+        .spawn(move || {
+            let mut signals = match Signals::new([SIGINT]) {
+                Ok(signals) => signals,
+                Err(e) => {
+                    error!("Failed to register signal handler: {e}");
+                    return;
+                }
+            };
 
-        for signal in signals.forever() {
-            match signal {
-                SIGINT => {
-                    info!("Received SIGINT signal (Ctrl+C), initiating graceful shutdown");
-                    if let Err(e) = to_main.send(MainMessage::Shutdown) {
-                        error!("Failed to send shutdown message: {e}");
+            for signal in signals.forever() {
+                match signal {
+                    SIGINT => {
+                        info!("Received SIGINT signal (Ctrl+C), initiating graceful shutdown");
+                        if let Err(e) = to_main.send(MainMessage::Shutdown) {
+                            error!("Failed to send shutdown message: {e}");
+                        }
+                        break;
                     }
-                    break;
-                }
-                _ => {
-                    warn!("Received unexpected signal: {signal}");
+                    _ => {
+                        warn!("Received unexpected signal: {signal}");
+                    }
                 }
             }
-        }
-    });
+        })?;
+
+    Ok(())
 }
 
 #[cfg(test)]
