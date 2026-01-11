@@ -365,16 +365,52 @@ impl WlShellSurface for DisplayState {
 }
 
 impl WlSurface for DisplayState {
-    fn destroy(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSurfaceDestroy<'_>) {
-        todo!()
+    fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSurfaceDestroy<'_>) {
+        ctx.registry.free_object(object_id, &mut ctx.writer);
     }
 
-    fn attach(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSurfaceAttach<'_>) {
-        todo!()
+    fn attach(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSurfaceAttach<'_>) {
+        let Some(pending_buffer) = params.buffer() else {
+            if !self.surface_manager.set_pending_buffer(
+                ctx.client_id,
+                object_id,
+                None,
+                params.x(),
+                params.y(),
+            ) {
+                ctx.writer
+                    .wl_display_error(DISPLAY_OBJECT_ID)
+                    .object_id(object_id)
+                    .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                    .message("Invalid surface");
+            }
+            return;
+        };
+        if ctx.registry.interface_index(pending_buffer) != Some(InterfaceIndex::WlBuffer) {
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(pending_buffer)
+                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                .message("Invalid buffer");
+            return;
+        }
+        if !self.surface_manager.set_pending_buffer(
+            ctx.client_id,
+            object_id,
+            Some(pending_buffer),
+            params.x(),
+            params.y(),
+        ) {
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(object_id)
+                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                .message("Invalid surface");
+        }
     }
 
     fn damage(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSurfaceDamage<'_>) {
-        todo!()
+        // TODO: Implement damage tracking
     }
 
     fn frame(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSurfaceFrame<'_>) {

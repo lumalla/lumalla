@@ -155,7 +155,7 @@ impl Registry {
         if object_id >= MIN_SERVER_OBJECT_ID {
             self.freed_object_ids.push(object_id);
         } else {
-            // The spec says that only objects created by the client should acknowledged
+            // The spec says that only objects created by the client should be acknowledged
             writer
                 .wl_display_delete_id(DISPLAY_OBJECT_ID)
                 .id(object_id.get());
