@@ -135,6 +135,32 @@ impl Device {
         unsafe { self.handle.device_wait_idle() }.context("Failed to wait for device idle")?;
         Ok(())
     }
+
+    /// Submits command buffers to the graphics queue.
+    ///
+    /// This submits the given command buffers with synchronization:
+    /// - Waits for `wait_semaphores` before execution
+    /// - Signals `signal_semaphores` after execution
+    /// - Signals `fence` when all commands complete
+    pub fn submit_graphics(
+        &self,
+        command_buffers: &[vk::CommandBuffer],
+        wait_semaphores: &[vk::Semaphore],
+        wait_stages: &[vk::PipelineStageFlags],
+        signal_semaphores: &[vk::Semaphore],
+        fence: vk::Fence,
+    ) -> anyhow::Result<()> {
+        let submit_info = vk::SubmitInfo::default()
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(wait_stages)
+            .command_buffers(command_buffers)
+            .signal_semaphores(signal_semaphores);
+
+        unsafe { self.handle.queue_submit(self.graphics_queue, &[submit_info], fence) }
+            .context("Failed to submit to graphics queue")?;
+
+        Ok(())
+    }
 }
 
 impl Drop for Device {

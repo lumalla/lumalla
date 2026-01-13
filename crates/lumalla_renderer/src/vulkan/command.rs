@@ -4,7 +4,7 @@ use anyhow::Context;
 use ash::vk;
 use log::{debug, info};
 
-use super::Device;
+use super::{Device, Framebuffer, GraphicsPipeline, RenderPass};
 
 /// Manages a Vulkan command pool and provides command buffer allocation.
 ///
@@ -174,6 +174,157 @@ impl<'a> CommandBufferRecorder<'a> {
     /// Returns a reference to the device.
     pub fn device(&self) -> &Device {
         self.device
+    }
+
+    /// Begins a render pass.
+    ///
+    /// This starts recording render pass commands. The framebuffer defines
+    /// the render targets, and the clear values are used to clear attachments
+    /// at the start of the render pass.
+    pub fn begin_render_pass(
+        &mut self,
+        render_pass: &RenderPass,
+        framebuffer: &Framebuffer,
+        clear_values: &[vk::ClearValue],
+    ) -> anyhow::Result<()> {
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: framebuffer.extent(),
+        };
+
+        let begin_info = vk::RenderPassBeginInfo::default()
+            .render_pass(render_pass.handle())
+            .framebuffer(framebuffer.handle())
+            .render_area(render_area)
+            .clear_values(clear_values);
+
+        unsafe {
+            self.device.handle().cmd_begin_render_pass(
+                self.command_buffer,
+                &begin_info,
+                vk::SubpassContents::INLINE,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Begins a render pass with a default clear color (black).
+    pub fn begin_render_pass_default(
+        &mut self,
+        render_pass: &RenderPass,
+        framebuffer: &Framebuffer,
+    ) -> anyhow::Result<()> {
+        let clear_color = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+        self.begin_render_pass(render_pass, framebuffer, &[clear_color])
+    }
+
+    /// Ends the current render pass.
+    pub fn end_render_pass(&mut self) {
+        unsafe {
+            self.device.handle().cmd_end_render_pass(self.command_buffer);
+        }
+    }
+
+    /// Binds a graphics pipeline.
+    pub fn bind_pipeline(&mut self, pipeline: &GraphicsPipeline) {
+        unsafe {
+            self.device.handle().cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline.handle(),
+            );
+        }
+    }
+
+    /// Sets the viewport dynamically.
+    pub fn set_viewport(&mut self, viewport: &vk::Viewport) {
+        unsafe {
+            self.device.handle().cmd_set_viewport(self.command_buffer, 0, &[viewport.clone()]);
+        }
+    }
+
+    /// Sets the viewport to cover the entire framebuffer.
+    pub fn set_viewport_fullscreen(&mut self, width: u32, height: u32) {
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: width as f32,
+            height: height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        self.set_viewport(&viewport);
+    }
+
+    /// Sets the scissor rectangle dynamically.
+    pub fn set_scissor(&mut self, scissor: &vk::Rect2D) {
+        unsafe {
+            self.device.handle().cmd_set_scissor(self.command_buffer, 0, &[scissor.clone()]);
+        }
+    }
+
+    /// Sets the scissor to cover the entire framebuffer.
+    pub fn set_scissor_fullscreen(&mut self, width: u32, height: u32) {
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D { width, height },
+        };
+        self.set_scissor(&scissor);
+    }
+
+    /// Binds descriptor sets.
+    pub fn bind_descriptor_sets(
+        &mut self,
+        pipeline_layout: vk::PipelineLayout,
+        first_set: u32,
+        descriptor_sets: &[vk::DescriptorSet],
+        dynamic_offsets: &[u32],
+    ) {
+        unsafe {
+            self.device.handle().cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                first_set,
+                descriptor_sets,
+                dynamic_offsets,
+            );
+        }
+    }
+
+    /// Draws a fullscreen quad using vertex shader generation.
+    ///
+    /// This uses `vkCmdDraw` with 3 vertices (one triangle) and relies on
+    /// the vertex shader to generate a fullscreen quad. The vertex shader
+    /// should use `gl_VertexIndex` to generate positions.
+    pub fn draw_fullscreen_quad(&mut self) {
+        unsafe {
+            self.device.handle().cmd_draw(
+                self.command_buffer,
+                3, // 3 vertices = one triangle
+                1, // 1 instance
+                0, // first vertex
+                0, // first instance
+            );
+        }
+    }
+
+    /// Draws vertices.
+    pub fn draw(&mut self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
+        unsafe {
+            self.device.handle().cmd_draw(
+                self.command_buffer,
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+            );
+        }
     }
 
     /// Ends recording and returns the command buffer.

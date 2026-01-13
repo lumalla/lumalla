@@ -13,3 +13,4 @@ anyhow = { workspace = true }
 mio = { workspace = true }
 log = { workspace = true }
 ash = "0.38"
+gpu-allocator = "0.28"

@@ -6,7 +6,7 @@ use anyhow::Context;
 use ash::vk;
 use log::{debug, info, warn};
 
-use super::{CommandPool, Device, PhysicalDevice};
+use super::{CommandPool, Device, MemoryAllocator, PhysicalDevice};
 
 /// Holds the core Vulkan objects needed for rendering.
 ///
@@ -14,7 +14,7 @@ use super::{CommandPool, Device, PhysicalDevice};
 /// along with optional debug utilities for development.
 pub struct VulkanContext {
     /// The Vulkan function loader
-    _entry: ash::Entry,
+    entry: ash::Entry,
     /// The Vulkan instance
     instance: ash::Instance,
     /// The selected physical device (GPU)
@@ -23,6 +23,8 @@ pub struct VulkanContext {
     device: Option<Device>,
     /// Command pool for graphics operations (must be destroyed before device)
     graphics_command_pool: Option<CommandPool>,
+    /// Memory allocator (must be destroyed before device)
+    memory_allocator: Option<MemoryAllocator>,
     /// Debug messenger (only present in debug builds with validation layers)
     #[cfg(debug_assertions)]
     debug_utils: Option<DebugUtils>,
@@ -162,12 +164,16 @@ impl VulkanContext {
         // Create command pool for graphics operations
         let graphics_command_pool = CommandPool::new_graphics(&device)?;
 
+        // Create memory allocator
+        let memory_allocator = MemoryAllocator::new(&instance, &device, physical_device.handle())?;
+
         Ok(Self {
-            _entry: entry,
+            entry,
             instance,
             physical_device,
             device: Some(device),
             graphics_command_pool: Some(graphics_command_pool),
+            memory_allocator: Some(memory_allocator),
             #[cfg(debug_assertions)]
             debug_utils,
         })
@@ -230,6 +236,18 @@ impl VulkanContext {
             .as_ref()
             .expect("Command pool should always be present while VulkanContext is alive")
     }
+
+    /// Returns a mutable reference to the memory allocator.
+    pub fn memory_allocator_mut(&mut self) -> &mut MemoryAllocator {
+        self.memory_allocator
+            .as_mut()
+            .expect("Memory allocator should always be present while VulkanContext is alive")
+    }
+
+    /// Returns a reference to the Vulkan entry (function loader).
+    pub fn entry(&self) -> &ash::Entry {
+        &self.entry
+    }
 }
 
 impl Drop for VulkanContext {
@@ -241,6 +259,10 @@ impl Drop for VulkanContext {
             command_pool.destroy(device);
         }
         self.graphics_command_pool = None;
+
+        // Memory allocator must be destroyed before device
+        // (gpu-allocator handles cleanup internally, but we drop it explicitly)
+        drop(self.memory_allocator.take());
 
         // Device must be destroyed before instance
         drop(self.device.take());
