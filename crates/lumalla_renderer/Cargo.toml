@@ -14,3 +14,7 @@ mio = { workspace = true }
 log = { workspace = true }
 ash = "0.38"
 gpu-allocator = "0.28"
+drm = "0.14"
+drm-ffi = "0.9"
+gbm = { version = "0.16", default-features = false, features = ["drm-support"] }
+rustix = { version = "1", features = ["fs", "event"] }

@@ -56,10 +56,22 @@ impl Device {
 
         // Extensions needed for a Wayland compositor
         let desired_extensions: &[&CStr] = &[
-            // For DRM/KMS rendering
+            // For DRM/KMS rendering (swapchain still useful for some cases)
             ash::khr::swapchain::NAME,
             // For timeline semaphores (useful for synchronization)
             ash::khr::timeline_semaphore::NAME,
+            // For DMA-BUF import (needed for GBM buffer import)
+            ash::khr::external_memory::NAME,
+            ash::khr::external_memory_fd::NAME,
+            ash::ext::external_memory_dma_buf::NAME,
+            // For DRM format modifiers
+            ash::ext::image_drm_format_modifier::NAME,
+            // Required dependency for external memory
+            ash::khr::bind_memory2::NAME,
+            ash::khr::get_memory_requirements2::NAME,
+            // For synchronization with DRM
+            ash::khr::external_semaphore::NAME,
+            ash::khr::external_semaphore_fd::NAME,
         ];
 
         for &ext in desired_extensions {

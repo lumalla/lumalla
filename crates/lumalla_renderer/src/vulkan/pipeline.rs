@@ -220,7 +220,7 @@ impl<'a> GraphicsPipelineBuilder<'a> {
 
         let pipelines = match result {
             Ok(pipelines) => pipelines,
-            Err((pipelines, err)) => {
+            Err((_pipelines, err)) => {
                 // Even on error, some pipelines might have been created
                 // For now, we'll fail, but in the future we could handle partial success
                 anyhow::bail!("Failed to create graphics pipeline: {:?}", err);

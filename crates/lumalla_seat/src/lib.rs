@@ -1,9 +1,12 @@
+use std::ffi::CString;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Arc, mpsc};
 
 use anyhow::Context;
-use log::error;
+use log::{error, info};
 use lumalla_shared::{
-    Comms, DisplayMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner, SeatMessage,
+    Comms, DisplayMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner, RendererMessage,
+    SeatMessage,
 };
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 
@@ -14,7 +17,7 @@ mod libseat;
 const SEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 
 pub struct SeatState {
-    _comms: Comms,
+    comms: Comms,
     event_loop: Poll,
     channel: mpsc::Receiver<SeatMessage>,
     shutting_down: bool,
@@ -34,7 +37,35 @@ impl SeatState {
             SeatMessage::SeatDisabled => {
                 self.seat_enabled = false;
             }
+            SeatMessage::OpenDevice { path } => {
+                self.handle_open_device(path)?;
+            }
         }
+
+        Ok(())
+    }
+
+    fn handle_open_device(&mut self, path: std::path::PathBuf) -> anyhow::Result<()> {
+        info!("Opening device: {}", path.display());
+
+        // Convert path to CString for libseat
+        let path_str = path
+            .to_str()
+            .context("Device path is not valid UTF-8")?;
+        let c_path = CString::new(path_str)
+            .context("Device path contains null byte")?;
+
+        // Open the device via libseat (this grants DRM master)
+        let raw_fd = self.seat.open_device(&c_path)?;
+
+        // Convert to OwnedFd for safe transfer
+        // SAFETY: libseat_open_device returns a valid fd on success
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        info!("Device opened successfully: {} (fd: {})", path.display(), raw_fd);
+
+        // Send the fd to the renderer
+        self.comms.renderer(RendererMessage::FileOpenedInSession { path, fd });
 
         Ok(())
     }
@@ -60,7 +91,7 @@ impl MessageRunner for SeatState {
         ));
 
         Ok(Self {
-            _comms: comms,
+            comms,
             event_loop,
             channel,
             shutting_down: false,
