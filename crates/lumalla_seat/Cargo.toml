@@ -7,12 +7,19 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumalla/lumalla"
 include = ["src/**/*", "LICENSE-*", "build.rs", "wrapper.h"]
 
+[features]
+default = []
+# Use the libseat crate instead of custom FFI bindings
+use-libseat-crate = ["libseat"]
+
 [dependencies]
 lumalla_shared = { path = "../lumalla_shared" }
 anyhow = { workspace = true }
 mio = { workspace = true }
 log = { workspace = true }
 libc = { workspace = true }
+# Optional: use the libseat crate instead of custom bindings
+libseat = { version = "0.2", optional = true }
 
 [build-dependencies]
 bindgen = { workspace = true }

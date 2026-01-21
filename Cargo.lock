@@ -419,6 +419,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "libseat"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6656c69b6e0366ffb83faa232f3e4fda5fc91161722d140f2c95ce2e90b1ef31"
+dependencies = [
+ "cc",
+ "errno",
+ "libseat-sys",
+ "log",
+ "pkg-config",
+]
+
+[[package]]
+name = "libseat-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8a484fa48be5f62a8d3ffed767779d0ab808cfead91de98ef4362d469097dfb"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -533,6 +555,7 @@ dependencies = [
  "drm-ffi",
  "gbm",
  "gpu-allocator",
+ "libc",
  "log",
  "lumalla_shared",
  "mio",
@@ -546,6 +569,7 @@ dependencies = [
  "anyhow",
  "bindgen",
  "libc",
+ "libseat",
  "log",
  "lumalla_shared",
  "mio",

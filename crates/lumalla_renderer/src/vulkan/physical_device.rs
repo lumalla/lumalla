@@ -1,10 +1,12 @@
 //! Physical device (GPU) selection and management
 
 use std::ffi::CStr;
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use ash::vk;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 /// Represents a selected physical device (GPU) and its properties.
 pub struct PhysicalDevice {
@@ -14,6 +16,8 @@ pub struct PhysicalDevice {
     properties: vk::PhysicalDeviceProperties,
     /// The queue family index that supports graphics operations
     graphics_queue_family: u32,
+    /// The DRM primary device path (e.g., /dev/dri/card0) if available
+    drm_primary_device_path: Option<PathBuf>,
 }
 
 impl PhysicalDevice {
@@ -94,11 +98,100 @@ impl PhysicalDevice {
             device_name, properties.device_type
         );
 
+        // Query DRM device properties if available
+        let drm_primary_device_path = Self::query_drm_device_path(instance, handle);
+        if let Some(ref path) = drm_primary_device_path {
+            info!("DRM primary device for selected GPU: {}", path.display());
+        } else {
+            warn!("Could not determine DRM device path for selected GPU");
+        }
+
         Ok(Self {
             handle,
             properties,
             graphics_queue_family,
+            drm_primary_device_path,
         })
+    }
+
+    /// Queries the DRM device path for a physical device using VK_EXT_physical_device_drm.
+    fn query_drm_device_path(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+    ) -> Option<PathBuf> {
+        // Query DRM properties using the pNext chain
+        let mut drm_properties = vk::PhysicalDeviceDrmPropertiesEXT::default();
+        let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm_properties);
+
+        // SAFETY: Physical device handle is valid
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut properties2) };
+
+        // Check if the device has a primary node (needed for modesetting)
+        // has_primary is a VkBool32 (u32), not a Rust bool
+        if drm_properties.has_primary == vk::FALSE {
+            debug!("Physical device does not have a DRM primary node");
+            return None;
+        }
+
+        let primary_major = drm_properties.primary_major;
+        let primary_minor = drm_properties.primary_minor;
+
+        debug!(
+            "DRM primary device: major={}, minor={}",
+            primary_major, primary_minor
+        );
+
+        // Find the matching /dev/dri/card* device by comparing major/minor numbers
+        Self::find_drm_device_by_dev_id(primary_major, primary_minor)
+    }
+
+    /// Finds a DRM device path by matching device major/minor numbers.
+    fn find_drm_device_by_dev_id(major: i64, minor: i64) -> Option<PathBuf> {
+        let dri_path = std::path::Path::new("/dev/dri");
+
+        if !dri_path.exists() {
+            return None;
+        }
+
+        let entries = match std::fs::read_dir(dri_path) {
+            Ok(e) => e,
+            Err(_) => return None,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Only check card* devices (not renderD*)
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if !name.starts_with("card") {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+
+            // Get the device's major/minor numbers via stat
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                let rdev = metadata.rdev();
+                // On Linux, major/minor can be extracted from rdev
+                // major = (rdev >> 8) & 0xfff, minor = (rdev & 0xff) | ((rdev >> 12) & 0xfff00)
+                // But we can use libc::major() and libc::minor() for correctness
+                let dev_major = libc::major(rdev) as i64;
+                let dev_minor = libc::minor(rdev) as i64;
+
+                if dev_major == major && dev_minor == minor {
+                    debug!(
+                        "Found DRM device {} matching major={}, minor={}",
+                        path.display(),
+                        major,
+                        minor
+                    );
+                    return Some(path);
+                }
+            }
+        }
+
+        None
     }
 
     /// Finds a queue family index that supports graphics operations.
@@ -173,6 +266,13 @@ impl PhysicalDevice {
     /// Returns the graphics queue family index.
     pub fn graphics_queue_family(&self) -> u32 {
         self.graphics_queue_family
+    }
+
+    /// Returns the DRM primary device path (e.g., /dev/dri/card0) if available.
+    ///
+    /// This path can be used to open the DRM device for modesetting.
+    pub fn drm_device_path(&self) -> Option<&PathBuf> {
+        self.drm_primary_device_path.as_ref()
     }
 
     /// Checks if the device supports a specific extension.

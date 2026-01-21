@@ -7,6 +7,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumalla/lumalla"
 include = ["src/**/*", "LICENSE-*", "README.md"]
 
+[features]
+default = []
+# Use the libseat crate instead of custom FFI bindings for seat management
+use-libseat-crate = ["lumalla_seat/use-libseat-crate"]
+
 [workspace]
 members = [
     "crates/lumalla_config",

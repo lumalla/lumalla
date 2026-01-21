@@ -1,6 +1,6 @@
 use std::{ffi::CStr, os::fd::RawFd, ptr::NonNull};
 
-use log::warn;
+use log::error;
 use lumalla_shared::{Comms, SeatMessage};
 
 #[allow(
@@ -31,6 +31,10 @@ impl LibSeat {
             _seat: *mut bindings::libseat,
             userdata: *mut std::ffi::c_void,
         ) {
+            if userdata.is_null() {
+                error!("enable_seat_callback called with null userdata");
+                return;
+            }
             unsafe {
                 let comms = &mut *(userdata as *mut Comms);
                 comms.seat(SeatMessage::SeatEnabled);
@@ -41,21 +45,26 @@ impl LibSeat {
             _seat: *mut bindings::libseat,
             userdata: *mut std::ffi::c_void,
         ) {
+            if userdata.is_null() {
+                error!("disable_seat_callback called with null userdata");
+                return;
+            }
             unsafe {
                 let comms = &mut *(userdata as *mut Comms);
                 comms.seat(SeatMessage::SeatDisabled);
             }
         }
 
-        let listener = bindings::libseat_seat_listener {
+        static LISTENER: bindings::libseat_seat_listener = bindings::libseat_seat_listener {
             enable_seat: Some(enable_seat_callback),
             disable_seat: Some(disable_seat_callback),
         };
 
-        let seat = unsafe { bindings::libseat_open_seat(&listener, comms_ptr) };
+        let seat = unsafe { bindings::libseat_open_seat(&LISTENER, comms_ptr) };
 
         if seat.is_null() {
-            anyhow::bail!("Failed to open seat");
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("Failed to open seat: {}", err);
         }
 
         Ok(Self {
@@ -78,9 +87,6 @@ impl LibSeat {
         let result = unsafe { bindings::libseat_dispatch(self.seat.as_ptr(), 0) };
         if result < 0 {
             anyhow::bail!("Failed to dispatch seat events");
-        }
-        if result == 0 {
-            warn!("No seat events to dispatch, but requested to dispatch anyway");
         }
         Ok(())
     }
@@ -110,10 +116,13 @@ impl LibSeat {
         let result = unsafe {
             bindings::libseat_open_device(self.seat.as_ptr(), path.as_ptr(), &mut fd as *mut RawFd)
         };
-        if result < 0 {
-            anyhow::bail!("Failed to open device: {}", path.to_string_lossy());
+
+        if result >= 0 {
+            return Ok(fd);
         }
-        Ok(fd)
+
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!("Unable to open device {}: {}", path.to_string_lossy(), err)
     }
 
     /// Close a device

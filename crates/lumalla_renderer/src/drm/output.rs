@@ -2,8 +2,8 @@
 
 use anyhow::Context;
 use drm::control::{
-    connector, crtc, framebuffer, plane, property, AtomicCommitFlags, Device as ControlDevice,
-    Mode, ResourceHandle,
+    AtomicCommitFlags, Device as ControlDevice, Mode, ResourceHandle, connector, crtc, framebuffer,
+    plane, property,
 };
 use log::{debug, info, warn};
 
@@ -274,7 +274,8 @@ impl OutputManager {
             let mode = connector.modes[0];
 
             // Get property handles
-            let props = self.get_output_properties(device, connector.handle, crtc_handle, plane_handle)?;
+            let props =
+                self.get_output_properties(device, connector.handle, crtc_handle, plane_handle)?;
 
             used_crtcs.push(crtc_handle);
             used_planes.push(plane_handle);
@@ -391,12 +392,19 @@ impl OutputManager {
         anyhow::bail!("Property '{}' not found", name)
     }
 
-    /// Performs an atomic commit to enable outputs and set modes.
-    pub fn atomic_enable(&self, device: &DrmDevice) -> anyhow::Result<()> {
+    /// Performs an atomic commit to enable outputs and set modes with initial framebuffer.
+    pub fn atomic_enable_with_fb(
+        &self,
+        device: &DrmDevice,
+        fbs: &[framebuffer::Handle],
+    ) -> anyhow::Result<()> {
         let mut atomic_req = drm::control::atomic::AtomicModeReq::new();
 
-        for output in &self.outputs {
+        for (i, output) in self.outputs.iter().enumerate() {
             let (width, height) = output.mode.size();
+
+            // Get the framebuffer for this output (use first if not enough provided)
+            let fb = fbs.get(i).or(fbs.first()).copied();
 
             // Create a mode blob
             let mode_blob = device
@@ -411,7 +419,11 @@ impl OutputManager {
             );
 
             // Set CRTC properties
-            atomic_req.add_property(output.crtc, output.props.crtc_active, property::Value::Boolean(true));
+            atomic_req.add_property(
+                output.crtc,
+                output.props.crtc_active,
+                property::Value::Boolean(true),
+            );
             atomic_req.add_property(
                 output.crtc,
                 output.props.crtc_mode_id,
@@ -419,7 +431,11 @@ impl OutputManager {
             );
 
             // Set plane properties (position and size)
-            // Note: FB_ID will be set when we have a framebuffer to display
+            atomic_req.add_property(
+                output.primary_plane,
+                output.props.plane_fb_id,
+                property::Value::Framebuffer(fb),
+            );
             atomic_req.add_property(
                 output.primary_plane,
                 output.props.plane_crtc_id,
@@ -471,8 +487,6 @@ impl OutputManager {
         device
             .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, atomic_req)
             .context("Failed to commit atomic modeset")?;
-
-        info!("Atomic modeset committed successfully");
 
         Ok(())
     }

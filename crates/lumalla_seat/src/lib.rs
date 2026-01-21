@@ -10,9 +10,17 @@ use lumalla_shared::{
 };
 use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 
-use crate::libseat::LibSeat;
+// Use the libseat crate wrapper when the feature is enabled,
+// otherwise use the custom FFI bindings
+#[cfg(feature = "use-libseat-crate")]
+mod libseat_crate;
+#[cfg(feature = "use-libseat-crate")]
+use crate::libseat_crate::LibSeat;
 
+#[cfg(not(feature = "use-libseat-crate"))]
 mod libseat;
+#[cfg(not(feature = "use-libseat-crate"))]
+use crate::libseat::LibSeat;
 
 const SEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 
@@ -46,26 +54,14 @@ impl SeatState {
     }
 
     fn handle_open_device(&mut self, path: std::path::PathBuf) -> anyhow::Result<()> {
-        info!("Opening device: {}", path.display());
+        let path_str = path.to_str().context("Device path is not valid UTF-8")?;
+        let c_path = CString::new(path_str).context("Device path contains null byte")?;
 
-        // Convert path to CString for libseat
-        let path_str = path
-            .to_str()
-            .context("Device path is not valid UTF-8")?;
-        let c_path = CString::new(path_str)
-            .context("Device path contains null byte")?;
-
-        // Open the device via libseat (this grants DRM master)
         let raw_fd = self.seat.open_device(&c_path)?;
 
-        // Convert to OwnedFd for safe transfer
-        // SAFETY: libseat_open_device returns a valid fd on success
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-
-        info!("Device opened successfully: {} (fd: {})", path.display(), raw_fd);
-
-        // Send the fd to the renderer
-        self.comms.renderer(RendererMessage::FileOpenedInSession { path, fd });
+        self.comms
+            .renderer(RendererMessage::FileOpenedInSession { path, fd });
 
         Ok(())
     }
@@ -80,15 +76,18 @@ impl MessageRunner for SeatState {
         channel: mpsc::Receiver<Self::Message>,
         _args: Arc<GlobalArgs>,
     ) -> anyhow::Result<Self> {
-        let seat = LibSeat::new(comms.clone()).context("Failed to create seat")?;
+        // mut needed for libseat crate feature, not for custom FFI
+        #[allow(unused_mut)]
+        let mut seat = LibSeat::new(comms.clone()).context("Failed to create seat")?;
+
         let seat_fd = seat.fd().context("Failed to get seat fd")?;
         let mut seat_source = SourceFd(&seat_fd);
         event_loop
             .registry()
             .register(&mut seat_source, SEAT_TOKEN, Interest::READABLE)?;
-        comms.display(DisplayMessage::ActivateSeat(
-            seat.seat_name().context("Failed to get seat name")?,
-        ));
+        let seat_name = seat.seat_name().context("Failed to get seat name")?;
+        comms.display(DisplayMessage::ActivateSeat(seat_name.clone()));
+        comms.renderer(RendererMessage::SeatSessionCreated { seat_name });
 
         Ok(Self {
             comms,
@@ -96,14 +95,15 @@ impl MessageRunner for SeatState {
             channel,
             shutting_down: false,
             seat,
-            seat_enabled: true,
+            seat_enabled: false,
         })
     }
 
     fn run(&mut self) -> anyhow::Result<()> {
         let mut events = Events::with_capacity(128);
         loop {
-            if let Err(err) = self.event_loop.poll(&mut events, None) {
+            let poll_timeout = Some(std::time::Duration::from_millis(100));
+            if let Err(err) = self.event_loop.poll(&mut events, poll_timeout) {
                 error!("Unable to poll event loop: {err}");
             }
 
@@ -117,7 +117,6 @@ impl MessageRunner for SeatState {
                         }
                     }
                     SEAT_TOKEN => {
-                        // Seat events are ready to be dispatched
                         if let Err(err) = self.seat.dispatch() {
                             error!("Failed to dispatch seat events: {err}");
                         }

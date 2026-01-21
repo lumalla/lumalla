@@ -248,6 +248,14 @@ impl VulkanContext {
     pub fn entry(&self) -> &ash::Entry {
         &self.entry
     }
+
+    /// Returns the DRM device path for the selected GPU, if available.
+    ///
+    /// This path corresponds to the primary DRM device (e.g., /dev/dri/card0)
+    /// that should be used for modesetting operations.
+    pub fn drm_device_path(&self) -> Option<&std::path::PathBuf> {
+        self.physical_device.drm_device_path()
+    }
 }
 
 impl Drop for VulkanContext {

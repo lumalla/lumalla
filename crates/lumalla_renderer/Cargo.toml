@@ -18,3 +18,4 @@ drm = "0.14"
 drm-ffi = "0.9"
 gbm = { version = "0.16", default-features = false, features = ["drm-support"] }
 rustix = { version = "1", features = ["fs", "event"] }
+libc = "0.2"

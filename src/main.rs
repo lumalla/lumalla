@@ -250,21 +250,22 @@ where
     R: MessageRunner<Message = M>,
     M: Send + 'static,
 {
+    let thread_name = name.clone();
     let join_handle = thread::Builder::new()
         .name(name)
         .spawn(move || {
-            let result = std::panic::catch_unwind(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut runner = R::new(comms, event_loop, channel, args)?;
                 runner.run().context("Message runner exited with an error")
-            });
+            }));
             match result {
                 Ok(Ok(())) => {
                     info!("Thread exited normally");
                 }
-                Ok(Err(err)) => {
+                Ok(Err(ref err)) => {
                     error!("Thread exited with an error: {err}");
                 }
-                Err(err) => {
+                Err(ref err) => {
                     if let Some(err) = err.downcast_ref::<&str>() {
                         error!("Thread panicked: {err}");
                     } else if let Some(err) = err.downcast_ref::<String>() {
