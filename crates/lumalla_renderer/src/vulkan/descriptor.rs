@@ -19,13 +19,23 @@ pub struct DescriptorSetLayout {
 
 impl DescriptorSetLayout {
     /// Creates a new descriptor set layout from bindings.
-    pub fn new(device: &Device, bindings: &[vk::DescriptorSetLayoutBinding]) -> anyhow::Result<Self> {
+    pub fn new(
+        device: &Device,
+        bindings: &[vk::DescriptorSetLayoutBinding],
+    ) -> anyhow::Result<Self> {
         let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(bindings);
 
-        let handle = unsafe { device.handle().create_descriptor_set_layout(&create_info, None) }
-            .context("Failed to create descriptor set layout")?;
+        let handle = unsafe {
+            device
+                .handle()
+                .create_descriptor_set_layout(&create_info, None)
+        }
+        .context("Failed to create descriptor set layout")?;
 
-        debug!("Created descriptor set layout with {} bindings", bindings.len());
+        debug!(
+            "Created descriptor set layout with {} bindings",
+            bindings.len()
+        );
 
         Ok(Self {
             handle,

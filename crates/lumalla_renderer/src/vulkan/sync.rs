@@ -46,8 +46,11 @@ impl Fence {
     ///
     /// This blocks the CPU until the GPU signals the fence.
     pub fn wait(&self, timeout_ns: u64) -> anyhow::Result<()> {
-        unsafe { self.device.wait_for_fences(&[self.handle], true, timeout_ns) }
-            .context("Failed to wait for fence")?;
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.handle], true, timeout_ns)
+        }
+        .context("Failed to wait for fence")?;
         Ok(())
     }
 

@@ -72,23 +72,14 @@ impl RendererState {
 
     /// Requests the seat to open a DRM device.
     ///
-    /// If Vulkan was initialized successfully, uses the DRM device that corresponds
-    /// to the selected Vulkan physical device. Otherwise, falls back to finding
-    /// available DRM devices and preferring card0.
+    /// Discovers available DRM devices and requests the seat to open the preferred one.
+    /// Vulkan is not initialized yet at this point to avoid it opening card nodes
+    /// before libseat does.
     fn request_drm_device(&mut self) -> anyhow::Result<()> {
-        // Try to use the DRM device from Vulkan's selected physical device
-        let path = if let Some(vulkan) = &self.vulkan {
-            if let Some(vulkan_drm_path) = vulkan.drm_device_path() {
-                vulkan_drm_path.clone()
-            } else {
-                // Vulkan didn't provide a DRM path, fall back to discovery
-                self.find_fallback_drm_device()?
-            }
-        } else {
-            // No Vulkan context, fall back to discovery
-            self.find_fallback_drm_device()?
-        };
+        // Find available DRM devices (this just reads /dev/dri, doesn't open anything)
+        let path = self.find_fallback_drm_device()?;
 
+        info!("Requesting seat to open DRM device: {}", path.display());
         self.pending_drm_path = Some(path.clone());
         self.comms.seat(SeatMessage::OpenDevice { path });
 
@@ -125,6 +116,16 @@ impl RendererState {
             return Ok(());
         }
         self.pending_drm_path = None;
+
+        // Initialize Vulkan NOW, after libseat has opened the DRM device.
+        // This ensures libseat has DRM master before Vulkan tries to open card nodes.
+        if self.vulkan.is_none() {
+            info!("Initializing Vulkan context (after DRM device opened)");
+            self.vulkan = VulkanContext::new().ok();
+            if self.vulkan.is_none() {
+                warn!("Vulkan initialization failed, continuing without Vulkan");
+            }
+        }
 
         let drm_device = DrmDevice::from_fd(fd)?;
 
@@ -194,15 +195,17 @@ impl MessageRunner for RendererState {
         channel: mpsc::Receiver<Self::Message>,
         _args: Arc<GlobalArgs>,
     ) -> anyhow::Result<Self> {
-        // Initialize Vulkan context (optional - continue without if it fails)
-        let vulkan = VulkanContext::new().ok();
+        // NOTE: Vulkan initialization is deferred until after the DRM device is opened.
+        // This is because Vulkan may open card nodes during init (for VK_EXT_physical_device_drm),
+        // which would prevent libseat from opening the device (EAGAIN error).
+        // By deferring Vulkan init, we ensure libseat opens the device first.
 
         Ok(Self {
             comms,
             event_loop,
             channel,
             shutting_down: false,
-            vulkan,
+            vulkan: None,
             display: None,
             pending_drm_path: None,
             start_time: Instant::now(),

@@ -55,8 +55,8 @@ impl ImportedDmaBuf {
 
         // Set up DRM format modifier info
         let modifiers = [modifier];
-        let mut modifier_list_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-            .drm_format_modifiers(&modifiers);
+        let mut modifier_list_info =
+            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&modifiers);
 
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)

@@ -4,7 +4,7 @@ use std::os::fd::OwnedFd;
 
 use anyhow::Context;
 use drm::buffer::DrmFourcc;
-use drm::control::{framebuffer, Device as ControlDevice};
+use drm::control::{Device as ControlDevice, framebuffer};
 use gbm::{BufferObject, BufferObjectFlags, Device as GbmDevice};
 use log::{debug, info};
 
@@ -133,7 +133,9 @@ impl GbmBuffer {
     ///
     /// The returned fd can be imported into Vulkan.
     pub fn export_dma_buf(&self) -> anyhow::Result<OwnedFd> {
-        self.bo.fd().context("Failed to export GBM buffer as DMA-BUF")
+        self.bo
+            .fd()
+            .context("Failed to export GBM buffer as DMA-BUF")
     }
 
     /// Exports the DMA-BUF fd for a specific plane.

@@ -106,17 +106,15 @@ impl Device {
             .enabled_extension_names(&extension_ptrs)
             .push_next(&mut features2);
 
-        let device = unsafe { instance.create_device(physical_device.handle(), &device_create_info, None) }
-            .context("Failed to create logical device")?;
+        let device =
+            unsafe { instance.create_device(physical_device.handle(), &device_create_info, None) }
+                .context("Failed to create logical device")?;
 
         info!("Vulkan logical device created");
 
         // Get the graphics queue
         let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family, 0) };
-        debug!(
-            "Got graphics queue from family {}",
-            graphics_queue_family
-        );
+        debug!("Got graphics queue from family {}", graphics_queue_family);
 
         Ok(Self {
             handle: device,
@@ -168,8 +166,11 @@ impl Device {
             .command_buffers(command_buffers)
             .signal_semaphores(signal_semaphores);
 
-        unsafe { self.handle.queue_submit(self.graphics_queue, &[submit_info], fence) }
-            .context("Failed to submit to graphics queue")?;
+        unsafe {
+            self.handle
+                .queue_submit(self.graphics_queue, &[submit_info], fence)
+        }
+        .context("Failed to submit to graphics queue")?;
 
         Ok(())
     }

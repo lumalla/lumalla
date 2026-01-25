@@ -121,7 +121,8 @@ impl PhysicalDevice {
     ) -> Option<PathBuf> {
         // Query DRM properties using the pNext chain
         let mut drm_properties = vk::PhysicalDeviceDrmPropertiesEXT::default();
-        let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm_properties);
+        let mut properties2 =
+            vk::PhysicalDeviceProperties2::default().push_next(&mut drm_properties);
 
         // SAFETY: Physical device handle is valid
         unsafe { instance.get_physical_device_properties2(physical_device, &mut properties2) };

@@ -44,8 +44,8 @@ impl VulkanContext {
     /// - Debug validation layers (in debug builds)
     pub fn new() -> anyhow::Result<Self> {
         // Load Vulkan dynamically
-        let entry =
-            unsafe { ash::Entry::load() }.context("Failed to load Vulkan. Is a Vulkan driver installed?")?;
+        let entry = unsafe { ash::Entry::load() }
+            .context("Failed to load Vulkan. Is a Vulkan driver installed?")?;
 
         // Log Vulkan version info
         // SAFETY: The entry point was successfully loaded above
@@ -65,8 +65,7 @@ impl VulkanContext {
 
         // Query available extensions
         // SAFETY: The entry point was successfully loaded above
-        let available_extensions =
-            unsafe { entry.enumerate_instance_extension_properties(None) }?;
+        let available_extensions = unsafe { entry.enumerate_instance_extension_properties(None) }?;
         let available_extension_names: Vec<&CStr> = available_extensions
             .iter()
             .map(|ext| ext.extension_name_as_c_str().unwrap_or(c""))
@@ -126,8 +125,10 @@ impl VulkanContext {
             }
         }
 
-        let layers_ptrs: Vec<*const i8> =
-            layers_to_enable.iter().map(|layer| layer.as_ptr()).collect();
+        let layers_ptrs: Vec<*const i8> = layers_to_enable
+            .iter()
+            .map(|layer| layer.as_ptr())
+            .collect();
 
         // Application info
         let app_name = CString::new("lumalla").unwrap();
@@ -197,8 +198,9 @@ impl VulkanContext {
             )
             .pfn_user_callback(Some(vulkan_debug_callback));
 
-        match unsafe { debug_utils_loader.create_debug_utils_messenger(&messenger_create_info, None) }
-        {
+        match unsafe {
+            debug_utils_loader.create_debug_utils_messenger(&messenger_create_info, None)
+        } {
             Ok(messenger) => {
                 debug!("Vulkan debug messenger created");
                 Some(DebugUtils {
@@ -261,8 +263,7 @@ impl VulkanContext {
 impl Drop for VulkanContext {
     fn drop(&mut self) {
         // Command pool must be destroyed before device
-        if let (Some(command_pool), Some(device)) =
-            (&mut self.graphics_command_pool, &self.device)
+        if let (Some(command_pool), Some(device)) = (&mut self.graphics_command_pool, &self.device)
         {
             command_pool.destroy(device);
         }

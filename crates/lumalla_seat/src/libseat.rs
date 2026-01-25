@@ -31,6 +31,7 @@ impl LibSeat {
             _seat: *mut bindings::libseat,
             userdata: *mut std::ffi::c_void,
         ) {
+            log::debug!("libseat: enable_seat_callback fired");
             if userdata.is_null() {
                 error!("enable_seat_callback called with null userdata");
                 return;
@@ -45,6 +46,7 @@ impl LibSeat {
             _seat: *mut bindings::libseat,
             userdata: *mut std::ffi::c_void,
         ) {
+            log::debug!("libseat: disable_seat_callback fired");
             if userdata.is_null() {
                 error!("disable_seat_callback called with null userdata");
                 return;
@@ -82,13 +84,22 @@ impl LibSeat {
         Ok(fd)
     }
 
-    /// Dispatch all available seat events
+    /// Dispatch all available seat events (non-blocking)
     pub fn dispatch(&self) -> anyhow::Result<()> {
         let result = unsafe { bindings::libseat_dispatch(self.seat.as_ptr(), 0) };
         if result < 0 {
             anyhow::bail!("Failed to dispatch seat events");
         }
         Ok(())
+    }
+
+    /// Dispatch seat events with a timeout in milliseconds
+    pub fn dispatch_timeout(&self, timeout_ms: i32) -> anyhow::Result<i32> {
+        let result = unsafe { bindings::libseat_dispatch(self.seat.as_ptr(), timeout_ms) };
+        if result < 0 {
+            anyhow::bail!("Failed to dispatch seat events");
+        }
+        Ok(result)
     }
 
     /// Get the seat name
@@ -110,24 +121,25 @@ impl LibSeat {
         Ok(())
     }
 
-    /// Open a device
-    pub fn open_device(&self, path: &CStr) -> anyhow::Result<RawFd> {
+    /// Open a device. Returns (device_id, fd).
+    /// The device_id is needed to close the device later.
+    pub fn open_device(&self, path: &CStr) -> anyhow::Result<(i32, RawFd)> {
         let mut fd: RawFd = 0;
-        let result = unsafe {
+        let device_id = unsafe {
             bindings::libseat_open_device(self.seat.as_ptr(), path.as_ptr(), &mut fd as *mut RawFd)
         };
 
-        if result >= 0 {
-            return Ok(fd);
+        if device_id >= 0 {
+            return Ok((device_id, fd));
         }
 
         let err = std::io::Error::last_os_error();
         anyhow::bail!("Unable to open device {}: {}", path.to_string_lossy(), err)
     }
 
-    /// Close a device
-    pub fn close_device(&self, fd: RawFd) -> anyhow::Result<()> {
-        let result = unsafe { bindings::libseat_close_device(self.seat.as_ptr(), fd) };
+    /// Close a device by its device_id (returned from open_device)
+    pub fn close_device(&self, device_id: i32) -> anyhow::Result<()> {
+        let result = unsafe { bindings::libseat_close_device(self.seat.as_ptr(), device_id) };
         if result < 0 {
             anyhow::bail!("Failed to close device");
         }

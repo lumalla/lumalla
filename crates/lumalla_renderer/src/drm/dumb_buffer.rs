@@ -5,7 +5,7 @@
 
 use anyhow::Context;
 use drm::buffer::{Buffer, DrmFourcc};
-use drm::control::{dumbbuffer, framebuffer, Device as ControlDevice};
+use drm::control::{Device as ControlDevice, dumbbuffer, framebuffer};
 use log::{debug, info};
 
 use super::DrmDevice;

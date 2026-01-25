@@ -143,8 +143,12 @@ impl<'a> CommandBufferRecorder<'a> {
     ) -> anyhow::Result<Self> {
         let begin_info = vk::CommandBufferBeginInfo::default().flags(usage);
 
-        unsafe { device.handle().begin_command_buffer(command_buffer, &begin_info) }
-            .context("Failed to begin command buffer")?;
+        unsafe {
+            device
+                .handle()
+                .begin_command_buffer(command_buffer, &begin_info)
+        }
+        .context("Failed to begin command buffer")?;
 
         Ok(Self {
             device,
@@ -226,7 +230,9 @@ impl<'a> CommandBufferRecorder<'a> {
     /// Ends the current render pass.
     pub fn end_render_pass(&mut self) {
         unsafe {
-            self.device.handle().cmd_end_render_pass(self.command_buffer);
+            self.device
+                .handle()
+                .cmd_end_render_pass(self.command_buffer);
         }
     }
 
@@ -244,7 +250,9 @@ impl<'a> CommandBufferRecorder<'a> {
     /// Sets the viewport dynamically.
     pub fn set_viewport(&mut self, viewport: &vk::Viewport) {
         unsafe {
-            self.device.handle().cmd_set_viewport(self.command_buffer, 0, &[viewport.clone()]);
+            self.device
+                .handle()
+                .cmd_set_viewport(self.command_buffer, 0, &[viewport.clone()]);
         }
     }
 
@@ -264,7 +272,9 @@ impl<'a> CommandBufferRecorder<'a> {
     /// Sets the scissor rectangle dynamically.
     pub fn set_scissor(&mut self, scissor: &vk::Rect2D) {
         unsafe {
-            self.device.handle().cmd_set_scissor(self.command_buffer, 0, &[scissor.clone()]);
+            self.device
+                .handle()
+                .cmd_set_scissor(self.command_buffer, 0, &[scissor.clone()]);
         }
     }
 
@@ -315,7 +325,13 @@ impl<'a> CommandBufferRecorder<'a> {
     }
 
     /// Draws vertices.
-    pub fn draw(&mut self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
+    pub fn draw(
+        &mut self,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) {
         unsafe {
             self.device.handle().cmd_draw(
                 self.command_buffer,

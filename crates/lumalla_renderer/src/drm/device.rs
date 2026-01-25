@@ -4,8 +4,8 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use anyhow::Context;
-use drm::control::Device as ControlDevice;
 use drm::Device;
+use drm::control::Device as ControlDevice;
 use log::{debug, info};
 
 /// A DRM device wrapper that implements the drm-rs traits.
@@ -41,11 +41,13 @@ impl DrmDevice {
             .context("Failed to get DRM resources - is this a valid DRM device?")?;
 
         // Check for atomic modesetting support
-        device.set_client_capability(drm::ClientCapability::Atomic, true)
+        device
+            .set_client_capability(drm::ClientCapability::Atomic, true)
             .context("Failed to enable atomic modesetting - driver may not support it")?;
 
         // Enable universal planes (needed for atomic)
-        device.set_client_capability(drm::ClientCapability::UniversalPlanes, true)
+        device
+            .set_client_capability(drm::ClientCapability::UniversalPlanes, true)
             .context("Failed to enable universal planes")?;
 
         info!("DRM device initialized with atomic modesetting support");
@@ -55,9 +57,7 @@ impl DrmDevice {
 
     /// Returns the DRM device capabilities.
     pub fn get_capabilities(&self) -> anyhow::Result<DrmCapabilities> {
-        let driver = self
-            .get_driver()
-            .context("Failed to get DRM driver info")?;
+        let driver = self.get_driver().context("Failed to get DRM driver info")?;
 
         let name = driver.name().to_string_lossy().into_owned();
         let description = driver.description().to_string_lossy().into_owned();

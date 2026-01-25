@@ -8,7 +8,7 @@ mod dumb_buffer;
 mod gbm;
 mod output;
 
-pub use device::{find_drm_devices, DrmDevice};
+pub use device::{DrmDevice, find_drm_devices};
 pub use dumb_buffer::DumbBuffer;
 pub use gbm::{GbmAllocator, GbmBuffer};
 pub use output::{Connector, Crtc, Output, OutputManager, Plane};

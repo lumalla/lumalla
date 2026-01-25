@@ -3,12 +3,12 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Arc, mpsc};
 
 use anyhow::Context;
-use log::{error, info};
+use log::{debug, error, info};
 use lumalla_shared::{
     Comms, DisplayMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner, RendererMessage,
     SeatMessage,
 };
-use mio::{Events, Interest, Poll, Token, unix::SourceFd};
+use mio::{Events, Poll};
 
 // Use the libseat crate wrapper when the feature is enabled,
 // otherwise use the custom FFI bindings
@@ -22,7 +22,7 @@ mod libseat;
 #[cfg(not(feature = "use-libseat-crate"))]
 use crate::libseat::LibSeat;
 
-const SEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
+// Note: We don't register the seat fd with mio - libseat handles its own polling
 
 pub struct SeatState {
     comms: Comms,
@@ -40,9 +40,17 @@ impl SeatState {
                 self.shutting_down = true;
             }
             SeatMessage::SeatEnabled => {
+                info!("Seat enabled");
                 self.seat_enabled = true;
+
+                let seat_name = self.seat.seat_name().context("Failed to get seat name")?;
+                self.comms
+                    .display(DisplayMessage::ActivateSeat(seat_name.clone()));
+                self.comms
+                    .renderer(RendererMessage::SeatSessionCreated { seat_name });
             }
             SeatMessage::SeatDisabled => {
+                info!("Seat disabled");
                 self.seat_enabled = false;
             }
             SeatMessage::OpenDevice { path } => {
@@ -54,10 +62,20 @@ impl SeatState {
     }
 
     fn handle_open_device(&mut self, path: std::path::PathBuf) -> anyhow::Result<()> {
+        debug!(
+            "handle_open_device called for {:?}, seat_enabled={}",
+            path, self.seat_enabled
+        );
+
         let path_str = path.to_str().context("Device path is not valid UTF-8")?;
         let c_path = CString::new(path_str).context("Device path contains null byte")?;
 
-        let raw_fd = self.seat.open_device(&c_path)?;
+        debug!("Calling seat.open_device()");
+        let (device_id, raw_fd) = self.seat.open_device(&c_path)?;
+        debug!(
+            "seat.open_device() returned device_id={}, fd={}",
+            device_id, raw_fd
+        );
 
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
         self.comms
@@ -80,14 +98,9 @@ impl MessageRunner for SeatState {
         #[allow(unused_mut)]
         let mut seat = LibSeat::new(comms.clone()).context("Failed to create seat")?;
 
-        let seat_fd = seat.fd().context("Failed to get seat fd")?;
-        let mut seat_source = SourceFd(&seat_fd);
-        event_loop
-            .registry()
-            .register(&mut seat_source, SEAT_TOKEN, Interest::READABLE)?;
-        let seat_name = seat.seat_name().context("Failed to get seat name")?;
-        comms.display(DisplayMessage::ActivateSeat(seat_name.clone()));
-        comms.renderer(RendererMessage::SeatSessionCreated { seat_name });
+        // NOTE: We intentionally do NOT register the seat fd with mio.
+        // Instead, we use libseat's dispatch_timeout() which handles its own polling.
+        // This avoids potential conflicts between mio's epoll and libseat's internal handling.
 
         Ok(Self {
             comms,
@@ -102,26 +115,41 @@ impl MessageRunner for SeatState {
     fn run(&mut self) -> anyhow::Result<()> {
         let mut events = Events::with_capacity(128);
         loop {
-            let poll_timeout = Some(std::time::Duration::from_millis(100));
+            // FIRST: Dispatch seat events - this must happen before processing messages
+            // to ensure the seat is in a consistent state
+            match self.seat.dispatch_timeout(50) {
+                Ok(n) if n > 0 => {
+                    debug!("Dispatched {} seat event(s)", n);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    error!("Failed to dispatch seat events: {err}");
+                }
+            }
+
+            // Use a short poll timeout
+            let poll_timeout = Some(std::time::Duration::from_millis(10));
             if let Err(err) = self.event_loop.poll(&mut events, poll_timeout) {
                 error!("Unable to poll event loop: {err}");
             }
 
+            // Process channel messages
             for event in events.iter() {
-                match event.token() {
-                    MESSAGE_CHANNEL_TOKEN => {
-                        while let Ok(msg) = self.channel.try_recv() {
-                            if let Err(err) = self.handle_message(msg) {
-                                error!("Unable to handle message: {err}");
-                            }
+                if event.token() == MESSAGE_CHANNEL_TOKEN {
+                    while let Ok(msg) = self.channel.try_recv() {
+                        debug!("Processing message: {:?}", msg);
+                        if let Err(err) = self.handle_message(msg) {
+                            error!("Unable to handle message: {err}");
                         }
                     }
-                    SEAT_TOKEN => {
-                        if let Err(err) = self.seat.dispatch() {
-                            error!("Failed to dispatch seat events: {err}");
-                        }
-                    }
-                    _ => {}
+                }
+            }
+
+            // Also check for messages that might have arrived without waking
+            while let Ok(msg) = self.channel.try_recv() {
+                debug!("Processing message (non-event): {:?}", msg);
+                if let Err(err) = self.handle_message(msg) {
+                    error!("Unable to handle message: {err}");
                 }
             }
 

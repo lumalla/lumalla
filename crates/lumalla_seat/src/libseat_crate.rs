@@ -74,12 +74,17 @@ impl LibSeat {
         Ok(borrowed_fd.as_raw_fd())
     }
 
-    /// Dispatch all available seat events
+    /// Dispatch all available seat events (non-blocking)
     pub fn dispatch(&mut self) -> anyhow::Result<()> {
-        // Dispatch with 0 timeout (non-blocking)
-        let _ = self
+        self.dispatch_timeout(0)?;
+        Ok(())
+    }
+
+    /// Dispatch seat events with a timeout in milliseconds
+    pub fn dispatch_timeout(&mut self, timeout_ms: i32) -> anyhow::Result<i32> {
+        let count = self
             .seat
-            .dispatch(0)
+            .dispatch(timeout_ms)
             .map_err(|e| anyhow::anyhow!("Failed to dispatch seat events: {}", e))?;
 
         // Process any pending events that were collected during dispatch
@@ -96,7 +101,7 @@ impl LibSeat {
             }
         }
 
-        Ok(())
+        Ok(count as i32)
     }
 
     /// Get the seat name
@@ -112,8 +117,9 @@ impl LibSeat {
             .map_err(|e| anyhow::anyhow!("Failed to disable seat: {}", e))
     }
 
-    /// Open a device
-    pub fn open_device(&mut self, path: &CStr) -> anyhow::Result<RawFd> {
+    /// Open a device. Returns (device_id, fd).
+    /// The device_id is needed to close the device later.
+    pub fn open_device(&mut self, path: &CStr) -> anyhow::Result<(i32, RawFd)> {
         let path_str = path.to_str().map_err(|_| anyhow::anyhow!("Invalid path"))?;
         let path = Path::new(path_str);
 
@@ -125,21 +131,19 @@ impl LibSeat {
         let fd = device.as_fd().as_raw_fd();
 
         // Store the device so it doesn't get dropped (and the fd doesn't get closed)
+        // Use the index as a synthetic device_id
+        let device_id = self.opened_devices.len() as i32;
         self.opened_devices.push(device);
 
-        Ok(fd)
+        Ok((device_id, fd))
     }
 
-    /// Close a device by fd
+    /// Close a device by its device_id (returned from open_device)
     #[allow(dead_code)]
-    pub fn close_device(&mut self, fd: RawFd) -> anyhow::Result<()> {
-        // Find and remove the device with matching fd
-        if let Some(pos) = self
-            .opened_devices
-            .iter()
-            .position(|d| d.as_fd().as_raw_fd() == fd)
-        {
-            let device = self.opened_devices.remove(pos);
+    pub fn close_device(&mut self, device_id: i32) -> anyhow::Result<()> {
+        let idx = device_id as usize;
+        if idx < self.opened_devices.len() {
+            let device = self.opened_devices.remove(idx);
             self.seat
                 .close_device(device)
                 .map_err(|e| anyhow::anyhow!("Failed to close device: {}", e))?;

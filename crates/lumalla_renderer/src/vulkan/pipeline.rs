@@ -112,8 +112,12 @@ impl<'a> GraphicsPipelineBuilder<'a> {
             .set_layouts(&self.descriptor_set_layouts)
             .push_constant_ranges(&self.push_constant_ranges);
 
-        let layout = unsafe { self.device.handle().create_pipeline_layout(&layout_create_info, None) }
-            .context("Failed to create pipeline layout")?;
+        let layout = unsafe {
+            self.device
+                .handle()
+                .create_pipeline_layout(&layout_create_info, None)
+        }
+        .context("Failed to create pipeline layout")?;
 
         // Build shader stage create infos
         let mut shader_stages = Vec::new();
@@ -195,8 +199,8 @@ impl<'a> GraphicsPipelineBuilder<'a> {
 
         // Dynamic state (viewport and scissor can be set dynamically)
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default()
-            .dynamic_states(&dynamic_states);
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
         // Create graphics pipeline
         let pipeline_create_info = vk::GraphicsPipelineCreateInfo::default()
@@ -213,9 +217,11 @@ impl<'a> GraphicsPipelineBuilder<'a> {
             .subpass(0);
 
         let result = unsafe {
-            self.device
-                .handle()
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_create_info], None)
+            self.device.handle().create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                &[pipeline_create_info],
+                None,
+            )
         };
 
         let pipelines = match result {

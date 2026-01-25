@@ -2,8 +2,8 @@
 
 use anyhow::Context;
 use ash::vk;
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 use gpu_allocator::MemoryLocation;
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 use log::debug;
 
 use super::{Device, MemoryAllocator};

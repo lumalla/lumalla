@@ -46,10 +46,7 @@ impl Framebuffer {
         let handle = unsafe { device.handle().create_framebuffer(&create_info, None) }
             .context("Failed to create framebuffer")?;
 
-        debug!(
-            "Created framebuffer: {}x{}",
-            extent.width, extent.height
-        );
+        debug!("Created framebuffer: {}x{}", extent.width, extent.height);
 
         Ok(Self {
             handle,
