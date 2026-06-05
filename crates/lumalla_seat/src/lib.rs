@@ -8,21 +8,14 @@ use lumalla_shared::{
     Comms, DisplayMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner, RendererMessage,
     SeatMessage,
 };
-use mio::{Events, Poll};
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll, Token};
 
-// Use the libseat crate wrapper when the feature is enabled,
-// otherwise use the custom FFI bindings
-#[cfg(feature = "use-libseat-crate")]
-mod libseat_crate;
-#[cfg(feature = "use-libseat-crate")]
-use crate::libseat_crate::LibSeat;
-
-#[cfg(not(feature = "use-libseat-crate"))]
-mod libseat;
-#[cfg(not(feature = "use-libseat-crate"))]
 use crate::libseat::LibSeat;
 
-// Note: We don't register the seat fd with mio - libseat handles its own polling
+mod libseat;
+
+pub const LIBSEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 
 pub struct SeatState {
     comms: Comms,
@@ -54,14 +47,14 @@ impl SeatState {
                 self.seat_enabled = false;
             }
             SeatMessage::OpenDevice { path } => {
-                self.handle_open_device(path)?;
+                self.open_device(path)?;
             }
         }
 
         Ok(())
     }
 
-    fn handle_open_device(&mut self, path: std::path::PathBuf) -> anyhow::Result<()> {
+    fn open_device(&mut self, path: std::path::PathBuf) -> anyhow::Result<()> {
         debug!(
             "handle_open_device called for {:?}, seat_enabled={}",
             path, self.seat_enabled
@@ -94,13 +87,12 @@ impl MessageRunner for SeatState {
         channel: mpsc::Receiver<Self::Message>,
         _args: Arc<GlobalArgs>,
     ) -> anyhow::Result<Self> {
-        // mut needed for libseat crate feature, not for custom FFI
-        #[allow(unused_mut)]
-        let mut seat = LibSeat::new(comms.clone()).context("Failed to create seat")?;
-
-        // NOTE: We intentionally do NOT register the seat fd with mio.
-        // Instead, we use libseat's dispatch_timeout() which handles its own polling.
-        // This avoids potential conflicts between mio's epoll and libseat's internal handling.
+        let seat = LibSeat::new(comms.clone()).context("Failed to create seat")?;
+        let seat_fd = seat.fd().context("Failed to get seat fd")?;
+        event_loop
+            .registry()
+            .register(&mut SourceFd(&seat_fd), LIBSEAT_TOKEN, Interest::READABLE)
+            .context("Unable to listen on seat fd")?;
 
         Ok(Self {
             comms,
@@ -115,41 +107,28 @@ impl MessageRunner for SeatState {
     fn run(&mut self) -> anyhow::Result<()> {
         let mut events = Events::with_capacity(128);
         loop {
-            // FIRST: Dispatch seat events - this must happen before processing messages
-            // to ensure the seat is in a consistent state
-            match self.seat.dispatch_timeout(50) {
-                Ok(n) if n > 0 => {
-                    debug!("Dispatched {} seat event(s)", n);
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    error!("Failed to dispatch seat events: {err}");
-                }
-            }
-
-            // Use a short poll timeout
-            let poll_timeout = Some(std::time::Duration::from_millis(10));
-            if let Err(err) = self.event_loop.poll(&mut events, poll_timeout) {
+            if let Err(err) = self.event_loop.poll(&mut events, None) {
                 error!("Unable to poll event loop: {err}");
             }
 
-            // Process channel messages
             for event in events.iter() {
-                if event.token() == MESSAGE_CHANNEL_TOKEN {
-                    while let Ok(msg) = self.channel.try_recv() {
-                        debug!("Processing message: {:?}", msg);
-                        if let Err(err) = self.handle_message(msg) {
-                            error!("Unable to handle message: {err}");
+                match event.token() {
+                    MESSAGE_CHANNEL_TOKEN => {
+                        while let Ok(msg) = self.channel.try_recv() {
+                            debug!("Processing message: {:?}", msg);
+                            if let Err(err) = self.handle_message(msg) {
+                                error!("Unable to handle message: {err}");
+                            }
                         }
                     }
-                }
-            }
-
-            // Also check for messages that might have arrived without waking
-            while let Ok(msg) = self.channel.try_recv() {
-                debug!("Processing message (non-event): {:?}", msg);
-                if let Err(err) = self.handle_message(msg) {
-                    error!("Unable to handle message: {err}");
+                    LIBSEAT_TOKEN => {
+                        self.seat
+                            .dispatch()
+                            .context("Failed to dispatch seat events")?;
+                    }
+                    _ => {
+                        error!("Received message for unknown token");
+                    }
                 }
             }
 

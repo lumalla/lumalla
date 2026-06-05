@@ -7,11 +7,40 @@ use lumalla_shared::{Comms, SeatMessage};
     non_camel_case_types,
     non_upper_case_globals,
     non_snake_case,
-    dead_code,
-    clippy::all
+    dead_code
 )]
 mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/libseat_bindings.rs"));
+    use std::ffi::{c_char, c_int, c_void};
+
+    #[repr(C)]
+    pub struct libseat {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct libseat_seat_listener {
+        pub enable_seat: Option<unsafe extern "C" fn(*mut libseat, *mut c_void)>,
+        pub disable_seat: Option<unsafe extern "C" fn(*mut libseat, *mut c_void)>,
+    }
+
+    unsafe extern "C" {
+        pub fn libseat_open_seat(
+            listener: *const libseat_seat_listener,
+            userdata: *mut c_void,
+        ) -> *mut libseat;
+        pub fn libseat_close_seat(seat: *mut libseat) -> c_int;
+        pub fn libseat_get_fd(seat: *mut libseat) -> c_int;
+        pub fn libseat_dispatch(seat: *mut libseat, timeout: c_int) -> c_int;
+        pub fn libseat_seat_name(seat: *mut libseat) -> *const c_char;
+        pub fn libseat_disable_seat(seat: *mut libseat) -> c_int;
+        pub fn libseat_open_device(
+            seat: *mut libseat,
+            path: *const c_char,
+            fd: *mut c_int,
+        ) -> c_int;
+        pub fn libseat_close_device(seat: *mut libseat, device_id: c_int) -> c_int;
+        pub fn libseat_switch_session(seat: *mut libseat, session: c_int) -> c_int;
+    }
 }
 
 /// Safe wrapper around libseat
