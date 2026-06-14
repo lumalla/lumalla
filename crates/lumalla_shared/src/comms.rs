@@ -2,10 +2,7 @@ use log::warn;
 use mio::{Poll, Waker};
 use std::sync::{Arc, mpsc};
 
-use crate::{
-    ConfigMessage, DisplayMessage, InputMessage, MESSAGE_CHANNEL_TOKEN, MainMessage,
-    RendererMessage, SeatMessage,
-};
+use crate::{ConfigMessage, MESSAGE_CHANNEL_TOKEN, MainMessage};
 
 /// Create a new event loop with a message channel already set up
 pub fn message_loop_with_channel<M>() -> anyhow::Result<(Poll, mpsc::Receiver<M>, MessageSender<M>)>
@@ -57,11 +54,7 @@ impl<T> MessageSender<T> {
 #[derive(Clone)]
 pub struct Comms {
     to_main: MessageSender<MainMessage>,
-    to_display: MessageSender<DisplayMessage>,
-    to_renderer: MessageSender<RendererMessage>,
-    to_input: MessageSender<InputMessage>,
     to_config: MessageSender<ConfigMessage>,
-    to_seat: MessageSender<SeatMessage>,
 }
 
 impl std::fmt::Debug for Comms {
@@ -74,34 +67,19 @@ impl Comms {
     /// Creates a new instance of `Comms` with the given channels.
     pub fn new(
         to_main: MessageSender<MainMessage>,
-        to_display: MessageSender<DisplayMessage>,
-        to_renderer: MessageSender<RendererMessage>,
-        to_input: MessageSender<InputMessage>,
         to_config: MessageSender<ConfigMessage>,
-        to_seat: MessageSender<SeatMessage>,
     ) -> Self {
-        Comms {
-            to_main,
-            to_display,
-            to_renderer,
-            to_input,
-            to_config,
-            to_seat,
-        }
+        Comms { to_main, to_config }
     }
 
     /// Sends a message to the main thread.
     ///
     /// # Example
     /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
+    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, message_loop_with_channel};
     /// # let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
     /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
+    /// # let comms = Comms::new(to_main, to_config);
     /// comms.main(MainMessage::Shutdown);
     /// assert!(matches!(main_channel.recv().unwrap(), MainMessage::Shutdown));
     /// ```
@@ -115,14 +93,10 @@ impl Comms {
     ///
     /// # Example
     /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
+    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, message_loop_with_channel};
     /// # let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
     /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
+    /// # let comms = Comms::new(to_main, to_config);
     /// let sender = comms.main_sender();
     /// sender.send(MainMessage::Shutdown).unwrap();
     /// assert!(matches!(main_channel.recv().unwrap(), MainMessage::Shutdown));
@@ -131,150 +105,14 @@ impl Comms {
         self.to_main.clone()
     }
 
-    /// Sends a message to the display thread.
-    ///
-    /// # Example
-    /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
-    /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, display_channel, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
-    /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
-    /// comms.display(DisplayMessage::Shutdown);
-    /// assert!(matches!(display_channel.recv().unwrap(), DisplayMessage::Shutdown));
-    /// ```
-    pub fn display(&self, message: DisplayMessage) {
-        if let Err(e) = self.to_display.send(message) {
-            warn!("Lost connection to display ({e}). Requesting shutdown");
-            self.to_main
-                .send(MainMessage::Shutdown)
-                .expect("Lost connection to the main thread");
-        }
-    }
-
-    /// Get a message sender for sending messages to the display thread.
-    ///
-    /// # Example
-    /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
-    /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, display_channel, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
-    /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
-    /// let sender = comms.display_sender();
-    /// sender.send(DisplayMessage::Shutdown).unwrap();
-    /// assert!(matches!(display_channel.recv().unwrap(), DisplayMessage::Shutdown));
-    /// ```
-    pub fn display_sender(&self) -> MessageSender<DisplayMessage> {
-        self.to_display.clone()
-    }
-
-    /// Sends a message to the renderer thread.
-    ///
-    /// # Example
-    /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
-    /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, renderer_channel, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
-    /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
-    /// comms.renderer(RendererMessage::Shutdown);
-    /// assert!(matches!(renderer_channel.recv().unwrap(), RendererMessage::Shutdown));
-    /// ```
-    pub fn renderer(&self, message: RendererMessage) {
-        if let Err(e) = self.to_renderer.send(message) {
-            warn!("Lost connection to renderer ({e}). Requesting shutdown");
-            self.to_main
-                .send(MainMessage::Shutdown)
-                .expect("Lost connection to the main thread");
-        }
-    }
-
-    /// Get a message sender for sending messages to the renderer thread.
-    ///
-    /// # Example
-    /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
-    /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, renderer_channel, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
-    /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
-    /// let sender = comms.renderer_sender();
-    /// sender.send(RendererMessage::Shutdown).unwrap();
-    /// assert!(matches!(renderer_channel.recv().unwrap(), RendererMessage::Shutdown));
-    /// ```
-    pub fn renderer_sender(&self) -> MessageSender<RendererMessage> {
-        self.to_renderer.clone()
-    }
-
-    /// Sends a message to the input thread.
-    ///
-    /// # Example
-    /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
-    /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, input_channel, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
-    /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
-    /// comms.input(InputMessage::Shutdown);
-    /// assert!(matches!(input_channel.recv().unwrap(), InputMessage::Shutdown));
-    /// ```
-    pub fn input(&self, message: InputMessage) {
-        if let Err(e) = self.to_input.send(message) {
-            warn!("Lost connection to input ({e}). Requesting shutdown");
-            self.to_main
-                .send(MainMessage::Shutdown)
-                .expect("Lost connection to the main thread");
-        }
-    }
-
-    /// Get a message sender for sending messages to the input thread.
-    ///
-    /// # Example
-    /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
-    /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, input_channel, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
-    /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
-    /// let sender = comms.input_sender();
-    /// sender.send(InputMessage::Shutdown).unwrap();
-    /// assert!(matches!(input_channel.recv().unwrap(), InputMessage::Shutdown));
-    /// ```
-    pub fn input_sender(&self) -> MessageSender<InputMessage> {
-        self.to_input.clone()
-    }
-
     /// Sends a message to the config thread.
     ///
     /// # Example
     /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
+    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, message_loop_with_channel};
     /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
     /// # let (_, config_channel, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
+    /// # let comms = Comms::new(to_main, to_config);
     /// comms.config(ConfigMessage::Shutdown);
     /// assert!(matches!(config_channel.recv().unwrap(), ConfigMessage::Shutdown));
     /// ```
@@ -291,64 +129,16 @@ impl Comms {
     ///
     /// # Example
     /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
+    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, message_loop_with_channel};
     /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
     /// # let (_, config_channel, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
+    /// # let comms = Comms::new(to_main, to_config);
     /// let sender = comms.config_sender();
     /// sender.send(ConfigMessage::Shutdown).unwrap();
     /// assert!(matches!(config_channel.recv().unwrap(), ConfigMessage::Shutdown));
     /// ```
     pub fn config_sender(&self) -> MessageSender<ConfigMessage> {
         self.to_config.clone()
-    }
-
-    /// Sends a message to the seat thread.
-    ///
-    /// # Example
-    /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
-    /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
-    /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, seat_channel, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
-    /// comms.seat(SeatMessage::Shutdown);
-    /// assert!(matches!(seat_channel.recv().unwrap(), SeatMessage::Shutdown));
-    /// ```
-    pub fn seat(&self, message: SeatMessage) {
-        if let Err(e) = self.to_seat.send(message) {
-            warn!("Lost connection to seat ({e}). Requesting shutdown");
-            self.to_main
-                .send(MainMessage::Shutdown)
-                .expect("Lost connection to the main thread");
-        }
-    }
-
-    /// Get a message sender for sending messages to the seat thread.
-    ///
-    /// # Example
-    /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, DisplayMessage, RendererMessage, InputMessage, ConfigMessage, SeatMessage, message_loop_with_channel};
-    /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-    /// # let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-    /// # let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
-    /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, seat_channel, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_display, to_renderer, to_input, to_config, to_seat);
-    /// let sender = comms.seat_sender();
-    /// sender.send(SeatMessage::Shutdown).unwrap();
-    /// assert!(matches!(seat_channel.recv().unwrap(), SeatMessage::Shutdown));
-    /// ```
-    pub fn seat_sender(&self) -> MessageSender<SeatMessage> {
-        self.to_seat.clone()
     }
 }
 
@@ -359,41 +149,20 @@ mod tests {
 
     struct Receivers {
         main: mpsc::Receiver<MainMessage>,
-        display: mpsc::Receiver<DisplayMessage>,
-        renderer: mpsc::Receiver<RendererMessage>,
-        input: mpsc::Receiver<InputMessage>,
         config: mpsc::Receiver<ConfigMessage>,
-        seat: mpsc::Receiver<SeatMessage>,
     }
 
     fn comms() -> (Comms, Receivers) {
         let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-        let (_, display_channel, to_display) =
-            message_loop_with_channel::<DisplayMessage>().unwrap();
-        let (_, renderer_channel, to_renderer) =
-            message_loop_with_channel::<RendererMessage>().unwrap();
-        let (_, input_channel, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
         let (_, config_channel, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-        let (_, seat_channel, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
 
-        let comms = Comms::new(
-            to_main,
-            to_display,
-            to_renderer,
-            to_input,
-            to_config,
-            to_seat,
-        );
+        let comms = Comms::new(to_main, to_config);
 
         (
             comms,
             Receivers {
                 main: main_channel,
-                display: display_channel,
-                renderer: renderer_channel,
-                input: input_channel,
                 config: config_channel,
-                seat: seat_channel,
             },
         )
     }
@@ -407,84 +176,6 @@ mod tests {
         drop(receivers.main);
 
         comms.main(MainMessage::Shutdown);
-    }
-
-    #[test]
-    fn to_display_sends_shutdown_to_main_on_lost_connection_to_display() {
-        let (comms, receivers) = comms();
-
-        // Close the channel to the display thread
-        drop(receivers.display);
-
-        comms.display(DisplayMessage::Shutdown);
-        assert!(matches!(
-            receivers.main.recv().unwrap(),
-            MainMessage::Shutdown
-        ));
-    }
-
-    #[test]
-    #[should_panic]
-    fn to_display_panics_on_lost_connection_to_display_and_main() {
-        let (comms, receivers) = comms();
-
-        // Close the display and main channels
-        drop(receivers.display);
-        drop(receivers.main);
-
-        comms.display(DisplayMessage::Shutdown);
-    }
-
-    #[test]
-    fn to_renderer_sends_shutdown_to_main_on_lost_connection_to_renderer() {
-        let (comms, receivers) = comms();
-
-        // Close the renderer channel
-        drop(receivers.renderer);
-
-        comms.renderer(RendererMessage::Shutdown);
-        assert!(matches!(
-            receivers.main.recv().unwrap(),
-            MainMessage::Shutdown
-        ));
-    }
-
-    #[test]
-    #[should_panic]
-    fn to_renderer_panics_on_lost_connection_to_renderer_and_main() {
-        let (comms, receivers) = comms();
-
-        // Close the renderer and main channels
-        drop(receivers.renderer);
-        drop(receivers.main);
-
-        comms.renderer(RendererMessage::Shutdown);
-    }
-
-    #[test]
-    fn to_input_sends_shutdown_to_main_on_lost_connection_to_input() {
-        let (comms, receivers) = comms();
-
-        // Close the input channel
-        drop(receivers.input);
-
-        comms.input(InputMessage::Shutdown);
-        assert!(matches!(
-            receivers.main.recv().unwrap(),
-            MainMessage::Shutdown
-        ));
-    }
-
-    #[test]
-    #[should_panic]
-    fn to_input_panics_on_lost_connection_to_input_and_main() {
-        let (comms, receivers) = comms();
-
-        // Close the input and main channels
-        drop(receivers.input);
-        drop(receivers.main);
-
-        comms.input(InputMessage::Shutdown);
     }
 
     #[test]
@@ -511,31 +202,5 @@ mod tests {
         drop(receivers.main);
 
         comms.config(ConfigMessage::Shutdown);
-    }
-
-    #[test]
-    fn to_seat_sends_shutdown_to_main_on_lost_connection_to_seat() {
-        let (comms, receivers) = comms();
-
-        // Close the seat channel
-        drop(receivers.seat);
-
-        comms.seat(SeatMessage::Shutdown);
-        assert!(matches!(
-            receivers.main.recv().unwrap(),
-            MainMessage::Shutdown
-        ));
-    }
-
-    #[test]
-    #[should_panic]
-    fn to_seat_panics_on_lost_connection_to_seat_and_main() {
-        let (comms, receivers) = comms();
-
-        // Close the seat and main channels
-        drop(receivers.seat);
-        drop(receivers.main);
-
-        comms.seat(SeatMessage::Shutdown);
     }
 }

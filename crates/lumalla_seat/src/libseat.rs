@@ -1,7 +1,13 @@
-use std::{ffi::CStr, os::fd::RawFd, ptr::NonNull};
+use std::{
+    ffi::CStr,
+    io,
+    os::fd::{FromRawFd, OwnedFd, RawFd},
+    ptr::NonNull,
+};
 
 use log::error;
-use lumalla_shared::{Comms, SeatMessage};
+use lumalla_shared::{Comms, MainMessage};
+use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
 
 #[allow(
     non_camel_case_types,
@@ -43,9 +49,15 @@ mod bindings {
     }
 }
 
+pub struct SeatDevice {
+    device_id: i32,
+    fd: OwnedFd,
+}
+
 /// Safe wrapper around libseat
 pub struct LibSeat {
     seat: NonNull<bindings::libseat>,
+    fd: RawFd,
     // Need to keep comms alive, since libseat's userdata is a pointer to it
     _comms: Box<Comms>,
 }
@@ -67,7 +79,7 @@ impl LibSeat {
             }
             unsafe {
                 let comms = &mut *(userdata as *mut Comms);
-                comms.seat(SeatMessage::SeatEnabled);
+                comms.main(MainMessage::SeatEnabled);
             }
         }
 
@@ -82,7 +94,7 @@ impl LibSeat {
             }
             unsafe {
                 let comms = &mut *(userdata as *mut Comms);
-                comms.seat(SeatMessage::SeatDisabled);
+                comms.main(MainMessage::SeatDisabled);
             }
         }
 
@@ -92,25 +104,24 @@ impl LibSeat {
         };
 
         let seat = unsafe { bindings::libseat_open_seat(&LISTENER, comms_ptr) };
-
-        if seat.is_null() {
+        let Some(seat) = NonNull::new(seat) else {
             let err = std::io::Error::last_os_error();
             anyhow::bail!("Failed to open seat: {}", err);
+        };
+        let fd = unsafe { bindings::libseat_get_fd(seat.as_ptr()) };
+        if fd < 0 {
+            anyhow::bail!("Failed to get seat file descriptor");
         }
-
         Ok(Self {
-            seat: unsafe { NonNull::new_unchecked(seat) },
+            seat,
+            fd,
             _comms: comms,
         })
     }
 
     /// Get the file descriptor for the seat
-    pub fn fd(&self) -> anyhow::Result<RawFd> {
-        let fd = unsafe { bindings::libseat_get_fd(self.seat.as_ptr()) };
-        if fd < 0 {
-            anyhow::bail!("Failed to get seat file descriptor");
-        }
-        Ok(fd)
+    pub fn fd(&self) -> RawFd {
+        self.fd
     }
 
     /// Dispatch all available seat events (non-blocking)
@@ -150,16 +161,18 @@ impl LibSeat {
         Ok(())
     }
 
-    /// Open a device. Returns (device_id, fd).
-    /// The device_id is needed to close the device later.
-    pub fn open_device(&self, path: &CStr) -> anyhow::Result<(i32, RawFd)> {
+    /// Open a device
+    pub fn open_device(&self, path: &CStr) -> anyhow::Result<SeatDevice> {
         let mut fd: RawFd = 0;
         let device_id = unsafe {
             bindings::libseat_open_device(self.seat.as_ptr(), path.as_ptr(), &mut fd as *mut RawFd)
         };
 
-        if device_id >= 0 {
-            return Ok((device_id, fd));
+        if device_id >= 0 && fd > 0 {
+            return Ok(SeatDevice {
+                device_id,
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            });
         }
 
         let err = std::io::Error::last_os_error();
@@ -167,8 +180,9 @@ impl LibSeat {
     }
 
     /// Close a device by its device_id (returned from open_device)
-    pub fn close_device(&self, device_id: i32) -> anyhow::Result<()> {
-        let result = unsafe { bindings::libseat_close_device(self.seat.as_ptr(), device_id) };
+    pub fn close_device(&self, device: SeatDevice) -> anyhow::Result<()> {
+        let result =
+            unsafe { bindings::libseat_close_device(self.seat.as_ptr(), device.device_id) };
         if result < 0 {
             anyhow::bail!("Failed to close device");
         }
@@ -190,5 +204,29 @@ impl Drop for LibSeat {
         unsafe {
             bindings::libseat_close_seat(self.seat.as_ptr());
         }
+    }
+}
+
+impl Source for LibSeat {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        SourceFd(&self.fd).register(registry, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        SourceFd(&self.fd).reregister(registry, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        SourceFd(&self.fd).deregister(registry)
     }
 }

@@ -20,17 +20,18 @@ use lumalla_shared::{
     MainMessage, MessageRunner, MessageSender, RendererMessage, SeatMessage,
     message_loop_with_channel,
 };
-use mio::{Events, Poll};
+use mio::{Events, Poll, unix::SourceFd};
 use signal_hook::{consts::SIGINT, iterator::Signals};
+
+pub const LIBSEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 
 fn main() -> anyhow::Result<()> {
     let Some(global_args) = GlobalArgs::parse(args()) else {
         return Ok(());
     };
-
     init_logger(global_args.log_file.as_deref())?;
-
-    run_app(Arc::new(global_args)).inspect_err(|err| error!("An error occurred: {err}"))
+    static GLOBAL_ARGS: GlobalArgs = global_args;
+    run_app(&GLOBAL_ARGS)
 }
 
 fn init_logger(log_file: Option<&str>) -> anyhow::Result<()> {
@@ -51,7 +52,6 @@ fn init_logger(log_file: Option<&str>) -> anyhow::Result<()> {
         )
     });
     builder.init();
-
     Ok(())
 }
 
@@ -59,31 +59,16 @@ fn init_logger(log_file: Option<&str>) -> anyhow::Result<()> {
 struct MainData {
     comms: Comms,
     config_join_handle: JoinHandle<()>,
-    input_join_handle: JoinHandle<()>,
-    display_join_handle: JoinHandle<()>,
-    renderer_join_handle: JoinHandle<()>,
-    seat_join_handle: JoinHandle<()>,
     shutting_down: bool,
     shutdown_timeout: Option<Instant>,
 }
 
 impl MainData {
     /// Creates a new instance of `MainData`
-    fn new(
-        comms: Comms,
-        config_join_handle: JoinHandle<()>,
-        input_join_handle: JoinHandle<()>,
-        display_join_handle: JoinHandle<()>,
-        renderer_join_handle: JoinHandle<()>,
-        seat_join_handle: JoinHandle<()>,
-    ) -> Self {
+    fn new(comms: Comms, config_join_handle: JoinHandle<()>) -> Self {
         Self {
             comms,
             config_join_handle,
-            input_join_handle,
-            display_join_handle,
-            renderer_join_handle,
-            seat_join_handle,
             shutting_down: false,
             shutdown_timeout: None,
         }
@@ -95,41 +80,33 @@ impl MainData {
                 if !self.shutting_down {
                     self.shutting_down = true;
                     // Notify the other threads that the application is shutting down
-                    self.comms.input(InputMessage::Shutdown);
-                    self.comms.display(DisplayMessage::Shutdown);
-                    self.comms.renderer(RendererMessage::Shutdown);
                     self.comms.config(ConfigMessage::Shutdown);
-                    self.comms.seat(SeatMessage::Shutdown);
                     // Force shutdown after some time
                     self.shutdown_timeout = Some(Instant::now() + Duration::from_millis(1000));
                 }
             }
+            MainMessage::SeatEnabled => {
+                info!("Seat enabled");
+                self.seat_enabled = true;
+            }
+            MainMessage::SeatDisabled => {
+                info!("Seat disabled");
+                self.seat_enabled = false;
+            }
         }
         Ok(())
     }
+
+    fn ready_for_shutdown(&self) -> bool {
+        self.shutting_down && self.config_join_handle.is_finished()
+    }
 }
 
-/// Starts the application by creating the needed channels and starting the necessary threads. The
-/// main thread will wait for the other threads to finish before exiting.
-fn run_app(args: Arc<GlobalArgs>) -> anyhow::Result<()> {
-    // Create the channels for communication between the threads
+fn run_app(args: &'static GlobalArgs) -> anyhow::Result<()> {
     let (mut main_event_loop, main_channel, to_main) = message_loop_with_channel::<MainMessage>()?;
-    let (display_event_loop, display_channel, to_display) =
-        message_loop_with_channel::<DisplayMessage>()?;
-    let (renderer_event_loop, renderer_channel, to_renderer) =
-        message_loop_with_channel::<RendererMessage>()?;
-    let (input_event_loop, input_channel, to_input) = message_loop_with_channel::<InputMessage>()?;
     let (config_event_loop, config_channel, to_config) =
         message_loop_with_channel::<ConfigMessage>()?;
-    let (seat_event_loop, seat_channel, to_seat) = message_loop_with_channel::<SeatMessage>()?;
-    let comms = Comms::new(
-        to_main.clone(),
-        to_display,
-        to_renderer,
-        to_input,
-        to_config,
-        to_seat,
-    );
+    let comms = Comms::new(to_main.clone(), to_config);
 
     handle_signals(to_main.clone()).context("Failed to spawn signal handler thread")?;
 
@@ -143,55 +120,14 @@ fn run_app(args: Arc<GlobalArgs>) -> anyhow::Result<()> {
         args.clone(),
     )
     .context("Unable to run config thread")?;
-    // Spawn the input thread
-    let input_join_handle = run_thread::<InputState, _>(
-        comms.clone(),
-        to_main.clone(),
-        String::from("input"),
-        input_event_loop,
-        input_channel,
-        args.clone(),
-    )
-    .context("Unable to run input thread")?;
-    // Spawn the renderer thread
-    let renderer_join_handle = run_thread::<RendererState, _>(
-        comms.clone(),
-        to_main.clone(),
-        String::from("renderer"),
-        renderer_event_loop,
-        renderer_channel,
-        args.clone(),
-    )
-    .context("Unable to run renderer thread")?;
-    // Spawn the display thread
-    let display_join_handle = run_thread::<DisplayState, _>(
-        comms.clone(),
-        to_main.clone(),
-        String::from("display"),
-        display_event_loop,
-        display_channel,
-        args.clone(),
-    )
-    .context("Unable to run display thread")?;
-    // Spawn the seat thread
-    let seat_join_handle = run_thread::<SeatState, _>(
-        comms.clone(),
-        to_main.clone(),
-        String::from("seat"),
-        seat_event_loop,
-        seat_channel,
-        args,
-    )
-    .context("Unable to run seat thread")?;
 
-    let mut data = MainData::new(
-        comms,
-        config_join_handle,
-        input_join_handle,
-        display_join_handle,
-        renderer_join_handle,
-        seat_join_handle,
-    );
+    let seat_state = SeatState::new(comms.clone())?;
+    main_event_loop
+        .registry()
+        .register(&mut seat_state, LIBSEAT_TOKEN, Interest::READABLE)
+        .context("Unable to listen on seat state")?;
+
+    let mut data = MainData::new(comms, config_join_handle);
 
     let mut events = Events::with_capacity(1024);
     loop {
@@ -219,15 +155,14 @@ fn run_app(args: Arc<GlobalArgs>) -> anyhow::Result<()> {
                     }
                 }
             }
+            if event.token() == LIBSEAT_TOKEN {
+                if let Err(err) = seat_state.dispatch() {
+                    error!("Unable to dispatch seat events: {err}");
+                }
+            }
         }
 
-        if data.shutting_down
-            && data.config_join_handle.is_finished()
-            && data.input_join_handle.is_finished()
-            && data.display_join_handle.is_finished()
-            && data.renderer_join_handle.is_finished()
-            && data.seat_join_handle.is_finished()
-        {
+        if data.ready_for_shutdown() {
             break;
         }
     }
@@ -347,19 +282,8 @@ mod tests {
     #[test]
     fn main_is_shutdown_on_thread_exit() {
         let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-        let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-        let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-        let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
         let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-        let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-        let comms = Comms::new(
-            to_main.clone(),
-            to_display,
-            to_renderer,
-            to_input,
-            to_config,
-            to_seat,
-        );
+        let comms = Comms::new(to_main.clone(), to_display);
         let args = Arc::new(GlobalArgs::default());
         let (test_event_loop, test_receiver, _) = message_loop_with_channel::<()>().unwrap();
 
@@ -406,19 +330,8 @@ mod tests {
     #[test]
     fn main_is_shutdown_on_thread_panic() {
         let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-        let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-        let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-        let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
         let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-        let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-        let comms = Comms::new(
-            to_main.clone(),
-            to_display,
-            to_renderer,
-            to_input,
-            to_config,
-            to_seat,
-        );
+        let comms = Comms::new(to_main.clone(), to_display);
         let args = Arc::new(GlobalArgs::default());
         let (test_event_loop, test_receiver, _) = message_loop_with_channel::<()>().unwrap();
 
