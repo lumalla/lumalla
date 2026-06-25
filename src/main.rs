@@ -11,7 +11,7 @@ use anyhow::Context;
 use env_logger::{Builder, Target};
 use log::{error, info, warn};
 use lumalla_config::ConfigState;
-use lumalla_dbus::DbusState;
+use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::DisplayState;
 use lumalla_input::InputState;
 use lumalla_renderer::RendererState;
@@ -122,6 +122,9 @@ fn run_app(args: &'static GlobalArgs) -> anyhow::Result<()> {
         message_loop_with_channel::<DbusMessage>()?;
     let comms = Comms::new(to_main.clone(), to_config, to_dbus);
 
+    let dbus_service =
+        DbusService::register(comms.clone()).context("Failed to register D-Bus service")?;
+
     handle_signals(to_main.clone()).context("Failed to spawn signal handler thread")?;
 
     // Spawn the config thread
@@ -135,13 +138,11 @@ fn run_app(args: &'static GlobalArgs) -> anyhow::Result<()> {
     )
     .context("Unable to run config thread")?;
 
-    let dbus_join_handle = run_thread::<DbusState, _>(
-        comms.clone(),
+    let dbus_join_handle = run_dbus_thread(
         to_main.clone(),
-        String::from("dbus"),
         dbus_event_loop,
         dbus_channel,
-        args,
+        dbus_service,
     )
     .context("Unable to run D-Bus thread")?;
 

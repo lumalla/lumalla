@@ -6,6 +6,7 @@ mod types;
 
 use std::{
     sync::{Arc, Mutex, mpsc},
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
@@ -13,11 +14,11 @@ use anyhow::Context;
 use log::{error, info};
 use lumalla_ipc::{BUS_NAME, OBJECT_PATH};
 use lumalla_shared::{
-    Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageRunner,
+    Comms, DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender,
 };
 use mio::{Events, Poll};
 use types::OutputInfo;
-use zbus::{blocking::connection, interface};
+use zbus::{Error as ZbusError, blocking::connection, interface};
 
 struct WindowManager {
     comms: Comms,
@@ -39,30 +40,24 @@ impl WindowManager {
     }
 }
 
-/// Holds the state of the D-Bus service thread.
-pub struct DbusState {
-    comms: Comms,
-    channel: mpsc::Receiver<DbusMessage>,
-    event_loop: Poll,
-    shutting_down: bool,
+/// A registered D-Bus service that must be kept alive for the lifetime of the compositor.
+pub struct DbusService {
     _connection: zbus::blocking::Connection,
     outputs: Arc<Mutex<Vec<OutputInfo>>>,
 }
 
-impl MessageRunner for DbusState {
-    type Message = DbusMessage;
-
-    fn new(
-        comms: Comms,
-        event_loop: Poll,
-        channel: mpsc::Receiver<Self::Message>,
-        _args: &'static GlobalArgs,
-    ) -> anyhow::Result<Self> {
+impl DbusService {
+    /// Connect to the session bus and acquire `org.lumalla.wm`.
+    ///
+    /// Returns an error if another process already owns the name.
+    pub fn register(comms: Comms) -> anyhow::Result<Self> {
         let outputs = Arc::new(Mutex::new(Vec::new()));
         let connection = connection::Builder::session()
             .context("Failed to connect to session bus")?
             .name(BUS_NAME)
-            .context("Failed to acquire D-Bus name")?
+            .context("Invalid D-Bus name")?
+            .allow_name_replacements(false)
+            .replace_existing_names(false)
             .serve_at(
                 OBJECT_PATH,
                 WindowManager {
@@ -72,17 +67,42 @@ impl MessageRunner for DbusState {
             )
             .context("Failed to register D-Bus object")?
             .build()
-            .context("Failed to build D-Bus connection")?;
+            .map_err(|err| -> anyhow::Error {
+                if err == ZbusError::NameTaken {
+                    anyhow::anyhow!("another process already owns the D-Bus name `{BUS_NAME}`")
+                } else {
+                    err.into()
+                }
+            })?;
         info!("D-Bus service listening on {BUS_NAME}{OBJECT_PATH}");
 
         Ok(Self {
-            comms,
-            channel,
-            event_loop,
-            shutting_down: false,
             _connection: connection,
             outputs,
         })
+    }
+}
+
+/// Holds the state of the D-Bus service thread.
+struct DbusState {
+    channel: mpsc::Receiver<DbusMessage>,
+    event_loop: Poll,
+    shutting_down: bool,
+    outputs: Arc<Mutex<Vec<OutputInfo>>>,
+}
+
+impl DbusState {
+    fn new(
+        event_loop: Poll,
+        channel: mpsc::Receiver<DbusMessage>,
+        service: DbusService,
+    ) -> Self {
+        Self {
+            channel,
+            event_loop,
+            shutting_down: false,
+            outputs: service.outputs,
+        }
     }
 
     fn run(&mut self) -> anyhow::Result<()> {
@@ -112,9 +132,7 @@ impl MessageRunner for DbusState {
 
         Ok(())
     }
-}
 
-impl DbusState {
     fn handle_message(&mut self, message: DbusMessage) -> anyhow::Result<()> {
         match message {
             DbusMessage::Shutdown => {
@@ -129,27 +147,76 @@ impl DbusState {
     }
 }
 
+/// Run the D-Bus message loop on a dedicated thread.
+///
+/// The service must already be registered via [`DbusService::register`].
+pub fn run_thread(
+    to_main: MessageSender<MainMessage>,
+    event_loop: Poll,
+    channel: mpsc::Receiver<DbusMessage>,
+    service: DbusService,
+) -> anyhow::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name(String::from("dbus"))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut state = DbusState::new(event_loop, channel, service);
+                state.run().context("D-Bus thread exited with an error")
+            }));
+            match result {
+                Ok(Ok(())) => {
+                    info!("D-Bus thread exited normally");
+                }
+                Ok(Err(ref err)) => {
+                    error!("D-Bus thread exited with an error: {err}");
+                }
+                Err(ref err) => {
+                    if let Some(err) = err.downcast_ref::<&str>() {
+                        error!("D-Bus thread panicked: {err}");
+                    } else if let Some(err) = err.downcast_ref::<String>() {
+                        error!("D-Bus thread panicked: {err}");
+                    } else {
+                        error!("D-Bus thread panicked: {:?}", err);
+                    }
+                }
+            }
+
+            if let Err(err) = to_main.send(MainMessage::Shutdown) {
+                error!("Unable to send shutdown signal to main from D-Bus thread: {err}");
+            }
+        })
+        .context("Unable to spawn D-Bus thread")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use lumalla_shared::{ConfigMessage, message_loop_with_channel};
 
-    #[test]
-    fn dbus_state_registers_service() {
+    fn comms() -> Comms {
         let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
         let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-        let (_, dbus_channel, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-        let comms = Comms::new(to_main, to_config, to_dbus);
-        let (event_loop, _, _) = message_loop_with_channel::<DbusMessage>().unwrap();
-        let args: &'static GlobalArgs = Box::leak(Box::new(GlobalArgs::default()));
+        let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
+        Comms::new(to_main, to_config, to_dbus)
+    }
 
-        let state = DbusState::new(comms, event_loop, dbus_channel, args);
+    #[test]
+    fn dbus_name_registration() {
         if std::env::var("DBUS_SESSION_BUS_ADDRESS").is_err() {
-            // CI or headless environments may not have a session bus.
-            assert!(state.is_err());
             return;
         }
 
-        assert!(state.is_ok());
+        let first = DbusService::register(comms()).expect("registration should succeed");
+        drop(first);
+
+        let holder = DbusService::register(comms()).expect("registration should succeed after release");
+        let second = DbusService::register(comms());
+        assert!(second.is_err(), "second registration should fail while name is held");
+        let err = second.err().unwrap();
+        assert!(
+            format!("{err:#}").contains("already owns"),
+            "unexpected error: {err:#}"
+        );
+        drop(holder);
     }
 }
