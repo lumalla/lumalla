@@ -198,12 +198,25 @@ pub fn run_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lumalla_shared::message_loop_with_channel;
+    use lumalla_shared::{
+        DisplayMessage, InputMessage, RendererMessage, SeatMessage, message_loop_with_channel,
+    };
 
     fn comms() -> Comms {
         let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
         let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-        Comms::new(to_main, to_dbus)
+        let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
+        let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
+        let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
+        let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
+        Comms::new(
+            to_main,
+            to_dbus,
+            to_display,
+            to_input,
+            to_renderer,
+            to_seat,
+        )
     }
 
     #[test]

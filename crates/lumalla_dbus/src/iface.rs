@@ -150,6 +150,7 @@ impl WindowManager {
 
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()> {
         self.state.keymaps.lock().unwrap().clear();
+        self.state.comms.input(InputMessage::ClearKeymaps);
         Ok(())
     }
 }

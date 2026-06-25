@@ -7,6 +7,13 @@ use crate::{CallbackRef, Mods};
 pub enum InputMessage {
     /// Requests the input thread to shut down
     Shutdown,
+    /// The seat is active; libinput may enumerate devices for this seat.
+    SeatEnabled {
+        /// Seat identifier assigned by logind / libseat.
+        seat_name: String,
+    },
+    /// Clears all registered keymaps
+    ClearKeymaps,
     /// Registers a new keyboard mapping
     Keymap {
         /// The name of the key that is mapped

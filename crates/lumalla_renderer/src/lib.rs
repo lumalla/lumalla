@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
 use lumalla_shared::{
-    Comms, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner, RendererMessage, SeatMessage,
+    Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner, RendererMessage,
+    SeatMessage,
 };
 use mio::Poll;
 
@@ -162,6 +163,10 @@ impl RendererState {
             start_time: Instant::now(),
         });
 
+        let outputs = outputs_from_manager(&self.display.as_ref().unwrap().output_manager);
+        self.comms.dbus(DbusMessage::SetOutputs(outputs.clone()));
+        self.comms.dbus(DbusMessage::EmitOutputChanged(outputs));
+
         Ok(())
     }
 
@@ -258,4 +263,24 @@ impl MessageRunner for RendererState {
 
         Ok(())
     }
+}
+
+fn outputs_from_manager(manager: &OutputManager) -> Vec<lumalla_shared::Output> {
+    let mut x_offset = 0;
+    manager
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(idx, output)| {
+            let (width, height) = output.mode.size();
+            let shared = lumalla_shared::Output {
+                name: format!("output-{idx}"),
+                description: format!("{:?}", output.connector.connector_type),
+                location: (x_offset, 0),
+                size: (width as i32, height as i32),
+            };
+            x_offset += width as i32;
+            shared
+        })
+        .collect()
 }

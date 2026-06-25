@@ -1,36 +1,24 @@
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::os::fd::{OwnedFd, RawFd};
+use std::path::Path;
 
 use anyhow::Context;
-use log::{debug, error, info};
-use lumalla_shared::{
-    Comms, DisplayMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner, RendererMessage,
-    SeatMessage,
-};
-use mio::event::Source;
-use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Registry, Token};
+use lumalla_shared::Comms;
 
-use crate::libseat::{LibSeat, SeatDevice};
+use crate::libseat::LibSeat;
 
 mod libseat;
 
 pub struct SeatState {
-    comms: Comms,
-    shutting_down: bool,
     seat: LibSeat,
     seat_enabled: bool,
 }
 
 impl SeatState {
     pub fn new(comms: Comms) -> anyhow::Result<Self> {
-        let seat = LibSeat::new(comms.clone()).context("Failed to create seat")?;
+        let seat = LibSeat::new(comms).context("Failed to create seat")?;
         Ok(Self {
-            comms,
-            shutting_down: false,
             seat,
             seat_enabled: false,
         })
@@ -46,61 +34,46 @@ impl SeatState {
             .context("Failed to dispatch libseat events")
     }
 
-    fn handle_message(&mut self, message: SeatMessage) -> anyhow::Result<()> {
-        match message {
-            SeatMessage::Shutdown => {
-                self.shutting_down = true;
-            }
-            SeatMessage::SeatEnabled => {
-                info!("Seat enabled");
-                self.seat_enabled = true;
+    pub fn seat_name(&self) -> anyhow::Result<String> {
+        self.seat.seat_name()
+    }
 
-                let seat_name = self.seat.seat_name().context("Failed to get seat name")?;
-                self.comms
-                    .display(DisplayMessage::ActivateSeat(seat_name.clone()));
-                self.comms
-                    .renderer(RendererMessage::SeatSessionCreated { seat_name });
-            }
-            SeatMessage::SeatDisabled => {
-                info!("Seat disabled");
-                self.seat_enabled = false;
-            }
-            SeatMessage::OpenDevice { path } => {
-                self.open_device(&path)?;
-            }
-        }
+    pub fn is_enabled(&self) -> bool {
+        self.seat_enabled
+    }
 
-        Ok(())
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.seat_enabled = enabled;
     }
 
     /// Open the device from the given path
-    pub fn open_device(&mut self, path: &Path) -> anyhow::Result<SeatDevice> {
+    pub fn open_device(&mut self, path: &Path) -> anyhow::Result<OwnedFd> {
         let path_str = path.to_str().context("Device path is not valid UTF-8")?;
         let c_path = CString::new(path_str).context("Device path contains null byte")?;
-        self.seat.open_device(&c_path)
+        Ok(self.seat.open_device(&c_path)?.into_fd())
     }
 }
 
-impl Source for SeatState {
+impl mio::event::Source for SeatState {
     fn register(
         &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
+        registry: &mio::Registry,
+        token: mio::Token,
+        interests: mio::Interest,
     ) -> io::Result<()> {
         self.seat.register(registry, token, interests)
     }
 
     fn reregister(
         &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
+        registry: &mio::Registry,
+        token: mio::Token,
+        interests: mio::Interest,
     ) -> io::Result<()> {
         self.seat.reregister(registry, token, interests)
     }
 
-    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+    fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()> {
         self.seat.deregister(registry)
     }
 }

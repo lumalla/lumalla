@@ -54,6 +54,12 @@ pub struct SeatDevice {
     fd: OwnedFd,
 }
 
+impl SeatDevice {
+    pub(crate) fn into_fd(self) -> OwnedFd {
+        self.fd
+    }
+}
+
 /// Safe wrapper around libseat
 pub struct LibSeat {
     seat: NonNull<bindings::libseat>,
