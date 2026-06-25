@@ -33,7 +33,7 @@ impl MessageRunner for InputState {
         comms: Comms,
         event_loop: Poll,
         channel: mpsc::Receiver<Self::Message>,
-        _args: Arc<GlobalArgs>,
+        _args: &'static GlobalArgs,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             _comms: comms,

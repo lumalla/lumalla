@@ -1,5 +1,5 @@
 /// Global arguments provided at process start
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GlobalArgs {
     /// Path to log file
     pub log_file: Option<String>,

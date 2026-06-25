@@ -1,4 +1,4 @@
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 
 use mio::Poll;
 
@@ -15,7 +15,7 @@ pub trait MessageRunner {
         comms: Comms,
         event_loop: Poll,
         channel: mpsc::Receiver<Self::Message>,
-        args: Arc<GlobalArgs>,
+        args: &'static GlobalArgs,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;

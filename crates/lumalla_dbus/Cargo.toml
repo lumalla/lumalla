@@ -1,0 +1,18 @@
+[package]
+name = "lumalla_dbus"
+version = "0.1.0"
+edition = "2024"
+description = "D-Bus server for the Lumalla compositor"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lumalla/lumalla"
+include = ["src/**/*", "LICENSE-*"]
+
+[dependencies]
+lumalla_ipc = { path = "../lumalla_ipc" }
+lumalla_shared = { path = "../lumalla_shared" }
+anyhow = { workspace = true }
+log = { workspace = true }
+mio = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+zbus = { version = "5.16", features = ["blocking-api"] }
+

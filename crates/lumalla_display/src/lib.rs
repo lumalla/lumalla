@@ -25,7 +25,7 @@ pub struct DisplayState {
     event_loop: Poll,
     channel: mpsc::Receiver<DisplayMessage>,
     shutting_down: bool,
-    args: Arc<GlobalArgs>,
+    args: &'static GlobalArgs,
     globals: Globals,
     surface_manager: SurfaceManager,
     shm_manager: ShmManager,
@@ -62,7 +62,7 @@ impl MessageRunner for DisplayState {
         comms: Comms,
         event_loop: Poll,
         channel: mpsc::Receiver<Self::Message>,
-        args: Arc<GlobalArgs>,
+        args: &'static GlobalArgs,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             _comms: comms,

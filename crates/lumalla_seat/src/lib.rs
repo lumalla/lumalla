@@ -19,6 +19,7 @@ use crate::libseat::{LibSeat, SeatDevice};
 mod libseat;
 
 pub struct SeatState {
+    comms: Comms,
     shutting_down: bool,
     seat: LibSeat,
     seat_enabled: bool,
@@ -28,6 +29,7 @@ impl SeatState {
     pub fn new(comms: Comms) -> anyhow::Result<Self> {
         let seat = LibSeat::new(comms.clone()).context("Failed to create seat")?;
         Ok(Self {
+            comms,
             shutting_down: false,
             seat,
             seat_enabled: false,
@@ -64,7 +66,7 @@ impl SeatState {
                 self.seat_enabled = false;
             }
             SeatMessage::OpenDevice { path } => {
-                self.open_device(path)?;
+                self.open_device(&path)?;
             }
         }
 

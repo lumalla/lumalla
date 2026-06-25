@@ -193,7 +193,7 @@ impl MessageRunner for RendererState {
         comms: Comms,
         event_loop: Poll,
         channel: mpsc::Receiver<Self::Message>,
-        _args: Arc<GlobalArgs>,
+        _args: &'static GlobalArgs,
     ) -> anyhow::Result<Self> {
         // NOTE: Vulkan initialization is deferred until after the DRM device is opened.
         // This is because Vulkan may open card nodes during init (for VK_EXT_physical_device_drm),

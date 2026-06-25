@@ -2,7 +2,7 @@ use std::{
     env::args,
     fs::OpenOptions,
     io::Write,
-    sync::{Arc, mpsc},
+    sync::mpsc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -11,16 +11,17 @@ use anyhow::Context;
 use env_logger::{Builder, Target};
 use log::{error, info, warn};
 use lumalla_config::ConfigState;
+use lumalla_dbus::DbusState;
 use lumalla_display::DisplayState;
 use lumalla_input::InputState;
 use lumalla_renderer::RendererState;
 use lumalla_seat::SeatState;
 use lumalla_shared::{
-    Comms, ConfigMessage, DisplayMessage, GlobalArgs, InputMessage, MESSAGE_CHANNEL_TOKEN,
+    Comms, ConfigMessage, DbusMessage, GlobalArgs, InputMessage, MESSAGE_CHANNEL_TOKEN,
     MainMessage, MessageRunner, MessageSender, RendererMessage, SeatMessage,
     message_loop_with_channel,
 };
-use mio::{Events, Poll, unix::SourceFd};
+use mio::{Events, Interest, Poll, Token, unix::SourceFd};
 use signal_hook::{consts::SIGINT, iterator::Signals};
 
 pub const LIBSEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
@@ -30,8 +31,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     };
     init_logger(global_args.log_file.as_deref())?;
-    static GLOBAL_ARGS: GlobalArgs = global_args;
-    run_app(&GLOBAL_ARGS)
+    let global_args: &'static GlobalArgs = Box::leak(Box::new(global_args));
+    run_app(global_args)
 }
 
 fn init_logger(log_file: Option<&str>) -> anyhow::Result<()> {
@@ -59,18 +60,26 @@ fn init_logger(log_file: Option<&str>) -> anyhow::Result<()> {
 struct MainData {
     comms: Comms,
     config_join_handle: JoinHandle<()>,
+    dbus_join_handle: JoinHandle<()>,
     shutting_down: bool,
     shutdown_timeout: Option<Instant>,
+    seat_enabled: bool,
 }
 
 impl MainData {
     /// Creates a new instance of `MainData`
-    fn new(comms: Comms, config_join_handle: JoinHandle<()>) -> Self {
+    fn new(
+        comms: Comms,
+        config_join_handle: JoinHandle<()>,
+        dbus_join_handle: JoinHandle<()>,
+    ) -> Self {
         Self {
             comms,
             config_join_handle,
+            dbus_join_handle,
             shutting_down: false,
             shutdown_timeout: None,
+            seat_enabled: false,
         }
     }
 
@@ -81,6 +90,7 @@ impl MainData {
                     self.shutting_down = true;
                     // Notify the other threads that the application is shutting down
                     self.comms.config(ConfigMessage::Shutdown);
+                    self.comms.dbus(DbusMessage::Shutdown);
                     // Force shutdown after some time
                     self.shutdown_timeout = Some(Instant::now() + Duration::from_millis(1000));
                 }
@@ -98,7 +108,9 @@ impl MainData {
     }
 
     fn ready_for_shutdown(&self) -> bool {
-        self.shutting_down && self.config_join_handle.is_finished()
+        self.shutting_down
+            && self.config_join_handle.is_finished()
+            && self.dbus_join_handle.is_finished()
     }
 }
 
@@ -106,7 +118,9 @@ fn run_app(args: &'static GlobalArgs) -> anyhow::Result<()> {
     let (mut main_event_loop, main_channel, to_main) = message_loop_with_channel::<MainMessage>()?;
     let (config_event_loop, config_channel, to_config) =
         message_loop_with_channel::<ConfigMessage>()?;
-    let comms = Comms::new(to_main.clone(), to_config);
+    let (dbus_event_loop, dbus_channel, to_dbus) =
+        message_loop_with_channel::<DbusMessage>()?;
+    let comms = Comms::new(to_main.clone(), to_config, to_dbus);
 
     handle_signals(to_main.clone()).context("Failed to spawn signal handler thread")?;
 
@@ -117,17 +131,27 @@ fn run_app(args: &'static GlobalArgs) -> anyhow::Result<()> {
         String::from("config"),
         config_event_loop,
         config_channel,
-        args.clone(),
+        args,
     )
     .context("Unable to run config thread")?;
 
-    let seat_state = SeatState::new(comms.clone())?;
+    let dbus_join_handle = run_thread::<DbusState, _>(
+        comms.clone(),
+        to_main.clone(),
+        String::from("dbus"),
+        dbus_event_loop,
+        dbus_channel,
+        args,
+    )
+    .context("Unable to run D-Bus thread")?;
+
+    let mut seat_state = SeatState::new(comms.clone())?;
     main_event_loop
         .registry()
         .register(&mut seat_state, LIBSEAT_TOKEN, Interest::READABLE)
         .context("Unable to listen on seat state")?;
 
-    let mut data = MainData::new(comms, config_join_handle);
+    let mut data = MainData::new(comms, config_join_handle, dbus_join_handle);
 
     let mut events = Events::with_capacity(1024);
     loop {
@@ -179,7 +203,7 @@ fn run_thread<R, M>(
     name: String,
     event_loop: Poll,
     channel: mpsc::Receiver<M>,
-    args: Arc<GlobalArgs>,
+    args: &'static GlobalArgs,
 ) -> anyhow::Result<JoinHandle<()>>
 where
     R: MessageRunner<Message = M>,
@@ -269,7 +293,7 @@ mod tests {
             _comms: Comms,
             _event_loop: Poll,
             _channel: mpsc::Receiver<Self::Message>,
-            _args: Arc<GlobalArgs>,
+            _args: &'static GlobalArgs,
         ) -> anyhow::Result<Self> {
             Ok(Self)
         }
@@ -283,8 +307,9 @@ mod tests {
     fn main_is_shutdown_on_thread_exit() {
         let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
         let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-        let comms = Comms::new(to_main.clone(), to_display);
-        let args = Arc::new(GlobalArgs::default());
+        let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
+        let comms = Comms::new(to_main.clone(), to_config, to_dbus);
+        let args: &'static GlobalArgs = Box::leak(Box::new(GlobalArgs::default()));
         let (test_event_loop, test_receiver, _) = message_loop_with_channel::<()>().unwrap();
 
         let join_handle = run_thread::<TestRunner, _>(
@@ -317,7 +342,7 @@ mod tests {
             _comms: Comms,
             _event_loop: Poll,
             _channel: mpsc::Receiver<Self::Message>,
-            _args: Arc<GlobalArgs>,
+            _args: &'static GlobalArgs,
         ) -> anyhow::Result<Self> {
             Ok(Self)
         }
@@ -331,8 +356,9 @@ mod tests {
     fn main_is_shutdown_on_thread_panic() {
         let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
         let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-        let comms = Comms::new(to_main.clone(), to_display);
-        let args = Arc::new(GlobalArgs::default());
+        let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
+        let comms = Comms::new(to_main.clone(), to_config, to_dbus);
+        let args: &'static GlobalArgs = Box::leak(Box::new(GlobalArgs::default()));
         let (test_event_loop, test_receiver, _) = message_loop_with_channel::<()>().unwrap();
 
         let join_handle = run_thread::<PanickingTestRunner, _>(

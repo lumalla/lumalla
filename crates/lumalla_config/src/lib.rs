@@ -50,7 +50,7 @@ impl MessageRunner for ConfigState {
         comms: Comms,
         event_loop: Poll,
         channel: mpsc::Receiver<Self::Message>,
-        args: Arc<GlobalArgs>,
+        args: &'static GlobalArgs,
     ) -> anyhow::Result<Self> {
         let config_watcher =
             ConfigWatcher::new(comms.config_sender()).context("Failed to create config watcher")?;
@@ -197,7 +197,7 @@ impl ConfigState {
     /// Initialize the lua state and starts requires some lua modules
     fn load_user_config(
         &mut self,
-        args: Arc<GlobalArgs>,
+        args: &'static GlobalArgs,
         callback_state: CallbackState,
     ) -> anyhow::Result<()> {
         let comms = self.comms.clone();
@@ -221,7 +221,7 @@ impl ConfigState {
         Ok(())
     }
 
-    fn run_and_watch_user_config(&mut self, args: Arc<GlobalArgs>) -> anyhow::Result<()> {
+    fn run_and_watch_user_config(&mut self, args: &'static GlobalArgs) -> anyhow::Result<()> {
         if let Some(config_path) = &args.config {
             self.load_config(config_path.as_ref())?;
         } else {

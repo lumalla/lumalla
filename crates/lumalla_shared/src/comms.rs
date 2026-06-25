@@ -2,7 +2,10 @@ use log::warn;
 use mio::{Poll, Waker};
 use std::sync::{Arc, mpsc};
 
-use crate::{ConfigMessage, MESSAGE_CHANNEL_TOKEN, MainMessage};
+use crate::{
+    ConfigMessage, DbusMessage, DisplayMessage, InputMessage, MESSAGE_CHANNEL_TOKEN, MainMessage,
+    RendererMessage, SeatMessage,
+};
 
 /// Create a new event loop with a message channel already set up
 pub fn message_loop_with_channel<M>() -> anyhow::Result<(Poll, mpsc::Receiver<M>, MessageSender<M>)>
@@ -55,6 +58,7 @@ impl<T> MessageSender<T> {
 pub struct Comms {
     to_main: MessageSender<MainMessage>,
     to_config: MessageSender<ConfigMessage>,
+    to_dbus: MessageSender<DbusMessage>,
 }
 
 impl std::fmt::Debug for Comms {
@@ -68,18 +72,24 @@ impl Comms {
     pub fn new(
         to_main: MessageSender<MainMessage>,
         to_config: MessageSender<ConfigMessage>,
+        to_dbus: MessageSender<DbusMessage>,
     ) -> Self {
-        Comms { to_main, to_config }
+        Comms {
+            to_main,
+            to_config,
+            to_dbus,
+        }
     }
 
     /// Sends a message to the main thread.
     ///
     /// # Example
     /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, message_loop_with_channel};
+    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, DbusMessage, message_loop_with_channel};
     /// # let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
     /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_config);
+    /// # let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
+    /// # let comms = Comms::new(to_main, to_config, to_dbus);
     /// comms.main(MainMessage::Shutdown);
     /// assert!(matches!(main_channel.recv().unwrap(), MainMessage::Shutdown));
     /// ```
@@ -93,10 +103,11 @@ impl Comms {
     ///
     /// # Example
     /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, message_loop_with_channel};
+    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, DbusMessage, message_loop_with_channel};
     /// # let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
     /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_config);
+    /// # let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
+    /// # let comms = Comms::new(to_main, to_config, to_dbus);
     /// let sender = comms.main_sender();
     /// sender.send(MainMessage::Shutdown).unwrap();
     /// assert!(matches!(main_channel.recv().unwrap(), MainMessage::Shutdown));
@@ -109,10 +120,11 @@ impl Comms {
     ///
     /// # Example
     /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, message_loop_with_channel};
+    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, DbusMessage, message_loop_with_channel};
     /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
     /// # let (_, config_channel, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_config);
+    /// # let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
+    /// # let comms = Comms::new(to_main, to_config, to_dbus);
     /// comms.config(ConfigMessage::Shutdown);
     /// assert!(matches!(config_channel.recv().unwrap(), ConfigMessage::Shutdown));
     /// ```
@@ -129,16 +141,55 @@ impl Comms {
     ///
     /// # Example
     /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, message_loop_with_channel};
+    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, DbusMessage, message_loop_with_channel};
     /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
     /// # let (_, config_channel, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_config);
+    /// # let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
+    /// # let comms = Comms::new(to_main, to_config, to_dbus);
     /// let sender = comms.config_sender();
     /// sender.send(ConfigMessage::Shutdown).unwrap();
     /// assert!(matches!(config_channel.recv().unwrap(), ConfigMessage::Shutdown));
     /// ```
     pub fn config_sender(&self) -> MessageSender<ConfigMessage> {
         self.to_config.clone()
+    }
+
+    /// Sends a message to the D-Bus thread.
+    pub fn dbus(&self, message: DbusMessage) {
+        if let Err(e) = self.to_dbus.send(message) {
+            warn!("Lost connection to D-Bus ({e}). Requesting shutdown");
+            self.to_main
+                .send(MainMessage::Shutdown)
+                .expect("Lost connection to the main thread");
+        }
+    }
+
+    /// Get a message sender for sending messages to the D-Bus thread.
+    pub fn dbus_sender(&self) -> MessageSender<DbusMessage> {
+        self.to_dbus.clone()
+    }
+
+    /// Sends a message to the seat handler.
+    ///
+    /// The seat currently runs on the main thread; this is a temporary stub until a dedicated
+    /// seat channel is wired up.
+    pub fn seat(&self, message: SeatMessage) {
+        warn!("Seat message not delivered (no seat channel yet): {message:?}");
+    }
+
+    /// Sends a message to the display thread.
+    pub fn display(&self, message: DisplayMessage) {
+        warn!("Display message not delivered (no display channel yet): {message:?}");
+    }
+
+    /// Sends a message to the input thread.
+    pub fn input(&self, message: InputMessage) {
+        warn!("Input message not delivered (no input channel yet): {message:?}");
+    }
+
+    /// Sends a message to the renderer thread.
+    pub fn renderer(&self, message: RendererMessage) {
+        warn!("Renderer message not delivered (no renderer channel yet): {message:?}");
     }
 }
 
@@ -150,19 +201,22 @@ mod tests {
     struct Receivers {
         main: mpsc::Receiver<MainMessage>,
         config: mpsc::Receiver<ConfigMessage>,
+        dbus: mpsc::Receiver<DbusMessage>,
     }
 
     fn comms() -> (Comms, Receivers) {
         let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
         let (_, config_channel, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
+        let (_, dbus_channel, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
 
-        let comms = Comms::new(to_main, to_config);
+        let comms = Comms::new(to_main, to_config, to_dbus);
 
         (
             comms,
             Receivers {
                 main: main_channel,
                 config: config_channel,
+                dbus: dbus_channel,
             },
         )
     }
