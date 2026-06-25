@@ -3,8 +3,8 @@ use mio::{Poll, Waker};
 use std::sync::{Arc, mpsc};
 
 use crate::{
-    ConfigMessage, DbusMessage, DisplayMessage, InputMessage, MESSAGE_CHANNEL_TOKEN, MainMessage,
-    RendererMessage, SeatMessage,
+    DbusMessage, DisplayMessage, InputMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, RendererMessage,
+    SeatMessage,
 };
 
 /// Create a new event loop with a message channel already set up
@@ -57,7 +57,6 @@ impl<T> MessageSender<T> {
 #[derive(Clone)]
 pub struct Comms {
     to_main: MessageSender<MainMessage>,
-    to_config: MessageSender<ConfigMessage>,
     to_dbus: MessageSender<DbusMessage>,
 }
 
@@ -69,14 +68,9 @@ impl std::fmt::Debug for Comms {
 
 impl Comms {
     /// Creates a new instance of `Comms` with the given channels.
-    pub fn new(
-        to_main: MessageSender<MainMessage>,
-        to_config: MessageSender<ConfigMessage>,
-        to_dbus: MessageSender<DbusMessage>,
-    ) -> Self {
+    pub fn new(to_main: MessageSender<MainMessage>, to_dbus: MessageSender<DbusMessage>) -> Self {
         Comms {
             to_main,
-            to_config,
             to_dbus,
         }
     }
@@ -85,11 +79,10 @@ impl Comms {
     ///
     /// # Example
     /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, DbusMessage, message_loop_with_channel};
+    /// # use lumalla_shared::{Comms, MainMessage, DbusMessage, message_loop_with_channel};
     /// # let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
     /// # let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_config, to_dbus);
+    /// # let comms = Comms::new(to_main, to_dbus);
     /// comms.main(MainMessage::Shutdown);
     /// assert!(matches!(main_channel.recv().unwrap(), MainMessage::Shutdown));
     /// ```
@@ -103,55 +96,16 @@ impl Comms {
     ///
     /// # Example
     /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, DbusMessage, message_loop_with_channel};
+    /// # use lumalla_shared::{Comms, MainMessage, DbusMessage, message_loop_with_channel};
     /// # let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
     /// # let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_config, to_dbus);
+    /// # let comms = Comms::new(to_main, to_dbus);
     /// let sender = comms.main_sender();
     /// sender.send(MainMessage::Shutdown).unwrap();
     /// assert!(matches!(main_channel.recv().unwrap(), MainMessage::Shutdown));
     /// ```
     pub fn main_sender(&self) -> MessageSender<MainMessage> {
         self.to_main.clone()
-    }
-
-    /// Sends a message to the config thread.
-    ///
-    /// # Example
-    /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, DbusMessage, message_loop_with_channel};
-    /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, config_channel, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_config, to_dbus);
-    /// comms.config(ConfigMessage::Shutdown);
-    /// assert!(matches!(config_channel.recv().unwrap(), ConfigMessage::Shutdown));
-    /// ```
-    pub fn config(&self, message: ConfigMessage) {
-        if let Err(e) = self.to_config.send(message) {
-            warn!("Lost connection to config ({e}). Requesting shutdown");
-            self.to_main
-                .send(MainMessage::Shutdown)
-                .expect("Lost connection to the main thread");
-        }
-    }
-
-    /// Get a message sender for sending messages to the config thread.
-    ///
-    /// # Example
-    /// ```
-    /// # use lumalla_shared::{Comms, MainMessage, ConfigMessage, DbusMessage, message_loop_with_channel};
-    /// # let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-    /// # let (_, config_channel, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
-    /// # let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-    /// # let comms = Comms::new(to_main, to_config, to_dbus);
-    /// let sender = comms.config_sender();
-    /// sender.send(ConfigMessage::Shutdown).unwrap();
-    /// assert!(matches!(config_channel.recv().unwrap(), ConfigMessage::Shutdown));
-    /// ```
-    pub fn config_sender(&self) -> MessageSender<ConfigMessage> {
-        self.to_config.clone()
     }
 
     /// Sends a message to the D-Bus thread.
@@ -200,22 +154,19 @@ mod tests {
 
     struct Receivers {
         main: mpsc::Receiver<MainMessage>,
-        config: mpsc::Receiver<ConfigMessage>,
         dbus: mpsc::Receiver<DbusMessage>,
     }
 
     fn comms() -> (Comms, Receivers) {
         let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-        let (_, config_channel, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
         let (_, dbus_channel, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
 
-        let comms = Comms::new(to_main, to_config, to_dbus);
+        let comms = Comms::new(to_main, to_dbus);
 
         (
             comms,
             Receivers {
                 main: main_channel,
-                config: config_channel,
                 dbus: dbus_channel,
             },
         )
@@ -226,20 +177,18 @@ mod tests {
     fn to_main_panics_on_lost_connection() {
         let (comms, receivers) = comms();
 
-        // Close the channel to the main thread
         drop(receivers.main);
 
         comms.main(MainMessage::Shutdown);
     }
 
     #[test]
-    fn to_config_sends_shutdown_to_main_on_lost_connection_to_config() {
+    fn to_dbus_sends_shutdown_to_main_on_lost_connection_to_dbus() {
         let (comms, receivers) = comms();
 
-        // Close the config channel
-        drop(receivers.config);
+        drop(receivers.dbus);
 
-        comms.config(ConfigMessage::Shutdown);
+        comms.dbus(DbusMessage::Shutdown);
         assert!(matches!(
             receivers.main.recv().unwrap(),
             MainMessage::Shutdown
@@ -248,13 +197,12 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn to_config_panics_on_lost_connection_to_config_and_main() {
+    fn to_dbus_panics_on_lost_connection_to_dbus_and_main() {
         let (comms, receivers) = comms();
 
-        // Close the config and main channels
-        drop(receivers.config);
+        drop(receivers.dbus);
         drop(receivers.main);
 
-        comms.config(ConfigMessage::Shutdown);
+        comms.dbus(DbusMessage::Shutdown);
     }
 }

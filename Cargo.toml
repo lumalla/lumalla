@@ -38,7 +38,6 @@ bindgen = "0.72"
 pkg-config = "0.3"
 
 [dependencies]
-lumalla_config = { path = "./crates/lumalla_config", version = "^0.1.0" }
 lumalla_dbus = { path = "./crates/lumalla_dbus", version = "^0.1.0" }
 lumalla_display = { path = "./crates/lumalla_display", version = "^0.1.0" }
 lumalla_input = { path = "./crates/lumalla_input", version = "^0.1.0" }

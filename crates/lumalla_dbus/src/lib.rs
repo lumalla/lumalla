@@ -198,13 +198,12 @@ pub fn run_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lumalla_shared::{ConfigMessage, message_loop_with_channel};
+    use lumalla_shared::message_loop_with_channel;
 
     fn comms() -> Comms {
         let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-        let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
         let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-        Comms::new(to_main, to_config, to_dbus)
+        Comms::new(to_main, to_dbus)
     }
 
     #[test]

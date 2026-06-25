@@ -608,6 +608,25 @@ pub(crate) fn load_config_files(lua: &Lua, args: &GlobalArgs) -> anyhow::Result<
     Ok(())
 }
 
+pub(crate) fn watch_config_files(
+    watcher: &mut crate::config_watcher::ConfigWatcher,
+    args: &GlobalArgs,
+) -> anyhow::Result<()> {
+    if let Some(config_path) = &args.config {
+        watcher.watch(config_path.as_ref())?;
+    } else {
+        let xdg_dirs = xdg::BaseDirectories::with_prefix("lumalla").unwrap();
+        for path in xdg_dirs.list_config_files("") {
+            watcher.watch(path.as_ref())?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reload_config_file(lua: &Lua, path: &std::path::Path) -> anyhow::Result<()> {
+    exec_config_file(lua, path)
+}
+
 fn exec_config_file(lua: &Lua, path: &std::path::Path) -> anyhow::Result<()> {
     let user_config = std::fs::read(path)?;
     lua.load(&user_config)

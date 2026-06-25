@@ -1,8 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use anyhow::Context;
 use log::error;
-use lumalla_shared::{ConfigMessage, MessageSender};
 use notify::{
     EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind, recommended_watcher,
 };
@@ -12,23 +12,20 @@ pub struct ConfigWatcher {
 }
 
 impl ConfigWatcher {
-    pub fn new(message_sender: MessageSender<ConfigMessage>) -> anyhow::Result<Self> {
+    pub fn new(reload_tx: mpsc::Sender<PathBuf>) -> anyhow::Result<Self> {
         let watcher =
             recommended_watcher(move |event_res: Result<notify::Event, notify::Error>| {
                 match &event_res {
                     Ok(event) => {
                         match &event.kind {
                             EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_)) => {
-                                // No change to file contents
                                 return;
                             }
                             _ => {}
                         }
 
                         for path in &event.paths {
-                            if let Err(e) =
-                                message_sender.send(ConfigMessage::LoadConfig(path.to_owned()))
-                            {
+                            if let Err(e) = reload_tx.send(path.to_owned()) {
                                 error!("Failed to send config change notification: {e}");
                                 return;
                             }

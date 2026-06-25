@@ -11,18 +11,13 @@ use std::{
 use anyhow::Context;
 use env_logger::{Builder, Target};
 use log::{error, info, warn};
-use lumalla_config::ConfigState;
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
-use lumalla_display::DisplayState;
-use lumalla_input::InputState;
-use lumalla_renderer::RendererState;
 use lumalla_seat::SeatState;
 use lumalla_shared::{
-    Comms, ConfigMessage, DbusMessage, GlobalArgs, InputMessage, MESSAGE_CHANNEL_TOKEN,
-    MainMessage, MessageRunner, MessageSender, RendererMessage, SeatMessage,
-    message_loop_with_channel,
+    Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageRunner,
+    MessageSender, message_loop_with_channel,
 };
-use mio::{Events, Interest, Poll, Token, unix::SourceFd};
+use mio::{Events, Interest, Poll, Token};
 use signal_hook::{consts::SIGINT, iterator::Signals};
 
 pub const LIBSEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
@@ -60,8 +55,7 @@ fn init_logger(log_file: Option<&str>) -> anyhow::Result<()> {
 /// Represents the data for the main thread
 struct MainData {
     comms: Comms,
-    config_join_handle: Option<JoinHandle<()>>,
-    external_config_child: Option<Child>,
+    config_child: Option<Child>,
     dbus_join_handle: JoinHandle<()>,
     shutting_down: bool,
     shutdown_timeout: Option<Instant>,
@@ -71,14 +65,12 @@ struct MainData {
 impl MainData {
     fn new(
         comms: Comms,
-        config_join_handle: Option<JoinHandle<()>>,
-        external_config_child: Option<Child>,
+        config_child: Option<Child>,
         dbus_join_handle: JoinHandle<()>,
     ) -> Self {
         Self {
             comms,
-            config_join_handle,
-            external_config_child,
+            config_child,
             dbus_join_handle,
             shutting_down: false,
             shutdown_timeout: None,
@@ -91,10 +83,12 @@ impl MainData {
             MainMessage::Shutdown => {
                 if !self.shutting_down {
                     self.shutting_down = true;
-                    // Notify the other threads that the application is shutting down
-                    self.comms.config(ConfigMessage::Shutdown);
                     self.comms.dbus(DbusMessage::Shutdown);
-                    // Force shutdown after some time
+                    if let Some(child) = &mut self.config_child {
+                        if let Err(err) = child.kill() {
+                            warn!("Failed to stop config process: {err}");
+                        }
+                    }
                     self.shutdown_timeout = Some(Instant::now() + Duration::from_millis(1000));
                 }
             }
@@ -115,13 +109,7 @@ impl MainData {
             return false;
         }
 
-        if let Some(config_join_handle) = &self.config_join_handle {
-            if !config_join_handle.is_finished() {
-                return false;
-            }
-        }
-
-        if let Some(child) = self.external_config_child.as_mut() {
+        if let Some(child) = self.config_child.as_mut() {
             match child.try_wait() {
                 Ok(Some(_)) => {}
                 Ok(None) => return false,
@@ -135,39 +123,19 @@ impl MainData {
 
 fn run_app(args: &'static GlobalArgs) -> anyhow::Result<()> {
     let (mut main_event_loop, main_channel, to_main) = message_loop_with_channel::<MainMessage>()?;
-    let (config_event_loop, config_channel, to_config) =
-        message_loop_with_channel::<ConfigMessage>()?;
     let (dbus_event_loop, dbus_channel, to_dbus) =
         message_loop_with_channel::<DbusMessage>()?;
-    let comms = Comms::new(to_main.clone(), to_config, to_dbus);
+    let comms = Comms::new(to_main.clone(), to_dbus);
 
     let dbus_service =
         DbusService::register(comms.clone()).context("Failed to register D-Bus service")?;
 
     handle_signals(to_main.clone()).context("Failed to spawn signal handler thread")?;
 
-    let external_config_child = if args.external_config && !args.no_config {
-        Some(spawn_external_config(args)?)
-    } else {
+    let config_child = if args.no_config {
         None
-    };
-
-    let config_join_handle = if args.no_config {
-        Some(run_config_shutdown_listener(config_channel))
-    } else if args.external_config {
-        Some(run_config_shutdown_listener(config_channel))
     } else {
-        Some(
-            run_thread::<ConfigState, _>(
-                comms.clone(),
-                to_main.clone(),
-                String::from("config"),
-                config_event_loop,
-                config_channel,
-                args,
-            )
-            .context("Unable to run config thread")?,
-        )
+        Some(spawn_config(args)?)
     };
 
     let dbus_join_handle = run_dbus_thread(
@@ -186,12 +154,7 @@ fn run_app(args: &'static GlobalArgs) -> anyhow::Result<()> {
         .register(&mut seat_state, LIBSEAT_TOKEN, Interest::READABLE)
         .context("Unable to listen on seat state")?;
 
-    let mut data = MainData::new(
-        comms,
-        config_join_handle,
-        external_config_child,
-        dbus_join_handle,
-    );
+    let mut data = MainData::new(comms, config_child, dbus_join_handle);
 
     let mut events = Events::with_capacity(1024);
     loop {
@@ -234,6 +197,7 @@ fn run_app(args: &'static GlobalArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 /// Spawns a new thread and runs the message runner in it, returning a handle to the newly created
 /// thread. The spawned thread is wrapped in a panic handler to gracefully handle any panics that
 /// might occur.
@@ -249,7 +213,6 @@ where
     R: MessageRunner<Message = M>,
     M: Send + 'static,
 {
-    let thread_name = name.clone();
     let join_handle = thread::Builder::new()
         .name(name)
         .spawn(move || {
@@ -276,8 +239,6 @@ where
             }
             info!("Sending shutdown signal to main, because thread is about to exit");
 
-            // The thread should only exit if the main thread has already sent a shutdown signal,
-            // but in case something is wrong, we send a shutdown signal to the main thread anyway.
             if let Err(err) = to_main.send(MainMessage::Shutdown) {
                 warn!("Unable to send shutdown signal to main: {err}");
             }
@@ -287,7 +248,7 @@ where
     Ok(join_handle)
 }
 
-fn spawn_external_config(args: &GlobalArgs) -> anyhow::Result<Child> {
+fn spawn_config(args: &GlobalArgs) -> anyhow::Result<Child> {
     let command = args
         .config_command
         .as_deref()
@@ -300,20 +261,7 @@ fn spawn_external_config(args: &GlobalArgs) -> anyhow::Result<Child> {
         cmd.arg("--log-file").arg(log_file);
     }
     cmd.spawn()
-        .with_context(|| format!("Failed to spawn external config command `{command}`"))
-}
-
-fn run_config_shutdown_listener(channel: mpsc::Receiver<ConfigMessage>) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name(String::from("config-shutdown"))
-        .spawn(move || {
-            while let Ok(message) = channel.recv() {
-                if matches!(message, ConfigMessage::Shutdown) {
-                    break;
-                }
-            }
-        })
-        .expect("Failed to spawn config shutdown listener")
+        .with_context(|| format!("Failed to spawn config command `{command}`"))
 }
 
 /// Handles signals sent to the process, such as SIGINT (Ctrl+C).
@@ -375,9 +323,8 @@ mod tests {
     #[test]
     fn main_is_shutdown_on_thread_exit() {
         let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-        let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
         let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-        let comms = Comms::new(to_main.clone(), to_config, to_dbus);
+        let comms = Comms::new(to_main.clone(), to_dbus);
         let args: &'static GlobalArgs = Box::leak(Box::new(GlobalArgs::default()));
         let (test_event_loop, test_receiver, _) = message_loop_with_channel::<()>().unwrap();
 
@@ -390,15 +337,12 @@ mod tests {
             args,
         );
 
-        // Wait for the thread to finish
         join_handle.unwrap().join().unwrap();
 
-        // Check if the main channel has received the shutdown signal
         assert!(matches!(
             main_channel.recv().unwrap(),
             MainMessage::Shutdown
         ));
-        // No other messages should be received
         assert!(main_channel.try_recv().is_err());
     }
 
@@ -424,9 +368,8 @@ mod tests {
     #[test]
     fn main_is_shutdown_on_thread_panic() {
         let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-        let (_, _, to_config) = message_loop_with_channel::<ConfigMessage>().unwrap();
         let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-        let comms = Comms::new(to_main.clone(), to_config, to_dbus);
+        let comms = Comms::new(to_main.clone(), to_dbus);
         let args: &'static GlobalArgs = Box::leak(Box::new(GlobalArgs::default()));
         let (test_event_loop, test_receiver, _) = message_loop_with_channel::<()>().unwrap();
 
@@ -439,15 +382,12 @@ mod tests {
             args,
         );
 
-        // Wait for the thread to finish
         join_handle.unwrap().join().unwrap();
 
-        // Check if the main channel has received the shutdown signal
         assert!(matches!(
             main_channel.recv().unwrap(),
             MainMessage::Shutdown
         ));
-        // No other messages should be received
         assert!(main_channel.try_recv().is_err());
     }
 }

@@ -7,8 +7,6 @@ pub struct GlobalArgs {
     pub config: Option<String>,
     /// Path to wayland socket
     pub socket_path: Option<String>,
-    /// Use an external config process instead of the embedded config thread
-    pub external_config: bool,
     /// Command used to spawn the external config process
     pub config_command: Option<String>,
     /// Do not start any configuration process
@@ -45,9 +43,6 @@ impl GlobalArgs {
                     if let Some(socket_path) = args.next() {
                         global_args.socket_path = Some(socket_path);
                     }
-                }
-                "--external-config" => {
-                    global_args.external_config = true;
                 }
                 "--no-config" => {
                     global_args.no_config = true;
@@ -112,9 +107,8 @@ fn print_help(program_name: &str) {
     println!("  -l, --log-file <FILE>  Path to log file");
     println!("  -c, --config <FILE>    Path to lua config file");
     println!("  -s, --socket-path <PATH>");
-    println!("      --external-config  Spawn lumalla-config instead of embedded config");
     println!("      --no-config        Do not start configuration");
-    println!("      --config-command <CMD>  External config command (default: lumalla-config)");
+    println!("      --config-command <CMD>  Config command (default: lumalla-config)");
 }
 
 fn print_config_client_help(program_name: &str) {

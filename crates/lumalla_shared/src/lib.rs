@@ -1,7 +1,6 @@
 mod action;
 mod args;
 mod comms;
-mod config_message;
 mod dbus_message;
 mod display_message;
 mod input_message;
@@ -17,7 +16,6 @@ mod zone;
 pub use action::{Action, CallbackRef};
 pub use args::GlobalArgs;
 pub use comms::{Comms, MessageSender, message_loop_with_channel};
-pub use config_message::ConfigMessage;
 pub use dbus_message::DbusMessage;
 pub use display_message::DisplayMessage;
 pub use input_message::InputMessage;

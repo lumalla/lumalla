@@ -16,7 +16,6 @@ lumalla_ipc = { path = "../lumalla_ipc" }
 lumalla_shared = { path = "../lumalla_shared" }
 anyhow = { workspace = true }
 env_logger = { workspace = true }
-mio = { workspace = true }
 log = { workspace = true }
 mlua = { workspace = true }
 xdg = { workspace = true }
