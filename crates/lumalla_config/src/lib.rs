@@ -4,6 +4,8 @@
 
 mod callback;
 mod config_watcher;
+mod dbus_lua;
+mod external;
 mod keymap;
 mod output;
 mod spawn;
@@ -19,6 +21,7 @@ use std::{
 
 use anyhow::Context;
 pub use callback::CallbackState;
+pub use external::ExternalConfig;
 use config_watcher::ConfigWatcher;
 use log::{error, warn};
 use lumalla_shared::{

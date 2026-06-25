@@ -2,6 +2,7 @@ use std::{
     env::args,
     fs::OpenOptions,
     io::Write,
+    process::{Child, Command},
     sync::mpsc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -59,7 +60,8 @@ fn init_logger(log_file: Option<&str>) -> anyhow::Result<()> {
 /// Represents the data for the main thread
 struct MainData {
     comms: Comms,
-    config_join_handle: JoinHandle<()>,
+    config_join_handle: Option<JoinHandle<()>>,
+    external_config_child: Option<Child>,
     dbus_join_handle: JoinHandle<()>,
     shutting_down: bool,
     shutdown_timeout: Option<Instant>,
@@ -67,15 +69,16 @@ struct MainData {
 }
 
 impl MainData {
-    /// Creates a new instance of `MainData`
     fn new(
         comms: Comms,
-        config_join_handle: JoinHandle<()>,
+        config_join_handle: Option<JoinHandle<()>>,
+        external_config_child: Option<Child>,
         dbus_join_handle: JoinHandle<()>,
     ) -> Self {
         Self {
             comms,
             config_join_handle,
+            external_config_child,
             dbus_join_handle,
             shutting_down: false,
             shutdown_timeout: None,
@@ -107,10 +110,26 @@ impl MainData {
         Ok(())
     }
 
-    fn ready_for_shutdown(&self) -> bool {
-        self.shutting_down
-            && self.config_join_handle.is_finished()
-            && self.dbus_join_handle.is_finished()
+    fn ready_for_shutdown(&mut self) -> bool {
+        if !self.shutting_down || !self.dbus_join_handle.is_finished() {
+            return false;
+        }
+
+        if let Some(config_join_handle) = &self.config_join_handle {
+            if !config_join_handle.is_finished() {
+                return false;
+            }
+        }
+
+        if let Some(child) = self.external_config_child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => return false,
+                Err(_) => {}
+            }
+        }
+
+        true
     }
 }
 
@@ -127,16 +146,29 @@ fn run_app(args: &'static GlobalArgs) -> anyhow::Result<()> {
 
     handle_signals(to_main.clone()).context("Failed to spawn signal handler thread")?;
 
-    // Spawn the config thread
-    let config_join_handle = run_thread::<ConfigState, _>(
-        comms.clone(),
-        to_main.clone(),
-        String::from("config"),
-        config_event_loop,
-        config_channel,
-        args,
-    )
-    .context("Unable to run config thread")?;
+    let external_config_child = if args.external_config && !args.no_config {
+        Some(spawn_external_config(args)?)
+    } else {
+        None
+    };
+
+    let config_join_handle = if args.no_config {
+        Some(run_config_shutdown_listener(config_channel))
+    } else if args.external_config {
+        Some(run_config_shutdown_listener(config_channel))
+    } else {
+        Some(
+            run_thread::<ConfigState, _>(
+                comms.clone(),
+                to_main.clone(),
+                String::from("config"),
+                config_event_loop,
+                config_channel,
+                args,
+            )
+            .context("Unable to run config thread")?,
+        )
+    };
 
     let dbus_join_handle = run_dbus_thread(
         to_main.clone(),
@@ -146,13 +178,20 @@ fn run_app(args: &'static GlobalArgs) -> anyhow::Result<()> {
     )
     .context("Unable to run D-Bus thread")?;
 
+    comms.dbus(DbusMessage::EmitReady);
+
     let mut seat_state = SeatState::new(comms.clone())?;
     main_event_loop
         .registry()
         .register(&mut seat_state, LIBSEAT_TOKEN, Interest::READABLE)
         .context("Unable to listen on seat state")?;
 
-    let mut data = MainData::new(comms, config_join_handle, dbus_join_handle);
+    let mut data = MainData::new(
+        comms,
+        config_join_handle,
+        external_config_child,
+        dbus_join_handle,
+    );
 
     let mut events = Events::with_capacity(1024);
     loop {
@@ -246,6 +285,35 @@ where
         .context("Unable to spawn thread")?;
 
     Ok(join_handle)
+}
+
+fn spawn_external_config(args: &GlobalArgs) -> anyhow::Result<Child> {
+    let command = args
+        .config_command
+        .as_deref()
+        .unwrap_or("lumalla-config");
+    let mut cmd = Command::new(command);
+    if let Some(config) = &args.config {
+        cmd.arg("--config").arg(config);
+    }
+    if let Some(log_file) = &args.log_file {
+        cmd.arg("--log-file").arg(log_file);
+    }
+    cmd.spawn()
+        .with_context(|| format!("Failed to spawn external config command `{command}`"))
+}
+
+fn run_config_shutdown_listener(channel: mpsc::Receiver<ConfigMessage>) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name(String::from("config-shutdown"))
+        .spawn(move || {
+            while let Ok(message) = channel.recv() {
+                if matches!(message, ConfigMessage::Shutdown) {
+                    break;
+                }
+            }
+        })
+        .expect("Failed to spawn config shutdown listener")
 }
 
 /// Handles signals sent to the process, such as SIGINT (Ctrl+C).

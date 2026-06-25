@@ -7,11 +7,18 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumalla/lumalla"
 include = ["src/**/*", "LICENSE-*"]
 
+[[bin]]
+name = "lumalla-config"
+path = "src/bin/lumalla_config.rs"
+
 [dependencies]
+lumalla_ipc = { path = "../lumalla_ipc" }
 lumalla_shared = { path = "../lumalla_shared" }
 anyhow = { workspace = true }
+env_logger = { workspace = true }
 mio = { workspace = true }
 log = { workspace = true }
 mlua = { workspace = true }
 xdg = { workspace = true }
 notify = { workspace = true }
+zbus = { version = "5.16", features = ["blocking-api"] }

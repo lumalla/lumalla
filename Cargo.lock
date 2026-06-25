@@ -764,12 +764,15 @@ name = "lumalla_config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "env_logger",
  "log",
+ "lumalla_ipc",
  "lumalla_shared",
  "mio",
  "mlua",
  "notify",
  "xdg",
+ "zbus",
 ]
 
 [[package]]
@@ -810,6 +813,12 @@ dependencies = [
 [[package]]
 name = "lumalla_ipc"
 version = "0.1.0"
+dependencies = [
+ "lumalla_shared",
+ "serde",
+ "zbus",
+ "zvariant",
+]
 
 [[package]]
 name = "lumalla_renderer"

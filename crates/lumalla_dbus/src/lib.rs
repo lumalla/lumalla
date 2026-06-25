@@ -2,56 +2,44 @@
 
 #![warn(missing_docs)]
 
-mod types;
+mod iface;
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use anyhow::Context;
+use iface::{emit_signal, ServiceState, WindowManager};
 use log::{error, info};
-use lumalla_ipc::{BUS_NAME, OBJECT_PATH};
+use lumalla_ipc::{types::OutputInfo, BUS_NAME, OBJECT_PATH};
 use lumalla_shared::{
-    Comms, DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender,
+    Comms, DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender, Output,
 };
 use mio::{Events, Poll};
-use types::OutputInfo;
-use zbus::{Error as ZbusError, blocking::connection, interface};
-
-struct WindowManager {
-    comms: Comms,
-    outputs: Arc<Mutex<Vec<OutputInfo>>>,
-}
-
-#[interface(name = "org.lumalla.WindowManager")]
-impl WindowManager {
-    /// Request a graceful compositor shutdown.
-    fn quit(&mut self) -> zbus::fdo::Result<()> {
-        info!("Quit requested over D-Bus");
-        self.comms.main(MainMessage::Shutdown);
-        Ok(())
-    }
-
-    /// Returns the current output layout.
-    fn get_outputs(&self) -> zbus::fdo::Result<Vec<OutputInfo>> {
-        Ok(self.outputs.lock().unwrap().clone())
-    }
-}
+use zbus::{blocking::connection, Error as ZbusError};
 
 /// A registered D-Bus service that must be kept alive for the lifetime of the compositor.
 pub struct DbusService {
-    _connection: zbus::blocking::Connection,
+    connection: zbus::blocking::Connection,
     outputs: Arc<Mutex<Vec<OutputInfo>>>,
+    output_lookup: Arc<Mutex<HashMap<String, Output>>>,
 }
 
 impl DbusService {
     /// Connect to the session bus and acquire `org.lumalla.wm`.
-    ///
-    /// Returns an error if another process already owns the name.
     pub fn register(comms: Comms) -> anyhow::Result<Self> {
         let outputs = Arc::new(Mutex::new(Vec::new()));
+        let output_lookup = Arc::new(Mutex::new(HashMap::new()));
+        let state = Arc::new(ServiceState {
+            comms: comms.clone(),
+            outputs: Arc::clone(&outputs),
+            output_lookup: Arc::clone(&output_lookup),
+            extra_env: Arc::new(Mutex::new(HashMap::new())),
+            keymaps: Arc::new(Mutex::new(Vec::new())),
+        });
         let connection = connection::Builder::session()
             .context("Failed to connect to session bus")?
             .name(BUS_NAME)
@@ -61,8 +49,7 @@ impl DbusService {
             .serve_at(
                 OBJECT_PATH,
                 WindowManager {
-                    comms: comms.clone(),
-                    outputs: Arc::clone(&outputs),
+                    state: Arc::clone(&state),
                 },
             )
             .context("Failed to register D-Bus object")?
@@ -77,18 +64,25 @@ impl DbusService {
         info!("D-Bus service listening on {BUS_NAME}{OBJECT_PATH}");
 
         Ok(Self {
-            _connection: connection,
+            connection,
             outputs,
+            output_lookup,
         })
+    }
+
+    /// Notify config clients that the compositor is ready.
+    pub fn emit_ready(&self) -> anyhow::Result<()> {
+        emit_signal(&self.connection, "Ready", &())
     }
 }
 
-/// Holds the state of the D-Bus service thread.
 struct DbusState {
     channel: mpsc::Receiver<DbusMessage>,
     event_loop: Poll,
     shutting_down: bool,
+    connection: zbus::blocking::Connection,
     outputs: Arc<Mutex<Vec<OutputInfo>>>,
+    output_lookup: Arc<Mutex<HashMap<String, Output>>>,
 }
 
 impl DbusState {
@@ -101,7 +95,9 @@ impl DbusState {
             channel,
             event_loop,
             shutting_down: false,
+            connection: service.connection,
             outputs: service.outputs,
+            output_lookup: service.output_lookup,
         }
     }
 
@@ -139,17 +135,40 @@ impl DbusState {
                 self.shutting_down = true;
             }
             DbusMessage::SetOutputs(outputs) => {
-                *self.outputs.lock().unwrap() = outputs.into_iter().map(OutputInfo::from).collect();
+                self.update_outputs(outputs);
+            }
+            DbusMessage::EmitReady => {
+                emit_signal(&self.connection, "Ready", &())?;
+            }
+            DbusMessage::EmitOutputChanged(outputs) => {
+                let infos = self.update_outputs(outputs);
+                emit_signal(&self.connection, "OutputChanged", &(&infos,))?;
+            }
+            DbusMessage::EmitBindingActivated(binding_id) => {
+                emit_signal(
+                    &self.connection,
+                    "BindingActivated",
+                    &(&binding_id,),
+                )?;
             }
         }
 
         Ok(())
     }
+
+    fn update_outputs(&self, outputs: Vec<Output>) -> Vec<OutputInfo> {
+        let infos: Vec<OutputInfo> = outputs.iter().map(OutputInfo::from).collect();
+        *self.outputs.lock().unwrap() = infos.clone();
+        let mut lookup = self.output_lookup.lock().unwrap();
+        lookup.clear();
+        for output in outputs {
+            lookup.insert(output.name.clone(), output);
+        }
+        infos
+    }
 }
 
 /// Run the D-Bus message loop on a dedicated thread.
-///
-/// The service must already be registered via [`DbusService::register`].
 pub fn run_thread(
     to_main: MessageSender<MainMessage>,
     event_loop: Poll,
@@ -164,21 +183,9 @@ pub fn run_thread(
                 state.run().context("D-Bus thread exited with an error")
             }));
             match result {
-                Ok(Ok(())) => {
-                    info!("D-Bus thread exited normally");
-                }
-                Ok(Err(ref err)) => {
-                    error!("D-Bus thread exited with an error: {err}");
-                }
-                Err(ref err) => {
-                    if let Some(err) = err.downcast_ref::<&str>() {
-                        error!("D-Bus thread panicked: {err}");
-                    } else if let Some(err) = err.downcast_ref::<String>() {
-                        error!("D-Bus thread panicked: {err}");
-                    } else {
-                        error!("D-Bus thread panicked: {:?}", err);
-                    }
-                }
+                Ok(Ok(())) => info!("D-Bus thread exited normally"),
+                Ok(Err(ref err)) => error!("D-Bus thread exited with an error: {err}"),
+                Err(ref err) => error!("D-Bus thread panicked: {err:?}"),
             }
 
             if let Err(err) = to_main.send(MainMessage::Shutdown) {

@@ -6,3 +6,9 @@ description = "Shared D-Bus types and constants for Lumalla"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumalla/lumalla"
 include = ["src/**/*", "xml/**/*", "LICENSE-*"]
+
+[dependencies]
+lumalla_shared = { path = "../lumalla_shared" }
+serde = { version = "1", features = ["derive"] }
+zbus = { version = "5.16", features = ["blocking-api"] }
+zvariant = "5"

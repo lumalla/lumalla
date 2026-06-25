@@ -15,4 +15,3 @@ log = { workspace = true }
 mio = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 zbus = { version = "5.16", features = ["blocking-api"] }
-
