@@ -1,4 +1,4 @@
-//! Window manager D-Bus interface implementation.
+//! Compositor-side implementation of the window manager D-Bus API.
 
 use std::{
     collections::HashMap,
@@ -6,13 +6,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use log::{error, info, warn};
+use log::{error, info};
 use lumalla_ipc::{
-    INTERFACE_NAME, KeyBindingInfo, OBJECT_PATH,
+    INTERFACE_NAME, KeyBindingInfo, OBJECT_PATH, WindowManagerHandler,
     types::{LayoutSpacesInfo, OutputInfo, WindowRuleInfo, ZoneInfo},
 };
-use lumalla_shared::{CallbackRef, Comms, DisplayMessage, InputMessage, MainMessage, Mods, Output};
-use zbus::interface;
+use lumalla_shared::{Comms, MainMessage, Output};
+use zbus::blocking::Connection;
 
 pub(crate) struct ServiceState {
     pub comms: Comms,
@@ -22,12 +22,11 @@ pub(crate) struct ServiceState {
     pub keymaps: Arc<Mutex<Vec<KeyBindingInfo>>>,
 }
 
-pub(crate) struct WindowManager {
+pub(crate) struct CompositorHandler {
     pub state: Arc<ServiceState>,
 }
 
-#[interface(name = "org.lumalla.WindowManager")]
-impl WindowManager {
+impl WindowManagerHandler for CompositorHandler {
     fn quit(&mut self) -> zbus::fdo::Result<()> {
         info!("Quit requested over D-Bus");
         self.state.comms.main(MainMessage::Shutdown);
@@ -39,6 +38,7 @@ impl WindowManager {
     }
 
     fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()> {
+        let _ = zones;
         // self.state.comms.display(DisplayMessage::SetZones(
         //     zones.into_iter().map(Into::into).collect(),
         // ));
@@ -46,7 +46,8 @@ impl WindowManager {
     }
 
     fn set_layout(&mut self, spaces: LayoutSpacesInfo) -> zbus::fdo::Result<()> {
-        let outputs = self.state.output_lookup.lock().unwrap();
+        let _outputs = self.state.output_lookup.lock().unwrap();
+        let _ = spaces;
         // self.state.comms.display(DisplayMessage::SetLayout {
         //     spaces: spaces
         //         .into_iter()
@@ -73,6 +74,7 @@ impl WindowManager {
     }
 
     fn add_window_rule(&mut self, rule: WindowRuleInfo) -> zbus::fdo::Result<()> {
+        let _ = rule;
         // self.state
         //     .comms
         //     .display(DisplayMessage::AddWindowRule(rule.into()));
@@ -85,6 +87,7 @@ impl WindowManager {
     }
 
     fn move_current_window_to_zone(&mut self, zone: &str) -> zbus::fdo::Result<()> {
+        let _ = zone;
         // self.state
         //     .comms
         //     .display(DisplayMessage::MoveCurrentWindowToZone(zone.to_string()));
@@ -102,6 +105,7 @@ impl WindowManager {
         command: &str,
         args: Vec<String>,
     ) -> zbus::fdo::Result<()> {
+        let _ = (app_id, command, args);
         // self.state.comms.display(DisplayMessage::FocusOrSpawn {
         //     app_id: app_id.to_string(),
         //     command: command.to_string(),
@@ -130,6 +134,7 @@ impl WindowManager {
     }
 
     fn vt_switch(&mut self, vt: i32) -> zbus::fdo::Result<()> {
+        let _ = vt;
         // self.state.comms.display(DisplayMessage::VtSwitch(vt));
         Ok(())
     }
@@ -137,6 +142,7 @@ impl WindowManager {
     fn map_key(&mut self, binding: KeyBindingInfo) -> zbus::fdo::Result<()> {
         self.state.keymaps.lock().unwrap().push(binding.clone());
         if let Ok(callback_id) = binding.binding_id.parse::<usize>() {
+            let _ = (binding, callback_id);
             // self.state.comms.input(InputMessage::Keymap {
             //     key_name: binding.key,
             //     mods: Mods::from(binding.mods),
@@ -165,7 +171,7 @@ fn spawn_process(command: &str, args: &[String], extra_env: &Arc<Mutex<HashMap<S
 }
 
 pub(crate) fn emit_signal<B>(
-    connection: &zbus::blocking::Connection,
+    connection: &Connection,
     member: &str,
     body: &B,
 ) -> anyhow::Result<()>

@@ -2,10 +2,11 @@
 
 #![warn(missing_docs)]
 
-mod proxy;
+#[allow(missing_docs)] // zbus-generated proxy trait methods
+mod window_manager;
 pub mod types;
 
-pub use proxy::WindowManagerProxy;
+pub use window_manager::{WindowManager, WindowManagerHandler, WindowManagerProxy, signals};
 pub use types::{
     KeyBindingInfo, LayoutOutputInfo, LayoutSpacesInfo, ModsInfo, OutputInfo, WindowRuleInfo,
     ZoneInfo,

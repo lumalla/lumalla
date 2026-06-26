@@ -12,9 +12,9 @@ use std::{
 };
 
 use anyhow::Context;
-use iface::{ServiceState, WindowManager, emit_signal};
+use iface::{CompositorHandler, ServiceState, emit_signal};
 use log::{error, info};
-use lumalla_ipc::{BUS_NAME, OBJECT_PATH, types::OutputInfo};
+use lumalla_ipc::{BUS_NAME, OBJECT_PATH, WindowManager, signals, types::OutputInfo};
 use lumalla_shared::{
     Comms, DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender, Output,
 };
@@ -48,9 +48,9 @@ impl DbusService {
             .replace_existing_names(false)
             .serve_at(
                 OBJECT_PATH,
-                WindowManager {
+                WindowManager::new(CompositorHandler {
                     state: Arc::clone(&state),
-                },
+                }),
             )
             .context("Failed to register D-Bus object")?
             .build()
@@ -72,7 +72,7 @@ impl DbusService {
 
     /// Notify config clients that the compositor is ready.
     pub fn emit_ready(&self) -> anyhow::Result<()> {
-        emit_signal(&self.connection, "Ready", &())
+        emit_signal(&self.connection, signals::READY, &())
     }
 }
 
@@ -134,14 +134,14 @@ impl DbusState {
                 self.update_outputs(outputs);
             }
             DbusMessage::EmitReady => {
-                emit_signal(&self.connection, "Ready", &())?;
+                emit_signal(&self.connection, signals::READY, &())?;
             }
             DbusMessage::EmitOutputChanged(outputs) => {
                 let infos = self.update_outputs(outputs);
-                emit_signal(&self.connection, "OutputChanged", &(&infos,))?;
+                emit_signal(&self.connection, signals::OUTPUT_CHANGED, &(&infos,))?;
             }
             DbusMessage::EmitBindingActivated(binding_id) => {
-                emit_signal(&self.connection, "BindingActivated", &(&binding_id,))?;
+                emit_signal(&self.connection, signals::BINDING_ACTIVATED, &(&binding_id,))?;
             }
         }
 
