@@ -12,14 +12,14 @@ use std::{
 };
 
 use anyhow::Context;
-use iface::{emit_signal, ServiceState, WindowManager};
+use iface::{ServiceState, WindowManager, emit_signal};
 use log::{error, info};
-use lumalla_ipc::{types::OutputInfo, BUS_NAME, OBJECT_PATH};
+use lumalla_ipc::{BUS_NAME, OBJECT_PATH, types::OutputInfo};
 use lumalla_shared::{
     Comms, DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender, Output,
 };
 use mio::{Events, Poll};
-use zbus::{blocking::connection, Error as ZbusError};
+use zbus::{Error as ZbusError, blocking::connection};
 
 /// A registered D-Bus service that must be kept alive for the lifetime of the compositor.
 pub struct DbusService {
@@ -86,11 +86,7 @@ struct DbusState {
 }
 
 impl DbusState {
-    fn new(
-        event_loop: Poll,
-        channel: mpsc::Receiver<DbusMessage>,
-        service: DbusService,
-    ) -> Self {
+    fn new(event_loop: Poll, channel: mpsc::Receiver<DbusMessage>, service: DbusService) -> Self {
         Self {
             channel,
             event_loop,
@@ -145,11 +141,7 @@ impl DbusState {
                 emit_signal(&self.connection, "OutputChanged", &(&infos,))?;
             }
             DbusMessage::EmitBindingActivated(binding_id) => {
-                emit_signal(
-                    &self.connection,
-                    "BindingActivated",
-                    &(&binding_id,),
-                )?;
+                emit_signal(&self.connection, "BindingActivated", &(&binding_id,))?;
             }
         }
 
@@ -198,25 +190,12 @@ pub fn run_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lumalla_shared::{
-        DisplayMessage, InputMessage, RendererMessage, SeatMessage, message_loop_with_channel,
-    };
+    use lumalla_shared::message_loop_with_channel;
 
     fn comms() -> Comms {
         let (_, _, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
         let (_, _, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-        let (_, _, to_display) = message_loop_with_channel::<DisplayMessage>().unwrap();
-        let (_, _, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
-        let (_, _, to_renderer) = message_loop_with_channel::<RendererMessage>().unwrap();
-        let (_, _, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
-        Comms::new(
-            to_main,
-            to_dbus,
-            to_display,
-            to_input,
-            to_renderer,
-            to_seat,
-        )
+        Comms::new(to_main, to_dbus)
     }
 
     #[test]
@@ -228,9 +207,13 @@ mod tests {
         let first = DbusService::register(comms()).expect("registration should succeed");
         drop(first);
 
-        let holder = DbusService::register(comms()).expect("registration should succeed after release");
+        let holder =
+            DbusService::register(comms()).expect("registration should succeed after release");
         let second = DbusService::register(comms());
-        assert!(second.is_err(), "second registration should fail while name is held");
+        assert!(
+            second.is_err(),
+            "second registration should fail while name is held"
+        );
         let err = second.err().unwrap();
         assert!(
             format!("{err:#}").contains("already owns"),

@@ -82,7 +82,7 @@ impl RendererState {
 
         info!("Requesting seat to open DRM device: {}", path.display());
         self.pending_drm_path = Some(path.clone());
-        self.comms.seat(SeatMessage::OpenDevice { path });
+        // self.comms.seat(SeatMessage::OpenDevice { path });
 
         Ok(())
     }

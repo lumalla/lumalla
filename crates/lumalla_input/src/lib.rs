@@ -49,7 +49,10 @@ impl InputState {
                     .insert((normalize_key_name(&key_name), mods), callback.callback_id);
             }
             InputMessage::OpenFileInSessionForRenderer { path } => {
-                warn!("OpenFileInSessionForRenderer not implemented: {}", path.display());
+                warn!(
+                    "OpenFileInSessionForRenderer not implemented: {}",
+                    path.display()
+                );
             }
         }
 
@@ -106,11 +109,18 @@ impl InputState {
     }
 
     fn try_activate_binding(&self, key_name: &str) {
-        let Some(callback_id) = self.keymaps.get(&(key_name.to_string(), self.mods)).copied() else {
+        let Some(callback_id) = self
+            .keymaps
+            .get(&(key_name.to_string(), self.mods))
+            .copied()
+        else {
             return;
         };
 
-        info!("Activating binding {callback_id} for {key_name} with mods {:?}", self.mods);
+        info!(
+            "Activating binding {callback_id} for {key_name} with mods {:?}",
+            self.mods
+        );
         self.comms
             .dbus(DbusMessage::EmitBindingActivated(callback_id.to_string()));
     }
@@ -172,13 +182,7 @@ impl MessageRunner for InputState {
     }
 }
 
-static DEVICE_OPENER: std::sync::OnceLock<Arc<RestrictedDeviceOpener>> =
-    std::sync::OnceLock::new();
-
-/// Configure how libinput opens device nodes (via the main thread / libseat).
-pub fn set_device_opener(opener: Arc<RestrictedDeviceOpener>) {
-    let _ = DEVICE_OPENER.set(opener);
-}
+static DEVICE_OPENER: std::sync::OnceLock<Arc<RestrictedDeviceOpener>> = std::sync::OnceLock::new();
 
 fn normalize_key_name(key_name: &str) -> String {
     key_name.to_ascii_lowercase()

@@ -2,10 +2,7 @@ use log::warn;
 use mio::{Poll, Token, Waker};
 use std::sync::{Arc, mpsc};
 
-use crate::{
-    DbusMessage, DisplayMessage, InputMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, RendererMessage,
-    SeatMessage,
-};
+use crate::{DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage};
 
 /// Create a new event loop with a message channel already set up
 pub fn message_loop_with_channel<M>() -> anyhow::Result<(Poll, mpsc::Receiver<M>, MessageSender<M>)>
@@ -68,10 +65,6 @@ impl<T> MessageSender<T> {
 pub struct Comms {
     to_main: MessageSender<MainMessage>,
     to_dbus: MessageSender<DbusMessage>,
-    to_display: MessageSender<DisplayMessage>,
-    to_input: MessageSender<InputMessage>,
-    to_renderer: MessageSender<RendererMessage>,
-    to_seat: MessageSender<SeatMessage>,
 }
 
 impl std::fmt::Debug for Comms {
@@ -82,22 +75,8 @@ impl std::fmt::Debug for Comms {
 
 impl Comms {
     /// Creates a new instance of `Comms` with the given channels.
-    pub fn new(
-        to_main: MessageSender<MainMessage>,
-        to_dbus: MessageSender<DbusMessage>,
-        to_display: MessageSender<DisplayMessage>,
-        to_input: MessageSender<InputMessage>,
-        to_renderer: MessageSender<RendererMessage>,
-        to_seat: MessageSender<SeatMessage>,
-    ) -> Self {
-        Comms {
-            to_main,
-            to_dbus,
-            to_display,
-            to_input,
-            to_renderer,
-            to_seat,
-        }
+    pub fn new(to_main: MessageSender<MainMessage>, to_dbus: MessageSender<DbusMessage>) -> Self {
+        Comms { to_main, to_dbus }
     }
 
     /// Sends a message to the main thread.
@@ -126,46 +105,6 @@ impl Comms {
     pub fn dbus_sender(&self) -> MessageSender<DbusMessage> {
         self.to_dbus.clone()
     }
-
-    /// Sends a message to the seat handler on the main thread.
-    pub fn seat(&self, message: SeatMessage) {
-        if let Err(e) = self.to_seat.send(message) {
-            warn!("Lost connection to seat ({e}). Requesting shutdown");
-            self.to_main
-                .send(MainMessage::Shutdown)
-                .expect("Lost connection to the main thread");
-        }
-    }
-
-    /// Sends a message to the display thread.
-    pub fn display(&self, message: DisplayMessage) {
-        if let Err(e) = self.to_display.send(message) {
-            warn!("Lost connection to display ({e}). Requesting shutdown");
-            self.to_main
-                .send(MainMessage::Shutdown)
-                .expect("Lost connection to the main thread");
-        }
-    }
-
-    /// Sends a message to the input thread.
-    pub fn input(&self, message: InputMessage) {
-        if let Err(e) = self.to_input.send(message) {
-            warn!("Lost connection to input ({e}). Requesting shutdown");
-            self.to_main
-                .send(MainMessage::Shutdown)
-                .expect("Lost connection to the main thread");
-        }
-    }
-
-    /// Sends a message to the renderer thread.
-    pub fn renderer(&self, message: RendererMessage) {
-        if let Err(e) = self.to_renderer.send(message) {
-            warn!("Lost connection to renderer ({e}). Requesting shutdown");
-            self.to_main
-                .send(MainMessage::Shutdown)
-                .expect("Lost connection to the main thread");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -176,40 +115,19 @@ mod tests {
     struct Receivers {
         main: mpsc::Receiver<MainMessage>,
         dbus: mpsc::Receiver<DbusMessage>,
-        display: mpsc::Receiver<DisplayMessage>,
-        input: mpsc::Receiver<InputMessage>,
-        renderer: mpsc::Receiver<RendererMessage>,
-        seat: mpsc::Receiver<SeatMessage>,
     }
 
     fn comms() -> (Comms, Receivers) {
         let (_, main_channel, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
         let (_, dbus_channel, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-        let (_, display_channel, to_display) =
-            message_loop_with_channel::<DisplayMessage>().unwrap();
-        let (_, input_channel, to_input) = message_loop_with_channel::<InputMessage>().unwrap();
-        let (_, renderer_channel, to_renderer) =
-            message_loop_with_channel::<RendererMessage>().unwrap();
-        let (_, seat_channel, to_seat) = message_loop_with_channel::<SeatMessage>().unwrap();
 
-        let comms = Comms::new(
-            to_main,
-            to_dbus,
-            to_display,
-            to_input,
-            to_renderer,
-            to_seat,
-        );
+        let comms = Comms::new(to_main, to_dbus);
 
         (
             comms,
             Receivers {
                 main: main_channel,
                 dbus: dbus_channel,
-                display: display_channel,
-                input: input_channel,
-                renderer: renderer_channel,
-                seat: seat_channel,
             },
         )
     }
