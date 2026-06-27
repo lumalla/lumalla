@@ -1,12 +1,9 @@
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
-use lumalla_shared::{
-    Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner, RendererMessage,
-    SeatMessage,
-};
+use lumalla_shared::{Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner};
 use mio::Poll;
 
 pub mod drm;
@@ -14,6 +11,8 @@ pub mod vulkan;
 
 use crate::drm::{DrmDevice, DumbBuffer, OutputManager, find_drm_devices};
 use vulkan::VulkanContext;
+
+pub struct RendererMessage;
 
 pub struct RendererState {
     comms: Comms,
@@ -48,25 +47,25 @@ const TEST_DISPLAY_TIMEOUT: Option<Duration> = Some(Duration::from_secs(5));
 
 impl RendererState {
     fn handle_message(&mut self, message: RendererMessage) -> anyhow::Result<()> {
-        match message {
-            RendererMessage::Shutdown => {
-                self.shutting_down = true;
-            }
-            RendererMessage::SeatSessionCreated {
-                seat_name: _seat_name,
-            } => {
-                self.request_drm_device()?;
-            }
-            RendererMessage::SeatSessionPaused => {
-                // TODO: Handle session pause (release DRM master)
-            }
-            RendererMessage::SeatSessionResumed => {
-                // TODO: Handle session resume (reacquire DRM master)
-            }
-            RendererMessage::FileOpenedInSession { path, fd } => {
-                self.handle_drm_device_opened(path, fd)?;
-            }
-        }
+        // match message {
+        //     RendererMessage::Shutdown => {
+        //         self.shutting_down = true;
+        //     }
+        //     RendererMessage::SeatSessionCreated {
+        //         seat_name: _seat_name,
+        //     } => {
+        //         self.request_drm_device()?;
+        //     }
+        //     RendererMessage::SeatSessionPaused => {
+        //         // TODO: Handle session pause (release DRM master)
+        //     }
+        //     RendererMessage::SeatSessionResumed => {
+        //         // TODO: Handle session resume (reacquire DRM master)
+        //     }
+        //     RendererMessage::FileOpenedInSession { path, fd } => {
+        //         self.handle_drm_device_opened(path, fd)?;
+        //     }
+        // }
 
         Ok(())
     }

@@ -805,6 +805,7 @@ dependencies = [
  "anyhow",
  "libc",
  "log",
+ "lumalla_seat",
  "lumalla_shared",
  "mio",
  "pkg-config",

@@ -4,6 +4,7 @@ use std::os::fd::{OwnedFd, RawFd};
 use std::path::Path;
 
 use anyhow::Context;
+use log::debug;
 use lumalla_shared::Comms;
 
 use crate::libseat::LibSeat;
@@ -43,7 +44,8 @@ impl SeatState {
     }
 
     /// Open the device from the given path
-    pub fn open_device(&mut self, path: &Path) -> anyhow::Result<OwnedFd> {
+    pub fn open_device(&self, path: &Path) -> anyhow::Result<OwnedFd> {
+        debug!("Opening device in main seat: {}", path.display());
         let path_str = path.to_str().context("Device path is not valid UTF-8")?;
         let c_path = CString::new(path_str).context("Device path contains null byte")?;
         Ok(self.main_seat.open_device(&c_path)?.into_fd())

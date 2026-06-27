@@ -1,17 +1,22 @@
 //! Safe wrapper around libinput (udev backend).
 
 use std::{
-    ffi::{CStr, CString, c_char, c_int, c_void},
+    ffi::{CStr, CString, OsStr, c_char, c_int, c_void},
     io,
-    os::fd::RawFd,
+    marker::PhantomData,
+    os::{
+        fd::{IntoRawFd, RawFd},
+        unix::ffi::OsStrExt,
+    },
+    path::Path,
+    pin::Pin,
     ptr::NonNull,
 };
 
 use anyhow::Context;
 use log::{debug, info, warn};
+use lumalla_seat::SeatState;
 use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
-
-use crate::restricted::RestrictedDeviceOpener;
 
 #[allow(
     non_camel_case_types,
@@ -22,9 +27,15 @@ use crate::restricted::RestrictedDeviceOpener;
 mod bindings {
     use std::ffi::{c_char, c_int, c_void};
 
-    pub const LIBINPUT_EVENT_DEVICE_ADDED: u32 = 0;
-    pub const LIBINPUT_EVENT_DEVICE_REMOVED: u32 = 1;
-    pub const LIBINPUT_EVENT_KEYBOARD_KEY: u32 = 200;
+    pub const LIBINPUT_EVENT_NONE: u32 = 0;
+    pub const LIBINPUT_EVENT_DEVICE_ADDED: u32 = 1;
+    pub const LIBINPUT_EVENT_DEVICE_REMOVED: u32 = 2;
+    pub const LIBINPUT_EVENT_KEYBOARD_KEY: u32 = 300;
+    pub const LIBINPUT_EVENT_POINTER_MOTION: u32 = 400;
+    pub const LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE: u32 = 401;
+    pub const LIBINPUT_EVENT_POINTER_BUTTON: u32 = 402;
+    pub const LIBINPUT_EVENT_POINTER_AXIS: u32 = 403; // Event is deprecated and should be ignored
+    pub const LIBINPUT_EVENT_POINTER_SCROLL_WHEEL: u32 = 404;
 
     pub const LIBINPUT_KEY_STATE_RELEASED: u32 = 0;
     pub const LIBINPUT_KEY_STATE_PRESSED: u32 = 1;
@@ -74,12 +85,14 @@ mod bindings {
 
         pub fn libinput_udev_create_context(
             interface: *const libinput_interface,
-            user_data: *mut c_void,
+            user_data: *const c_void,
             udev: *mut udev,
         ) -> *mut libinput;
         pub fn libinput_udev_assign_seat(libinput: *mut libinput, seat_id: *const c_char) -> c_int;
         pub fn libinput_unref(libinput: *mut libinput);
         pub fn libinput_get_fd(libinput: *mut libinput) -> c_int;
+        pub fn libinput_suspend(libinput: *mut libinput) -> c_int;
+        pub fn libinput_resume(libinput: *mut libinput) -> c_int;
         pub fn libinput_dispatch(libinput: *mut libinput) -> c_int;
         pub fn libinput_get_event(libinput: *mut libinput) -> *mut libinput_event;
         pub fn libinput_event_destroy(event: *mut libinput_event);
@@ -88,24 +101,27 @@ mod bindings {
             event: *mut libinput_event,
         ) -> *mut libinput_event_keyboard;
         pub fn libinput_event_keyboard_get_key(event: *mut libinput_event_keyboard) -> u32;
-        pub fn libinput_event_keyboard_get_key_state(
-            event: *mut libinput_event_keyboard,
-        ) -> u32;
+        pub fn libinput_event_keyboard_get_key_state(event: *mut libinput_event_keyboard) -> u32;
     }
 }
 
 /// Wrapper around a libinput udev context.
+///
+/// The `seat_state` reference passed to [`Self::new`] is stored as libinput userdata and
+/// must remain valid until this value is dropped.
 pub struct LibInput {
     libinput: NonNull<bindings::libinput>,
     udev: NonNull<bindings::udev>,
     fd: RawFd,
-    _opener: std::sync::Arc<RestrictedDeviceOpener>,
+    _seat_state_lifetime: PhantomData<*const SeatState>,
+    seat_assigned: bool,
+    suspended: bool,
 }
 
 impl LibInput {
     /// Create a libinput context backed by udev.
-    pub fn new(opener: std::sync::Arc<RestrictedDeviceOpener>) -> anyhow::Result<Self> {
-        let opener_ptr: &'static RestrictedDeviceOpener = Box::leak(Box::new((*opener).clone()));
+    pub fn new(seat_state: Pin<&SeatState>) -> anyhow::Result<Self> {
+        let seat_ptr = (seat_state.get_ref() as *const SeatState).cast::<c_void>();
 
         unsafe extern "C" fn open_restricted(
             path: *const c_char,
@@ -115,19 +131,31 @@ impl LibInput {
             if path.is_null() || userdata.is_null() {
                 return -1;
             }
-            let opener = &*(userdata as *const RestrictedDeviceOpener);
+            let seat_state = unsafe { NonNull::new_unchecked(userdata.cast::<SeatState>()) };
             let path = unsafe { CStr::from_ptr(path) };
-            match opener.open(path, flags) {
-                Ok(fd) => fd,
+            let path = Path::new(OsStr::from_bytes(path.to_bytes()));
+            match unsafe { seat_state.as_ref() }.open_device(path) {
+                Ok(fd) => {
+                    let raw_fd = fd.into_raw_fd();
+                    if flags & libc::O_CLOEXEC == 0 {
+                        clear_close_on_exec(raw_fd);
+                    }
+                    raw_fd
+                }
                 Err(err) => {
-                    warn!("Failed to open restricted device {}: {err:#}", path.to_string_lossy());
+                    warn!(
+                        "Failed to open restricted device {}: {err:#}",
+                        path.display()
+                    );
                     -1
                 }
             }
         }
 
         unsafe extern "C" fn close_restricted(fd: c_int, _userdata: *mut c_void) {
-            RestrictedDeviceOpener::close(fd);
+            unsafe {
+                libc::close(fd);
+            }
         }
 
         static INTERFACE: bindings::libinput_interface = bindings::libinput_interface {
@@ -140,13 +168,8 @@ impl LibInput {
             anyhow::bail!("Failed to create udev context");
         };
 
-        let libinput = unsafe {
-            bindings::libinput_udev_create_context(
-                &INTERFACE,
-                opener_ptr as *const _ as *mut c_void,
-                udev.as_ptr(),
-            )
-        };
+        let libinput =
+            unsafe { bindings::libinput_udev_create_context(&INTERFACE, seat_ptr, udev.as_ptr()) };
         let Some(libinput) = NonNull::new(libinput) else {
             unsafe { bindings::udev_unref(udev.as_ptr()) };
             anyhow::bail!("Failed to create libinput context");
@@ -165,12 +188,18 @@ impl LibInput {
             libinput,
             udev,
             fd,
-            _opener: opener,
+            _seat_state_lifetime: PhantomData,
+            seat_assigned: false,
+            suspended: false,
         })
     }
 
     /// Assign the udev seat used for device discovery.
+    /// Only does something if the seat has not been assigned yet.
     pub fn assign_seat(&self, seat_name: &str) -> anyhow::Result<()> {
+        if self.seat_assigned {
+            return Ok(());
+        }
         let seat_name_c = CString::new(seat_name).context("Seat name contains null byte")?;
         let result = unsafe {
             bindings::libinput_udev_assign_seat(self.libinput.as_ptr(), seat_name_c.as_ptr())
@@ -182,10 +211,6 @@ impl LibInput {
         Ok(())
     }
 
-    pub(crate) fn fd(&self) -> RawFd {
-        self.fd
-    }
-
     pub(crate) fn dispatch(&self) -> anyhow::Result<()> {
         let result = unsafe { bindings::libinput_dispatch(self.libinput.as_ptr()) };
         if result != 0 {
@@ -194,10 +219,8 @@ impl LibInput {
         Ok(())
     }
 
-    pub(crate) fn drain_events(
-        &self,
-        mut handler: impl FnMut(u32, u32),
-    ) -> anyhow::Result<()> {
+    pub(crate) fn drain_events(&self, mut handler: impl FnMut(u32, u32)) {
+        let mut i = 50;
         loop {
             let event = unsafe { bindings::libinput_get_event(self.libinput.as_ptr()) };
             if event.is_null() {
@@ -205,7 +228,13 @@ impl LibInput {
             }
 
             let event_type = unsafe { bindings::libinput_event_get_type(event) };
+            info!("libinput event type: {event_type}");
             match event_type {
+                bindings::LIBINPUT_EVENT_NONE => {
+                    // No more events for now
+                    unsafe { bindings::libinput_event_destroy(event) };
+                    break;
+                }
                 bindings::LIBINPUT_EVENT_DEVICE_ADDED => {
                     debug!("libinput device added");
                 }
@@ -213,22 +242,59 @@ impl LibInput {
                     debug!("libinput device removed");
                 }
                 bindings::LIBINPUT_EVENT_KEYBOARD_KEY => {
-                    let keyboard =
+                    let keyboard_event =
                         unsafe { bindings::libinput_event_get_keyboard_event(event) };
-                    if !keyboard.is_null() {
-                        let key = unsafe { bindings::libinput_event_keyboard_get_key(keyboard) };
-                        let state =
-                            unsafe { bindings::libinput_event_keyboard_get_key_state(keyboard) };
+                    if !keyboard_event.is_null() {
+                        let key =
+                            unsafe { bindings::libinput_event_keyboard_get_key(keyboard_event) };
+                        let state = unsafe {
+                            bindings::libinput_event_keyboard_get_key_state(keyboard_event)
+                        };
                         handler(key, state);
                     }
                 }
-                _ => {}
+                event_type => {
+                    warn!("Unhandled libinput event type: {event_type}");
+                }
             }
-
             unsafe { bindings::libinput_event_destroy(event) };
+            i -= 1;
+            if i == 0 {
+                break;
+            }
         }
+    }
 
+    pub(crate) fn suspend(&mut self) -> anyhow::Result<()> {
+        if self.suspended {
+            return Ok(());
+        }
+        let result = unsafe { bindings::libinput_suspend(self.libinput.as_ptr()) };
+        if result < 0 {
+            anyhow::bail!("Failed to suspend libinput");
+        }
+        self.suspended = true;
         Ok(())
+    }
+
+    pub(crate) fn resume(&mut self) -> anyhow::Result<()> {
+        if !self.suspended {
+            return Ok(());
+        }
+        let result = unsafe { bindings::libinput_resume(self.libinput.as_ptr()) };
+        if result < 0 {
+            anyhow::bail!("Failed to resume libinput");
+        }
+        self.suspended = false;
+        Ok(())
+    }
+}
+
+/// Clears the close-on-exec flag on `fd`, leaving other descriptor flags unchanged.
+fn clear_close_on_exec(fd: RawFd) {
+    let current = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if current >= 0 && current & libc::FD_CLOEXEC != 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, current & !libc::FD_CLOEXEC) };
     }
 }
 

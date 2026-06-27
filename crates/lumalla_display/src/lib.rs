@@ -1,12 +1,8 @@
-use std::{
-    collections::HashMap,
-    num::NonZeroU32,
-    sync::{Arc, mpsc},
-};
+use std::{collections::HashMap, num::NonZeroU32, sync::mpsc};
 
 use anyhow::Context;
 use log::{debug, error, info, warn};
-use lumalla_shared::{Comms, DisplayMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner};
+use lumalla_shared::{Comms, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner};
 use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland, registry::InterfaceIndex};
 use mio::{Interest, Poll, Token};
 
@@ -19,6 +15,8 @@ mod surface;
 
 pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 pub const CLIENT_TOKEN_START: Token = Token(WAYLAND_SOCKET_TOKEN.0 + 1);
+
+pub struct DisplayMessage;
 
 pub struct DisplayState {
     _comms: Comms,
@@ -38,18 +36,18 @@ impl DisplayState {
         message: DisplayMessage,
         connected_clients: impl Iterator<Item = &'connection mut ClientConnection>,
     ) -> anyhow::Result<()> {
-        match message {
-            DisplayMessage::Shutdown => {
-                self.shutting_down = true;
-            }
-            DisplayMessage::ActivateSeat(seat_name) => {
-                self.seat_manager
-                    .add_seat(seat_name, &mut self.globals, connected_clients);
-            }
-            message => {
-                warn!("Message not handled: {message:?}");
-            }
-        }
+        // match message {
+        //     DisplayMessage::Shutdown => {
+        //         self.shutting_down = true;
+        //     }
+        //     DisplayMessage::ActivateSeat(seat_name) => {
+        //         self.seat_manager
+        //             .add_seat(seat_name, &mut self.globals, connected_clients);
+        //     }
+        //     message => {
+        //         warn!("Message not handled: {message:?}");
+        //     }
+        // }
 
         Ok(())
     }
