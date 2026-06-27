@@ -15,7 +15,7 @@ mod zone;
 
 pub use action::{Action, CallbackRef};
 pub use args::GlobalArgs;
-pub use comms::{Comms, MessageSender, message_loop_with_channel, message_sender_on_poll};
+pub use comms::{Comms, MessageSender, message_loop_with_channel};
 pub use dbus_message::DbusMessage;
 pub use display_message::DisplayMessage;
 pub use input_message::InputMessage;

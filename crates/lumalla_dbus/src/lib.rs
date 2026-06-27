@@ -15,9 +15,7 @@ use anyhow::Context;
 use iface::{CompositorHandler, ServiceState, emit_signal};
 use log::{error, info};
 use lumalla_ipc::{BUS_NAME, OBJECT_PATH, WindowManager, signals, types::OutputInfo};
-use lumalla_shared::{
-    Comms, DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender, Output,
-};
+use lumalla_shared::{Comms, DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, Output};
 use mio::{Events, Poll};
 use zbus::{Error as ZbusError, blocking::connection};
 
@@ -141,7 +139,11 @@ impl DbusState {
                 emit_signal(&self.connection, signals::OUTPUT_CHANGED, &(&infos,))?;
             }
             DbusMessage::EmitBindingActivated(binding_id) => {
-                emit_signal(&self.connection, signals::BINDING_ACTIVATED, &(&binding_id,))?;
+                emit_signal(
+                    &self.connection,
+                    signals::BINDING_ACTIVATED,
+                    &(&binding_id,),
+                )?;
             }
         }
 
@@ -162,7 +164,7 @@ impl DbusState {
 
 /// Run the D-Bus message loop on a dedicated thread.
 pub fn run_thread(
-    to_main: MessageSender<MainMessage>,
+    comms: Comms,
     event_loop: Poll,
     channel: mpsc::Receiver<DbusMessage>,
     service: DbusService,
@@ -179,10 +181,7 @@ pub fn run_thread(
                 Ok(Err(ref err)) => error!("D-Bus thread exited with an error: {err}"),
                 Err(ref err) => error!("D-Bus thread panicked: {err:?}"),
             }
-
-            if let Err(err) = to_main.send(MainMessage::Shutdown) {
-                error!("Unable to send shutdown signal to main from D-Bus thread: {err}");
-            }
+            comms.main(MainMessage::Shutdown);
         })
         .context("Unable to spawn D-Bus thread")
 }

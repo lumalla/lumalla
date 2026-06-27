@@ -1,5 +1,5 @@
 use log::warn;
-use mio::{Poll, Token, Waker};
+use mio::{Poll, Waker};
 use std::sync::{Arc, mpsc};
 
 use crate::{DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage};
@@ -15,16 +15,6 @@ pub fn message_loop_with_channel<M>() -> anyhow::Result<(Poll, mpsc::Receiver<M>
         receiver,
         MessageSender::new(sender, Arc::new(waker)),
     ))
-}
-
-/// Attach a message channel to an existing event loop.
-pub fn message_sender_on_poll<M>(
-    poll: &Poll,
-    token: Token,
-) -> anyhow::Result<(mpsc::Receiver<M>, MessageSender<M>)> {
-    let (sender, receiver) = mpsc::channel();
-    let waker = Waker::new(poll.registry(), token)?;
-    Ok((receiver, MessageSender::new(sender, Arc::new(waker))))
 }
 
 /// A sender that works with mio channels
