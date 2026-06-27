@@ -24,7 +24,7 @@ use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
     non_snake_case,
     dead_code
 )]
-mod bindings {
+pub(crate) mod bindings {
     use std::ffi::{c_char, c_int, c_void};
 
     pub const LIBINPUT_EVENT_NONE: u32 = 0;

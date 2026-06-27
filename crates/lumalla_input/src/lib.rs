@@ -4,7 +4,7 @@ use std::{io, pin::Pin};
 
 use log::info;
 use lumalla_seat::SeatState;
-use lumalla_shared::Comms;
+use lumalla_shared::{Comms, MainMessage};
 use mio::{Interest, Registry, Token, event::Source};
 
 use crate::libinput::LibInput;
@@ -12,14 +12,14 @@ use crate::libinput::LibInput;
 mod libinput;
 
 pub struct InputState {
-    _comms: Comms,
+    comms: Comms,
     libinput: LibInput,
 }
 
 impl InputState {
     pub fn new(comms: Comms, seat_state: Pin<&SeatState>) -> anyhow::Result<Self> {
         Ok(Self {
-            _comms: comms,
+            comms,
             libinput: LibInput::new(seat_state)?,
         })
     }
@@ -35,8 +35,12 @@ impl InputState {
 
     pub fn dispatch(&mut self) -> anyhow::Result<()> {
         self.libinput.dispatch()?;
-        self.libinput
-            .drain_events(|key, state| info!("key event: {key:?} {state:?}"));
+        self.libinput.drain_events(|key, state| {
+            info!("key event: {key:?} {state:?}");
+            if key == libinput::bindings::KEY_F1 {
+                self.comms.main(MainMessage::Shutdown);
+            }
+        });
         Ok(())
     }
 }
