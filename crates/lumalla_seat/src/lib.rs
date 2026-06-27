@@ -11,46 +11,42 @@ use crate::libseat::LibSeat;
 mod libseat;
 
 pub struct SeatState {
-    seat: LibSeat,
-    seat_enabled: bool,
+    main_seat: LibSeat,
 }
 
 impl SeatState {
     pub fn new(comms: Comms) -> anyhow::Result<Self> {
         let seat = LibSeat::new(comms).context("Failed to create seat")?;
-        Ok(Self {
-            seat,
-            seat_enabled: false,
-        })
+        Ok(Self { main_seat: seat })
     }
 
     pub fn fd(&self) -> RawFd {
-        self.seat.fd()
+        self.main_seat.fd()
     }
 
     pub fn dispatch(&mut self) -> anyhow::Result<()> {
-        self.seat
+        self.main_seat
             .dispatch()
             .context("Failed to dispatch libseat events")
     }
 
     pub fn seat_name(&self) -> anyhow::Result<String> {
-        self.seat.seat_name()
+        self.main_seat.seat_name()
     }
 
-    pub fn is_enabled(&self) -> bool {
-        self.seat_enabled
+    pub fn enable_main_seat(&mut self) {
+        self.main_seat.enable();
     }
 
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.seat_enabled = enabled;
+    pub fn disable_main_seat(&mut self) {
+        self.main_seat.disable();
     }
 
     /// Open the device from the given path
     pub fn open_device(&mut self, path: &Path) -> anyhow::Result<OwnedFd> {
         let path_str = path.to_str().context("Device path is not valid UTF-8")?;
         let c_path = CString::new(path_str).context("Device path contains null byte")?;
-        Ok(self.seat.open_device(&c_path)?.into_fd())
+        Ok(self.main_seat.open_device(&c_path)?.into_fd())
     }
 }
 
@@ -61,7 +57,7 @@ impl mio::event::Source for SeatState {
         token: mio::Token,
         interests: mio::Interest,
     ) -> io::Result<()> {
-        self.seat.register(registry, token, interests)
+        self.main_seat.register(registry, token, interests)
     }
 
     fn reregister(
@@ -70,10 +66,10 @@ impl mio::event::Source for SeatState {
         token: mio::Token,
         interests: mio::Interest,
     ) -> io::Result<()> {
-        self.seat.reregister(registry, token, interests)
+        self.main_seat.reregister(registry, token, interests)
     }
 
     fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()> {
-        self.seat.deregister(registry)
+        self.main_seat.deregister(registry)
     }
 }

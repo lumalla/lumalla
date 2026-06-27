@@ -64,6 +64,7 @@ impl SeatDevice {
 pub struct LibSeat {
     seat: NonNull<bindings::libseat>,
     fd: RawFd,
+    enabled: bool,
     // Need to keep comms alive, since libseat's userdata is a pointer to it
     _comms: Box<Comms>,
 }
@@ -85,7 +86,7 @@ impl LibSeat {
             }
             unsafe {
                 let comms = &mut *(userdata as *mut Comms);
-                comms.main(MainMessage::SeatEnabled);
+                comms.main(MainMessage::MainSeatEnabled);
             }
         }
 
@@ -100,7 +101,7 @@ impl LibSeat {
             }
             unsafe {
                 let comms = &mut *(userdata as *mut Comms);
-                comms.main(MainMessage::SeatDisabled);
+                comms.main(MainMessage::MainSeatDisabled);
             }
         }
 
@@ -121,6 +122,7 @@ impl LibSeat {
         Ok(Self {
             seat,
             fd,
+            enabled: false,
             _comms: comms,
         })
     }
@@ -185,7 +187,7 @@ impl LibSeat {
         anyhow::bail!("Unable to open device {}: {}", path.to_string_lossy(), err)
     }
 
-    /// Close a device by its device_id (returned from open_device)
+    /// Close a device by its device_id
     pub fn close_device(&self, device: SeatDevice) -> anyhow::Result<()> {
         let result =
             unsafe { bindings::libseat_close_device(self.seat.as_ptr(), device.device_id) };
@@ -202,6 +204,14 @@ impl LibSeat {
             anyhow::bail!("Failed to switch session");
         }
         Ok(())
+    }
+
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    pub fn disable(&mut self) {
+        self.enabled = false;
     }
 }
 

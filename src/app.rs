@@ -67,11 +67,11 @@ impl AppData {
             if event.token() == MESSAGE_CHANNEL_TOKEN {
                 while let Ok(msg) = main_channel.try_recv() {
                     match msg {
-                        MainMessage::SeatEnabled => {
-                            seat_state.set_enabled(true);
+                        MainMessage::MainSeatEnabled => {
+                            seat_state.enable_main_seat();
                         }
-                        MainMessage::SeatDisabled => {
-                            seat_state.set_enabled(false);
+                        MainMessage::MainSeatDisabled => {
+                            seat_state.disable_main_seat();
                         }
                         MainMessage::Shutdown => {
                             if !self.shutting_down {
