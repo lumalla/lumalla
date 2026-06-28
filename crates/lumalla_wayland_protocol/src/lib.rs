@@ -56,19 +56,13 @@ pub struct Wayland {
 
 impl Wayland {
     pub fn new(socket_path: String) -> anyhow::Result<Self> {
-        // Remove existing socket if it exists
         if Path::new(&socket_path).exists() {
             fs::remove_file(&socket_path).context("Failed to remove existing socket")?;
         }
-
-        // Create Unix domain socket
         let listener = UnixListener::bind(&socket_path).context("Failed to bind to socket")?;
-
-        // Set socket to non-blocking mode
         listener
             .set_nonblocking(true)
             .context("Failed to set socket to non-blocking mode")?;
-
         Ok(Self {
             listener,
             next_client_id: ClientId::new(

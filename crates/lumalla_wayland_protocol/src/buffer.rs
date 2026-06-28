@@ -142,8 +142,7 @@ impl Reader {
             // If we've read all the data in the buffer, reset the offset
             self.current_buffer_offset = 0;
             self.bytes_in_buffer = 0;
-        }
-        if self.bytes_in_buffer == self.buffer.len() {
+        } else if self.bytes_in_buffer == self.buffer.len() {
             // The buffer is full, copy the rest to the front
             debug!("Buffer is too small and needs copying",);
             self.buffer.copy_within(self.current_buffer_offset.., 0);
