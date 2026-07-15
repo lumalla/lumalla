@@ -1,4 +1,6 @@
 use std::{
+    collections::HashMap,
+    num::NonZeroU32,
     pin::Pin,
     process::Child,
     sync::mpsc::Receiver,
@@ -7,8 +9,9 @@ use std::{
 };
 
 use anyhow::Context;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
+use lumalla_display::{ClientConnection, ClientId, DisplayState, Wayland, create_wayland_display};
 use lumalla_input::InputState;
 use lumalla_seat::SeatState;
 use lumalla_shared::{
@@ -19,6 +22,7 @@ use mio::{Events, Interest, Poll, Token};
 
 pub const LIBSEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 pub const LIBINPUT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 2);
+pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 3);
 
 /// Represents the data for the main app thread
 struct AppData {
@@ -30,6 +34,9 @@ struct AppData {
     input_state: InputState,
     shutting_down: bool,
     shutdown_timeout: Option<Instant>,
+    wayland: Wayland,
+    connected_clients: HashMap<ClientId, ClientConnection>,
+    display_state: DisplayState,
 }
 
 impl AppData {
@@ -39,6 +46,8 @@ impl AppData {
         dbus_join_handle: JoinHandle<()>,
         seat_state: Pin<Box<SeatState>>,
         input_state: InputState,
+        wayland: Wayland,
+        display_state: DisplayState,
     ) -> Self {
         Self {
             comms,
@@ -48,6 +57,9 @@ impl AppData {
             input_state,
             shutting_down: false,
             shutdown_timeout: None,
+            wayland,
+            connected_clients: HashMap::new(),
+            display_state,
         }
     }
 
@@ -66,6 +78,7 @@ impl AppData {
                 warn!("Unable to poll event loop: {err}");
             }
             self.handle_events(&events, &main_channel, event_loop)?;
+            self.flush_clients(event_loop);
         }
         Ok(())
     }
@@ -74,41 +87,119 @@ impl AppData {
         &mut self,
         events: &Events,
         main_channel: &Receiver<MainMessage>,
-        _event_loop: &mut Poll,
+        event_loop: &mut Poll,
     ) -> anyhow::Result<()> {
         for event in events {
-            if event.token() == MESSAGE_CHANNEL_TOKEN {
-                while let Ok(msg) = main_channel.try_recv() {
-                    match msg {
-                        MainMessage::MainSeatEnabled => {
-                            self.seat_state.enable_main_seat();
-                            if let Ok(seat_name) = self.seat_state.seat_name() {
-                                if let Err(err) = self.input_state.enable_seat(&seat_name) {
-                                    error!("Unable to enable libinput: {err}");
-                                }
-                            }
-                        }
-                        MainMessage::MainSeatDisabled => {
-                            self.seat_state.disable_main_seat();
-                        }
-                        MainMessage::Shutdown => {
-                            if !self.shutting_down {
-                                self.init_shutdown();
-                            }
-                        }
+            match event.token() {
+                MESSAGE_CHANNEL_TOKEN => {
+                    self.handle_channel_messages(main_channel);
+                }
+                LIBSEAT_TOKEN => {
+                    if let Err(err) = self.seat_state.dispatch() {
+                        error!("Unable to dispatch seat events: {err}");
                     }
                 }
-            } else if event.token() == LIBSEAT_TOKEN {
-                if let Err(err) = self.seat_state.dispatch() {
-                    error!("Unable to dispatch seat events: {err}");
+                LIBINPUT_TOKEN => {
+                    if let Err(err) = self.input_state.dispatch() {
+                        error!("Unable to dispatch libinput events: {err}");
+                    }
                 }
-            } else if event.token() == LIBINPUT_TOKEN {
-                if let Err(err) = self.input_state.dispatch() {
-                    error!("Unable to dispatch libinput events: {err}");
+                WAYLAND_SOCKET_TOKEN => {
+                    self.connect_client(event_loop);
+                }
+                token => {
+                    self.handle_client_messages(token, event_loop)?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn handle_channel_messages(&mut self, main_channel: &Receiver<MainMessage>) {
+        while let Ok(msg) = main_channel.try_recv() {
+            match msg {
+                MainMessage::MainSeatEnabled => {
+                    self.seat_state.enable_main_seat();
+                    if let Ok(seat_name) = self.seat_state.seat_name() {
+                        if let Err(err) = self.input_state.enable_seat(&seat_name) {
+                            error!("Unable to enable libinput: {err}");
+                        }
+                    }
+                }
+                MainMessage::MainSeatDisabled => {
+                    self.seat_state.disable_main_seat();
+                }
+                MainMessage::Shutdown => {
+                    if !self.shutting_down {
+                        self.init_shutdown();
+                    }
+                }
+            }
+        }
+    }
+
+    fn flush_clients(&mut self, event_loop: &mut Poll) {
+        let mut clients_to_remove = Vec::new();
+        for (&client_id, client) in self.connected_clients.iter_mut() {
+            if let Err(err) = client.flush() {
+                error!("Unable to flush client {:?}: {err}", client_id);
+                if let Err(err) = event_loop.registry().deregister(client) {
+                    error!("Unable to deregister client {:?}: {err}", client_id);
+                }
+                clients_to_remove.push(client_id);
+            }
+        }
+        for client_id in clients_to_remove {
+            self.connected_clients.remove(&client_id);
+        }
+    }
+
+    fn handle_client_messages(
+        &mut self,
+        token: Token,
+        event_loop: &mut Poll,
+    ) -> anyhow::Result<()> {
+        let client_id = ClientId::new(
+            NonZeroU32::new((token.0 - WAYLAND_SOCKET_TOKEN.0) as u32)
+                .ok_or(anyhow::anyhow!("Created invalid client id from token"))?,
+        );
+        if let Some(client) = self.connected_clients.get_mut(&client_id) {
+            if let Err(err) = client.handle_messages(&mut self.display_state) {
+                error!(
+                    "Unable to handle messages for client {:?}: {err}",
+                    client_id
+                );
+                if let Err(err) = client.flush() {
+                    error!("Unable to flush client {:?}: {err}", client_id);
+                }
+                if let Err(err) = event_loop.registry().deregister(client) {
+                    error!("Unable to deregister client {:?}: {err}", client_id);
+                }
+                self.connected_clients.remove(&client_id);
+            }
+        } else {
+            debug!("Received message for unknown client {:?}", client_id);
+        }
+        Ok(())
+    }
+
+    fn connect_client(&mut self, event_loop: &mut Poll) {
+        if let Some(mut client) = self.wayland.next_client() {
+            let client_id = client.client_id();
+            info!("New client connected with id {:?}", client_id);
+            if let Err(err) = event_loop.registry().register(
+                &mut client,
+                Token(WAYLAND_SOCKET_TOKEN.0 + client_id.get() as usize),
+                Interest::READABLE,
+            ) {
+                error!(
+                    "Unable to listen on client socket with client id {:?}: {err}",
+                    client_id
+                );
+            } else {
+                self.connected_clients.insert(client.client_id(), client);
+            }
+        }
     }
 
     fn init_shutdown(&mut self) {
@@ -154,7 +245,7 @@ impl AppData {
 }
 
 pub(crate) fn run_app(
-    _args: &'static GlobalArgs,
+    args: &'static GlobalArgs,
     mut main_event_loop: Poll,
     main_channel: Receiver<MainMessage>,
     to_main: MessageSender<MainMessage>,
@@ -166,14 +257,35 @@ pub(crate) fn run_app(
     let seat_state = init_and_register_seat_state(comms.clone(), &mut main_event_loop)?;
     let input_state =
         init_and_register_input_state(comms.clone(), &mut main_event_loop, seat_state.as_ref())?;
+    let wayland =
+        init_and_register_wayland_display(args.socket_path.clone(), &mut main_event_loop)?;
+    let display_state = DisplayState::new(comms.clone())?;
     let mut data = AppData::new(
         comms.clone(),
         config_child,
         dbus_join_handle,
         seat_state,
         input_state,
+        wayland,
+        display_state,
     );
     data.run_event_loop(&mut main_event_loop, main_channel)
+}
+
+fn init_and_register_wayland_display(
+    socket_path: Option<String>,
+    main_event_loop: &mut Poll,
+) -> anyhow::Result<Wayland> {
+    let mut wayland = create_wayland_display(socket_path)?;
+    info!(
+        "Created wayland display socket at: {}",
+        wayland.socket_path()
+    );
+    main_event_loop
+        .registry()
+        .register(&mut wayland, WAYLAND_SOCKET_TOKEN, Interest::READABLE)
+        .context("Unable to listen on wayland display socket")?;
+    Ok(wayland)
 }
 
 fn init_and_register_seat_state(

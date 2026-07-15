@@ -5,6 +5,7 @@ use lumalla_wayland_protocol::{ClientConnection, registry::InterfaceIndex};
 use crate::{GlobalId, Globals};
 
 pub struct SeatManager {
+    has_main_seat: bool,
     known_seats: HashSet<String>,
     id_to_name: HashMap<GlobalId, String>,
 }
@@ -12,6 +13,7 @@ pub struct SeatManager {
 impl Default for SeatManager {
     fn default() -> Self {
         Self {
+            has_main_seat: false,
             known_seats: HashSet::new(),
             id_to_name: HashMap::new(),
         }
@@ -31,6 +33,20 @@ impl SeatManager {
             let id = globals.register(InterfaceIndex::WlSeat, client_connections);
             self.id_to_name.insert(id, seat_name);
         }
+    }
+
+    pub fn add_main_seat<'connection>(
+        &mut self,
+        seat_name: String,
+        globals: &mut Globals,
+        client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
+    ) -> anyhow::Result<()> {
+        if self.has_main_seat {
+            return Ok(());
+        }
+        self.add_seat(seat_name, globals, client_connections);
+        self.has_main_seat = true;
+        Ok(())
     }
 
     pub fn get_name(&self, id: GlobalId) -> Option<&str> {

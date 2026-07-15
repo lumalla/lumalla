@@ -1,10 +1,8 @@
-use std::{collections::HashMap, num::NonZeroU32, sync::mpsc};
+use std::collections::HashMap;
 
 use anyhow::Context;
-use log::{debug, error, info, warn};
-use lumalla_shared::{Comms, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MessageRunner};
-use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland, registry::InterfaceIndex};
-use mio::{Interest, Poll, Token};
+use lumalla_shared::Comms;
+use lumalla_wayland_protocol::registry::InterfaceIndex;
 
 use crate::{seat::SeatManager, shm::ShmManager, surface::SurfaceManager};
 
@@ -13,17 +11,12 @@ mod seat;
 mod shm;
 mod surface;
 
-pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
-pub const CLIENT_TOKEN_START: Token = Token(WAYLAND_SOCKET_TOKEN.0 + 1);
+pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland};
 
 pub struct DisplayMessage;
 
 pub struct DisplayState {
     _comms: Comms,
-    event_loop: Poll,
-    channel: mpsc::Receiver<DisplayMessage>,
-    shutting_down: bool,
-    args: &'static GlobalArgs,
     globals: Globals,
     surface_manager: SurfaceManager,
     shm_manager: ShmManager,
@@ -31,43 +24,9 @@ pub struct DisplayState {
 }
 
 impl DisplayState {
-    fn handle_message<'connection>(
-        &mut self,
-        message: DisplayMessage,
-        connected_clients: impl Iterator<Item = &'connection mut ClientConnection>,
-    ) -> anyhow::Result<()> {
-        // match message {
-        //     DisplayMessage::Shutdown => {
-        //         self.shutting_down = true;
-        //     }
-        //     DisplayMessage::ActivateSeat(seat_name) => {
-        //         self.seat_manager
-        //             .add_seat(seat_name, &mut self.globals, connected_clients);
-        //     }
-        //     message => {
-        //         warn!("Message not handled: {message:?}");
-        //     }
-        // }
-
-        Ok(())
-    }
-}
-
-impl MessageRunner for DisplayState {
-    type Message = DisplayMessage;
-
-    fn new(
-        comms: Comms,
-        event_loop: Poll,
-        channel: mpsc::Receiver<Self::Message>,
-        args: &'static GlobalArgs,
-    ) -> anyhow::Result<Self> {
+    pub fn new(comms: Comms) -> anyhow::Result<Self> {
         Ok(Self {
             _comms: comms,
-            event_loop,
-            channel,
-            shutting_down: false,
-            args,
             globals: Globals::default(),
             surface_manager: SurfaceManager::default(),
             shm_manager: ShmManager::default(),
@@ -75,120 +34,30 @@ impl MessageRunner for DisplayState {
         })
     }
 
-    fn run(&mut self) -> anyhow::Result<()> {
-        let mut wayland = self.create_wayland_display()?;
-        info!(
-            "Created wayland display socket at: {}",
-            wayland.socket_path()
-        );
-        self.event_loop
-            .registry()
-            .register(&mut wayland, WAYLAND_SOCKET_TOKEN, Interest::READABLE)
-            .context("Unable to listen on wayland display socket")?;
-
-        let mut connected_clients = HashMap::<ClientId, ClientConnection>::new();
-        let mut events = mio::Events::with_capacity(128);
-        loop {
-            if let Err(err) = self.event_loop.poll(&mut events, None) {
-                error!("Unable to poll event loop: {err}");
-            }
-
-            for event in events.iter() {
-                match event.token() {
-                    MESSAGE_CHANNEL_TOKEN => {
-                        while let Ok(msg) = self.channel.try_recv() {
-                            if let Err(err) =
-                                self.handle_message(msg, connected_clients.values_mut())
-                            {
-                                error!("Unable to handle message: {err}");
-                            }
-                        }
-                    }
-                    WAYLAND_SOCKET_TOKEN => {
-                        if let Some(mut client) = wayland.next_client() {
-                            let client_id = client.client_id();
-                            info!("New client connected with id {:?}", client_id);
-                            if let Err(err) = self.event_loop.registry().register(
-                                &mut client,
-                                Token(CLIENT_TOKEN_START.0 + client_id.get() as usize),
-                                Interest::READABLE,
-                            ) {
-                                error!(
-                                    "Unable to listen on client socket with client id {:?}: {err}",
-                                    client_id
-                                );
-                            } else {
-                                connected_clients.insert(client.client_id(), client);
-                            }
-                        }
-                    }
-                    token => {
-                        let client_id = ClientId::new(
-                            NonZeroU32::new((token.0 - CLIENT_TOKEN_START.0) as u32)
-                                .ok_or(anyhow::anyhow!("Created invalid client id from token"))?,
-                        );
-                        if let Some(client) = connected_clients.get_mut(&client_id) {
-                            if let Err(err) = client.handle_messages(self) {
-                                error!(
-                                    "Unable to handle messages for client {:?}: {err}",
-                                    client_id
-                                );
-                                // Flush any remaining messages
-                                if let Err(err) = client.flush() {
-                                    error!("Unable to flush client {:?}: {err}", client_id);
-                                }
-                                if let Err(err) = self.event_loop.registry().deregister(client) {
-                                    error!("Unable to deregister client {:?}: {err}", client_id);
-                                }
-                                connected_clients.remove(&client_id);
-                            }
-                        } else {
-                            debug!("Received message for unknown client {:?}", client_id);
-                        }
-                    }
-                }
-            }
-
-            let mut clients_to_remove = Vec::new();
-            for (&client_id, client) in connected_clients.iter_mut() {
-                if let Err(err) = client.flush() {
-                    error!("Unable to flush client {:?}: {err}", client_id);
-                    if let Err(err) = self.event_loop.registry().deregister(client) {
-                        error!("Unable to deregister client {:?}: {err}", client_id);
-                    }
-                    clients_to_remove.push(client_id);
-                }
-            }
-            for client_id in clients_to_remove {
-                connected_clients.remove(&client_id);
-            }
-
-            if self.shutting_down {
-                break;
-            }
-        }
-
+    pub fn activate_main_seat<'connection>(
+        &mut self,
+        seat_name: String,
+        client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
+    ) -> anyhow::Result<()> {
+        self.seat_manager
+            .add_main_seat(seat_name, &mut self.globals, client_connections)?;
         Ok(())
     }
 }
 
-impl DisplayState {
-    fn create_wayland_display(&self) -> anyhow::Result<Wayland> {
-        if let Some(socket_path) = &self.args.socket_path {
-            Wayland::new(socket_path.clone())
-                .context("Failed to create Wayland display at given socket path")
-        } else {
-            let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").context(
-                "XDG_RUNTIME_DIR not set. Set the socket path manually using --socket-path",
-            )?;
-            for i in 0..10 {
-                let socket_path = format!("{xdg_runtime_dir}/wayland-{i}");
-                if let Ok(wayland) = Wayland::new(socket_path) {
-                    return Ok(wayland);
-                }
+pub fn create_wayland_display(socket_path: Option<String>) -> anyhow::Result<Wayland> {
+    if let Some(socket_path) = socket_path {
+        Wayland::new(socket_path).context("Failed to create Wayland display at given socket path")
+    } else {
+        let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .context("XDG_RUNTIME_DIR not set. Set the socket path manually using --socket-path")?;
+        for i in 0..10 {
+            let socket_path = format!("{xdg_runtime_dir}/wayland-{i}");
+            if let Ok(wayland) = Wayland::new(socket_path) {
+                return Ok(wayland);
             }
-            anyhow::bail!("Failed to create Wayland display");
         }
+        anyhow::bail!("Failed to create Wayland display");
     }
 }
 
