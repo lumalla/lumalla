@@ -2,18 +2,26 @@
 
 use std::{io, pin::Pin};
 
-use log::info;
+use log::debug;
 use lumalla_seat::SeatState;
-use lumalla_shared::{Comms, MainMessage};
+use lumalla_shared::{Comms, DbusMessage, MainMessage, Mods};
 use mio::{Interest, Registry, Token, event::Source};
 
-use crate::libinput::LibInput;
+use crate::libinput::{InputEvent, KEY_STATE_PRESSED, LibInput, is_modifier_key, update_modifier};
 
 mod libinput;
+
+struct KeyBinding {
+    key: u32,
+    mods: Mods,
+    binding_id: String,
+}
 
 pub struct InputState {
     comms: Comms,
     libinput: LibInput,
+    mods: Mods,
+    keymaps: Vec<KeyBinding>,
 }
 
 impl InputState {
@@ -21,6 +29,8 @@ impl InputState {
         Ok(Self {
             comms,
             libinput: LibInput::new(seat_state)?,
+            mods: Mods::default(),
+            keymaps: Vec::new(),
         })
     }
 
@@ -30,18 +40,58 @@ impl InputState {
     }
 
     pub fn disable_seat(&mut self) -> anyhow::Result<()> {
+        self.mods = Mods::default();
         self.libinput.suspend()
+    }
+
+    pub fn add_keymap(&mut self, key: u32, mods: Mods, binding_id: String) {
+        self.keymaps.push(KeyBinding {
+            key,
+            mods,
+            binding_id,
+        });
+    }
+
+    pub fn clear_keymaps(&mut self) {
+        self.keymaps.clear();
     }
 
     pub fn dispatch(&mut self) -> anyhow::Result<()> {
         self.libinput.dispatch()?;
-        self.libinput.drain_events(|key, state| {
-            info!("key event: {key:?} {state:?}");
-            if key == libinput::bindings::KEY_F1 {
-                self.comms.main(MainMessage::Shutdown);
+        while let Some(event) = self.libinput.next_event() {
+            match event {
+                InputEvent::KeyboardKey { key, state } => self.handle_key(key, state),
             }
-        });
+        }
         Ok(())
+    }
+
+    fn handle_key(&mut self, key: u32, state: u32) {
+        if key == libinput::bindings::KEY_F1 {
+            self.comms.main(MainMessage::Shutdown);
+            return;
+        }
+        let pressed = state == KEY_STATE_PRESSED;
+        if is_modifier_key(key) {
+            update_modifier(key, pressed, &mut self.mods);
+            return;
+        }
+        if !pressed {
+            return;
+        }
+        let binding_id = self
+            .keymaps
+            .iter()
+            .find(|binding| binding.key == key && binding.mods == self.mods)
+            .map(|binding| binding.binding_id.clone());
+        if let Some(binding_id) = binding_id {
+            debug!(
+                "Key binding activated: key={key} mods={:?} id={binding_id}",
+                self.mods
+            );
+            self.comms
+                .dbus(DbusMessage::EmitBindingActivated(binding_id));
+        }
     }
 }
 

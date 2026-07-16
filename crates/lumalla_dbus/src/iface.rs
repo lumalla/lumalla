@@ -11,8 +11,27 @@ use lumalla_ipc::{
     INTERFACE_NAME, KeyBindingInfo, OBJECT_PATH, WindowManagerHandler,
     types::{LayoutSpacesInfo, OutputInfo, WindowRuleInfo, ZoneInfo},
 };
-use lumalla_shared::{Comms, MainMessage, Output};
+use lumalla_shared::{Comms, MainMessage, Mods, Output};
 use zbus::blocking::Connection;
+
+fn key_name_to_keycode(key_name: &str) -> Option<u32> {
+    match key_name {
+        "backspace" => Some(14),
+        "f1" => Some(59),
+        "f2" => Some(60),
+        "f3" => Some(61),
+        "f4" => Some(62),
+        "f5" => Some(63),
+        "f6" => Some(64),
+        "f7" => Some(65),
+        "f8" => Some(66),
+        "f9" => Some(67),
+        "f10" => Some(68),
+        "f11" => Some(69),
+        "f12" => Some(70),
+        _ => None,
+    }
+}
 
 pub(crate) struct ServiceState {
     pub comms: Comms,
@@ -141,20 +160,20 @@ impl WindowManagerHandler for CompositorHandler {
 
     fn map_key(&mut self, binding: KeyBindingInfo) -> zbus::fdo::Result<()> {
         self.state.keymaps.lock().unwrap().push(binding.clone());
-        if let Ok(callback_id) = binding.binding_id.parse::<usize>() {
-            let _ = (binding, callback_id);
-            // self.state.comms.input(InputMessage::Keymap {
-            //     key_name: binding.key,
-            //     mods: Mods::from(binding.mods),
-            //     callback: CallbackRef { callback_id },
-            // });
-        }
+        let Some(key) = key_name_to_keycode(&binding.key) else {
+            return Ok(());
+        };
+        self.state.comms.main(MainMessage::AddKeymap {
+            key,
+            mods: Mods::from(binding.mods),
+            binding_id: binding.binding_id,
+        });
         Ok(())
     }
 
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()> {
         self.state.keymaps.lock().unwrap().clear();
-        // self.state.comms.input(InputMessage::ClearKeymaps);
+        self.state.comms.main(MainMessage::ClearKeymaps);
         Ok(())
     }
 }

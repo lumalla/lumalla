@@ -230,45 +230,6 @@ impl LibInput {
         Ok(())
     }
 
-    pub(crate) fn drain_events(&self, mut handler: impl FnMut(u32, u32)) {
-        loop {
-            let event = unsafe { bindings::libinput_get_event(self.libinput.as_ptr()) };
-            if event.is_null() {
-                break;
-            }
-
-            let event_type = unsafe { bindings::libinput_event_get_type(event) };
-            match event_type {
-                bindings::LIBINPUT_EVENT_NONE => {
-                    unsafe { bindings::libinput_event_destroy(event) };
-                    break;
-                }
-                bindings::LIBINPUT_EVENT_DEVICE_ADDED => {
-                    debug!("libinput device added");
-                }
-                bindings::LIBINPUT_EVENT_DEVICE_REMOVED => {
-                    debug!("libinput device removed");
-                }
-                bindings::LIBINPUT_EVENT_KEYBOARD_KEY => {
-                    let keyboard_event =
-                        unsafe { bindings::libinput_event_get_keyboard_event(event) };
-                    if !keyboard_event.is_null() {
-                        let key =
-                            unsafe { bindings::libinput_event_keyboard_get_key(keyboard_event) };
-                        let state = unsafe {
-                            bindings::libinput_event_keyboard_get_key_state(keyboard_event)
-                        };
-                        handler(key, state);
-                    }
-                }
-                event_type => {
-                    debug!("Unhandled libinput event type: {event_type}");
-                }
-            }
-            unsafe { bindings::libinput_event_destroy(event) };
-        }
-    }
-
     pub(crate) fn suspend(&mut self) -> anyhow::Result<()> {
         if self.suspended {
             return Ok(());
@@ -338,12 +299,8 @@ impl Source for LibInput {
 pub(crate) const KEY_STATE_PRESSED: u32 = bindings::LIBINPUT_KEY_STATE_PRESSED;
 pub(crate) const KEY_STATE_RELEASED: u32 = bindings::LIBINPUT_KEY_STATE_RELEASED;
 
-pub(crate) fn key_to_name(key: u32) -> Option<String> {
-    match key {
-        bindings::KEY_BACKSPACE => Some(String::from("backspace")),
-        bindings::KEY_F1..=bindings::KEY_F12 => Some(format!("f{}", key - bindings::KEY_F1 + 1)),
-        _ => None,
-    }
+pub(crate) enum InputEvent {
+    KeyboardKey { key: u32, state: u32 },
 }
 
 pub(crate) fn is_modifier_key(key: u32) -> bool {
@@ -372,5 +329,55 @@ pub(crate) fn update_modifier(key: u32, pressed: bool, mods: &mut lumalla_shared
         KEY_LEFTSHIFT | KEY_RIGHTSHIFT => mods.shift = pressed,
         KEY_LEFTMETA | KEY_RIGHTMETA => mods.logo = pressed,
         _ => {}
+    }
+}
+
+impl LibInput {
+    pub(crate) fn next_event(&self) -> Option<InputEvent> {
+        loop {
+            let event = unsafe { bindings::libinput_get_event(self.libinput.as_ptr()) };
+            if event.is_null() {
+                return None;
+            }
+
+            let event_type = unsafe { bindings::libinput_event_get_type(event) };
+            let input_event = match event_type {
+                bindings::LIBINPUT_EVENT_NONE => {
+                    unsafe { bindings::libinput_event_destroy(event) };
+                    return None;
+                }
+                bindings::LIBINPUT_EVENT_DEVICE_ADDED => {
+                    debug!("libinput device added");
+                    None
+                }
+                bindings::LIBINPUT_EVENT_DEVICE_REMOVED => {
+                    debug!("libinput device removed");
+                    None
+                }
+                bindings::LIBINPUT_EVENT_KEYBOARD_KEY => {
+                    let keyboard_event =
+                        unsafe { bindings::libinput_event_get_keyboard_event(event) };
+                    if keyboard_event.is_null() {
+                        None
+                    } else {
+                        let key =
+                            unsafe { bindings::libinput_event_keyboard_get_key(keyboard_event) };
+                        let state = unsafe {
+                            bindings::libinput_event_keyboard_get_key_state(keyboard_event)
+                        };
+                        Some(InputEvent::KeyboardKey { key, state })
+                    }
+                }
+                event_type => {
+                    debug!("Unhandled libinput event type: {event_type}");
+                    None
+                }
+            };
+            unsafe { bindings::libinput_event_destroy(event) };
+
+            if input_event.is_some() {
+                return input_event;
+            }
+        }
     }
 }

@@ -132,6 +132,16 @@ impl AppData {
                     }
                     self.seat_state.disable_main_seat();
                 }
+                MainMessage::AddKeymap {
+                    key,
+                    mods,
+                    binding_id,
+                } => {
+                    self.input_state.add_keymap(key, mods, binding_id);
+                }
+                MainMessage::ClearKeymaps => {
+                    self.input_state.clear_keymaps();
+                }
                 MainMessage::Shutdown => {
                     if !self.shutting_down {
                         self.init_shutdown();
