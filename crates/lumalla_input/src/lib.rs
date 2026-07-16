@@ -8,8 +8,10 @@ use lumalla_shared::{Comms, DbusMessage, MainMessage, Mods};
 use mio::{Interest, Registry, Token, event::Source};
 
 use crate::libinput::{InputEvent, KEY_STATE_PRESSED, LibInput, is_modifier_key, update_modifier};
+use crate::xkb::Xkb;
 
 mod libinput;
+mod xkb;
 
 struct KeyBinding {
     key: u32,
@@ -20,6 +22,7 @@ struct KeyBinding {
 pub struct InputState {
     comms: Comms,
     libinput: LibInput,
+    xkb: Xkb,
     mods: Mods,
     keymaps: Vec<KeyBinding>,
 }
@@ -29,6 +32,7 @@ impl InputState {
         Ok(Self {
             comms,
             libinput: LibInput::new(seat_state)?,
+            xkb: Xkb::new()?,
             mods: Mods::default(),
             keymaps: Vec::new(),
         })
@@ -41,6 +45,7 @@ impl InputState {
 
     pub fn disable_seat(&mut self) -> anyhow::Result<()> {
         self.mods = Mods::default();
+        self.xkb.reset()?;
         self.libinput.suspend()
     }
 
@@ -72,6 +77,14 @@ impl InputState {
             return;
         }
         let pressed = state == KEY_STATE_PRESSED;
+        self.xkb.update_key(key, pressed);
+        if pressed {
+            let keysym = self.xkb.key_get_one_sym(key);
+            match Xkb::keysym_get_name(keysym) {
+                Ok(name) => debug!("xkb keysym: {name} (evdev key={key})"),
+                Err(err) => debug!("xkb keysym lookup failed for key={key}: {err:#}"),
+            }
+        }
         if is_modifier_key(key) {
             update_modifier(key, pressed, &mut self.mods);
             return;
