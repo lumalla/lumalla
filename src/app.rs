@@ -127,6 +127,9 @@ impl AppData {
                     }
                 }
                 MainMessage::MainSeatDisabled => {
+                    if let Err(err) = self.input_state.disable_seat() {
+                        error!("Unable to disable libinput: {err}");
+                    }
                     self.seat_state.disable_main_seat();
                 }
                 MainMessage::Shutdown => {

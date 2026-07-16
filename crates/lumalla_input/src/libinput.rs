@@ -184,19 +184,29 @@ impl LibInput {
             anyhow::bail!("Failed to get libinput file descriptor");
         }
 
+        // Stay suspended until the session is enabled and a seat is assigned.
+        let result = unsafe { bindings::libinput_suspend(libinput.as_ptr()) };
+        if result < 0 {
+            unsafe {
+                bindings::libinput_unref(libinput.as_ptr());
+                bindings::udev_unref(udev.as_ptr());
+            }
+            anyhow::bail!("Failed to suspend libinput after creation");
+        }
+
         Ok(Self {
             libinput,
             udev,
             fd,
             _seat_state_lifetime: PhantomData,
             seat_assigned: false,
-            suspended: false,
+            suspended: true,
         })
     }
 
     /// Assign the udev seat used for device discovery.
     /// Only does something if the seat has not been assigned yet.
-    pub fn assign_seat(&self, seat_name: &str) -> anyhow::Result<()> {
+    pub fn assign_seat(&mut self, seat_name: &str) -> anyhow::Result<()> {
         if self.seat_assigned {
             return Ok(());
         }
@@ -207,6 +217,7 @@ impl LibInput {
         if result != 0 {
             anyhow::bail!("Failed to assign libinput seat `{seat_name}`");
         }
+        self.seat_assigned = true;
         info!("Assigned libinput seat `{seat_name}`");
         Ok(())
     }
@@ -220,7 +231,6 @@ impl LibInput {
     }
 
     pub(crate) fn drain_events(&self, mut handler: impl FnMut(u32, u32)) {
-        let mut i = 50;
         loop {
             let event = unsafe { bindings::libinput_get_event(self.libinput.as_ptr()) };
             if event.is_null() {
@@ -228,10 +238,8 @@ impl LibInput {
             }
 
             let event_type = unsafe { bindings::libinput_event_get_type(event) };
-            info!("libinput event type: {event_type}");
             match event_type {
                 bindings::LIBINPUT_EVENT_NONE => {
-                    // No more events for now
                     unsafe { bindings::libinput_event_destroy(event) };
                     break;
                 }
@@ -254,14 +262,10 @@ impl LibInput {
                     }
                 }
                 event_type => {
-                    warn!("Unhandled libinput event type: {event_type}");
+                    debug!("Unhandled libinput event type: {event_type}");
                 }
             }
             unsafe { bindings::libinput_event_destroy(event) };
-            i -= 1;
-            if i == 0 {
-                break;
-            }
         }
     }
 
