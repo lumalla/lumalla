@@ -11,8 +11,10 @@ use std::{
 use anyhow::Context;
 use log::{debug, error, info, warn};
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
-use lumalla_display::{ClientConnection, ClientId, DisplayState, Wayland, create_wayland_display};
-use lumalla_input::InputState;
+use lumalla_display::{
+    ClientConnection, ClientId, DisplayState, KeyboardModifiers, Wayland, create_wayland_display,
+};
+use lumalla_input::{InputState, KeyboardEvent};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender,
@@ -100,7 +102,37 @@ impl AppData {
                     }
                 }
                 LIBINPUT_TOKEN => {
-                    if let Err(err) = self.input_state.dispatch() {
+                    let AppData {
+                        input_state,
+                        display_state,
+                        connected_clients,
+                        ..
+                    } = self;
+                    if let Err(err) = input_state.dispatch(|event| match event {
+                        KeyboardEvent::Key {
+                            time_msec,
+                            key,
+                            pressed,
+                        } => {
+                            display_state.handle_keyboard_key(
+                                connected_clients,
+                                time_msec,
+                                key,
+                                pressed,
+                            );
+                        }
+                        KeyboardEvent::Modifiers(modifiers) => {
+                            display_state.handle_keyboard_modifiers(
+                                connected_clients,
+                                KeyboardModifiers {
+                                    depressed: modifiers.depressed,
+                                    latched: modifiers.latched,
+                                    locked: modifiers.locked,
+                                    group: modifiers.group,
+                                },
+                            );
+                        }
+                    }) {
                         error!("Unable to dispatch libinput events: {err}");
                     }
                 }
@@ -123,6 +155,12 @@ impl AppData {
                     if let Ok(seat_name) = self.seat_state.seat_name() {
                         if let Err(err) = self.input_state.enable_seat(&seat_name) {
                             error!("Unable to enable libinput: {err}");
+                        }
+                        if let Err(err) = self
+                            .display_state
+                            .activate_main_seat(seat_name, self.connected_clients.values_mut())
+                        {
+                            error!("Unable to activate Wayland seat: {err}");
                         }
                     }
                 }
@@ -272,7 +310,20 @@ pub(crate) fn run_app(
         init_and_register_input_state(comms.clone(), &mut main_event_loop, seat_state.as_ref())?;
     let wayland =
         init_and_register_wayland_display(args.socket_path.clone(), &mut main_event_loop)?;
-    let display_state = DisplayState::new(comms.clone())?;
+    let mut display_state = DisplayState::new(comms.clone())?;
+    match input_state.keymap_memfd() {
+        Ok(keymap) => {
+            display_state.set_keyboard_keymap(keymap);
+            let mods = input_state.modifiers();
+            display_state.set_keyboard_modifiers(KeyboardModifiers {
+                depressed: mods.depressed,
+                latched: mods.latched,
+                locked: mods.locked,
+                group: mods.group,
+            });
+        }
+        Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
+    }
     let mut data = AppData::new(
         comms.clone(),
         config_child,

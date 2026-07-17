@@ -339,7 +339,6 @@ impl LibInput {
             if event.is_null() {
                 return None;
             }
-
             let event_type = unsafe { bindings::libinput_event_get_type(event) };
             let input_event = match event_type {
                 bindings::LIBINPUT_EVENT_NONE => {
@@ -374,7 +373,6 @@ impl LibInput {
                 }
             };
             unsafe { bindings::libinput_event_destroy(event) };
-
             if input_event.is_some() {
                 return input_event;
             }

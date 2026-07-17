@@ -13,6 +13,13 @@ impl SurfaceManager {
             .insert((client_id, id), Surface::new(id, client_id));
     }
 
+    pub fn first_surface(&self, client_id: ClientId) -> Option<ObjectId> {
+        self.surfaces
+            .iter()
+            .find(|((cid, _), _)| *cid == client_id)
+            .map(|((_, id), _)| *id)
+    }
+
     #[must_use]
     pub fn set_pending_buffer(
         &mut self,

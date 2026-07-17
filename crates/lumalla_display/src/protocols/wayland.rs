@@ -81,8 +81,11 @@ impl WlCompositor for DisplayState {
     ) {
         ctx.registry
             .register_object(params.id(), InterfaceIndex::WlSurface);
+        let surface_id = *params.id();
         self.surface_manager
-            .create_surface(ctx.client_id, *params.id());
+            .create_surface(ctx.client_id, surface_id);
+        self.seat_manager
+            .focus_keyboards_on_surface(ctx.client_id, surface_id, ctx.writer);
     }
 
     fn create_region(
@@ -483,19 +486,27 @@ impl WlSeat for DisplayState {
 
     fn get_keyboard(
         &mut self,
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
         _object_id: ObjectId,
-        _params: &WlSeatGetKeyboard<'_>,
+        params: &WlSeatGetKeyboard<'_>,
     ) {
-        todo!()
+        ctx.registry
+            .register_object(params.id(), InterfaceIndex::WlKeyboard);
+        let focus = self.surface_manager.first_surface(ctx.client_id);
+        if let Err(err) =
+            self.seat_manager
+                .create_keyboard(ctx.client_id, *params.id(), ctx.writer, focus)
+        {
+            log::error!("Failed to create wl_keyboard: {err:#}");
+        }
     }
 
     fn get_touch(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSeatGetTouch<'_>) {
         todo!()
     }
 
-    fn release(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSeatRelease<'_>) {
-        todo!()
+    fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSeatRelease<'_>) {
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 }
 
@@ -515,8 +526,9 @@ impl WlPointer for DisplayState {
 }
 
 impl WlKeyboard for DisplayState {
-    fn release(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlKeyboardRelease<'_>) {
-        todo!()
+    fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlKeyboardRelease<'_>) {
+        self.seat_manager.destroy_keyboard(ctx.client_id, object_id);
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 }
 

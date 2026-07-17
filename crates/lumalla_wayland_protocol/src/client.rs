@@ -65,6 +65,10 @@ impl ClientConnection {
         self.client_id
     }
 
+    pub fn writer_mut(&mut self) -> &mut Writer {
+        &mut self.writer
+    }
+
     pub fn stream(&self) -> &UnixStream {
         &self.stream
     }

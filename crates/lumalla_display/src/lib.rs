@@ -12,6 +12,7 @@ mod shm;
 mod surface;
 
 pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland};
+pub use seat::KeyboardModifiers;
 
 pub struct DisplayMessage;
 
@@ -32,6 +33,33 @@ impl DisplayState {
             shm_manager: ShmManager::default(),
             seat_manager: SeatManager::default(),
         })
+    }
+
+    pub fn set_keyboard_keymap(&mut self, keymap: lumalla_shared::KeymapMemfd) {
+        self.seat_manager.set_keymap(keymap);
+    }
+
+    pub fn set_keyboard_modifiers(&mut self, modifiers: seat::KeyboardModifiers) {
+        self.seat_manager.set_modifiers(modifiers);
+    }
+
+    pub fn handle_keyboard_key(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        time_msec: u32,
+        key: u32,
+        pressed: bool,
+    ) {
+        self.seat_manager
+            .handle_key(clients, time_msec, key, pressed);
+    }
+
+    pub fn handle_keyboard_modifiers(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        modifiers: seat::KeyboardModifiers,
+    ) {
+        self.seat_manager.handle_modifiers(clients, modifiers);
     }
 
     pub fn activate_main_seat<'connection>(
