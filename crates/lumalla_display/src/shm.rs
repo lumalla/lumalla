@@ -24,7 +24,7 @@ impl ShmManager {
         size: usize,
     ) -> bool {
         let mut shm_pool = ShmPool::new(fd, size);
-        let map_success = !shm_pool.map();
+        let map_success = shm_pool.map();
         shm_pool.ref_count += 1;
         let index = if let Some(index) = self.free_shm_pool_indexes.pop() {
             self.shm_pools[index] = shm_pool;
