@@ -833,6 +833,7 @@ dependencies = [
  "gpu-allocator",
  "libc",
  "log",
+ "pkg-config",
  "rustix 1.1.4",
 ]
 
@@ -855,6 +856,7 @@ dependencies = [
  "anyhow",
  "log",
  "mio",
+ "pkg-config",
 ]
 
 [[package]]

@@ -16,6 +16,7 @@ use std::{
 use anyhow::Context;
 use log::{debug, info, warn};
 use lumalla_seat::SeatState;
+use lumalla_shared::Udev;
 use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
 
 #[allow(
@@ -26,6 +27,8 @@ use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
 )]
 pub(crate) mod bindings {
     use std::ffi::{c_char, c_int, c_void};
+
+    pub use lumalla_shared::udev::bindings::udev;
 
     pub const LIBINPUT_EVENT_NONE: u32 = 0;
     pub const LIBINPUT_EVENT_DEVICE_ADDED: u32 = 1;
@@ -68,11 +71,6 @@ pub(crate) mod bindings {
     }
 
     #[repr(C)]
-    pub struct udev {
-        _private: [u8; 0],
-    }
-
-    #[repr(C)]
     pub struct libinput_interface {
         pub open_restricted:
             Option<unsafe extern "C" fn(*const c_char, c_int, *mut c_void) -> c_int>,
@@ -80,9 +78,6 @@ pub(crate) mod bindings {
     }
 
     unsafe extern "C" {
-        pub fn udev_new() -> *mut udev;
-        pub fn udev_unref(udev: *mut udev);
-
         pub fn libinput_udev_create_context(
             interface: *const libinput_interface,
             user_data: *const c_void,
@@ -111,7 +106,7 @@ pub(crate) mod bindings {
 /// must remain valid until this value is dropped.
 pub struct LibInput {
     libinput: NonNull<bindings::libinput>,
-    udev: NonNull<bindings::udev>,
+    _udev: Udev,
     fd: RawFd,
     _seat_state_lifetime: PhantomData<*const SeatState>,
     seat_assigned: bool,
@@ -163,15 +158,12 @@ impl LibInput {
             close_restricted: Some(close_restricted),
         };
 
-        let udev = unsafe { bindings::udev_new() };
-        let Some(udev) = NonNull::new(udev) else {
-            anyhow::bail!("Failed to create udev context");
-        };
+        let udev = Udev::new()?;
 
-        let libinput =
-            unsafe { bindings::libinput_udev_create_context(&INTERFACE, seat_ptr, udev.as_ptr()) };
+        let libinput = unsafe {
+            bindings::libinput_udev_create_context(&INTERFACE, seat_ptr, udev.as_ptr())
+        };
         let Some(libinput) = NonNull::new(libinput) else {
-            unsafe { bindings::udev_unref(udev.as_ptr()) };
             anyhow::bail!("Failed to create libinput context");
         };
 
@@ -179,7 +171,6 @@ impl LibInput {
         if fd < 0 {
             unsafe {
                 bindings::libinput_unref(libinput.as_ptr());
-                bindings::udev_unref(udev.as_ptr());
             }
             anyhow::bail!("Failed to get libinput file descriptor");
         }
@@ -189,14 +180,13 @@ impl LibInput {
         if result < 0 {
             unsafe {
                 bindings::libinput_unref(libinput.as_ptr());
-                bindings::udev_unref(udev.as_ptr());
             }
             anyhow::bail!("Failed to suspend libinput after creation");
         }
 
         Ok(Self {
             libinput,
-            udev,
+            _udev: udev,
             fd,
             _seat_state_lifetime: PhantomData,
             seat_assigned: false,
@@ -267,7 +257,6 @@ impl Drop for LibInput {
     fn drop(&mut self) {
         unsafe {
             bindings::libinput_unref(self.libinput.as_ptr());
-            bindings::udev_unref(self.udev.as_ptr());
         }
     }
 }

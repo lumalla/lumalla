@@ -7,6 +7,7 @@ mod main_message;
 mod message_runner;
 mod mods;
 mod output;
+pub mod udev;
 mod window_rule;
 mod zone;
 
@@ -19,5 +20,6 @@ pub use main_message::MainMessage;
 pub use message_runner::{MESSAGE_CHANNEL_TOKEN, MessageRunner};
 pub use mods::Mods;
 pub use output::Output;
+pub use udev::{Udev, UdevDevice, UdevEnumerate};
 pub use window_rule::WindowRule;
 pub use zone::Zone;

@@ -5,7 +5,7 @@ edition = "2024"
 description = "Renderer handling library for lumalla"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumalla/lumalla"
-include = ["src/**/*", "LICENSE-*"]
+include = ["src/**/*", "LICENSE-*", "build.rs"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -17,3 +17,6 @@ drm-ffi = "0.9"
 gbm = { version = "0.16", default-features = false, features = ["drm-support"] }
 rustix = { version = "1", features = ["fs", "event"] }
 libc = "0.2"
+
+[build-dependencies]
+pkg-config = { workspace = true }
