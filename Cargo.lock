@@ -833,8 +833,6 @@ dependencies = [
  "gpu-allocator",
  "libc",
  "log",
- "lumalla_shared",
- "mio",
  "rustix 1.1.4",
 ]
 

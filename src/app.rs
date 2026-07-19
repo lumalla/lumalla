@@ -15,6 +15,7 @@ use lumalla_display::{
     ClientConnection, ClientId, DisplayState, KeyboardModifiers, Wayland, create_wayland_display,
 };
 use lumalla_input::{InputState, KeyboardEvent};
+use lumalla_renderer::RendererState;
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender,
@@ -39,6 +40,8 @@ struct AppData {
     wayland: Wayland,
     connected_clients: HashMap<ClientId, ClientConnection>,
     display_state: DisplayState,
+    #[allow(dead_code)]
+    renderer_state: RendererState,
 }
 
 impl AppData {
@@ -50,6 +53,7 @@ impl AppData {
         input_state: InputState,
         wayland: Wayland,
         display_state: DisplayState,
+        renderer_state: RendererState,
     ) -> Self {
         Self {
             comms,
@@ -62,6 +66,7 @@ impl AppData {
             wayland,
             connected_clients: HashMap::new(),
             display_state,
+            renderer_state,
         }
     }
 
@@ -324,6 +329,7 @@ pub(crate) fn run_app(
         }
         Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
     }
+    let renderer_state = RendererState::new()?;
     let mut data = AppData::new(
         comms.clone(),
         config_child,
@@ -332,6 +338,7 @@ pub(crate) fn run_app(
         input_state,
         wayland,
         display_state,
+        renderer_state,
     );
     data.run_event_loop(&mut main_event_loop, main_channel)
 }

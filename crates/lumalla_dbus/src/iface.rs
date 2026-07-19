@@ -189,11 +189,7 @@ fn spawn_process(command: &str, args: &[String], extra_env: &Arc<Mutex<HashMap<S
     }
 }
 
-pub(crate) fn emit_signal<B>(
-    connection: &Connection,
-    member: &str,
-    body: &B,
-) -> anyhow::Result<()>
+pub(crate) fn emit_signal<B>(connection: &Connection, member: &str, body: &B) -> anyhow::Result<()>
 where
     B: serde::ser::Serialize + zbus::zvariant::DynamicType,
 {
