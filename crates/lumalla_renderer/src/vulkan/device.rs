@@ -15,6 +15,10 @@ use super::PhysicalDevice;
 pub struct Device {
     /// The Vulkan logical device handle
     handle: ash::Device,
+    /// DMA-BUF export via `VK_KHR_external_memory_fd`
+    external_memory_fd: ash::khr::external_memory_fd::Device,
+    /// DRM modifier queries via `VK_EXT_image_drm_format_modifier`
+    image_drm_format_modifier: ash::ext::image_drm_format_modifier::Device,
     /// The graphics queue
     graphics_queue: vk::Queue,
     /// The graphics queue family index
@@ -51,36 +55,43 @@ impl Device {
             available_extension_names.len()
         );
 
-        // Determine which extensions to enable
-        let mut extensions_to_enable: Vec<&CStr> = Vec::new();
-
-        // Extensions needed for a Wayland compositor
-        let desired_extensions: &[&CStr] = &[
-            // For DRM/KMS rendering (swapchain still useful for some cases)
-            ash::khr::swapchain::NAME,
-            // For timeline semaphores (useful for synchronization)
-            ash::khr::timeline_semaphore::NAME,
-            // For DMA-BUF import (needed for GBM buffer import)
-            ash::khr::external_memory::NAME,
+        // Extensions required for Vulkan → DMA-BUF → KMS scanout buffers.
+        let required_extensions: &[&CStr] = &[
             ash::khr::external_memory_fd::NAME,
             ash::ext::external_memory_dma_buf::NAME,
-            // For DRM format modifiers
             ash::ext::image_drm_format_modifier::NAME,
-            // Required dependency for external memory
             ash::khr::bind_memory2::NAME,
             ash::khr::get_memory_requirements2::NAME,
-            // For synchronization with DRM
+        ];
+
+        for &ext in required_extensions {
+            if !available_extension_names.contains(&ext) {
+                anyhow::bail!("Required Vulkan device extension not available: {ext:?}");
+            }
+        }
+
+        let mut extensions_to_enable: Vec<&CStr> = required_extensions.to_vec();
+
+        // Optional extensions useful for a Wayland compositor
+        let optional_extensions: &[&CStr] = &[
+            ash::khr::swapchain::NAME,
+            ash::khr::timeline_semaphore::NAME,
+            ash::khr::external_memory::NAME,
             ash::khr::external_semaphore::NAME,
             ash::khr::external_semaphore_fd::NAME,
         ];
 
-        for &ext in desired_extensions {
+        for &ext in optional_extensions {
             if available_extension_names.contains(&ext) {
                 extensions_to_enable.push(ext);
-                debug!("Enabling device extension: {:?}", ext);
+                debug!("Enabling optional device extension: {:?}", ext);
             } else {
-                debug!("Device extension not available: {:?}", ext);
+                debug!("Optional device extension not available: {:?}", ext);
             }
+        }
+
+        for &ext in required_extensions {
+            debug!("Enabling required device extension: {:?}", ext);
         }
 
         let extension_ptrs: Vec<*const i8> = extensions_to_enable
@@ -112,12 +123,18 @@ impl Device {
 
         info!("Vulkan logical device created");
 
+        let external_memory_fd = ash::khr::external_memory_fd::Device::new(instance, &device);
+        let image_drm_format_modifier =
+            ash::ext::image_drm_format_modifier::Device::new(instance, &device);
+
         // Get the graphics queue
         let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family, 0) };
         debug!("Got graphics queue from family {}", graphics_queue_family);
 
         Ok(Self {
             handle: device,
+            external_memory_fd,
+            image_drm_format_modifier,
             graphics_queue,
             graphics_queue_family,
         })
@@ -126,6 +143,16 @@ impl Device {
     /// Returns the raw Vulkan device handle.
     pub fn handle(&self) -> &ash::Device {
         &self.handle
+    }
+
+    /// Returns the external memory FD device extension loader.
+    pub fn external_memory_fd(&self) -> &ash::khr::external_memory_fd::Device {
+        &self.external_memory_fd
+    }
+
+    /// Returns the DRM format modifier device extension loader.
+    pub fn image_drm_format_modifier(&self) -> &ash::ext::image_drm_format_modifier::Device {
+        &self.image_drm_format_modifier
     }
 
     /// Returns the graphics queue.

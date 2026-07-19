@@ -14,6 +14,8 @@ pub struct PhysicalDevice {
     handle: vk::PhysicalDevice,
     /// Cached device properties
     properties: vk::PhysicalDeviceProperties,
+    /// Cached memory properties
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// The queue family index that supports graphics operations
     graphics_queue_family: u32,
     /// The DRM primary device path (e.g., /dev/dri/card0) if available
@@ -106,9 +108,13 @@ impl PhysicalDevice {
             warn!("Could not determine DRM device path for selected GPU");
         }
 
+        let memory_properties =
+            unsafe { instance.get_physical_device_memory_properties(handle) };
+
         Ok(Self {
             handle,
             properties,
+            memory_properties,
             graphics_queue_family,
             drm_primary_device_path,
         })
@@ -248,6 +254,11 @@ impl PhysicalDevice {
     /// Returns the device properties.
     pub fn properties(&self) -> &vk::PhysicalDeviceProperties {
         &self.properties
+    }
+
+    /// Returns the device memory properties.
+    pub fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
+        &self.memory_properties
     }
 
     /// Returns the device name as a string.
