@@ -3,7 +3,7 @@
 use zbus::{interface, object_server::SignalEmitter};
 
 use crate::types::{
-    KeyBindingInfo, LayoutSpacesInfo, OutputInfo, WindowRuleInfo, ZoneInfo,
+    DrmDeviceInfo, KeyBindingInfo, LayoutSpacesInfo, OutputInfo, WindowRuleInfo, ZoneInfo,
 };
 
 /// Server-side handler for [`WindowManager`] D-Bus methods.
@@ -15,6 +15,9 @@ pub trait WindowManagerHandler: Send + Sync {
 
     /// Return the current output layout.
     fn get_outputs(&self) -> zbus::fdo::Result<Vec<OutputInfo>>;
+
+    /// Return the current DRM primary nodes.
+    fn get_drm_devices(&self) -> zbus::fdo::Result<Vec<DrmDeviceInfo>>;
 
     /// Replace zone definitions.
     fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()>;
@@ -81,6 +84,8 @@ pub mod signals {
     pub const READY: &str = "Ready";
     /// Output layout changed.
     pub const OUTPUT_CHANGED: &str = "OutputChanged";
+    /// DRM primary node list changed.
+    pub const DRM_DEVICES_CHANGED: &str = "DrmDevicesChanged";
     /// A configured key binding was activated.
     pub const BINDING_ACTIVATED: &str = "BindingActivated";
 }
@@ -101,6 +106,10 @@ impl WindowManager {
 
     fn get_outputs(&self) -> zbus::fdo::Result<Vec<OutputInfo>> {
         self.handler.get_outputs()
+    }
+
+    fn get_drm_devices(&self) -> zbus::fdo::Result<Vec<DrmDeviceInfo>> {
+        self.handler.get_drm_devices()
     }
 
     fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()> {
@@ -167,6 +176,12 @@ impl WindowManager {
     async fn output_changed(
         emitter: &SignalEmitter<'_>,
         outputs: Vec<OutputInfo>,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn drm_devices_changed(
+        emitter: &SignalEmitter<'_>,
+        devices: Vec<DrmDeviceInfo>,
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]

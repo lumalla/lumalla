@@ -14,7 +14,10 @@ use std::{
 use anyhow::Context;
 use iface::{CompositorHandler, ServiceState, emit_signal};
 use log::{error, info};
-use lumalla_ipc::{BUS_NAME, OBJECT_PATH, WindowManager, signals, types::OutputInfo};
+use lumalla_ipc::{
+    BUS_NAME, OBJECT_PATH, WindowManager, signals,
+    types::{DrmDeviceInfo, OutputInfo},
+};
 use lumalla_shared::{Comms, DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, Output};
 use mio::{Events, Poll};
 use zbus::{Error as ZbusError, blocking::connection};
@@ -24,6 +27,7 @@ pub struct DbusService {
     connection: zbus::blocking::Connection,
     outputs: Arc<Mutex<Vec<OutputInfo>>>,
     output_lookup: Arc<Mutex<HashMap<String, Output>>>,
+    drm_devices: Arc<Mutex<Vec<DrmDeviceInfo>>>,
 }
 
 impl DbusService {
@@ -31,10 +35,12 @@ impl DbusService {
     pub fn register(comms: Comms) -> anyhow::Result<Self> {
         let outputs = Arc::new(Mutex::new(Vec::new()));
         let output_lookup = Arc::new(Mutex::new(HashMap::new()));
+        let drm_devices = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(ServiceState {
             comms: comms.clone(),
             outputs: Arc::clone(&outputs),
             output_lookup: Arc::clone(&output_lookup),
+            drm_devices: Arc::clone(&drm_devices),
             extra_env: Arc::new(Mutex::new(HashMap::new())),
             keymaps: Arc::new(Mutex::new(Vec::new())),
         });
@@ -65,6 +71,7 @@ impl DbusService {
             connection,
             outputs,
             output_lookup,
+            drm_devices,
         })
     }
 
@@ -81,6 +88,7 @@ struct DbusState {
     connection: zbus::blocking::Connection,
     outputs: Arc<Mutex<Vec<OutputInfo>>>,
     output_lookup: Arc<Mutex<HashMap<String, Output>>>,
+    drm_devices: Arc<Mutex<Vec<DrmDeviceInfo>>>,
 }
 
 impl DbusState {
@@ -92,6 +100,7 @@ impl DbusState {
             connection: service.connection,
             outputs: service.outputs,
             output_lookup: service.output_lookup,
+            drm_devices: service.drm_devices,
         }
     }
 
@@ -131,12 +140,19 @@ impl DbusState {
             DbusMessage::SetOutputs(outputs) => {
                 self.update_outputs(outputs);
             }
+            DbusMessage::SetDrmDevices(paths) => {
+                self.update_drm_devices(paths);
+            }
             DbusMessage::EmitReady => {
                 emit_signal(&self.connection, signals::READY, &())?;
             }
             DbusMessage::EmitOutputChanged(outputs) => {
                 let infos = self.update_outputs(outputs);
                 emit_signal(&self.connection, signals::OUTPUT_CHANGED, &(&infos,))?;
+            }
+            DbusMessage::EmitDrmDevicesChanged(paths) => {
+                let infos = self.update_drm_devices(paths);
+                emit_signal(&self.connection, signals::DRM_DEVICES_CHANGED, &(&infos,))?;
             }
             DbusMessage::EmitBindingActivated(binding_id) => {
                 emit_signal(
@@ -158,6 +174,17 @@ impl DbusState {
         for output in outputs {
             lookup.insert(output.name.clone(), output);
         }
+        infos
+    }
+
+    fn update_drm_devices(&self, paths: Vec<std::path::PathBuf>) -> Vec<DrmDeviceInfo> {
+        let infos: Vec<DrmDeviceInfo> = paths
+            .into_iter()
+            .map(|path| DrmDeviceInfo {
+                path: path.to_string_lossy().into_owned(),
+            })
+            .collect();
+        *self.drm_devices.lock().unwrap() = infos.clone();
         infos
     }
 }

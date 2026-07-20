@@ -9,7 +9,7 @@ use std::{
 use log::{error, info};
 use lumalla_ipc::{
     INTERFACE_NAME, KeyBindingInfo, OBJECT_PATH, WindowManagerHandler,
-    types::{LayoutSpacesInfo, OutputInfo, WindowRuleInfo, ZoneInfo},
+    types::{DrmDeviceInfo, LayoutSpacesInfo, OutputInfo, WindowRuleInfo, ZoneInfo},
 };
 use lumalla_shared::{Comms, MainMessage, Mods, Output};
 use zbus::blocking::Connection;
@@ -37,6 +37,7 @@ pub(crate) struct ServiceState {
     pub comms: Comms,
     pub outputs: Arc<Mutex<Vec<OutputInfo>>>,
     pub output_lookup: Arc<Mutex<HashMap<String, Output>>>,
+    pub drm_devices: Arc<Mutex<Vec<DrmDeviceInfo>>>,
     pub extra_env: Arc<Mutex<HashMap<String, String>>>,
     pub keymaps: Arc<Mutex<Vec<KeyBindingInfo>>>,
 }
@@ -54,6 +55,10 @@ impl WindowManagerHandler for CompositorHandler {
 
     fn get_outputs(&self) -> zbus::fdo::Result<Vec<OutputInfo>> {
         Ok(self.state.outputs.lock().unwrap().clone())
+    }
+
+    fn get_drm_devices(&self) -> zbus::fdo::Result<Vec<DrmDeviceInfo>> {
+        Ok(self.state.drm_devices.lock().unwrap().clone())
     }
 
     fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()> {

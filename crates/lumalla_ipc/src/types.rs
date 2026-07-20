@@ -6,6 +6,13 @@ use lumalla_shared::{Mods, Output, WindowRule, Zone};
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
 
+/// DRM primary node exposed over D-Bus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct DrmDeviceInfo {
+    /// Primary node path (e.g. `/dev/dri/card0`).
+    pub path: String,
+}
+
 /// Output state exposed over D-Bus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct OutputInfo {

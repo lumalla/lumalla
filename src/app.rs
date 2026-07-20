@@ -148,6 +148,9 @@ impl AppData {
                                 "DRM devices updated: {:?}",
                                 self.renderer_state.drm_devices()
                             );
+                            self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
+                                self.renderer_state.drm_devices().to_vec(),
+                            ));
                         }
                         Ok(false) => {}
                         Err(err) => {
@@ -344,6 +347,9 @@ pub(crate) fn run_app(
         Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
     }
     let renderer_state = init_and_register_renderer_state(&mut main_event_loop)?;
+    comms.dbus(DbusMessage::SetDrmDevices(
+        renderer_state.drm_devices().to_vec(),
+    ));
     let mut data = AppData::new(
         comms.clone(),
         config_child,
