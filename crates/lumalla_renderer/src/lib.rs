@@ -1,12 +1,13 @@
-use std::{io, path::PathBuf};
+use std::io;
 
 use lumalla_seat::SeatState;
+use lumalla_shared::DrmDeviceState;
 use mio::{Interest, Registry, Token, event::Source};
 
 pub mod drm;
 pub mod vulkan;
 
-use crate::drm::DrmDevices;
+use crate::drm::{DrmDevices, DrmDispatchResult};
 
 pub struct RendererState {
     drm_devices: DrmDevices,
@@ -19,25 +20,24 @@ impl RendererState {
         })
     }
 
-    pub fn drm_devices(&self) -> &[PathBuf] {
-        self.drm_devices.paths()
+    /// Snapshot of discovered DRM devices and probed connectors.
+    pub fn drm_device_states(&self) -> Vec<DrmDeviceState> {
+        self.drm_devices.device_states()
     }
 
-    /// Drain pending udev DRM events and rescan primary nodes.
-    ///
-    /// Returns `true` if the discovered device list changed.
-    pub fn dispatch(&mut self) -> anyhow::Result<bool> {
+    /// Drain pending udev DRM events; update device paths and/or connectors.
+    pub fn dispatch(&mut self) -> anyhow::Result<DrmDispatchResult> {
         self.drm_devices.dispatch()
     }
 
-    /// Open missing DRM devices via the seat and acquire DRM master.
+    /// Open missing DRM devices via the seat (fresh open after VT resume).
     pub fn activate_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
         self.drm_devices.activate(seat)
     }
 
-    /// Drop DRM master without closing seat-opened devices.
-    pub fn deactivate_drm(&mut self) {
-        self.drm_devices.deactivate();
+    /// Close seat-opened DRM devices after session disable was acknowledged.
+    pub fn deactivate_drm(&mut self, seat: &SeatState) {
+        self.drm_devices.deactivate(seat);
     }
 
     /// Close removed / open newly discovered DRM devices while the seat is active.

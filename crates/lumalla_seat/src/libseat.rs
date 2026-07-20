@@ -3,6 +3,7 @@ use std::{
     io,
     os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     ptr::NonNull,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use log::error;
@@ -78,20 +79,29 @@ impl SeatDevice {
     }
 }
 
+/// Userdata passed to libseat enable/disable callbacks.
+struct SeatUserdata {
+    comms: Comms,
+    /// Updated from callbacks so VT disable is reflected before message handling.
+    enabled: AtomicBool,
+}
+
 /// Safe wrapper around libseat
 pub struct LibSeat {
     seat: NonNull<bindings::libseat>,
     fd: RawFd,
-    enabled: bool,
-    // Need to keep comms alive, since libseat's userdata is a pointer to it
-    _comms: Box<Comms>,
+    // Kept alive for the lifetime of the seat; pointer is libseat userdata.
+    userdata: Box<SeatUserdata>,
 }
 
 impl LibSeat {
     /// Open a new seat
     pub fn new(comms: Comms) -> anyhow::Result<Self> {
-        let mut comms = Box::new(comms);
-        let comms_ptr = comms.as_mut() as *mut Comms as *mut std::ffi::c_void;
+        let mut userdata = Box::new(SeatUserdata {
+            comms,
+            enabled: AtomicBool::new(false),
+        });
+        let userdata_ptr = userdata.as_mut() as *mut SeatUserdata as *mut std::ffi::c_void;
 
         unsafe extern "C" fn enable_seat_callback(
             _seat: *mut bindings::libseat,
@@ -103,23 +113,42 @@ impl LibSeat {
                 return;
             }
             unsafe {
-                let comms = &mut *(userdata as *mut Comms);
-                comms.main(MainMessage::MainSeatEnabled);
+                let data = &mut *(userdata as *mut SeatUserdata);
+                data.enabled.store(true, Ordering::SeqCst);
+                data.comms.main(MainMessage::MainSeatEnabled);
             }
         }
 
         unsafe extern "C" fn disable_seat_callback(
-            _seat: *mut bindings::libseat,
+            seat: *mut bindings::libseat,
             userdata: *mut std::ffi::c_void,
         ) {
             log::debug!("libseat: disable_seat_callback fired");
             if userdata.is_null() {
                 error!("disable_seat_callback called with null userdata");
+                // Still acknowledge so the VT switch is not stuck forever.
+                let result = unsafe { bindings::libseat_disable_seat(seat) };
+                if result < 0 {
+                    error!(
+                        "libseat_disable_seat failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
                 return;
             }
             unsafe {
-                let comms = &mut *(userdata as *mut Comms);
-                comms.main(MainMessage::MainSeatDisabled);
+                let data = &mut *(userdata as *mut SeatUserdata);
+                data.enabled.store(false, Ordering::SeqCst);
+                // Acknowledge immediately (wlroots/libseat requirement). Deferring
+                // via the main loop races with enable and leaves VT switch stuck.
+                let result = bindings::libseat_disable_seat(seat);
+                if result < 0 {
+                    error!(
+                        "libseat_disable_seat failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                data.comms.main(MainMessage::MainSeatDisabled);
             }
         }
 
@@ -128,7 +157,7 @@ impl LibSeat {
             disable_seat: Some(disable_seat_callback),
         };
 
-        let seat = unsafe { bindings::libseat_open_seat(&LISTENER, comms_ptr) };
+        let seat = unsafe { bindings::libseat_open_seat(&LISTENER, userdata_ptr) };
         let Some(seat) = NonNull::new(seat) else {
             let err = std::io::Error::last_os_error();
             anyhow::bail!("Failed to open seat: {}", err);
@@ -140,8 +169,7 @@ impl LibSeat {
         Ok(Self {
             seat,
             fd,
-            enabled: false,
-            _comms: comms,
+            userdata,
         })
     }
 
@@ -207,10 +235,18 @@ impl LibSeat {
 
     /// Close a device by its device_id
     pub fn close_device(&self, device: SeatDevice) -> anyhow::Result<()> {
-        let result =
-            unsafe { bindings::libseat_close_device(self.seat.as_ptr(), device.device_id) };
+        self.close_device_by_id(device.device_id)
+    }
+
+    /// Close a device known only by its libseat device id.
+    pub fn close_device_by_id(&self, device_id: i32) -> anyhow::Result<()> {
+        // Guard against use-after-close during teardown races.
+        if self.seat == NonNull::dangling() {
+            anyhow::bail!("Seat already closed");
+        }
+        let result = unsafe { bindings::libseat_close_device(self.seat.as_ptr(), device_id) };
         if result < 0 {
-            anyhow::bail!("Failed to close device");
+            anyhow::bail!("Failed to close device {device_id}");
         }
         Ok(())
     }
@@ -224,16 +260,8 @@ impl LibSeat {
         Ok(())
     }
 
-    pub fn enable(&mut self) {
-        self.enabled = true;
-    }
-
-    pub fn disable(&mut self) {
-        self.enabled = false;
-    }
-
     pub fn is_enabled(&self) -> bool {
-        self.enabled
+        self.userdata.enabled.load(Ordering::SeqCst)
     }
 }
 
@@ -242,6 +270,9 @@ impl Drop for LibSeat {
         unsafe {
             bindings::libseat_close_seat(self.seat.as_ptr());
         }
+        // Prevent accidental reuse if Drop runs while close_restricted is still
+        // in flight on a stale userdata pointer.
+        self.seat = NonNull::dangling();
     }
 }
 

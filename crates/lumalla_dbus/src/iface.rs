@@ -158,8 +158,8 @@ impl WindowManagerHandler for CompositorHandler {
     }
 
     fn vt_switch(&mut self, vt: i32) -> zbus::fdo::Result<()> {
-        let _ = vt;
-        // self.state.comms.display(DisplayMessage::VtSwitch(vt));
+        info!("VT switch to {vt} requested over D-Bus");
+        self.state.comms.main(MainMessage::SwitchVt(vt));
         Ok(())
     }
 

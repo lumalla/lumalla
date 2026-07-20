@@ -2,15 +2,62 @@
 
 use std::collections::HashMap;
 
-use lumalla_shared::{Mods, Output, WindowRule, Zone};
+use lumalla_shared::{DrmConnector, DrmDeviceState, Mods, Output, WindowRule, Zone};
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
+
+/// DRM connector exposed over D-Bus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct DrmConnectorInfo {
+    /// Connector name (e.g. `HDMI-A-1`).
+    pub name: String,
+    /// DRM connector object id.
+    pub connector_id: u32,
+    /// Connector type name (e.g. `HDMI-A`, `eDP`).
+    pub connector_type: String,
+    /// Whether a sink is currently connected.
+    pub connected: bool,
+    /// Physical width in millimeters.
+    pub mm_width: u32,
+    /// Physical height in millimeters.
+    pub mm_height: u32,
+}
+
+impl From<&DrmConnector> for DrmConnectorInfo {
+    fn from(connector: &DrmConnector) -> Self {
+        Self {
+            name: connector.name.clone(),
+            connector_id: connector.connector_id,
+            connector_type: connector.connector_type.clone(),
+            connected: connector.connected,
+            mm_width: connector.mm_width,
+            mm_height: connector.mm_height,
+        }
+    }
+}
 
 /// DRM primary node exposed over D-Bus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct DrmDeviceInfo {
     /// Primary node path (e.g. `/dev/dri/card0`).
     pub path: String,
+    /// Connectors on this device.
+    pub connectors: Vec<DrmConnectorInfo>,
+}
+
+impl From<&DrmDeviceState> for DrmDeviceInfo {
+    fn from(device: &DrmDeviceState) -> Self {
+        Self {
+            path: device.path.to_string_lossy().into_owned(),
+            connectors: device.connectors.iter().map(DrmConnectorInfo::from).collect(),
+        }
+    }
+}
+
+impl From<DrmDeviceState> for DrmDeviceInfo {
+    fn from(device: DrmDeviceState) -> Self {
+        Self::from(&device)
+    }
 }
 
 /// Output state exposed over D-Bus.

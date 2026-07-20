@@ -87,6 +87,14 @@ impl AppData {
             self.handle_events(&events, &main_channel, event_loop)?;
             self.flush_clients(event_loop);
         }
+        // Close seat devices while libseat is still valid. If we leave that to
+        // LibInput/DrmDevice Drop during AppData teardown, close_restricted can
+        // call libseat_close_device on a destroyed seat and SIGSEGV.
+        if let Err(err) = self.input_state.disable_seat() {
+            warn!("Unable to suspend libinput during shutdown: {err}");
+        }
+        self.renderer_state
+            .deactivate_drm(self.seat_state.as_ref().get_ref());
         Ok(())
     }
 
@@ -142,12 +150,14 @@ impl AppData {
                     }
                 }
                 UDEV_DRM_TOKEN => match self.renderer_state.dispatch() {
-                    Ok(true) => {
+                    Ok(result) if result.changed() => {
                         info!(
-                            "DRM devices updated: {:?}",
-                            self.renderer_state.drm_devices()
+                            "DRM state updated (devices={}, connectors={}): {:?}",
+                            result.devices_changed,
+                            result.connectors_changed,
+                            self.renderer_state.drm_device_states()
                         );
-                        if self.seat_state.is_enabled() {
+                        if result.devices_changed && self.seat_state.is_enabled() {
                             if let Err(err) = self
                                 .renderer_state
                                 .reconcile_drm(self.seat_state.as_ref().get_ref())
@@ -156,10 +166,10 @@ impl AppData {
                             }
                         }
                         self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
-                            self.renderer_state.drm_devices().to_vec(),
+                            self.renderer_state.drm_device_states(),
                         ));
                     }
-                    Ok(false) => {}
+                    Ok(_) => {}
                     Err(err) => {
                         error!("Unable to dispatch DRM udev events: {err}");
                     }
@@ -179,7 +189,12 @@ impl AppData {
         while let Ok(msg) = main_channel.try_recv() {
             match msg {
                 MainMessage::MainSeatEnabled => {
-                    self.seat_state.enable_main_seat();
+                    // Callback already set the flag; ignore stale enables if we
+                    // were disabled again before this message was processed.
+                    if !self.seat_state.is_enabled() {
+                        debug!("Ignoring stale MainSeatEnabled (seat disabled)");
+                        continue;
+                    }
                     if let Ok(seat_name) = self.seat_state.seat_name() {
                         if let Err(err) = self.input_state.enable_seat(&seat_name) {
                             error!("Unable to enable libinput: {err}");
@@ -196,14 +211,31 @@ impl AppData {
                         .activate_drm(self.seat_state.as_ref().get_ref())
                     {
                         error!("Unable to activate DRM devices: {err}");
+                    } else {
+                        self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
+                            self.renderer_state.drm_device_states(),
+                        ));
                     }
                 }
                 MainMessage::MainSeatDisabled => {
-                    self.renderer_state.deactivate_drm();
+                    // Callback already acknowledged libseat_disable_seat and cleared
+                    // the flag. Ignore stale disables if we were re-enabled since.
+                    if self.seat_state.is_enabled() {
+                        debug!("Ignoring stale MainSeatDisabled (seat enabled)");
+                        continue;
+                    }
+                    // Suspend input before releasing DRM; close may fail after disable.
                     if let Err(err) = self.input_state.disable_seat() {
                         error!("Unable to disable libinput: {err}");
                     }
-                    self.seat_state.disable_main_seat();
+                    self.renderer_state
+                        .deactivate_drm(self.seat_state.as_ref().get_ref());
+                }
+                MainMessage::SwitchVt(vt) => {
+                    info!("Switching to VT {vt}");
+                    if let Err(err) = self.seat_state.switch_session(vt) {
+                        error!("Unable to switch to VT {vt}: {err}");
+                    }
                 }
                 MainMessage::AddKeymap {
                     key,
@@ -361,7 +393,7 @@ pub(crate) fn run_app(
     }
     let renderer_state = init_and_register_renderer_state(&mut main_event_loop)?;
     comms.dbus(DbusMessage::SetDrmDevices(
-        renderer_state.drm_devices().to_vec(),
+        renderer_state.drm_device_states(),
     ));
     let mut data = AppData::new(
         comms.clone(),

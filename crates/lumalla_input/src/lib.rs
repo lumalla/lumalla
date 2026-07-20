@@ -65,13 +65,19 @@ impl InputState {
 
     pub fn enable_seat(&mut self, seat_name: &str) -> anyhow::Result<()> {
         self.libinput.assign_seat(seat_name)?;
-        self.libinput.resume()
+        self.libinput.resume()?;
+        // Resume queues DEVICE_ADDED while we are inside another poll handler.
+        // mio uses edge-triggered epoll, so that readability edge is missed and
+        // the fd stays readable forever — no further LIBINPUT_TOKEN wakes.
+        // Drain now so the fd can go idle and re-arm on real input.
+        self.dispatch(|_| {})
     }
 
     pub fn disable_seat(&mut self) -> anyhow::Result<()> {
         self.mods = Mods::default();
         self.xkb.reset()?;
-        self.libinput.suspend()
+        self.libinput.suspend()?;
+        self.dispatch(|_| {})
     }
 
     pub fn add_keymap(&mut self, key: u32, mods: Mods, binding_id: String) {
@@ -107,11 +113,20 @@ impl InputState {
         state: u32,
         on_keyboard_event: &mut impl FnMut(KeyboardEvent),
     ) {
-        if key == libinput::bindings::KEY_F1 {
-            self.comms.main(MainMessage::Shutdown);
-            return;
-        }
         let pressed = state == KEY_STATE_PRESSED;
+        if pressed {
+            // Hardcoded: Ctrl+Alt+F1..F12 switches VT; bare F1 exits.
+            if self.mods.ctrl && self.mods.alt {
+                if let Some(vt) = fn_key_to_vt(key) {
+                    self.comms.main(MainMessage::SwitchVt(vt));
+                    return;
+                }
+            }
+            if key == libinput::bindings::KEY_F1 {
+                self.comms.main(MainMessage::Shutdown);
+                return;
+            }
+        }
         let mods_changed = self.xkb.update_key(key, pressed);
         if pressed {
             let keysym = self.xkb.key_get_one_sym(key);
@@ -153,6 +168,15 @@ impl InputState {
             self.comms
                 .dbus(DbusMessage::EmitBindingActivated(binding_id));
         }
+    }
+}
+
+/// Map Linux evdev `KEY_F1`..`KEY_F12` to VT numbers 1..12.
+fn fn_key_to_vt(key: u32) -> Option<i32> {
+    if (libinput::bindings::KEY_F1..=libinput::bindings::KEY_F12).contains(&key) {
+        Some((key - libinput::bindings::KEY_F1 + 1) as i32)
+    } else {
+        None
     }
 }
 

@@ -8,6 +8,8 @@ pub enum MainMessage {
     MainSeatEnabled,
     /// Notifies that the main seat has been disabled
     MainSeatDisabled,
+    /// Switch to the given VT/session (1-based).
+    SwitchVt(i32),
     /// Registers a compositor key binding.
     AddKeymap {
         /// Linux input keycode.

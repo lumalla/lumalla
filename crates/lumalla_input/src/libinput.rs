@@ -147,10 +147,17 @@ impl LibInput {
             }
         }
 
-        unsafe extern "C" fn close_restricted(fd: c_int, _userdata: *mut c_void) {
-            unsafe {
-                libc::close(fd);
+        unsafe extern "C" fn close_restricted(fd: c_int, userdata: *mut c_void) {
+            if userdata.is_null() {
+                unsafe {
+                    libc::close(fd);
+                }
+                return;
             }
+            let seat_state = unsafe { NonNull::new_unchecked(userdata.cast::<SeatState>()) };
+            // Must call libseat_close_device, not only close(2), or reopen after
+            // VT resume fails with EINVAL (device still claimed by the seat).
+            unsafe { seat_state.as_ref() }.close_device_fd(fd);
         }
 
         static INTERFACE: bindings::libinput_interface = bindings::libinput_interface {

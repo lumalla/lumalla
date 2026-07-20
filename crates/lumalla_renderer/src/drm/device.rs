@@ -11,8 +11,10 @@ use std::ptr;
 use anyhow::Context;
 use log::{info, warn};
 use lumalla_seat::{SeatDevice, SeatState};
-use lumalla_shared::{Udev, UdevMonitor};
+use lumalla_shared::{DrmConnector, DrmDeviceState, Udev, UdevMonitor};
 use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
+
+use super::connector::probe_connectors;
 
 #[allow(non_camel_case_types, dead_code)]
 mod bindings {
@@ -37,6 +39,22 @@ mod bindings {
     }
 }
 
+/// Result of draining udev DRM events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrmDispatchResult {
+    /// Primary-node path list changed.
+    pub devices_changed: bool,
+    /// Connector state on an opened device changed.
+    pub connectors_changed: bool,
+}
+
+impl DrmDispatchResult {
+    /// True if either devices or connectors changed.
+    pub fn changed(self) -> bool {
+        self.devices_changed || self.connectors_changed
+    }
+}
+
 /// A DRM primary-node file descriptor opened through libseat.
 ///
 /// Modesetting will be layered on top of this later via raw DRM ioctls.
@@ -44,6 +62,7 @@ pub struct DrmDevice {
     path: PathBuf,
     device_id: i32,
     fd: OwnedFd,
+    connectors: Vec<DrmConnector>,
 }
 
 impl AsFd for DrmDevice {
@@ -60,6 +79,7 @@ impl DrmDevice {
             path,
             device_id,
             fd: device.into_fd(),
+            connectors: Vec::new(),
         }
     }
 
@@ -71,6 +91,11 @@ impl DrmDevice {
     /// Returns a reference to the underlying file descriptor.
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+
+    /// Last probed connectors for this device.
+    pub fn connectors(&self) -> &[DrmConnector] {
+        &self.connectors
     }
 
     /// Become DRM master on this device.
@@ -97,6 +122,25 @@ impl DrmDevice {
             );
         }
         Ok(())
+    }
+
+    /// Probe connectors via libdrm; returns `true` if the list changed.
+    pub fn probe_connectors(&mut self) -> anyhow::Result<bool> {
+        let connectors = probe_connectors(self.fd.as_raw_fd())
+            .with_context(|| format!("Failed to probe connectors on {}", self.path.display()))?;
+        if connectors == self.connectors {
+            return Ok(false);
+        }
+        info!(
+            "DRM connectors on {}: {:?}",
+            self.path.display(),
+            connectors
+                .iter()
+                .map(|c| format!("{}({})", c.name, if c.connected { "connected" } else { "disconnected" }))
+                .collect::<Vec<_>>()
+        );
+        self.connectors = connectors;
+        Ok(true)
     }
 
     /// Convert back into a [`SeatDevice`] for `libseat_close_device`.
@@ -142,10 +186,26 @@ impl DrmDevices {
         &self.opened
     }
 
-    /// Drain pending udev DRM events and rescan primary nodes.
-    ///
-    /// Returns `true` if the discovered device list changed.
-    pub fn dispatch(&mut self) -> anyhow::Result<bool> {
+    /// Snapshot of discovered devices and probed connectors for IPC.
+    pub fn device_states(&self) -> Vec<DrmDeviceState> {
+        self.paths
+            .iter()
+            .map(|path| {
+                let connectors = self
+                    .opened
+                    .get(path)
+                    .map(|device| device.connectors().to_vec())
+                    .unwrap_or_default();
+                DrmDeviceState {
+                    path: path.clone(),
+                    connectors,
+                }
+            })
+            .collect()
+    }
+
+    /// Drain pending udev DRM events; update device paths and/or connectors.
+    pub fn dispatch(&mut self) -> anyhow::Result<DrmDispatchResult> {
         let mut saw_card_event = false;
         while let Some(device) = self.monitor.receive_device() {
             let sysname = device.sysname().unwrap_or("");
@@ -155,48 +215,46 @@ impl DrmDevices {
         }
 
         if !saw_card_event {
-            return Ok(false);
+            return Ok(DrmDispatchResult::default());
         }
+
+        let mut result = DrmDispatchResult::default();
 
         let paths = find_drm_devices()?;
-        if paths == self.paths {
-            return Ok(false);
+        if paths != self.paths {
+            info!("DRM device list changed: {:?} -> {:?}", self.paths, paths);
+            self.paths = paths;
+            result.devices_changed = true;
         }
 
-        info!("DRM device list changed: {:?} -> {:?}", self.paths, paths);
-        self.paths = paths;
-        Ok(true)
+        if !self.opened.is_empty() {
+            result.connectors_changed = self.probe_all_connectors()?;
+        }
+
+        Ok(result)
     }
 
     /// Open any missing primary nodes via the seat.
     ///
-    /// Fresh opens through libseat already have DRM master. `drmSetMaster` is only
-    /// called for devices that were already open (re-acquiring master after a VT switch).
+    /// Fresh opens through libseat already have DRM master. After a VT switch,
+    /// devices must have been closed in [`Self::deactivate`] so they are reopened here.
     pub fn activate(&mut self, seat: &SeatState) -> anyhow::Result<()> {
-        let already_open: Vec<PathBuf> = self.opened.keys().cloned().collect();
         self.open_missing(seat)?;
-        for path in already_open {
-            let Some(device) = self.opened.get(&path) else {
-                continue;
-            };
-            if let Err(err) = device.set_master() {
-                warn!(
-                    "Failed to set DRM master for {}: {err:#}",
-                    device.path().display()
-                );
-            }
-        }
+        self.probe_all_connectors()?;
         Ok(())
     }
 
-    /// Drop DRM master on all opened devices without closing them.
-    pub fn deactivate(&mut self) {
-        for device in self.opened.values() {
-            if let Err(err) = device.drop_master() {
-                warn!(
-                    "Failed to drop DRM master for {}: {err:#}",
-                    device.path().display()
-                );
+    /// Close all seat-opened DRM devices in preparation for session disable.
+    ///
+    /// libseat requires acknowledging disable with `libseat_disable_seat` after
+    /// devices are no longer used; existing fds may be revoked on VT switch.
+    pub fn deactivate(&mut self, seat: &SeatState) {
+        let opened = std::mem::take(&mut self.opened);
+        for (path, device) in opened {
+            info!("Closing DRM device {} for session disable", path.display());
+            let seat_device = device.into_seat_device();
+            if let Err(err) = seat.close_device(seat_device) {
+                warn!("Failed to close DRM device {}: {err:#}", path.display());
             }
         }
     }
@@ -207,7 +265,22 @@ impl DrmDevices {
     pub fn reconcile(&mut self, seat: &SeatState) -> anyhow::Result<()> {
         self.close_removed(seat)?;
         self.open_missing(seat)?;
+        self.probe_all_connectors()?;
         Ok(())
+    }
+
+    fn probe_all_connectors(&mut self) -> anyhow::Result<bool> {
+        let mut changed = false;
+        let paths: Vec<PathBuf> = self.opened.keys().cloned().collect();
+        for path in paths {
+            let Some(device) = self.opened.get_mut(&path) else {
+                continue;
+            };
+            if device.probe_connectors()? {
+                changed = true;
+            }
+        }
+        Ok(changed)
     }
 
     fn open_missing(&mut self, seat: &SeatState) -> anyhow::Result<()> {
@@ -223,7 +296,13 @@ impl DrmDevices {
                 path.display(),
                 seat_device.device_id()
             );
-            let device = DrmDevice::from_seat_device(path.clone(), seat_device);
+            let mut device = DrmDevice::from_seat_device(path.clone(), seat_device);
+            if let Err(err) = device.probe_connectors() {
+                warn!(
+                    "Failed to probe connectors on newly opened {}: {err:#}",
+                    path.display()
+                );
+            }
             self.opened.insert(path.clone(), device);
         }
         Ok(())

@@ -18,7 +18,7 @@ use lumalla_ipc::{
     BUS_NAME, OBJECT_PATH, WindowManager, signals,
     types::{DrmDeviceInfo, OutputInfo},
 };
-use lumalla_shared::{Comms, DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage, Output};
+use lumalla_shared::{Comms, DbusMessage, DrmDeviceState, MESSAGE_CHANNEL_TOKEN, MainMessage, Output};
 use mio::{Events, Poll};
 use zbus::{Error as ZbusError, blocking::connection};
 
@@ -140,8 +140,8 @@ impl DbusState {
             DbusMessage::SetOutputs(outputs) => {
                 self.update_outputs(outputs);
             }
-            DbusMessage::SetDrmDevices(paths) => {
-                self.update_drm_devices(paths);
+            DbusMessage::SetDrmDevices(devices) => {
+                self.update_drm_devices(devices);
             }
             DbusMessage::EmitReady => {
                 emit_signal(&self.connection, signals::READY, &())?;
@@ -150,8 +150,8 @@ impl DbusState {
                 let infos = self.update_outputs(outputs);
                 emit_signal(&self.connection, signals::OUTPUT_CHANGED, &(&infos,))?;
             }
-            DbusMessage::EmitDrmDevicesChanged(paths) => {
-                let infos = self.update_drm_devices(paths);
+            DbusMessage::EmitDrmDevicesChanged(devices) => {
+                let infos = self.update_drm_devices(devices);
                 emit_signal(&self.connection, signals::DRM_DEVICES_CHANGED, &(&infos,))?;
             }
             DbusMessage::EmitBindingActivated(binding_id) => {
@@ -177,13 +177,8 @@ impl DbusState {
         infos
     }
 
-    fn update_drm_devices(&self, paths: Vec<std::path::PathBuf>) -> Vec<DrmDeviceInfo> {
-        let infos: Vec<DrmDeviceInfo> = paths
-            .into_iter()
-            .map(|path| DrmDeviceInfo {
-                path: path.to_string_lossy().into_owned(),
-            })
-            .collect();
+    fn update_drm_devices(&self, devices: Vec<DrmDeviceState>) -> Vec<DrmDeviceInfo> {
+        let infos: Vec<DrmDeviceInfo> = devices.iter().map(DrmDeviceInfo::from).collect();
         *self.drm_devices.lock().unwrap() = infos.clone();
         infos
     }
