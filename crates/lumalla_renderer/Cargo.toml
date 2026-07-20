@@ -9,6 +9,7 @@ include = ["src/**/*", "LICENSE-*", "build.rs"]
 
 [dependencies]
 lumalla_shared = { path = "../lumalla_shared" }
+lumalla_seat = { path = "../lumalla_seat" }
 anyhow = { workspace = true }
 mio = { workspace = true }
 log = { workspace = true }

@@ -130,8 +130,8 @@ impl LibInput {
             let path = unsafe { CStr::from_ptr(path) };
             let path = Path::new(OsStr::from_bytes(path.to_bytes()));
             match unsafe { seat_state.as_ref() }.open_device(path) {
-                Ok(fd) => {
-                    let raw_fd = fd.into_raw_fd();
+                Ok(device) => {
+                    let raw_fd = device.into_fd().into_raw_fd();
                     if flags & libc::O_CLOEXEC == 0 {
                         clear_close_on_exec(raw_fd);
                     }

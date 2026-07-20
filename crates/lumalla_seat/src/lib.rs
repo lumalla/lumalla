@@ -1,6 +1,6 @@
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::RawFd;
 use std::path::Path;
 
 use anyhow::Context;
@@ -10,6 +10,8 @@ use lumalla_shared::Comms;
 use crate::libseat::LibSeat;
 
 mod libseat;
+
+pub use libseat::SeatDevice;
 
 pub struct SeatState {
     main_seat: LibSeat,
@@ -43,12 +45,25 @@ impl SeatState {
         self.main_seat.disable();
     }
 
-    /// Open the device from the given path
-    pub fn open_device(&self, path: &Path) -> anyhow::Result<OwnedFd> {
+    pub fn is_enabled(&self) -> bool {
+        self.main_seat.is_enabled()
+    }
+
+    /// Open the device from the given path via libseat.
+    pub fn open_device(&self, path: &Path) -> anyhow::Result<SeatDevice> {
         debug!("Opening device in main seat: {}", path.display());
         let path_str = path.to_str().context("Device path is not valid UTF-8")?;
         let c_path = CString::new(path_str).context("Device path contains null byte")?;
-        Ok(self.main_seat.open_device(&c_path)?.into_fd())
+        self.main_seat.open_device(&c_path)
+    }
+
+    /// Close a device previously opened with [`Self::open_device`].
+    pub fn close_device(&self, device: SeatDevice) -> anyhow::Result<()> {
+        debug!(
+            "Closing device in main seat: device_id={}",
+            device.device_id()
+        );
+        self.main_seat.close_device(device)
     }
 }
 

@@ -1,13 +1,16 @@
 //! DRM device management
 
+use std::collections::HashMap;
 use std::ffi::{CStr, OsStr, c_int};
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
-use log::info;
+use anyhow::Context;
+use log::{info, warn};
+use lumalla_seat::{SeatDevice, SeatState};
 use lumalla_shared::{Udev, UdevMonitor};
 use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
 
@@ -29,13 +32,17 @@ mod bindings {
     unsafe extern "C" {
         pub fn drmGetDevices2(flags: u32, devices: *mut drmDevicePtr, max_devices: c_int) -> c_int;
         pub fn drmFreeDevices(devices: *mut drmDevicePtr, count: c_int);
+        pub fn drmSetMaster(fd: c_int) -> c_int;
+        pub fn drmDropMaster(fd: c_int) -> c_int;
     }
 }
 
-/// A DRM primary-node file descriptor (typically from libseat).
+/// A DRM primary-node file descriptor opened through libseat.
 ///
 /// Modesetting will be layered on top of this later via raw DRM ioctls.
 pub struct DrmDevice {
+    path: PathBuf,
+    device_id: i32,
     fd: OwnedFd,
 }
 
@@ -46,20 +53,62 @@ impl AsFd for DrmDevice {
 }
 
 impl DrmDevice {
-    /// Wraps an owned DRM device file descriptor.
-    pub fn from_fd(fd: OwnedFd) -> Self {
-        Self { fd }
+    /// Wraps a seat-opened DRM primary node.
+    pub fn from_seat_device(path: PathBuf, device: SeatDevice) -> Self {
+        let device_id = device.device_id();
+        Self {
+            path,
+            device_id,
+            fd: device.into_fd(),
+        }
+    }
+
+    /// Primary node path (e.g. `/dev/dri/card0`).
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Returns a reference to the underlying file descriptor.
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
+
+    /// Become DRM master on this device.
+    pub fn set_master(&self) -> anyhow::Result<()> {
+        let result = unsafe { bindings::drmSetMaster(self.fd.as_raw_fd()) };
+        if result != 0 {
+            anyhow::bail!(
+                "drmSetMaster failed for {}: {}",
+                self.path.display(),
+                io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    /// Drop DRM master on this device.
+    pub fn drop_master(&self) -> anyhow::Result<()> {
+        let result = unsafe { bindings::drmDropMaster(self.fd.as_raw_fd()) };
+        if result != 0 {
+            anyhow::bail!(
+                "drmDropMaster failed for {}: {}",
+                self.path.display(),
+                io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    /// Convert back into a [`SeatDevice`] for `libseat_close_device`.
+    fn into_seat_device(self) -> SeatDevice {
+        SeatDevice::from_raw_parts(self.device_id, self.fd)
+    }
 }
 
 /// Discovered DRM primary nodes, refreshed via udev when GPUs appear or go away.
 pub struct DrmDevices {
     paths: Vec<PathBuf>,
+    opened: HashMap<PathBuf, DrmDevice>,
     /// Kept alive so the monitor's udev context remains valid.
     _udev: Udev,
     monitor: UdevMonitor,
@@ -77,6 +126,7 @@ impl DrmDevices {
 
         Ok(Self {
             paths,
+            opened: HashMap::new(),
             _udev: udev,
             monitor,
         })
@@ -85,6 +135,11 @@ impl DrmDevices {
     /// Currently known primary-node paths (e.g. `/dev/dri/card0`).
     pub fn paths(&self) -> &[PathBuf] {
         &self.paths
+    }
+
+    /// Currently opened DRM devices (session-active fds).
+    pub fn opened(&self) -> &HashMap<PathBuf, DrmDevice> {
+        &self.opened
     }
 
     /// Drain pending udev DRM events and rescan primary nodes.
@@ -111,6 +166,87 @@ impl DrmDevices {
         info!("DRM device list changed: {:?} -> {:?}", self.paths, paths);
         self.paths = paths;
         Ok(true)
+    }
+
+    /// Open any missing primary nodes via the seat.
+    ///
+    /// Fresh opens through libseat already have DRM master. `drmSetMaster` is only
+    /// called for devices that were already open (re-acquiring master after a VT switch).
+    pub fn activate(&mut self, seat: &SeatState) -> anyhow::Result<()> {
+        let already_open: Vec<PathBuf> = self.opened.keys().cloned().collect();
+        self.open_missing(seat)?;
+        for path in already_open {
+            let Some(device) = self.opened.get(&path) else {
+                continue;
+            };
+            if let Err(err) = device.set_master() {
+                warn!(
+                    "Failed to set DRM master for {}: {err:#}",
+                    device.path().display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop DRM master on all opened devices without closing them.
+    pub fn deactivate(&mut self) {
+        for device in self.opened.values() {
+            if let Err(err) = device.drop_master() {
+                warn!(
+                    "Failed to drop DRM master for {}: {err:#}",
+                    device.path().display()
+                );
+            }
+        }
+    }
+
+    /// Close removed devices and open newly discovered ones while the seat is active.
+    ///
+    /// New devices opened via libseat already have DRM master; no `drmSetMaster` needed.
+    pub fn reconcile(&mut self, seat: &SeatState) -> anyhow::Result<()> {
+        self.close_removed(seat)?;
+        self.open_missing(seat)?;
+        Ok(())
+    }
+
+    fn open_missing(&mut self, seat: &SeatState) -> anyhow::Result<()> {
+        for path in &self.paths {
+            if self.opened.contains_key(path) {
+                continue;
+            }
+            let seat_device = seat
+                .open_device(path)
+                .with_context(|| format!("Failed to open DRM device {}", path.display()))?;
+            info!(
+                "Opened DRM device {} (device_id={})",
+                path.display(),
+                seat_device.device_id()
+            );
+            let device = DrmDevice::from_seat_device(path.clone(), seat_device);
+            self.opened.insert(path.clone(), device);
+        }
+        Ok(())
+    }
+
+    fn close_removed(&mut self, seat: &SeatState) -> anyhow::Result<()> {
+        let to_close: Vec<PathBuf> = self
+            .opened
+            .keys()
+            .filter(|path| !self.paths.contains(path))
+            .cloned()
+            .collect();
+
+        for path in to_close {
+            if let Some(device) = self.opened.remove(&path) {
+                info!("Closing removed DRM device {}", path.display());
+                let seat_device = device.into_seat_device();
+                if let Err(err) = seat.close_device(seat_device) {
+                    warn!("Failed to close DRM device {}: {err:#}", path.display());
+                }
+            }
+        }
+        Ok(())
     }
 }
 

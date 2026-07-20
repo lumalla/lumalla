@@ -1,7 +1,7 @@
 use std::{
     ffi::CStr,
     io,
-    os::fd::{FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     ptr::NonNull,
 };
 
@@ -55,8 +55,26 @@ pub struct SeatDevice {
 }
 
 impl SeatDevice {
-    pub(crate) fn into_fd(self) -> OwnedFd {
+    /// Libseat device id used with `libseat_close_device`.
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
+
+    /// Borrow the opened file descriptor.
+    pub fn fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    /// Take ownership of the fd, discarding the libseat device id.
+    ///
+    /// Callers that use this cannot later close the device via libseat.
+    pub fn into_fd(self) -> OwnedFd {
         self.fd
+    }
+
+    /// Rebuild a [`SeatDevice`] from parts previously obtained via libseat.
+    pub fn from_raw_parts(device_id: i32, fd: OwnedFd) -> Self {
+        Self { device_id, fd }
     }
 }
 
@@ -212,6 +230,10 @@ impl LibSeat {
 
     pub fn disable(&mut self) {
         self.enabled = false;
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 }
 

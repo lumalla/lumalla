@@ -141,23 +141,29 @@ impl AppData {
                         error!("Unable to dispatch libinput events: {err}");
                     }
                 }
-                UDEV_DRM_TOKEN => {
-                    match self.renderer_state.dispatch() {
-                        Ok(true) => {
-                            info!(
-                                "DRM devices updated: {:?}",
-                                self.renderer_state.drm_devices()
-                            );
-                            self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
-                                self.renderer_state.drm_devices().to_vec(),
-                            ));
+                UDEV_DRM_TOKEN => match self.renderer_state.dispatch() {
+                    Ok(true) => {
+                        info!(
+                            "DRM devices updated: {:?}",
+                            self.renderer_state.drm_devices()
+                        );
+                        if self.seat_state.is_enabled() {
+                            if let Err(err) = self
+                                .renderer_state
+                                .reconcile_drm(self.seat_state.as_ref().get_ref())
+                            {
+                                error!("Unable to reconcile DRM devices: {err}");
+                            }
                         }
-                        Ok(false) => {}
-                        Err(err) => {
-                            error!("Unable to dispatch DRM udev events: {err}");
-                        }
+                        self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
+                            self.renderer_state.drm_devices().to_vec(),
+                        ));
                     }
-                }
+                    Ok(false) => {}
+                    Err(err) => {
+                        error!("Unable to dispatch DRM udev events: {err}");
+                    }
+                },
                 WAYLAND_SOCKET_TOKEN => {
                     self.connect_client(event_loop);
                 }
@@ -185,8 +191,15 @@ impl AppData {
                             error!("Unable to activate Wayland seat: {err}");
                         }
                     }
+                    if let Err(err) = self
+                        .renderer_state
+                        .activate_drm(self.seat_state.as_ref().get_ref())
+                    {
+                        error!("Unable to activate DRM devices: {err}");
+                    }
                 }
                 MainMessage::MainSeatDisabled => {
+                    self.renderer_state.deactivate_drm();
                     if let Err(err) = self.input_state.disable_seat() {
                         error!("Unable to disable libinput: {err}");
                     }
@@ -363,9 +376,7 @@ pub(crate) fn run_app(
     data.run_event_loop(&mut main_event_loop, main_channel)
 }
 
-fn init_and_register_renderer_state(
-    main_event_loop: &mut Poll,
-) -> anyhow::Result<RendererState> {
+fn init_and_register_renderer_state(main_event_loop: &mut Poll) -> anyhow::Result<RendererState> {
     let mut renderer_state = RendererState::new()?;
     main_event_loop
         .registry()
