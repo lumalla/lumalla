@@ -2,9 +2,36 @@
 
 use std::collections::HashMap;
 
-use lumalla_shared::{DrmConnector, DrmDeviceState, Mods, Output, WindowRule, Zone};
+use lumalla_shared::{DrmConnector, DrmDeviceState, DrmMode, Mods, Output, WindowRule, Zone};
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
+
+/// Display mode on a DRM connector, exposed over D-Bus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct DrmModeInfo {
+    /// Horizontal active pixels.
+    pub width: u32,
+    /// Vertical active pixels.
+    pub height: u32,
+    /// Vertical refresh rate in Hz.
+    pub refresh_hz: u32,
+    /// Kernel mode name (e.g. `1920x1080`).
+    pub name: String,
+    /// Whether this is the connector's preferred mode.
+    pub preferred: bool,
+}
+
+impl From<&DrmMode> for DrmModeInfo {
+    fn from(mode: &DrmMode) -> Self {
+        Self {
+            width: mode.width,
+            height: mode.height,
+            refresh_hz: mode.refresh_hz,
+            name: mode.name.clone(),
+            preferred: mode.preferred,
+        }
+    }
+}
 
 /// DRM connector exposed over D-Bus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -21,6 +48,8 @@ pub struct DrmConnectorInfo {
     pub mm_width: u32,
     /// Physical height in millimeters.
     pub mm_height: u32,
+    /// Available modes for this connector.
+    pub modes: Vec<DrmModeInfo>,
 }
 
 impl From<&DrmConnector> for DrmConnectorInfo {
@@ -32,6 +61,7 @@ impl From<&DrmConnector> for DrmConnectorInfo {
             connected: connector.connected,
             mm_width: connector.mm_width,
             mm_height: connector.mm_height,
+            modes: connector.modes.iter().map(DrmModeInfo::from).collect(),
         }
     }
 }

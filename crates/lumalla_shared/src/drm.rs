@@ -1,5 +1,20 @@
 use std::path::PathBuf;
 
+/// A display mode advertised on a DRM connector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrmMode {
+    /// Horizontal active pixels.
+    pub width: u32,
+    /// Vertical active pixels.
+    pub height: u32,
+    /// Vertical refresh rate in Hz (as reported by the kernel).
+    pub refresh_hz: u32,
+    /// Kernel mode name (e.g. `1920x1080`).
+    pub name: String,
+    /// Whether this is the connector's preferred mode.
+    pub preferred: bool,
+}
+
 /// A DRM connector discovered on a primary node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrmConnector {
@@ -15,6 +30,8 @@ pub struct DrmConnector {
     pub mm_width: u32,
     /// Physical height in millimeters.
     pub mm_height: u32,
+    /// Modes advertised by the kernel for this connector (usually empty if disconnected).
+    pub modes: Vec<DrmMode>,
 }
 
 /// Snapshot of a DRM primary node and its connectors.

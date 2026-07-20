@@ -136,7 +136,24 @@ impl DrmDevice {
             self.path.display(),
             connectors
                 .iter()
-                .map(|c| format!("{}({})", c.name, if c.connected { "connected" } else { "disconnected" }))
+                .map(|c| {
+                    let status = if c.connected {
+                        "connected"
+                    } else {
+                        "disconnected"
+                    };
+                    let preferred = c
+                        .modes
+                        .iter()
+                        .find(|m| m.preferred)
+                        .map(|m| format!("{}@{}Hz", m.name, m.refresh_hz))
+                        .unwrap_or_else(|| "-".into());
+                    format!(
+                        "{}({status}, {} modes, preferred={preferred})",
+                        c.name,
+                        c.modes.len()
+                    )
+                })
                 .collect::<Vec<_>>()
         );
         self.connectors = connectors;
