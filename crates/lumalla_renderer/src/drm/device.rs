@@ -15,6 +15,7 @@ use lumalla_shared::{DrmConnector, DrmDeviceState, Udev, UdevMonitor};
 use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
 
 use super::connector::probe_connectors;
+use super::modeset::enable_atomic_client_caps;
 
 #[allow(non_camel_case_types, dead_code)]
 mod bindings {
@@ -314,6 +315,12 @@ impl DrmDevices {
                 seat_device.device_id()
             );
             let mut device = DrmDevice::from_seat_device(path.clone(), seat_device);
+            if let Err(err) = enable_atomic_client_caps(device.fd().as_raw_fd()) {
+                warn!(
+                    "Failed to enable atomic DRM caps on {}: {err:#}",
+                    path.display()
+                );
+            }
             if let Err(err) = device.probe_connectors() {
                 warn!(
                     "Failed to probe connectors on newly opened {}: {err:#}",
