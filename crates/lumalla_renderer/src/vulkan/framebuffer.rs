@@ -29,13 +29,25 @@ impl Framebuffer {
         render_pass: &RenderPass,
         color_attachment: &Image,
     ) -> anyhow::Result<Self> {
-        let extent = color_attachment.extent();
-        let image_view = color_attachment.view();
+        Self::from_view(
+            device,
+            render_pass,
+            color_attachment.view(),
+            color_attachment.extent(),
+        )
+    }
 
-        // Store array in variable to ensure it lives long enough
+    /// Creates a framebuffer from an existing image view and extent.
+    ///
+    /// Used for scanout targets such as [`super::DmaBufImage`].
+    pub fn from_view(
+        device: &Device,
+        render_pass: &RenderPass,
+        image_view: vk::ImageView,
+        extent: vk::Extent2D,
+    ) -> anyhow::Result<Self> {
         let attachments = [image_view];
 
-        // Create framebuffer
         let create_info = vk::FramebufferCreateInfo::default()
             .render_pass(render_pass.handle())
             .attachments(&attachments)

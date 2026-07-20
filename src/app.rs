@@ -15,7 +15,7 @@ use lumalla_display::{
     ClientConnection, ClientId, DisplayState, KeyboardModifiers, Wayland, create_wayland_display,
 };
 use lumalla_input::{InputState, KeyboardEvent};
-use lumalla_renderer::RendererState;
+use lumalla_renderer::{RendererState, SOLID_CLEAR_COLOR};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender,
@@ -215,6 +215,10 @@ impl AppData {
                         self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                             self.renderer_state.drm_device_states(),
                         ));
+                        if let Err(err) = self.renderer_state.present_solid_clear(SOLID_CLEAR_COLOR)
+                        {
+                            error!("Unable to present solid clear: {err:#}");
+                        }
                     }
                 }
                 MainMessage::MainSeatDisabled => {

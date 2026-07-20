@@ -42,7 +42,10 @@ impl VulkanContext {
     /// This sets up:
     /// - Vulkan instance with appropriate extensions
     /// - Debug validation layers (in debug builds)
-    pub fn new() -> anyhow::Result<Self> {
+    ///
+    /// When `preferred_drm_path` is set, device selection prefers the GPU that
+    /// drives that primary node (needed so DMA-BUFs can be imported by the same KMS device).
+    pub fn new(preferred_drm_path: Option<&std::path::Path>) -> anyhow::Result<Self> {
         // Load Vulkan dynamically
         let entry = unsafe { ash::Entry::load() }
             .context("Failed to load Vulkan. Is a Vulkan driver installed?")?;
@@ -156,8 +159,8 @@ impl VulkanContext {
         #[cfg(debug_assertions)]
         let debug_utils = Self::setup_debug_messenger(&entry, &instance);
 
-        // Select a physical device
-        let physical_device = PhysicalDevice::select(&instance)?;
+        // Select a physical device (prefer the KMS card we will modeset on)
+        let physical_device = PhysicalDevice::select(&instance, preferred_drm_path)?;
 
         // Create the logical device
         let device = Device::new(&instance, &physical_device)?;

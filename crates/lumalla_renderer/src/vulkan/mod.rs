@@ -2,6 +2,7 @@
 //!
 //! This module provides Vulkan-based rendering using the `ash` crate.
 
+mod clear;
 mod command;
 mod descriptor;
 mod device;
@@ -16,6 +17,7 @@ mod render_pass;
 pub mod shaders;
 mod sync;
 
+pub use clear::clear_framebuffer_to_color;
 pub use command::{CommandBufferRecorder, CommandPool};
 pub use descriptor::DescriptorSetLayout;
 pub use device::Device;

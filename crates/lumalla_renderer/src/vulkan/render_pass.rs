@@ -81,9 +81,23 @@ impl RenderPass {
     /// Creates a render pass suitable for rendering to a display output.
     ///
     /// This uses PRESENT_SRC_KHR as the final layout, which is appropriate
-    /// for images that will be presented directly to a display.
+    /// for images that will be presented directly via WSI.
     pub fn new_for_display(device: &Device, format: vk::Format) -> anyhow::Result<Self> {
-        // Color attachment description
+        Self::new_with_final_layout(device, format, vk::ImageLayout::PRESENT_SRC_KHR)
+    }
+
+    /// Creates a render pass for clearing a DMA-BUF image destined for KMS scanout.
+    ///
+    /// Final layout is `GENERAL` so the image can be exported and scanned out.
+    pub fn new_for_scanout(device: &Device, format: vk::Format) -> anyhow::Result<Self> {
+        Self::new_with_final_layout(device, format, vk::ImageLayout::GENERAL)
+    }
+
+    fn new_with_final_layout(
+        device: &Device,
+        format: vk::Format,
+        final_layout: vk::ImageLayout,
+    ) -> anyhow::Result<Self> {
         let color_attachment = vk::AttachmentDescription::default()
             .format(format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -92,16 +106,15 @@ impl RenderPass {
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR); // For display presentation
+            .final_layout(final_layout);
 
-        // Attachment reference
         let color_attachment_ref = vk::AttachmentReference {
             attachment: 0,
             layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         };
 
-        // Subpass dependency
-        let dependency = vk::SubpassDependency::default()
+        // External dependency after the pass so KMS can sample the stored image.
+        let dependency_begin = vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
             .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
@@ -109,17 +122,22 @@ impl RenderPass {
             .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
 
-        // Store arrays in variables to ensure they live long enough
+        let dependency_end = vk::SubpassDependency::default()
+            .src_subpass(0)
+            .dst_subpass(vk::SUBPASS_EXTERNAL)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags::BOTTOM_OF_PIPE)
+            .dst_access_mask(vk::AccessFlags::empty());
+
         let attachments = [color_attachment];
         let color_attachment_refs = [color_attachment_ref];
-        let dependencies = [dependency];
+        let dependencies = [dependency_begin, dependency_end];
 
-        // Subpass description
         let subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_attachment_refs);
 
-        // Create render pass
         let subpasses = [subpass];
         let create_info = vk::RenderPassCreateInfo::default()
             .attachments(&attachments)
@@ -127,9 +145,12 @@ impl RenderPass {
             .dependencies(&dependencies);
 
         let handle = unsafe { device.handle().create_render_pass(&create_info, None) }
-            .context("Failed to create render pass for display")?;
+            .context("Failed to create render pass")?;
 
-        debug!("Created render pass for display with format {:?}", format);
+        debug!(
+            "Created render pass with format {:?} final_layout={:?}",
+            format, final_layout
+        );
 
         Ok(Self {
             handle,

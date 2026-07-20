@@ -2,7 +2,7 @@
 
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use ash::vk;
@@ -26,10 +26,14 @@ impl PhysicalDevice {
     /// Selects the best available physical device for rendering.
     ///
     /// Selection criteria:
-    /// 1. Must have a queue family that supports graphics operations
-    /// 2. Prefers discrete GPUs over integrated
-    /// 3. Falls back to any suitable device if no discrete GPU is found
-    pub fn select(instance: &ash::Instance) -> anyhow::Result<Self> {
+    /// 1. Prefer a GPU whose DRM primary path matches `preferred_drm_path`
+    /// 2. Must have a queue family that supports graphics operations
+    /// 3. Prefers discrete GPUs over integrated
+    /// 4. Falls back to any suitable device if no discrete GPU is found
+    pub fn select(
+        instance: &ash::Instance,
+        preferred_drm_path: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         // SAFETY: Instance is valid and was created successfully
         let physical_devices = unsafe { instance.enumerate_physical_devices() }
             .context("Failed to enumerate physical devices")?;
@@ -41,8 +45,13 @@ impl PhysicalDevice {
         info!("Found {} Vulkan-capable device(s)", physical_devices.len());
 
         // Evaluate each device and collect suitable candidates
-        let mut candidates: Vec<(vk::PhysicalDevice, vk::PhysicalDeviceProperties, u32, i32)> =
-            Vec::new();
+        let mut candidates: Vec<(
+            vk::PhysicalDevice,
+            vk::PhysicalDeviceProperties,
+            u32,
+            i32,
+            Option<PathBuf>,
+        )> = Vec::new();
 
         for &physical_device in &physical_devices {
             // SAFETY: Physical device handle is valid from enumeration
@@ -71,14 +80,22 @@ impl PhysicalDevice {
                 }
             };
 
+            let drm_path = Self::query_drm_device_path(instance, physical_device);
+
             // Score the device (higher is better)
-            let score = Self::score_device(&properties);
+            let mut score = Self::score_device(&properties);
+            if let (Some(preferred), Some(path)) = (preferred_drm_path, &drm_path) {
+                if path == preferred {
+                    score += 10_000;
+                    debug!("  Matches preferred DRM path {}", path.display());
+                }
+            }
             debug!(
                 "  Score: {}, Graphics queue family: {}",
                 score, queue_family
             );
 
-            candidates.push((physical_device, properties, queue_family, score));
+            candidates.push((physical_device, properties, queue_family, score, drm_path));
         }
 
         if candidates.is_empty() {
@@ -87,7 +104,8 @@ impl PhysicalDevice {
 
         // Select the device with the highest score
         candidates.sort_by(|a, b| b.3.cmp(&a.3));
-        let (handle, properties, graphics_queue_family, _score) = candidates.remove(0);
+        let (handle, properties, graphics_queue_family, _score, drm_primary_device_path) =
+            candidates.remove(0);
 
         let device_name = unsafe {
             CStr::from_ptr(properties.device_name.as_ptr())
@@ -100,8 +118,6 @@ impl PhysicalDevice {
             device_name, properties.device_type
         );
 
-        // Query DRM device properties if available
-        let drm_primary_device_path = Self::query_drm_device_path(instance, handle);
         if let Some(ref path) = drm_primary_device_path {
             info!("DRM primary device for selected GPU: {}", path.display());
         } else {
