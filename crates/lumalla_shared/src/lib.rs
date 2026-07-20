@@ -16,7 +16,7 @@ pub use action::{Action, CallbackRef};
 pub use args::GlobalArgs;
 pub use comms::{Comms, MessageSender, message_loop_with_channel};
 pub use dbus_message::DbusMessage;
-pub use drm::{DrmConnector, DrmDeviceState, DrmMode};
+pub use drm::{DrmConnector, DrmDeviceState, DrmMode, OutputConfig};
 pub use keymap_memfd::KeymapMemfd;
 pub use main_message::MainMessage;
 pub use message_runner::{MESSAGE_CHANNEL_TOKEN, MessageRunner};

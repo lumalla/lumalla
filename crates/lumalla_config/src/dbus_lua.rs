@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use lumalla_ipc::{
-    KeyBindingInfo, LayoutOutputInfo, LayoutSpacesInfo, ModsInfo, OutputInfo, WindowManagerProxy,
-    WindowRuleInfo, ZoneInfo,
+    DrmDeviceInfo, KeyBindingInfo, LayoutOutputInfo, LayoutSpacesInfo, ModsInfo, OutputConfigInfo,
+    OutputInfo, WindowManagerProxy, WindowRuleInfo, ZoneInfo,
 };
 use lumalla_shared::{CallbackRef, GlobalArgs, Mods, Output};
 use mlua::{
@@ -54,6 +54,7 @@ pub(crate) fn init_dbus_module(
     callback_state: CallbackState,
     on_startup: Rc<RefCell<Option<CallbackRef>>>,
     on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
+    on_drm_devices_change: Rc<RefCell<Option<CallbackRef>>>,
 ) -> LuaResult<LuaTable> {
     let module = lua.create_table()?;
 
@@ -75,6 +76,17 @@ pub(crate) fn init_dbus_module(
         lua.create_function(move |_, callback: LuaFunction| {
             let callback = cb_state.register_callback(callback);
             *on_connector_change_cb.borrow_mut() = Some(callback);
+            Ok(())
+        })?,
+    )?;
+
+    let cb_state = callback_state.clone();
+    let on_drm_devices_change_cb = on_drm_devices_change.clone();
+    module.set(
+        "on_drm_devices_change",
+        lua.create_function(move |_, callback: LuaFunction| {
+            let callback = cb_state.register_callback(callback);
+            *on_drm_devices_change_cb.borrow_mut() = Some(callback);
             Ok(())
         })?,
     )?;
@@ -102,6 +114,7 @@ pub(crate) fn init_dbus_module(
 
     init_dbus_keymap(lua, &module, client.clone(), callback_state)?;
     init_dbus_output(lua, &module, client.clone())?;
+    init_dbus_drm(lua, &module, client.clone())?;
     init_dbus_spawn(lua, &module, client.clone())?;
     init_dbus_zone(lua, &module, client.clone())?;
     init_dbus_window(lua, &module, client)?;
@@ -115,6 +128,7 @@ pub(crate) fn register_dbus_module(
     callback_state: CallbackState,
     on_startup: Rc<RefCell<Option<CallbackRef>>>,
     on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
+    on_drm_devices_change: Rc<RefCell<Option<CallbackRef>>>,
 ) -> anyhow::Result<()> {
     lua.register_module(
         LUA_MODULE_NAME,
@@ -124,6 +138,7 @@ pub(crate) fn register_dbus_module(
             callback_state,
             on_startup,
             on_connector_change,
+            on_drm_devices_change,
         )
         .map_err(|err| anyhow::anyhow!("Unable to create D-Bus config module: {err}"))?,
     )
@@ -192,6 +207,100 @@ fn init_dbus_output(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
         })?,
     )?;
     Ok(())
+}
+
+fn init_dbus_drm(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> LuaResult<()> {
+    let get_client = client.clone();
+    module.set(
+        "get_drm_devices",
+        lua.create_function(move |lua, ()| {
+            let devices = dbus_result(get_client.proxy.get_drm_devices())?;
+            drm_devices_to_lua(lua, devices)
+        })?,
+    )?;
+
+    let render_client = client.clone();
+    module.set(
+        "set_render_device",
+        lua.create_function(move |_, path: Option<String>| {
+            let path = path.unwrap_or_default();
+            dbus_result(render_client.proxy.set_render_device(&path))?;
+            Ok(())
+        })?,
+    )?;
+
+    let configs_client = client;
+    module.set(
+        "set_output_configs",
+        lua.create_function(move |_, configs: Vec<ConfigOutputSetting>| {
+            let infos: Vec<OutputConfigInfo> = configs
+                .into_iter()
+                .map(|c| OutputConfigInfo {
+                    name: c.name,
+                    enabled: c.enabled,
+                    mode_name: c.mode.unwrap_or_default(),
+                })
+                .collect();
+            dbus_result(configs_client.proxy.set_output_configs(infos))?;
+            Ok(())
+        })?,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn drm_devices_to_lua(lua: &Lua, devices: Vec<DrmDeviceInfo>) -> LuaResult<LuaValue> {
+    let table = lua.create_table()?;
+    for (index, device) in devices.into_iter().enumerate() {
+        let device_table = lua.create_table()?;
+        device_table.set("path", device.path)?;
+        device_table.set("selected_render_device", device.selected_render_device)?;
+        let connectors = lua.create_table()?;
+        for (c_index, connector) in device.connectors.into_iter().enumerate() {
+            let connector_table = lua.create_table()?;
+            connector_table.set("name", connector.name)?;
+            connector_table.set("connector_id", connector.connector_id)?;
+            connector_table.set("connector_type", connector.connector_type)?;
+            connector_table.set("connected", connector.connected)?;
+            connector_table.set("mm_width", connector.mm_width)?;
+            connector_table.set("mm_height", connector.mm_height)?;
+            let modes = lua.create_table()?;
+            for (m_index, mode) in connector.modes.into_iter().enumerate() {
+                let mode_table = lua.create_table()?;
+                mode_table.set("name", mode.name)?;
+                mode_table.set("width", mode.width)?;
+                mode_table.set("height", mode.height)?;
+                mode_table.set("refresh_hz", mode.refresh_hz)?;
+                mode_table.set("preferred", mode.preferred)?;
+                modes.set(m_index + 1, mode_table)?;
+            }
+            connector_table.set("modes", modes)?;
+            connectors.set(c_index + 1, connector_table)?;
+        }
+        device_table.set("connectors", connectors)?;
+        table.set(index + 1, device_table)?;
+    }
+    table.into_lua(lua)
+}
+
+struct ConfigOutputSetting {
+    name: String,
+    enabled: bool,
+    mode: Option<String>,
+}
+
+impl FromLua for ConfigOutputSetting {
+    fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
+        let table = value.as_table().ok_or_else(|| LuaError::FromLuaConversionError {
+            from: "LuaOutputConfig",
+            to: String::from("ConfigOutputSetting"),
+            message: Some(String::from("Expected a Lua table for output config")),
+        })?;
+        Ok(Self {
+            name: table.get("name")?,
+            enabled: table.get("enabled").unwrap_or(true),
+            mode: table.get::<Option<String>>("mode").unwrap_or(None),
+        })
+    }
 }
 
 fn init_dbus_spawn(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> LuaResult<()> {

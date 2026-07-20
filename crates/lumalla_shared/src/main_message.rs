@@ -1,4 +1,6 @@
 use crate::Mods;
+use crate::OutputConfig;
+use std::path::PathBuf;
 
 /// Represents the messages that can be sent to the main thread
 pub enum MainMessage {
@@ -21,4 +23,8 @@ pub enum MainMessage {
     },
     /// Clears all compositor key bindings.
     ClearKeymaps,
+    /// Select the Vulkan render device by DRM primary path (`None` = auto).
+    SetRenderDevice(Option<PathBuf>),
+    /// Merge per-connector output configuration (enabled / mode).
+    SetOutputConfigs(Vec<OutputConfig>),
 }

@@ -73,6 +73,8 @@ pub struct DrmDeviceInfo {
     pub path: String,
     /// Connectors on this device.
     pub connectors: Vec<DrmConnectorInfo>,
+    /// Whether this device is the currently selected Vulkan render device.
+    pub selected_render_device: bool,
 }
 
 impl From<&DrmDeviceState> for DrmDeviceInfo {
@@ -80,6 +82,7 @@ impl From<&DrmDeviceState> for DrmDeviceInfo {
         Self {
             path: device.path.to_string_lossy().into_owned(),
             connectors: device.connectors.iter().map(DrmConnectorInfo::from).collect(),
+            selected_render_device: device.selected_render_device,
         }
     }
 }
@@ -87,6 +90,41 @@ impl From<&DrmDeviceState> for DrmDeviceInfo {
 impl From<DrmDeviceState> for DrmDeviceInfo {
     fn from(device: DrmDeviceState) -> Self {
         Self::from(&device)
+    }
+}
+
+/// Per-connector presentation config exposed over D-Bus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct OutputConfigInfo {
+    /// Connector name (e.g. `HDMI-A-1`).
+    pub name: String,
+    /// Whether the connector should be driven when connected.
+    pub enabled: bool,
+    /// Kernel mode name; empty string means preferred/first mode.
+    pub mode_name: String,
+}
+
+impl From<&lumalla_shared::OutputConfig> for OutputConfigInfo {
+    fn from(config: &lumalla_shared::OutputConfig) -> Self {
+        Self {
+            name: config.name.clone(),
+            enabled: config.enabled,
+            mode_name: config.mode_name.clone().unwrap_or_default(),
+        }
+    }
+}
+
+impl From<OutputConfigInfo> for lumalla_shared::OutputConfig {
+    fn from(info: OutputConfigInfo) -> Self {
+        Self {
+            name: info.name,
+            enabled: info.enabled,
+            mode_name: if info.mode_name.is_empty() {
+                None
+            } else {
+                Some(info.mode_name)
+            },
+        }
     }
 }
 

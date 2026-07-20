@@ -27,7 +27,6 @@ pub const LIBSEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 pub const LIBINPUT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 2);
 pub const UDEV_DRM_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 3);
 pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 4);
-pub const DRM_CARD_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 5);
 
 /// Represents the data for the main app thread
 struct AppData {
@@ -78,22 +77,14 @@ impl AppData {
     ) -> anyhow::Result<()> {
         let mut events = Events::with_capacity(1024);
         loop {
-            let (shutdown_now, shutdown_timeout) = self.check_for_shutdown();
+            let (shutdown_now, event_loop_timeout) = self.check_for_shutdown();
             if shutdown_now {
                 break;
             }
-            let color_timeout = self.renderer_state.color_cycle_timeout();
-            let event_loop_timeout = match (shutdown_timeout, color_timeout) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
             if let Err(err) = event_loop.poll(&mut events, event_loop_timeout) {
                 warn!("Unable to poll event loop: {err}");
             }
             self.handle_events(&events, &main_channel, event_loop)?;
-            if let Err(err) = self.renderer_state.tick_color_cycle() {
-                error!("Unable to tick color cycle: {err:#}");
-            }
             self.flush_clients(event_loop);
         }
         // Close seat devices while libseat is still valid. If we leave that to
@@ -102,10 +93,8 @@ impl AppData {
         if let Err(err) = self.input_state.disable_seat() {
             warn!("Unable to suspend libinput during shutdown: {err}");
         }
-        self.renderer_state.deactivate_drm(
-            self.seat_state.as_ref().get_ref(),
-            Some(event_loop.registry()),
-        );
+        self.renderer_state
+            .deactivate_drm(self.seat_state.as_ref().get_ref());
         Ok(())
     }
 
@@ -118,7 +107,7 @@ impl AppData {
         for event in events {
             match event.token() {
                 MESSAGE_CHANNEL_TOKEN => {
-                    self.handle_channel_messages(main_channel, event_loop);
+                    self.handle_channel_messages(main_channel);
                 }
                 LIBSEAT_TOKEN => {
                     if let Err(err) = self.seat_state.dispatch() {
@@ -168,12 +157,20 @@ impl AppData {
                             result.connectors_changed,
                             self.renderer_state.drm_device_states()
                         );
-                        if result.devices_changed && self.seat_state.is_enabled() {
-                            if let Err(err) = self.renderer_state.reconcile_drm(
-                                self.seat_state.as_ref().get_ref(),
-                                Some(event_loop.registry()),
-                            ) {
-                                error!("Unable to reconcile DRM devices: {err}");
+                        if self.seat_state.is_enabled() {
+                            if result.devices_changed {
+                                if let Err(err) = self
+                                    .renderer_state
+                                    .reconcile_drm(self.seat_state.as_ref().get_ref())
+                                {
+                                    error!("Unable to reconcile DRM devices: {err}");
+                                }
+                            }
+                            if let Err(err) = self
+                                .renderer_state
+                                .present_enabled_outputs(SOLID_CLEAR_COLOR)
+                            {
+                                error!("Unable to present outputs after DRM change: {err:#}");
                             }
                         }
                         self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
@@ -185,11 +182,6 @@ impl AppData {
                         error!("Unable to dispatch DRM udev events: {err}");
                     }
                 },
-                DRM_CARD_TOKEN => {
-                    if let Err(err) = self.renderer_state.dispatch_page_flips() {
-                        error!("Unable to dispatch DRM page-flip events: {err:#}");
-                    }
-                }
                 WAYLAND_SOCKET_TOKEN => {
                     self.connect_client(event_loop);
                 }
@@ -201,7 +193,7 @@ impl AppData {
         Ok(())
     }
 
-    fn handle_channel_messages(&mut self, main_channel: &Receiver<MainMessage>, event_loop: &Poll) {
+    fn handle_channel_messages(&mut self, main_channel: &Receiver<MainMessage>) {
         while let Ok(msg) = main_channel.try_recv() {
             match msg {
                 MainMessage::MainSeatEnabled => {
@@ -233,15 +225,11 @@ impl AppData {
                         ));
                         if let Err(err) = self
                             .renderer_state
-                            .present_solid_clear(SOLID_CLEAR_COLOR, Some(event_loop.registry()))
+                            .present_enabled_outputs(SOLID_CLEAR_COLOR)
                         {
-                            error!("Unable to present solid clear: {err:#}");
-                        } else if let Err(err) = self
-                            .renderer_state
-                            .register_page_flip_source(event_loop.registry(), DRM_CARD_TOKEN)
-                        {
-                            error!("Unable to register DRM page-flip source: {err}");
+                            error!("Unable to present enabled outputs: {err:#}");
                         }
+                        self.comms.dbus(DbusMessage::EmitReady);
                     }
                 }
                 MainMessage::MainSeatDisabled => {
@@ -255,10 +243,8 @@ impl AppData {
                     if let Err(err) = self.input_state.disable_seat() {
                         error!("Unable to disable libinput: {err}");
                     }
-                    self.renderer_state.deactivate_drm(
-                        self.seat_state.as_ref().get_ref(),
-                        Some(event_loop.registry()),
-                    );
+                    self.renderer_state
+                        .deactivate_drm(self.seat_state.as_ref().get_ref());
                 }
                 MainMessage::SwitchVt(vt) => {
                     info!("Switching to VT {vt}");
@@ -275,6 +261,22 @@ impl AppData {
                 }
                 MainMessage::ClearKeymaps => {
                     self.input_state.clear_keymaps();
+                }
+                MainMessage::SetRenderDevice(path) => {
+                    if let Err(err) = self.renderer_state.set_render_device(path) {
+                        error!("Unable to set render device: {err:#}");
+                    }
+                    self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
+                        self.renderer_state.drm_device_states(),
+                    ));
+                }
+                MainMessage::SetOutputConfigs(configs) => {
+                    if let Err(err) = self.renderer_state.set_output_configs(configs) {
+                        error!("Unable to set output configs: {err:#}");
+                    }
+                    self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
+                        self.renderer_state.drm_device_states(),
+                    ));
                 }
                 MainMessage::Shutdown => {
                     if !self.shutting_down {

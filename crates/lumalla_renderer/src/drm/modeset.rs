@@ -1,6 +1,6 @@
 //! DRM modesetting via the atomic API: planes, property blobs, and page-flips.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, c_void};
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
@@ -246,13 +246,26 @@ pub fn enable_atomic_client_caps(fd: RawFd) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve a connected connector into a modeset-ready output.
+///
+/// `mode_name` selects a kernel mode by name; `None` uses preferred (else first).
+/// `used_crtcs` skips CRTCs already assigned on this card and records the chosen one.
+pub fn resolve_connected_output(
+    fd: RawFd,
+    connector_id: u32,
+    mode_name: Option<&str>,
+    used_crtcs: &mut HashSet<u32>,
+) -> anyhow::Result<Option<ConnectedOutput>> {
+    let resources = get_resources(fd)?;
+    probe_connected_output(fd, &resources, connector_id, mode_name, used_crtcs)
+}
+
 /// Find the first connected connector with a usable CRTC, primary plane, and preferred mode.
 pub fn find_first_connected_output(fd: RawFd) -> anyhow::Result<Option<ConnectedOutput>> {
     let resources = get_resources(fd)?;
-    let connector_ids = resources.connector_ids();
-
-    for &connector_id in connector_ids {
-        match probe_connected_output(fd, &resources, connector_id) {
+    let mut used_crtcs = HashSet::new();
+    for &connector_id in resources.connector_ids() {
+        match probe_connected_output(fd, &resources, connector_id, None, &mut used_crtcs) {
             Ok(Some(output)) => return Ok(Some(output)),
             Ok(None) => {}
             Err(err) => {
@@ -260,7 +273,6 @@ pub fn find_first_connected_output(fd: RawFd) -> anyhow::Result<Option<Connected
             }
         }
     }
-
     Ok(None)
 }
 
@@ -436,6 +448,8 @@ fn probe_connected_output(
     fd: RawFd,
     resources: &DrmModeResources,
     connector_id: u32,
+    mode_name: Option<&str>,
+    used_crtcs: &mut HashSet<u32>,
 ) -> anyhow::Result<Option<ConnectedOutput>> {
     let connector = get_connector(fd, connector_id)?;
     let raw = connector.get();
@@ -444,11 +458,13 @@ fn probe_connected_output(
         return Ok(None);
     }
 
-    let Some(mode) = connector.preferred_or_first_mode() else {
+    let Some(mode) = connector.select_mode(mode_name) else {
         return Ok(None);
     };
 
-    let Some((crtc_id, crtc_index)) = find_crtc_for_connector(fd, resources, &connector)? else {
+    let Some((crtc_id, crtc_index)) =
+        find_crtc_for_connector(fd, resources, &connector, used_crtcs)?
+    else {
         anyhow::bail!(
             "No usable CRTC for connector {connector_id} ({})",
             connector_name(raw)
@@ -461,6 +477,8 @@ fn probe_connected_output(
             connector_name(raw)
         );
     };
+
+    used_crtcs.insert(crtc_id);
 
     let props = AtomicProps {
         connector_crtc_id: find_prop_id(fd, connector_id, sys::DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID")?,
@@ -493,17 +511,18 @@ fn find_crtc_for_connector(
     fd: RawFd,
     resources: &DrmModeResources,
     connector: &DrmModeConnector,
+    used_crtcs: &HashSet<u32>,
 ) -> anyhow::Result<Option<(u32, u32)>> {
     let raw = connector.get();
 
     if raw.encoder_id != 0 {
-        if let Some(found) = crtc_from_encoder(fd, resources, raw.encoder_id)? {
+        if let Some(found) = crtc_from_encoder(fd, resources, raw.encoder_id, used_crtcs)? {
             return Ok(Some(found));
         }
     }
 
     for &encoder_id in connector.encoder_ids() {
-        if let Some(found) = crtc_from_encoder(fd, resources, encoder_id)? {
+        if let Some(found) = crtc_from_encoder(fd, resources, encoder_id, used_crtcs)? {
             return Ok(Some(found));
         }
     }
@@ -515,26 +534,32 @@ fn crtc_from_encoder(
     fd: RawFd,
     resources: &DrmModeResources,
     encoder_id: u32,
+    used_crtcs: &HashSet<u32>,
 ) -> anyhow::Result<Option<(u32, u32)>> {
     let encoder = get_encoder(fd, encoder_id)?;
     let enc = encoder.get();
 
-    if enc.crtc_id != 0 {
+    if enc.crtc_id != 0 && !used_crtcs.contains(&enc.crtc_id) {
         if let Some(index) = resources.crtc_index(enc.crtc_id) {
             return Ok(Some((enc.crtc_id, index)));
         }
     }
 
-    Ok(crtc_from_possible_mask(resources, enc.possible_crtcs))
+    Ok(crtc_from_possible_mask(
+        resources,
+        enc.possible_crtcs,
+        used_crtcs,
+    ))
 }
 
 fn crtc_from_possible_mask(
     resources: &DrmModeResources,
     possible_crtcs: u32,
+    used_crtcs: &HashSet<u32>,
 ) -> Option<(u32, u32)> {
     let crtcs = resources.crtc_ids();
     for (index, &crtc_id) in crtcs.iter().enumerate() {
-        if possible_crtcs & (1 << index) != 0 {
+        if possible_crtcs & (1 << index) != 0 && !used_crtcs.contains(&crtc_id) {
             return Some((crtc_id, index as u32));
         }
     }
@@ -752,13 +777,27 @@ impl DrmModeConnector {
         unsafe { std::slice::from_raw_parts(raw.encoders, count) }
     }
 
-    fn preferred_or_first_mode(&self) -> Option<ModeInfo> {
+    fn select_mode(&self, mode_name: Option<&str>) -> Option<ModeInfo> {
         let raw = self.get();
         let count = raw.count_modes.max(0) as usize;
         if raw.modes.is_null() || count == 0 {
             return None;
         }
         let modes = unsafe { std::slice::from_raw_parts(raw.modes, count) };
+
+        if let Some(wanted) = mode_name {
+            if let Some(mode) = modes.iter().find(|m| {
+                let name = unsafe { CStr::from_ptr(m.name.as_ptr()) }.to_string_lossy();
+                name == wanted
+            }) {
+                return Some(ModeInfo { raw: *mode });
+            }
+            log::warn!(
+                "Mode '{wanted}' not found on connector {}; using preferred/first",
+                raw.connector_id
+            );
+        }
+
         let preferred = modes
             .iter()
             .find(|m| m.type_ & sys::DRM_MODE_TYPE_PREFERRED != 0)

@@ -41,4 +41,17 @@ pub struct DrmDeviceState {
     pub path: PathBuf,
     /// Connectors on this device (empty until probed with an open fd).
     pub connectors: Vec<DrmConnector>,
+    /// Whether this device is the currently selected Vulkan render device.
+    pub selected_render_device: bool,
+}
+
+/// Per-connector presentation configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputConfig {
+    /// Connector name (e.g. `HDMI-A-1`).
+    pub name: String,
+    /// Whether the connector should be driven when connected.
+    pub enabled: bool,
+    /// Kernel mode name to use; `None` selects the preferred (or first) mode.
+    pub mode_name: Option<String>,
 }

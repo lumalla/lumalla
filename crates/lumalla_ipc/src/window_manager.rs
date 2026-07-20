@@ -3,7 +3,8 @@
 use zbus::{interface, object_server::SignalEmitter};
 
 use crate::types::{
-    DrmDeviceInfo, KeyBindingInfo, LayoutSpacesInfo, OutputInfo, WindowRuleInfo, ZoneInfo,
+    DrmDeviceInfo, KeyBindingInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowRuleInfo,
+    ZoneInfo,
 };
 
 /// Server-side handler for [`WindowManager`] D-Bus methods.
@@ -18,6 +19,12 @@ pub trait WindowManagerHandler: Send + Sync {
 
     /// Return the current DRM primary nodes.
     fn get_drm_devices(&self) -> zbus::fdo::Result<Vec<DrmDeviceInfo>>;
+
+    /// Select the Vulkan render device by DRM primary path (empty = auto).
+    fn set_render_device(&mut self, path: &str) -> zbus::fdo::Result<()>;
+
+    /// Merge per-connector output configuration.
+    fn set_output_configs(&mut self, configs: Vec<OutputConfigInfo>) -> zbus::fdo::Result<()>;
 
     /// Replace zone definitions.
     fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()>;
@@ -110,6 +117,14 @@ impl WindowManager {
 
     fn get_drm_devices(&self) -> zbus::fdo::Result<Vec<DrmDeviceInfo>> {
         self.handler.get_drm_devices()
+    }
+
+    fn set_render_device(&mut self, path: &str) -> zbus::fdo::Result<()> {
+        self.handler.set_render_device(path)
+    }
+
+    fn set_output_configs(&mut self, configs: Vec<OutputConfigInfo>) -> zbus::fdo::Result<()> {
+        self.handler.set_output_configs(configs)
     }
 
     fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()> {

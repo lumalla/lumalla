@@ -9,9 +9,12 @@ use std::{
 use log::{error, info};
 use lumalla_ipc::{
     INTERFACE_NAME, KeyBindingInfo, OBJECT_PATH, WindowManagerHandler,
-    types::{DrmDeviceInfo, LayoutSpacesInfo, OutputInfo, WindowRuleInfo, ZoneInfo},
+    types::{
+        DrmDeviceInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowRuleInfo, ZoneInfo,
+    },
 };
 use lumalla_shared::{Comms, MainMessage, Mods, Output};
+use std::path::PathBuf;
 use zbus::blocking::Connection;
 
 fn key_name_to_keycode(key_name: &str) -> Option<u32> {
@@ -59,6 +62,25 @@ impl WindowManagerHandler for CompositorHandler {
 
     fn get_drm_devices(&self) -> zbus::fdo::Result<Vec<DrmDeviceInfo>> {
         Ok(self.state.drm_devices.lock().unwrap().clone())
+    }
+
+    fn set_render_device(&mut self, path: &str) -> zbus::fdo::Result<()> {
+        let device = if path.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path))
+        };
+        info!("Set render device over D-Bus: {path:?}");
+        self.state.comms.main(MainMessage::SetRenderDevice(device));
+        Ok(())
+    }
+
+    fn set_output_configs(&mut self, configs: Vec<OutputConfigInfo>) -> zbus::fdo::Result<()> {
+        info!("Set output configs over D-Bus: {} entries", configs.len());
+        self.state.comms.main(MainMessage::SetOutputConfigs(
+            configs.into_iter().map(Into::into).collect(),
+        ));
+        Ok(())
     }
 
     fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()> {

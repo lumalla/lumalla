@@ -214,9 +214,10 @@ impl DrmDevices {
                     .get(path)
                     .map(|device| device.connectors().to_vec())
                     .unwrap_or_default();
-                DrmDeviceState {
+    DrmDeviceState {
                     path: path.clone(),
                     connectors,
+                    selected_render_device: false,
                 }
             })
             .collect()

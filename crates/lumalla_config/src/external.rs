@@ -27,6 +27,7 @@ pub struct ExternalConfig {
     callback_state: CallbackState,
     on_startup: Rc<RefCell<Option<CallbackRef>>>,
     on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
+    on_drm_devices_change: Rc<RefCell<Option<CallbackRef>>>,
     outputs: HashMap<String, Output>,
     config_watcher: ConfigWatcher,
     reload_receiver: mpsc::Receiver<PathBuf>,
@@ -41,8 +42,9 @@ impl ExternalConfig {
         let callback_state = CallbackState::default();
         let on_startup = Rc::new(RefCell::new(None));
         let on_connector_change = Rc::new(RefCell::new(None));
+        let on_drm_devices_change = Rc::new(RefCell::new(None));
         let (reload_tx, reload_receiver) = mpsc::channel();
-        let mut config_watcher = ConfigWatcher::new(reload_tx)?;
+        let config_watcher = ConfigWatcher::new(reload_tx)?;
 
         register_dbus_module(
             &lua,
@@ -50,6 +52,7 @@ impl ExternalConfig {
             callback_state.clone(),
             on_startup.clone(),
             on_connector_change.clone(),
+            on_drm_devices_change.clone(),
         )?;
 
         let mut state = Self {
@@ -58,6 +61,7 @@ impl ExternalConfig {
             callback_state,
             on_startup,
             on_connector_change,
+            on_drm_devices_change,
             outputs: HashMap::new(),
             config_watcher,
             reload_receiver,
@@ -84,6 +88,7 @@ impl ExternalConfig {
         let proxy = self.client.proxy.clone();
         let mut ready = proxy.receive_ready()?;
         let mut output_changed = proxy.receive_output_changed()?;
+        let mut drm_devices_changed = proxy.receive_drm_devices_changed()?;
         let mut binding_activated = proxy.receive_binding_activated()?;
 
         info!("External config connected to compositor");
@@ -108,6 +113,11 @@ impl ExternalConfig {
                 self.handle_output_changed(args.outputs)?;
             }
 
+            if let Some(signal) = drm_devices_changed.next() {
+                let args = signal.args()?;
+                self.handle_drm_devices_changed(args.devices)?;
+            }
+
             if let Some(signal) = binding_activated.next() {
                 let args = signal.args()?;
                 self.handle_binding_activated(&args.binding_id)?;
@@ -130,6 +140,19 @@ impl ExternalConfig {
     fn handle_output_changed(&mut self, outputs: Vec<OutputInfo>) -> anyhow::Result<()> {
         self.outputs = outputs_from_infos(outputs);
         self.on_connector_change()?;
+        Ok(())
+    }
+
+    fn handle_drm_devices_changed(
+        &mut self,
+        devices: Vec<lumalla_ipc::DrmDeviceInfo>,
+    ) -> anyhow::Result<()> {
+        if let Some(on_drm_devices_change) = *self.on_drm_devices_change.borrow() {
+            let devices_lua = crate::dbus_lua::drm_devices_to_lua(&self.lua, devices)
+                .map_err(|err| anyhow::anyhow!("Unable to convert DRM devices for Lua: {err}"))?;
+            self.callback_state
+                .run_callback::<mlua::Value, ()>(on_drm_devices_change, devices_lua)?;
+        }
         Ok(())
     }
 
