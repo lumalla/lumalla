@@ -736,6 +736,8 @@ dependencies = [
  "gpu-allocator",
  "libc",
  "log",
+ "lumalla_shared",
+ "mio",
  "pkg-config",
 ]
 

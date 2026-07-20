@@ -20,6 +20,6 @@ pub use main_message::MainMessage;
 pub use message_runner::{MESSAGE_CHANNEL_TOKEN, MessageRunner};
 pub use mods::Mods;
 pub use output::Output;
-pub use udev::{Udev, UdevDevice, UdevEnumerate};
+pub use udev::{Udev, UdevDevice, UdevEnumerate, UdevMonitor};
 pub use window_rule::WindowRule;
 pub use zone::Zone;

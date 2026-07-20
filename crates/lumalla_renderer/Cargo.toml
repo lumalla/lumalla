@@ -8,7 +8,9 @@ repository = "https://github.com/lumalla/lumalla"
 include = ["src/**/*", "LICENSE-*", "build.rs"]
 
 [dependencies]
+lumalla_shared = { path = "../lumalla_shared" }
 anyhow = { workspace = true }
+mio = { workspace = true }
 log = { workspace = true }
 ash = "0.38"
 gpu-allocator = "0.28"

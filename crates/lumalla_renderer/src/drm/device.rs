@@ -1,12 +1,15 @@
 //! DRM device management
 
 use std::ffi::{CStr, OsStr, c_int};
+use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr;
 
 use log::info;
+use lumalla_shared::{Udev, UdevMonitor};
+use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
 
 #[allow(non_camel_case_types, dead_code)]
 mod bindings {
@@ -24,11 +27,7 @@ mod bindings {
     pub type drmDevicePtr = *mut drmDevice;
 
     unsafe extern "C" {
-        pub fn drmGetDevices2(
-            flags: u32,
-            devices: *mut drmDevicePtr,
-            max_devices: c_int,
-        ) -> c_int;
+        pub fn drmGetDevices2(flags: u32, devices: *mut drmDevicePtr, max_devices: c_int) -> c_int;
         pub fn drmFreeDevices(devices: *mut drmDevicePtr, count: c_int);
     }
 }
@@ -55,6 +54,87 @@ impl DrmDevice {
     /// Returns a reference to the underlying file descriptor.
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+}
+
+/// Discovered DRM primary nodes, refreshed via udev when GPUs appear or go away.
+pub struct DrmDevices {
+    paths: Vec<PathBuf>,
+    /// Kept alive so the monitor's udev context remains valid.
+    _udev: Udev,
+    monitor: UdevMonitor,
+}
+
+impl DrmDevices {
+    /// Enumerate primary nodes and start watching for add/remove via udev.
+    pub fn new() -> anyhow::Result<Self> {
+        let paths = find_drm_devices()?;
+
+        let udev = Udev::new()?;
+        let mut monitor = udev.monitor()?;
+        monitor.match_subsystem("drm")?;
+        monitor.enable_receiving()?;
+
+        Ok(Self {
+            paths,
+            _udev: udev,
+            monitor,
+        })
+    }
+
+    /// Currently known primary-node paths (e.g. `/dev/dri/card0`).
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    /// Drain pending udev DRM events and rescan primary nodes.
+    ///
+    /// Returns `true` if the discovered device list changed.
+    pub fn dispatch(&mut self) -> anyhow::Result<bool> {
+        let mut saw_card_event = false;
+        while let Some(device) = self.monitor.receive_device() {
+            let sysname = device.sysname().unwrap_or("");
+            if sysname.starts_with("card") {
+                saw_card_event = true;
+            }
+        }
+
+        if !saw_card_event {
+            return Ok(false);
+        }
+
+        let paths = find_drm_devices()?;
+        if paths == self.paths {
+            return Ok(false);
+        }
+
+        info!("DRM device list changed: {:?} -> {:?}", self.paths, paths);
+        self.paths = paths;
+        Ok(true)
+    }
+}
+
+impl Source for DrmDevices {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        SourceFd(&self.monitor.fd()).register(registry, token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        SourceFd(&self.monitor.fd()).reregister(registry, token, interests)
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        SourceFd(&self.monitor.fd()).deregister(registry)
     }
 }
 

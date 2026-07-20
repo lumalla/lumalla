@@ -2,7 +2,10 @@
 
 use std::{
     ffi::{CStr, CString, OsStr},
-    os::unix::ffi::OsStrExt,
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     ptr::NonNull,
 };
@@ -38,6 +41,11 @@ pub mod bindings {
         _private: [u8; 0],
     }
 
+    #[repr(C)]
+    pub struct udev_monitor {
+        _private: [u8; 0],
+    }
+
     unsafe extern "C" {
         pub fn udev_new() -> *mut udev;
         pub fn udev_ref(udev: *mut udev) -> *mut udev;
@@ -68,6 +76,22 @@ pub mod bindings {
         pub fn udev_device_unref(udev_device: *mut udev_device) -> *mut udev_device;
         pub fn udev_device_get_devnode(udev_device: *mut udev_device) -> *const c_char;
         pub fn udev_device_get_sysname(udev_device: *mut udev_device) -> *const c_char;
+        pub fn udev_device_get_action(udev_device: *mut udev_device) -> *const c_char;
+        pub fn udev_device_get_subsystem(udev_device: *mut udev_device) -> *const c_char;
+
+        pub fn udev_monitor_new_from_netlink(
+            udev: *mut udev,
+            name: *const c_char,
+        ) -> *mut udev_monitor;
+        pub fn udev_monitor_unref(udev_monitor: *mut udev_monitor) -> *mut udev_monitor;
+        pub fn udev_monitor_filter_add_match_subsystem_devtype(
+            udev_monitor: *mut udev_monitor,
+            subsystem: *const c_char,
+            devtype: *const c_char,
+        ) -> c_int;
+        pub fn udev_monitor_enable_receiving(udev_monitor: *mut udev_monitor) -> c_int;
+        pub fn udev_monitor_get_fd(udev_monitor: *mut udev_monitor) -> c_int;
+        pub fn udev_monitor_receive_device(udev_monitor: *mut udev_monitor) -> *mut udev_device;
     }
 }
 
@@ -101,6 +125,17 @@ impl Udev {
             enumerate,
             udev: self,
         })
+    }
+
+    /// Create a netlink monitor for receiving device events.
+    pub fn monitor(&self) -> anyhow::Result<UdevMonitor> {
+        let name = CString::new("udev").context("Invalid udev monitor name")?;
+        let monitor =
+            unsafe { bindings::udev_monitor_new_from_netlink(self.as_ptr(), name.as_ptr()) };
+        let Some(monitor) = NonNull::new(monitor) else {
+            anyhow::bail!("Failed to create udev monitor");
+        };
+        Ok(UdevMonitor { monitor })
     }
 }
 
@@ -184,6 +219,65 @@ impl Drop for UdevEnumerate<'_> {
     }
 }
 
+/// Netlink monitor for udev device add/remove/change events.
+pub struct UdevMonitor {
+    monitor: NonNull<bindings::udev_monitor>,
+}
+
+impl UdevMonitor {
+    /// Only receive events for devices in `subsystem` (e.g. `"drm"`).
+    pub fn match_subsystem(&mut self, subsystem: &str) -> anyhow::Result<()> {
+        let subsystem = CString::new(subsystem).context("Subsystem contains null byte")?;
+        let result = unsafe {
+            bindings::udev_monitor_filter_add_match_subsystem_devtype(
+                self.monitor.as_ptr(),
+                subsystem.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        if result < 0 {
+            anyhow::bail!("Failed to add udev monitor subsystem filter");
+        }
+        Ok(())
+    }
+
+    /// Start receiving events on the monitor socket.
+    ///
+    /// Must be called after configuring filters and before polling [`Self::fd`].
+    pub fn enable_receiving(&mut self) -> anyhow::Result<()> {
+        let result = unsafe { bindings::udev_monitor_enable_receiving(self.monitor.as_ptr()) };
+        if result < 0 {
+            anyhow::bail!("Failed to enable udev monitor receiving");
+        }
+        Ok(())
+    }
+
+    /// File descriptor suitable for `poll`/`epoll`/`mio`.
+    pub fn fd(&self) -> RawFd {
+        unsafe { bindings::udev_monitor_get_fd(self.monitor.as_ptr()) }
+    }
+
+    /// Receive the next pending device event, if any.
+    pub fn receive_device(&mut self) -> Option<UdevDevice> {
+        let device = unsafe { bindings::udev_monitor_receive_device(self.monitor.as_ptr()) };
+        NonNull::new(device).map(|device| UdevDevice { device })
+    }
+}
+
+impl AsRawFd for UdevMonitor {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd()
+    }
+}
+
+impl Drop for UdevMonitor {
+    fn drop(&mut self) {
+        unsafe {
+            bindings::udev_monitor_unref(self.monitor.as_ptr());
+        }
+    }
+}
+
 /// A single udev device.
 pub struct UdevDevice {
     device: NonNull<bindings::udev_device>,
@@ -203,6 +297,24 @@ impl UdevDevice {
     /// Sysfs device name (e.g. `card0`).
     pub fn sysname(&self) -> Option<&str> {
         let ptr = unsafe { bindings::udev_device_get_sysname(self.device.as_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+    }
+
+    /// Event action (`"add"`, `"remove"`, `"change"`, …), if any.
+    pub fn action(&self) -> Option<&str> {
+        let ptr = unsafe { bindings::udev_device_get_action(self.device.as_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+    }
+
+    /// Device subsystem (e.g. `"drm"`), if any.
+    pub fn subsystem(&self) -> Option<&str> {
+        let ptr = unsafe { bindings::udev_device_get_subsystem(self.device.as_ptr()) };
         if ptr.is_null() {
             return None;
         }

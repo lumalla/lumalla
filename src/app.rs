@@ -25,7 +25,8 @@ use mio::{Events, Interest, Poll, Token};
 
 pub const LIBSEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 pub const LIBINPUT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 2);
-pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 3);
+pub const UDEV_DRM_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 3);
+pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 4);
 
 /// Represents the data for the main app thread
 struct AppData {
@@ -40,7 +41,6 @@ struct AppData {
     wayland: Wayland,
     connected_clients: HashMap<ClientId, ClientConnection>,
     display_state: DisplayState,
-    #[allow(dead_code)]
     renderer_state: RendererState,
 }
 
@@ -139,6 +139,20 @@ impl AppData {
                         }
                     }) {
                         error!("Unable to dispatch libinput events: {err}");
+                    }
+                }
+                UDEV_DRM_TOKEN => {
+                    match self.renderer_state.dispatch() {
+                        Ok(true) => {
+                            info!(
+                                "DRM devices updated: {:?}",
+                                self.renderer_state.drm_devices()
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            error!("Unable to dispatch DRM udev events: {err}");
+                        }
                     }
                 }
                 WAYLAND_SOCKET_TOKEN => {
@@ -329,7 +343,7 @@ pub(crate) fn run_app(
         }
         Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
     }
-    let renderer_state = RendererState::new()?;
+    let renderer_state = init_and_register_renderer_state(&mut main_event_loop)?;
     let mut data = AppData::new(
         comms.clone(),
         config_child,
@@ -341,6 +355,17 @@ pub(crate) fn run_app(
         renderer_state,
     );
     data.run_event_loop(&mut main_event_loop, main_channel)
+}
+
+fn init_and_register_renderer_state(
+    main_event_loop: &mut Poll,
+) -> anyhow::Result<RendererState> {
+    let mut renderer_state = RendererState::new()?;
+    main_event_loop
+        .registry()
+        .register(&mut renderer_state, UDEV_DRM_TOKEN, Interest::READABLE)
+        .context("Unable to listen on DRM udev monitor")?;
+    Ok(renderer_state)
 }
 
 fn init_and_register_wayland_display(
