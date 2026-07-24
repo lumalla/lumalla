@@ -274,3 +274,49 @@ fn find_host_memory_type(
     }
     host_visible
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vulkan::{Framebuffer, RenderPass, VulkanContext, clear_framebuffer_to_color};
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU with DMA-BUF export support"]
+    fn hardware_uploads_bgra_to_exportable_image() {
+        let vulkan = VulkanContext::new(None).unwrap();
+        let image = DmaBufImage::allocate(
+            vulkan.device(),
+            vulkan.physical_device(),
+            16,
+            16,
+            vk::Format::B8G8R8A8_UNORM,
+        )
+        .unwrap();
+        let render_pass =
+            RenderPass::new_for_scanout(vulkan.device(), vk::Format::B8G8R8A8_UNORM).unwrap();
+        let framebuffer =
+            Framebuffer::from_view(vulkan.device(), &render_pass, image.view(), image.extent())
+                .unwrap();
+        clear_framebuffer_to_color(
+            vulkan.device(),
+            vulkan.graphics_command_pool(),
+            &render_pass,
+            &framebuffer,
+            [0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+        let pixels = vec![0x7f; 16 * 16 * 4];
+        upload_bgra_to_image(
+            vulkan.device(),
+            vulkan.physical_device(),
+            vulkan.graphics_command_pool(),
+            &image,
+            &pixels,
+            16,
+            16,
+        )
+        .unwrap();
+        image.export_dma_buf().unwrap();
+    }
+}

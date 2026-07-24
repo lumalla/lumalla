@@ -887,6 +887,8 @@ mod tests {
             fd::{AsRawFd, FromRawFd, IntoRawFd},
             unix::net::UnixStream,
         },
+        ptr,
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     use lumalla_shared::{DbusMessage, MainMessage, message_loop_with_channel};
@@ -928,6 +930,52 @@ mod tests {
         file.set_len(bytes.len() as u64).unwrap();
         file.write_all(bytes).unwrap();
         file.into_raw_fd()
+    }
+
+    fn wire_message(object_id: u32, opcode: u16, payload: &[u32]) -> Vec<u8> {
+        let size = 8 + payload.len() * 4;
+        let mut message = Vec::with_capacity(size);
+        message.extend_from_slice(&object_id.to_ne_bytes());
+        message.extend_from_slice(&opcode.to_ne_bytes());
+        message.extend_from_slice(&(size as u16).to_ne_bytes());
+        for value in payload {
+            message.extend_from_slice(&value.to_ne_bytes());
+        }
+        message
+    }
+
+    fn wire_bind(name: u32, interface: &str, id: u32) -> Vec<u8> {
+        let mut data = bind_data(name, interface, 1, id);
+        let size = 8 + data.len();
+        let mut message = Vec::with_capacity(size);
+        message.extend_from_slice(&2u32.to_ne_bytes());
+        message.extend_from_slice(&WL_REGISTRY_BIND_OPCODE.to_ne_bytes());
+        message.extend_from_slice(&(size as u16).to_ne_bytes());
+        message.append(&mut data);
+        message
+    }
+
+    fn send_wire_with_fd(stream: &UnixStream, bytes: &[u8], fd: i32) {
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
+        let mut control = vec![0usize; control_len.div_ceil(std::mem::size_of::<usize>())];
+        let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+        header.msg_iov = &mut iov;
+        header.msg_iovlen = 1;
+        header.msg_control = control.as_mut_ptr().cast();
+        header.msg_controllen = control_len;
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&header);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+            ptr::write(libc::CMSG_DATA(cmsg).cast::<i32>(), fd);
+        }
+        let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &header, libc::MSG_NOSIGNAL) };
+        assert_eq!(sent as usize, bytes.len());
     }
 
     #[test]
@@ -1092,5 +1140,58 @@ mod tests {
                 surface_id: unmapped,
             }] if *owner == client_id && *unmapped == surface_id
         ));
+    }
+
+    #[test]
+    fn wire_client_can_commit_a_wl_shell_shm_surface() {
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+        let socket_path = std::env::temp_dir().join(format!(
+            "lumalla-wayland-test-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut wayland =
+            lumalla_wayland_protocol::Wayland::new(socket_path.to_string_lossy().into_owned())
+                .unwrap();
+        let client_stream = UnixStream::connect(&socket_path).unwrap();
+        let mut client = wayland.next_client().unwrap();
+        let mut state = display_state();
+
+        let mut wire = Vec::new();
+        wire.extend(wire_message(1, WL_DISPLAY_GET_REGISTRY_OPCODE, &[2]));
+        wire.extend(wire_bind(1, "wl_compositor", 3));
+        wire.extend(wire_bind(2, "wl_shm", 4));
+        wire.extend(wire_bind(3, "wl_shell", 5));
+        wire.extend(wire_message(3, WL_COMPOSITOR_CREATE_SURFACE_OPCODE, &[6]));
+        wire.extend(wire_message(4, WL_SHM_CREATE_POOL_OPCODE, &[7, 4]));
+        wire.extend(wire_message(
+            7,
+            WL_SHM_POOL_CREATE_BUFFER_OPCODE,
+            &[8, 0, 1, 1, 4, WL_SHM_FORMAT_XRGB8888],
+        ));
+        wire.extend(wire_message(5, WL_SHELL_GET_SHELL_SURFACE_OPCODE, &[9, 6]));
+        wire.extend(wire_message(9, WL_SHELL_SURFACE_SET_TOPLEVEL_OPCODE, &[]));
+        wire.extend(wire_message(6, WL_SURFACE_ATTACH_OPCODE, &[8, 0, 0]));
+        wire.extend(wire_message(6, WL_SURFACE_DAMAGE_OPCODE, &[0, 0, 1, 1]));
+        wire.extend(wire_message(6, WL_SURFACE_FRAME_OPCODE, &[10]));
+        wire.extend(wire_message(6, WL_SURFACE_COMMIT_OPCODE, &[]));
+
+        let fd = memory_file(&[1, 2, 3, 0xff]);
+        send_wire_with_fd(&client_stream, &wire, fd);
+        unsafe {
+            libc::close(fd);
+        }
+        client.handle_messages(&mut state).unwrap();
+
+        let updates: Vec<_> = state.take_surface_updates().collect();
+        let [SurfaceUpdate::Frame(frame)] = updates.as_slice() else {
+            panic!("expected one committed frame");
+        };
+        assert_eq!(frame.client_id, client.client_id());
+        assert_eq!(frame.surface_id, object_id(6));
+        assert_eq!(frame.buffer_id, object_id(8));
+        assert_eq!(frame.pixels, [1, 2, 3, 0xff]);
+        assert_eq!((frame.width, frame.height, frame.stride), (1, 1, 4));
+        assert_eq!(frame.format, WL_SHM_FORMAT_XRGB8888);
     }
 }

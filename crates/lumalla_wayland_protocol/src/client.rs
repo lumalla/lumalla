@@ -45,6 +45,7 @@ impl ClientConnection {
     pub(crate) fn new(stream: UnixStream, client_id: ClientId) -> io::Result<Self> {
         // Set the stream to non-blocking mode
         stream.set_nonblocking(true)?;
+        let stream_fd = stream.as_raw_fd();
 
         debug!(
             "Created client connection with ID: {:?} (from {:?})",
@@ -53,11 +54,11 @@ impl ClientConnection {
         );
 
         Ok(Self {
-            stream: stream.try_clone()?,
+            stream,
             client_id,
             registry: Registry::new(),
-            reader: Reader::new(stream.as_raw_fd()),
-            writer: Writer::new(stream.as_raw_fd()),
+            reader: Reader::new(stream_fd),
+            writer: Writer::new(stream_fd),
         })
     }
 
