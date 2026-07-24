@@ -99,8 +99,8 @@ struct Globals {
 
 #[derive(Debug)]
 struct Global {
-    _name: &'static str,
-    _version: u32,
+    name: &'static str,
+    version: u32,
     interface_index: InterfaceIndex,
 }
 
@@ -129,13 +129,13 @@ impl Globals {
         self.globals.insert(
             id,
             Global {
-                _name: interface_index.interface_name(),
-                _version: interface_index.interface_version(),
+                name: interface_index.interface_name(),
+                version: interface_index.interface_version(),
                 interface_index,
             },
         );
         for client in client_connections {
-            client.broadcast_global(id, interface_index);
+            client.broadcast_global(id, interface_index, interface_index.interface_version());
         }
         id
     }

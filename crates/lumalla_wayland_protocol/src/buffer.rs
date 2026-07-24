@@ -1,26 +1,29 @@
-use std::{collections::VecDeque, mem, os::fd::RawFd, ptr};
+use std::{collections::VecDeque, io, mem, os::fd::RawFd, ptr};
 
 use libc::{
-    CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_NXTHDR, EAGAIN, EWOULDBLOCK, MSG_NOSIGNAL, SCM_RIGHTS,
-    SOL_SOCKET, cmsghdr, iovec, msghdr, recvmsg, sendmsg,
+    CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_NXTHDR, CMSG_SPACE, EAGAIN, EWOULDBLOCK, MSG_CTRUNC,
+    MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET, close, cmsghdr, iovec, msghdr, recvmsg, sendmsg,
 };
-use log::{debug, error};
+use log::error;
 
 use crate::{ObjectId, Opcode};
 
 #[derive(Debug)]
-#[repr(C)]
 pub struct MessageHeader {
     pub object_id: ObjectId,
     pub size: u16,
     pub opcode: Opcode,
 }
 
+const HEADER_SIZE: usize = 8;
 const MAX_MESSAGE_SIZE: usize = u16::MAX as usize;
 const BUFFER_SIZE: usize = MAX_MESSAGE_SIZE * 2;
 type Buffer = [u8; BUFFER_SIZE];
 const MAX_FDS_IN_CMSG: usize = 253;
-type CmsgBuffer = [u8; mem::size_of::<cmsghdr>() + MAX_FDS_IN_CMSG * mem::size_of::<RawFd>()];
+const CMSG_BUFFER_SIZE: usize =
+    unsafe { CMSG_SPACE((MAX_FDS_IN_CMSG * mem::size_of::<RawFd>()) as u32) as usize };
+const CMSG_BUFFER_WORDS: usize = CMSG_BUFFER_SIZE.div_ceil(mem::size_of::<usize>());
+type CmsgBuffer = [usize; CMSG_BUFFER_WORDS];
 const MAX_STRING_LENGTH: usize = 1_024 * 2;
 const MAX_ARRAY_LENGTH: usize = MAX_STRING_LENGTH;
 
@@ -55,7 +58,18 @@ impl Reader {
 
     #[must_use]
     pub fn read(&mut self) -> ReadResult {
-        let usable_buffer = &mut self.buffer[self.current_buffer_offset..];
+        if self.current_buffer_offset > 0 {
+            self.buffer
+                .copy_within(self.current_buffer_offset..self.bytes_in_buffer, 0);
+            self.bytes_in_buffer -= self.current_buffer_offset;
+            self.current_buffer_offset = 0;
+        }
+        if self.bytes_in_buffer == self.buffer.len() {
+            error!("Wayland receive buffer is full");
+            return ReadResult::EndOfStream;
+        }
+
+        let usable_buffer = &mut self.buffer[self.bytes_in_buffer..];
         let mut iov = iovec {
             iov_base: usable_buffer.as_mut_ptr() as *mut _,
             iov_len: usable_buffer.len(),
@@ -65,8 +79,8 @@ impl Reader {
             msg_namelen: 0,
             msg_iov: &mut iov as *mut _,
             msg_iovlen: 1,
-            msg_control: self.cmsg_buffer.as_mut_ptr() as *mut _,
-            msg_controllen: self.cmsg_buffer.len(),
+            msg_control: self.cmsg_buffer.as_mut_ptr().cast(),
+            msg_controllen: mem::size_of_val(self.cmsg_buffer.as_ref()),
             msg_flags: 0,
         };
         let received_bytes = unsafe { recvmsg(self.fd, &mut msghdr as *mut _, 0) };
@@ -82,10 +96,15 @@ impl Reader {
             },
             _ => {
                 self.bytes_in_buffer += received_bytes as usize;
+                let first_new_fd = self.fds.len();
                 unsafe {
                     let mut cmsg = CMSG_FIRSTHDR(&msghdr);
                     while !cmsg.is_null() {
                         if (*cmsg).cmsg_level == SOL_SOCKET && (*cmsg).cmsg_type == SCM_RIGHTS {
+                            if (*cmsg).cmsg_len < CMSG_LEN(0) as usize {
+                                error!("Received malformed Wayland ancillary data");
+                                return ReadResult::EndOfStream;
+                            }
                             let data_ptr = CMSG_DATA(cmsg) as *const RawFd;
                             let data_len = (*cmsg).cmsg_len - CMSG_LEN(0) as usize;
                             let fd_count = data_len / mem::size_of::<RawFd>();
@@ -98,40 +117,53 @@ impl Reader {
                         cmsg = CMSG_NXTHDR(&msghdr, cmsg);
                     }
                 }
+                if msghdr.msg_flags & MSG_CTRUNC != 0 {
+                    error!("Wayland ancillary data was truncated");
+                    while self.fds.len() > first_new_fd {
+                        if let Some(fd) = self.fds.pop_back() {
+                            unsafe {
+                                close(fd);
+                            }
+                        }
+                    }
+                    return ReadResult::EndOfStream;
+                }
                 ReadResult::ReadData
             }
         }
     }
 
-    pub fn next(
-        &mut self,
-    ) -> anyhow::Result<Option<(&MessageHeader, &[u8], &mut VecDeque<RawFd>)>> {
+    pub fn next(&mut self) -> anyhow::Result<Option<(MessageHeader, &[u8], &mut VecDeque<RawFd>)>> {
         let available_bytes = self.bytes_in_buffer - self.current_buffer_offset;
-        if available_bytes < size_of::<MessageHeader>() {
+        if available_bytes < HEADER_SIZE {
             return Ok(None);
         }
 
-        // Need to check if the object ID is all zeros, as that means the message is invalid
-        // and would violate the cast to the MessageHeader
-        if self.buffer
-            [self.current_buffer_offset..self.current_buffer_offset + size_of::<ObjectId>()]
-            .iter()
-            .all(|v| *v == 0)
-        {
-            anyhow::bail!("Invalid message received, where the object ID is all zeros");
+        let start = self.current_buffer_offset;
+        let object_id = u32::from_ne_bytes(self.buffer[start..start + 4].try_into().unwrap());
+        let object_id = ObjectId::new(
+            std::num::NonZeroU32::new(object_id)
+                .ok_or_else(|| anyhow::anyhow!("Wayland message has object ID zero"))?,
+        );
+        let opcode = u16::from_ne_bytes(self.buffer[start + 4..start + 6].try_into().unwrap());
+        let size = u16::from_ne_bytes(self.buffer[start + 6..start + 8].try_into().unwrap());
+        let size = size as usize;
+        anyhow::ensure!(
+            (HEADER_SIZE..=MAX_MESSAGE_SIZE).contains(&size) && size.is_multiple_of(4),
+            "Invalid Wayland message size {size}"
+        );
+        if size > available_bytes {
+            return Ok(None);
         }
 
-        let header = unsafe {
-            &*(self.buffer.as_ptr().add(self.current_buffer_offset) as *const MessageHeader)
+        let header = MessageHeader {
+            object_id,
+            size: size as u16,
+            opcode,
         };
-        if header.size as usize > available_bytes {
-            return Ok(None);
-        }
-
         Ok(Some((
             header,
-            &self.buffer[self.current_buffer_offset + size_of::<MessageHeader>()
-                ..self.current_buffer_offset + header.size as usize],
+            &self.buffer[start + HEADER_SIZE..start + size],
             &mut self.fds,
         )))
     }
@@ -142,12 +174,16 @@ impl Reader {
             // If we've read all the data in the buffer, reset the offset
             self.current_buffer_offset = 0;
             self.bytes_in_buffer = 0;
-        } else if self.bytes_in_buffer == self.buffer.len() {
-            // The buffer is full, copy the rest to the front
-            debug!("Buffer is too small and needs copying",);
-            self.buffer.copy_within(self.current_buffer_offset.., 0);
-            self.bytes_in_buffer -= self.current_buffer_offset;
-            self.current_buffer_offset = 0;
+        }
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        for fd in self.fds.drain(..) {
+            unsafe {
+                close(fd);
+            }
         }
     }
 }
@@ -157,8 +193,8 @@ pub struct Writer {
     fd: RawFd,
     buffer: Box<Buffer>,
     bytes_in_buffer: usize,
-    fds: Box<CmsgBuffer>,
-    bytes_in_fds: usize,
+    fds: Vec<RawFd>,
+    message_start_index: usize,
     message_length_index: usize,
     last_err: Option<anyhow::Error>,
 }
@@ -166,19 +202,15 @@ pub struct Writer {
 // TODO: change the writer to unchecked copies
 impl Writer {
     pub fn new(fd: RawFd) -> Self {
-        let mut writer = Self {
+        Self {
             fd,
             buffer: unsafe { Box::new_uninit().assume_init() },
             bytes_in_buffer: 0,
-            fds: unsafe { Box::new_uninit().assume_init() },
-            bytes_in_fds: mem::size_of::<cmsghdr>(),
+            fds: Vec::new(),
+            message_start_index: 0,
             message_length_index: 0,
             last_err: None,
-        };
-        let cmsghdr = unsafe { &mut *(writer.fds.as_mut_ptr() as *mut cmsghdr) };
-        cmsghdr.cmsg_level = SOL_SOCKET;
-        cmsghdr.cmsg_type = SCM_RIGHTS;
-        writer
+        }
     }
 
     pub fn last_err(&mut self) -> Option<anyhow::Error> {
@@ -194,18 +226,25 @@ impl Writer {
             self.last_err = Some(err);
             return;
         }
+        self.message_start_index = self.bytes_in_buffer;
         self.write_u32(object_id.get());
+        self.write_u16(opcode);
         self.message_length_index = self.bytes_in_buffer;
         self.write_u16(0);
-        self.write_u16(opcode);
     }
 
     #[inline]
     pub fn write_message_length(&mut self) {
+        let message_length = self.bytes_in_buffer - self.message_start_index;
+        if message_length > MAX_MESSAGE_SIZE || !message_length.is_multiple_of(4) {
+            self.last_err = Some(anyhow::anyhow!(
+                "Invalid outgoing Wayland message size {message_length}"
+            ));
+            return;
+        }
         let index = self.message_length_index;
-        self.buffer[index..index + mem::size_of::<u16>()].copy_from_slice(
-            &((self.bytes_in_buffer - index + mem::size_of::<ObjectId>()) as u16).to_ne_bytes(),
-        );
+        self.buffer[index..index + mem::size_of::<u16>()]
+            .copy_from_slice(&(message_length as u16).to_ne_bytes());
     }
 
     #[inline]
@@ -240,23 +279,39 @@ impl Writer {
     #[inline]
     pub fn write_str(&mut self, value: &str) {
         let bytes = value.as_bytes();
-        let bytes = &bytes[..bytes.len().min(MAX_STRING_LENGTH)];
-        let len = bytes.len();
+        if bytes.len() + 1 > MAX_STRING_LENGTH {
+            self.last_err = Some(anyhow::anyhow!("Wayland string is too long"));
+            return;
+        }
+        let len = bytes.len() + 1;
         let len_index_start = self.bytes_in_buffer;
         let len_index_end = self.bytes_in_buffer + mem::size_of::<u32>();
         self.buffer[len_index_start..len_index_end].copy_from_slice(&(len as u32).to_ne_bytes());
         let str_index_start = len_index_end;
-        let str_index_end = str_index_start + len;
+        let str_index_end = str_index_start + bytes.len();
         self.buffer[str_index_start..str_index_end].copy_from_slice(bytes);
         self.buffer[str_index_end] = 0;
-        // Pad to 32-bit boundary
-        self.bytes_in_buffer =
-            str_index_end + (mem::size_of::<u32>() - len % mem::size_of::<u32>());
+        let padded_len = (len + 3) & !3;
+        self.buffer[str_index_end + 1..str_index_start + padded_len].fill(0);
+        self.bytes_in_buffer = str_index_start + padded_len;
+    }
+
+    #[inline]
+    pub fn write_optional_str(&mut self, value: Option<&str>) {
+        if let Some(value) = value {
+            self.write_str(value);
+        } else {
+            self.write_u32(0);
+        }
     }
 
     #[inline]
     pub fn write_array(&mut self, array: &[u8]) {
-        let bytes = &array[..array.len().min(MAX_ARRAY_LENGTH)];
+        if array.len() > MAX_ARRAY_LENGTH {
+            self.last_err = Some(anyhow::anyhow!("Wayland array is too long"));
+            return;
+        }
+        let bytes = array;
         let len = bytes.len();
         let len_index_start = self.bytes_in_buffer;
         let len_index_end = self.bytes_in_buffer + mem::size_of::<u32>();
@@ -264,27 +319,25 @@ impl Writer {
         let val_index_start = len_index_end;
         let val_index_end = val_index_start + len;
         self.buffer[val_index_start..val_index_end].copy_from_slice(bytes);
-        // Pad to 32-bit boundary
-        self.bytes_in_buffer = val_index_end
-            + ((mem::size_of::<u32>() - (val_index_end + 1) % mem::size_of::<u32>())
-                % mem::size_of::<u32>());
+        let padded_len = (len + 3) & !3;
+        self.buffer[val_index_end..val_index_start + padded_len].fill(0);
+        self.bytes_in_buffer = val_index_start + padded_len;
     }
 
     #[inline]
     pub fn write_fd(&mut self, fd: RawFd) {
-        let fd_index_start = self.bytes_in_fds;
-        let fd_index_end = fd_index_start + mem::size_of::<RawFd>();
-        self.fds[fd_index_start..fd_index_end].copy_from_slice(&fd.to_ne_bytes());
-        self.bytes_in_fds += size_of::<RawFd>();
+        if self.fds.len() == MAX_FDS_IN_CMSG {
+            self.last_err = Some(anyhow::anyhow!(
+                "Too many file descriptors in Wayland message"
+            ));
+            return;
+        }
+        self.fds.push(fd);
     }
 
     #[inline]
     pub fn flush_if_needed(&mut self) -> anyhow::Result<()> {
-        if self.bytes_in_buffer >= MAX_MESSAGE_SIZE ||
-            // This is just a guard against sending too many FDs in a single message,
-            // since a single message should not contain more than 100 FDs
-            self.bytes_in_fds > self.fds.len() / 2
-        {
+        if self.bytes_in_buffer >= MAX_MESSAGE_SIZE || self.fds.len() >= 100 {
             self.flush()
         } else {
             Ok(())
@@ -297,35 +350,65 @@ impl Writer {
             return Ok(());
         }
 
-        let cmsghdr = unsafe { &mut *(self.fds.as_mut_ptr() as *mut cmsghdr) };
-        cmsghdr.cmsg_len = self.bytes_in_fds;
-        let msg = msghdr {
-            msg_name: ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: &mut iovec {
-                iov_base: self.buffer.as_mut_ptr() as *mut _,
-                iov_len: self.bytes_in_buffer.min(MAX_MESSAGE_SIZE),
-            },
-            msg_iovlen: 1,
-            msg_control: self.fds.as_mut_ptr() as *mut _,
-            msg_controllen: self.bytes_in_fds,
-            msg_flags: 0,
-        };
-        let result = unsafe { sendmsg(self.fd, &msg as *const _, MSG_NOSIGNAL) };
-        if result < 0 {
-            anyhow::bail!("Error sending message: {}", unsafe {
-                *libc::__errno_location()
-            });
-        }
+        while self.bytes_in_buffer > 0 {
+            let mut iov = iovec {
+                iov_base: self.buffer.as_mut_ptr().cast(),
+                iov_len: self.bytes_in_buffer,
+            };
+            let mut control = [0usize; CMSG_BUFFER_WORDS];
+            let (control_ptr, control_len) = if self.fds.is_empty() {
+                (ptr::null_mut(), 0)
+            } else {
+                let payload_len = self.fds.len() * mem::size_of::<RawFd>();
+                let cmsg = control.as_mut_ptr().cast::<cmsghdr>();
+                unsafe {
+                    (*cmsg).cmsg_level = SOL_SOCKET;
+                    (*cmsg).cmsg_type = SCM_RIGHTS;
+                    (*cmsg).cmsg_len = CMSG_LEN(payload_len as u32) as usize;
+                    ptr::copy_nonoverlapping(
+                        self.fds.as_ptr().cast::<u8>(),
+                        CMSG_DATA(cmsg),
+                        payload_len,
+                    );
+                }
+                (control.as_mut_ptr().cast(), unsafe {
+                    CMSG_SPACE(payload_len as u32) as usize
+                })
+            };
+            let msg = msghdr {
+                msg_name: ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                msg_control: control_ptr,
+                msg_controllen: control_len,
+                msg_flags: 0,
+            };
+            let result = unsafe { sendmsg(self.fd, &msg, MSG_NOSIGNAL) };
+            if result < 0 {
+                let err = io::Error::last_os_error();
+                if err
+                    .raw_os_error()
+                    .is_some_and(|code| code == EWOULDBLOCK || code == EAGAIN)
+                {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
+            if result == 0 {
+                anyhow::bail!("Wayland socket write returned zero");
+            }
 
-        if self.bytes_in_buffer > MAX_MESSAGE_SIZE {
-            self.buffer.copy_within(MAX_MESSAGE_SIZE.., 0);
-            self.bytes_in_buffer -= MAX_MESSAGE_SIZE;
-        } else {
-            self.bytes_in_buffer = 0;
+            let written = result as usize;
+            self.fds.clear();
+            self.buffer.copy_within(written..self.bytes_in_buffer, 0);
+            self.bytes_in_buffer -= written;
         }
-        self.bytes_in_fds = mem::size_of::<cmsghdr>();
         Ok(())
+    }
+
+    pub fn has_pending_output(&self) -> bool {
+        self.bytes_in_buffer != 0
     }
 }
 
@@ -342,6 +425,7 @@ pub fn f32_to_fixed(value: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::{Read, Write},
         num::NonZeroU32,
         os::{fd::AsRawFd, unix::net::UnixStream},
     };
@@ -357,7 +441,6 @@ mod tests {
         let str = "Hello, world!";
         let array = [1, 2, 3, 4, 5];
         writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 2);
-        writer.write_u16(10);
         writer.write_i32(-2);
         writer.write_u32(3);
         writer.write_fixed(4.3);
@@ -371,15 +454,9 @@ mod tests {
         let (header, data, fds) = reader.next().unwrap().unwrap();
         assert_eq!(header.object_id.get(), 1);
         assert_eq!(header.opcode, 2);
-        assert_eq!(data.len(), 43);
-        assert_eq!(
-            header.size as usize,
-            data.len() + mem::size_of::<MessageHeader>()
-        );
+        assert_eq!(data.len(), 44);
+        assert_eq!(header.size as usize, data.len() + HEADER_SIZE);
         let start_index = 0;
-        let end_index = mem::size_of::<u16>();
-        assert_eq!(data[start_index..end_index], 10u16.to_ne_bytes());
-        let start_index = end_index;
         let end_index = start_index + mem::size_of::<i32>();
         assert_eq!(data[start_index..end_index], (-2i32).to_ne_bytes());
         let start_index = end_index;
@@ -395,17 +472,13 @@ mod tests {
         let end_index = start_index + mem::size_of::<u32>();
         assert_eq!(
             data[start_index..end_index],
-            (str.len() as u32).to_ne_bytes()
+            ((str.len() + 1) as u32).to_ne_bytes()
         );
         let start_index = end_index;
         let end_index = start_index + str.bytes().len();
         assert_eq!(&data[start_index..end_index], str.as_bytes());
-        // Skip null terminator (1 byte) and padding to 32-bit boundary
-        // The write_str function writes: string bytes, null terminator, then padding.
-        // It sets bytes_in_buffer to end_index + (4 - len % 4), which is where the next write starts.
-        let str_len = str.bytes().len();
-        let total_after_string = mem::size_of::<u32>() - str_len % mem::size_of::<u32>();
-        let start_index = end_index + total_after_string;
+        assert_eq!(data[end_index], 0);
+        let start_index = end_index + 3;
         let end_index = start_index + mem::size_of::<u32>();
         assert_eq!(
             data[start_index..end_index],
@@ -415,6 +488,55 @@ mod tests {
         let end_index = start_index + array.len();
         assert_eq!(&data[start_index..end_index], array);
         assert_eq!(fds.len(), 1);
+    }
+
+    #[test]
+    fn writer_matches_wayland_wire_format() {
+        let (mut receiver, sender) = UnixStream::pair().unwrap();
+        let mut writer = Writer::new(sender.as_raw_fd());
+
+        writer.start_message(ObjectId::new(NonZeroU32::new(7).unwrap()), 3);
+        writer.write_u32(0x1122_3344);
+        writer.write_str("abc");
+        writer.write_array(&[5, 6, 7]);
+        writer.write_message_length();
+        writer.flush().unwrap();
+
+        let mut bytes = [0u8; 28];
+        receiver.read_exact(&mut bytes).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&7u32.to_ne_bytes());
+        expected.extend_from_slice(&3u16.to_ne_bytes());
+        expected.extend_from_slice(&28u16.to_ne_bytes());
+        expected.extend_from_slice(&0x1122_3344u32.to_ne_bytes());
+        expected.extend_from_slice(&4u32.to_ne_bytes());
+        expected.extend_from_slice(b"abc\0");
+        expected.extend_from_slice(&3u32.to_ne_bytes());
+        expected.extend_from_slice(&[5, 6, 7, 0]);
+        assert_eq!(bytes.as_slice(), expected);
+    }
+
+    #[test]
+    fn reader_preserves_partial_messages() {
+        let (receiver, mut sender) = UnixStream::pair().unwrap();
+        let mut reader = Reader::new(receiver.as_raw_fd());
+        let mut message = Vec::new();
+        message.extend_from_slice(&9u32.to_ne_bytes());
+        message.extend_from_slice(&1u16.to_ne_bytes());
+        message.extend_from_slice(&12u16.to_ne_bytes());
+        message.extend_from_slice(&42u32.to_ne_bytes());
+
+        sender.write_all(&message[..6]).unwrap();
+        assert_eq!(reader.read(), ReadResult::ReadData);
+        assert!(reader.next().unwrap().is_none());
+        sender.write_all(&message[6..]).unwrap();
+        assert_eq!(reader.read(), ReadResult::ReadData);
+
+        let (header, data, _) = reader.next().unwrap().unwrap();
+        assert_eq!(header.object_id.get(), 9);
+        assert_eq!(header.opcode, 1);
+        assert_eq!(header.size, 12);
+        assert_eq!(data, 42u32.to_ne_bytes());
     }
 
     #[test]

@@ -229,6 +229,7 @@ pub fn wayland_protocol(input: TokenStream) -> TokenStream {
             ObjectId, NewObjectId,
             buffer::{MessageHeader, Writer},
             client::Ctx,
+            registry::DISPLAY_OBJECT_ID,
         };
 
         #(#interface_codes)*
@@ -443,6 +444,27 @@ fn generate_interface_code_parts(
                 }
             });
 
+    let request_opcode_constants = interface
+        .request
+        .as_ref()
+        .unwrap_or(&empty)
+        .iter()
+        .enumerate()
+        .map(|(opcode, request)| {
+            let constant_name = syn::Ident::new(
+                &format!(
+                    "{}_{}_OPCODE",
+                    interface.name.to_uppercase(),
+                    request.name.to_uppercase()
+                ),
+                proc_macro2::Span::call_site(),
+            );
+            let opcode = opcode as u16;
+            quote! {
+                pub const #constant_name: u16 = #opcode;
+            }
+        });
+
     // Generate interface trait
     let empty = Vec::new();
     let trait_methods = interface
@@ -497,10 +519,31 @@ fn generate_interface_code_parts(
                 ),
                 proc_macro2::Span::call_site(),
             );
-            let opcode_lit = (opcode + 1) as u16; // Opcodes start from 1
+            let opcode_lit = opcode as u16;
+            let since_lit = request
+                .since
+                .as_deref()
+                .unwrap_or("1")
+                .parse::<u32>()
+                .unwrap_or(1);
 
             quote! {
-                #opcode_lit => self.#method_name(ctx, header.object_id, &#param_type::new(data, fds)),
+                #opcode_lit => {
+                    if object_version < #since_lit {
+                        ctx.writer
+                            .wl_display_error(DISPLAY_OBJECT_ID)
+                            .object_id(header.object_id)
+                            .code(WL_DISPLAY_ERROR_INVALID_METHOD)
+                            .message("Request is not supported by the bound object version");
+                        anyhow::bail!(
+                            "Request opcode {} requires version {}, object is version {}",
+                            #opcode_lit,
+                            #since_lit,
+                            object_version
+                        );
+                    }
+                    self.#method_name(ctx, header.object_id, &#param_type::new(data, fds))
+                },
             }
         });
 
@@ -517,14 +560,18 @@ fn generate_interface_code_parts(
             );
             quote! {
                 ctx.writer
-                    .wl_display_error(header.object_id)
+                    .wl_display_error(DISPLAY_OBJECT_ID)
                     .object_id(header.object_id)
                     .code(#error_constant)
                     .message("Invalid method");
             }
         } else {
             quote! {
-                // No error enum defined for this interface
+                ctx.writer
+                    .wl_display_error(DISPLAY_OBJECT_ID)
+                    .object_id(header.object_id)
+                    .code(WL_DISPLAY_ERROR_INVALID_METHOD)
+                    .message("Invalid method");
             }
         };
 
@@ -545,6 +592,7 @@ fn generate_interface_code_parts(
                     header: &MessageHeader,
                     data: &[u8],
                     fds: &mut std::collections::VecDeque<std::os::unix::io::RawFd>,
+                    object_version: u32,
                 ) -> anyhow::Result<()> {
                     match header.opcode {
                         #(#request_match_arms)*
@@ -640,7 +688,7 @@ fn generate_interface_code_parts(
                     "fixed" => (quote! { write_fixed }, quote! { #arg_name }),
                     "string" => {
                         if arg.allow_null.unwrap_or(false) {
-                            (quote! { write_str }, quote! { #arg_name.unwrap_or("") })
+                            (quote! { write_optional_str }, quote! { #arg_name })
                         } else {
                             (quote! { write_str }, quote! { #arg_name })
                         }
@@ -656,7 +704,13 @@ fn generate_interface_code_parts(
                         }
                     }
                     "fd" => (quote! { write_fd }, quote! { #arg_name as i32 }),
-                    "array" => (quote! { write_u32 }, quote! { #arg_name.len() as u32 }),
+                    "array" => {
+                        if arg.allow_null.unwrap_or(false) {
+                            (quote! { write_array }, quote! { #arg_name.unwrap_or(&[]) })
+                        } else {
+                            (quote! { write_array }, quote! { #arg_name })
+                        }
+                    }
                     _ => (
                         quote! { write_u32 },
                         quote! { panic!("Invalid argument type") },
@@ -723,6 +777,9 @@ fn generate_interface_code_parts(
 
         // Parameter structs
         #(#request_param_structs)*
+
+        // Request opcodes
+        #(#request_opcode_constants)*
 
         // Interface trait
         #interface_trait

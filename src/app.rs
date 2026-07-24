@@ -296,6 +296,13 @@ impl AppData {
                     error!("Unable to deregister client {:?}: {err}", client_id);
                 }
                 clients_to_remove.push(client_id);
+            } else if let Err(err) = event_loop.registry().reregister(
+                client,
+                Token(WAYLAND_SOCKET_TOKEN.0 + client_id.get() as usize),
+                client.interest(),
+            ) {
+                error!("Unable to update client {:?} interests: {err}", client_id);
+                clients_to_remove.push(client_id);
             }
         }
         for client_id in clients_to_remove {
@@ -335,11 +342,12 @@ impl AppData {
     fn connect_client(&mut self, event_loop: &mut Poll) {
         if let Some(mut client) = self.wayland.next_client() {
             let client_id = client.client_id();
+            let interest = client.interest();
             info!("New client connected with id {:?}", client_id);
             if let Err(err) = event_loop.registry().register(
                 &mut client,
                 Token(WAYLAND_SOCKET_TOKEN.0 + client_id.get() as usize),
-                Interest::READABLE,
+                interest,
             ) {
                 error!(
                     "Unable to listen on client socket with client id {:?}: {err}",

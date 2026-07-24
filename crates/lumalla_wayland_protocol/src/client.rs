@@ -1,5 +1,5 @@
 use log::debug;
-use mio::{event::Source, unix::SourceFd};
+use mio::{Interest, event::Source, unix::SourceFd};
 use std::{
     io::{self},
     num::NonZeroU32,
@@ -69,6 +69,14 @@ impl ClientConnection {
         &mut self.writer
     }
 
+    pub fn interest(&self) -> Interest {
+        if self.writer.has_pending_output() {
+            Interest::READABLE.add(Interest::WRITABLE)
+        } else {
+            Interest::READABLE
+        }
+    }
+
     pub fn stream(&self) -> &UnixStream {
         &self.stream
     }
@@ -87,10 +95,9 @@ impl ClientConnection {
             }
             ReadResult::ReadData => {
                 while let Some((header, data, fds)) = self.reader.next()? {
-                    let Some(interface_index) = self.registry.interface_index(header.object_id)
-                    else {
+                    let Some(object) = self.registry.object_metadata(header.object_id) else {
                         self.writer
-                            .wl_display_error(header.object_id)
+                            .wl_display_error(crate::registry::DISPLAY_OBJECT_ID)
                             .object_id(header.object_id)
                             .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
                             .message("Invalid object ID");
@@ -101,13 +108,13 @@ impl ClientConnection {
                         );
                     };
                     let result = handler.handle_request(
-                        interface_index,
+                        object,
                         &mut Ctx {
                             registry: &mut self.registry,
                             writer: &mut self.writer,
                             client_id: self.client_id,
                         },
-                        header,
+                        &header,
                         data,
                         fds,
                     );
@@ -131,7 +138,12 @@ impl ClientConnection {
         self.writer.flush()
     }
 
-    pub fn broadcast_global(&mut self, global_id: u32, interface_index: InterfaceIndex) {
+    pub fn broadcast_global(
+        &mut self,
+        global_id: u32,
+        interface_index: InterfaceIndex,
+        version: u32,
+    ) {
         // TODO: If this is called a lot, we should probably cache the registry object ids
         for registry_object_id in self
             .registry
@@ -141,7 +153,7 @@ impl ClientConnection {
                 .wl_registry_global(registry_object_id)
                 .name(global_id)
                 .interface(interface_index.interface_name())
-                .version(interface_index.interface_version());
+                .version(version);
         }
     }
 }

@@ -1,6 +1,6 @@
 use log::debug;
 use lumalla_wayland_protocol::{
-    Ctx, ObjectId,
+    Ctx, NewObjectId, ObjectId,
     protocols::{WaylandProtocol, WlDisplay, wayland::*},
     registry::{DISPLAY_OBJECT_ID, InterfaceIndex},
 };
@@ -9,8 +9,32 @@ use crate::{DisplayState, GlobalId};
 
 impl WaylandProtocol for DisplayState {}
 
+fn register_object(
+    ctx: &mut Ctx,
+    id: NewObjectId,
+    interface: InterfaceIndex,
+    version: u32,
+) -> bool {
+    if let Err(err) = ctx
+        .registry
+        .register_client_object_with_version(id, interface, version)
+    {
+        debug!("Failed to register {}: {err}", interface.interface_name());
+        ctx.writer
+            .wl_display_error(DISPLAY_OBJECT_ID)
+            .object_id(*id)
+            .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+            .message("Invalid or duplicate object ID");
+        return false;
+    }
+    true
+}
+
 impl WlDisplay for DisplayState {
     fn sync(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlDisplaySync<'_>) {
+        if !register_object(ctx, params.callback(), InterfaceIndex::WlCallback, 1) {
+            return;
+        }
         ctx.writer
             .wl_callback_done(*params.callback())
             .callback_data(0);
@@ -25,14 +49,15 @@ impl WlDisplay for DisplayState {
         _object_id: ObjectId,
         params: &WlDisplayGetRegistry<'_>,
     ) {
-        ctx.registry
-            .register_object(params.registry(), InterfaceIndex::WlRegistry);
+        if !register_object(ctx, params.registry(), InterfaceIndex::WlRegistry, 1) {
+            return;
+        }
         for (&name, global) in self.globals.iter() {
             ctx.writer
                 .wl_registry_global(*params.registry())
                 .name(name)
-                .interface(global.interface_index.interface_name())
-                .version(global.interface_index.interface_version());
+                .interface(global.name)
+                .version(global.version);
         }
     }
 }
@@ -44,12 +69,29 @@ impl WlRegistry for DisplayState {
             debug!("Received bind request for unknown global {}", global_id);
             return;
         };
-        // TODO: Do we need to care what version the global is bound to?
-        ctx.registry
-            .register_object(params.id().0, global.interface_index);
+        let (id, interface_name, requested_version) = params.id();
+        let interface_index = global.interface_index;
+        let global_name = global.name;
+        let global_version = global.version;
+        if interface_name != global_name
+            || requested_version == 0
+            || requested_version > global_version
+        {
+            debug!(
+                "Invalid bind for global {global_id}: interface={interface_name}, version={requested_version}"
+            );
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(*id)
+                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                .message("Global interface or version mismatch");
+            return;
+        }
+        if !register_object(ctx, id, interface_index, requested_version) {
+            return;
+        }
 
-        let interface_name = params.id().1;
-        match params.id().1 {
+        match interface_name {
             _ if interface_name == InterfaceIndex::WlShm.interface_name() => {
                 // TODO: Get the available formats from the GPU
                 ctx.writer
@@ -60,11 +102,13 @@ impl WlRegistry for DisplayState {
                     .format(WL_SHM_FORMAT_XRGB8888);
             }
             _ if interface_name == InterfaceIndex::WlSeat.interface_name() => {
+                if requested_version >= 2 {
+                    ctx.writer
+                        .wl_seat_name(*id)
+                        .name(self.seat_manager.get_name(global_id).unwrap_or_default());
+                }
                 ctx.writer
-                    .wl_seat_name(*params.id().0)
-                    .name(self.seat_manager.get_name(global_id).unwrap_or_default());
-                ctx.writer
-                    .wl_seat_capabilities(*params.id().0)
+                    .wl_seat_capabilities(*id)
                     .capabilities(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
             }
             _ => {}
@@ -76,11 +120,16 @@ impl WlCompositor for DisplayState {
     fn create_surface(
         &mut self,
         ctx: &mut Ctx,
-        _object_id: ObjectId,
+        object_id: ObjectId,
         params: &WlCompositorCreateSurface<'_>,
     ) {
-        ctx.registry
-            .register_object(params.id(), InterfaceIndex::WlSurface);
+        let version = ctx
+            .registry
+            .object_metadata(object_id)
+            .map_or(1, |object| object.version.min(WL_SURFACE_VERSION));
+        if !register_object(ctx, params.id(), InterfaceIndex::WlSurface, version) {
+            return;
+        }
         let surface_id = *params.id();
         self.surface_manager
             .create_surface(ctx.client_id, surface_id);
@@ -91,18 +140,26 @@ impl WlCompositor for DisplayState {
     fn create_region(
         &mut self,
         ctx: &mut Ctx,
-        _object_id: ObjectId,
+        object_id: ObjectId,
         params: &WlCompositorCreateRegion<'_>,
     ) {
-        ctx.registry
-            .register_object(params.id(), InterfaceIndex::WlRegion);
+        let version = ctx
+            .registry
+            .object_metadata(object_id)
+            .map_or(1, |object| object.version.min(WL_REGION_VERSION));
+        register_object(ctx, params.id(), InterfaceIndex::WlRegion, version);
     }
 }
 
 impl WlShm for DisplayState {
-    fn create_pool(&mut self, ctx: &mut Ctx, _object_id: ObjectId, params: &WlShmCreatePool) {
-        ctx.registry
-            .register_object(params.id(), InterfaceIndex::WlShmPool);
+    fn create_pool(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlShmCreatePool) {
+        let version = ctx
+            .registry
+            .object_metadata(object_id)
+            .map_or(1, |object| object.version.min(WL_SHM_POOL_VERSION));
+        if !register_object(ctx, params.id(), InterfaceIndex::WlShmPool, version) {
+            return;
+        }
         if self.shm_manager.create_pool(
             ctx.client_id,
             *params.id(),
@@ -133,8 +190,9 @@ impl WlShmPool for DisplayState {
         object_id: ObjectId,
         params: &WlShmPoolCreateBuffer<'_>,
     ) {
-        ctx.registry
-            .register_object(params.id(), InterfaceIndex::WlBuffer);
+        if !register_object(ctx, params.id(), InterfaceIndex::WlBuffer, 1) {
+            return;
+        }
         if self.shm_manager.create_buffer(
             ctx.client_id,
             object_id,
@@ -484,14 +542,14 @@ impl WlSeat for DisplayState {
         todo!()
     }
 
-    fn get_keyboard(
-        &mut self,
-        ctx: &mut Ctx,
-        _object_id: ObjectId,
-        params: &WlSeatGetKeyboard<'_>,
-    ) {
-        ctx.registry
-            .register_object(params.id(), InterfaceIndex::WlKeyboard);
+    fn get_keyboard(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSeatGetKeyboard<'_>) {
+        let version = ctx
+            .registry
+            .object_metadata(object_id)
+            .map_or(1, |object| object.version.min(WL_KEYBOARD_VERSION));
+        if !register_object(ctx, params.id(), InterfaceIndex::WlKeyboard, version) {
+            return;
+        }
         let focus = self.surface_manager.first_surface(ctx.client_id);
         if let Err(err) =
             self.seat_manager
@@ -641,5 +699,93 @@ impl WlFixes for DisplayState {
         _params: &WlFixesDestroyRegistry,
     ) {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        num::NonZeroU32,
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
+
+    use lumalla_shared::{DbusMessage, MainMessage, message_loop_with_channel};
+    use lumalla_wayland_protocol::{
+        ClientId,
+        buffer::Writer,
+        registry::{InterfaceIndex, Registry},
+    };
+
+    use super::*;
+
+    fn object_id(id: u32) -> ObjectId {
+        ObjectId::new(NonZeroU32::new(id).unwrap())
+    }
+
+    fn bind_data(name: u32, interface: &str, version: u32, id: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&name.to_ne_bytes());
+        let string_len = interface.len() + 1;
+        data.extend_from_slice(&(string_len as u32).to_ne_bytes());
+        data.extend_from_slice(interface.as_bytes());
+        data.push(0);
+        data.resize((data.len() + 3) & !3, 0);
+        data.extend_from_slice(&version.to_ne_bytes());
+        data.extend_from_slice(&id.to_ne_bytes());
+        data
+    }
+
+    fn display_state() -> DisplayState {
+        let (_main_poll, _main_rx, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
+        let (_dbus_poll, _dbus_rx, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
+        DisplayState::new(lumalla_shared::Comms::new(to_main, to_dbus)).unwrap()
+    }
+
+    #[test]
+    fn registry_bind_records_requested_version() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let mut registry = Registry::new();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
+        };
+        let mut fds = VecDeque::new();
+        let data = bind_data(1, "wl_compositor", 3, 2);
+        let params = WlRegistryBind::new(&data, &mut fds);
+
+        WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
+
+        let metadata = ctx.registry.object_metadata(object_id(2)).unwrap();
+        assert_eq!(metadata.interface_index, InterfaceIndex::WlCompositor);
+        assert_eq!(metadata.version, 3);
+    }
+
+    #[test]
+    fn registry_bind_rejects_interface_and_version_mismatches() {
+        for data in [
+            bind_data(1, "wl_shm", 1, 2),
+            bind_data(1, "wl_compositor", WL_COMPOSITOR_VERSION + 1, 2),
+            bind_data(1, "wl_compositor", 0, 2),
+        ] {
+            let (_receiver, sender) = UnixStream::pair().unwrap();
+            let mut state = display_state();
+            let mut registry = Registry::new();
+            let mut writer = Writer::new(sender.as_raw_fd());
+            let mut ctx = Ctx {
+                registry: &mut registry,
+                writer: &mut writer,
+                client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
+            };
+            let mut fds = VecDeque::new();
+            let params = WlRegistryBind::new(&data, &mut fds);
+
+            WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
+
+            assert!(ctx.registry.object_metadata(object_id(2)).is_none());
+        }
     }
 }
