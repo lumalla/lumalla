@@ -62,6 +62,19 @@ impl DisplayState {
         self.seat_manager.handle_modifiers(clients, modifiers);
     }
 
+    pub fn remove_client(&mut self, client_id: ClientId) {
+        self.shm_manager.delete_client(client_id);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_shm_buffer(
+        &self,
+        client_id: ClientId,
+        buffer_id: lumalla_wayland_protocol::ObjectId,
+    ) -> Result<shm::ShmBufferSnapshot, shm::ShmError> {
+        self.shm_manager.snapshot_buffer(client_id, buffer_id)
+    }
+
     pub fn activate_main_seat<'connection>(
         &mut self,
         seat_name: String,

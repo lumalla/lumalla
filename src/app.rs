@@ -306,6 +306,7 @@ impl AppData {
             }
         }
         for client_id in clients_to_remove {
+            self.display_state.remove_client(client_id);
             self.connected_clients.remove(&client_id);
         }
     }
@@ -331,6 +332,7 @@ impl AppData {
                 if let Err(err) = event_loop.registry().deregister(client) {
                     error!("Unable to deregister client {:?}: {err}", client_id);
                 }
+                self.display_state.remove_client(client_id);
                 self.connected_clients.remove(&client_id);
             }
         } else {

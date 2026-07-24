@@ -5,7 +5,10 @@ use lumalla_wayland_protocol::{
     registry::{DISPLAY_OBJECT_ID, InterfaceIndex},
 };
 
-use crate::{DisplayState, GlobalId};
+use crate::{
+    DisplayState, GlobalId,
+    shm::{ShmError, ShmErrorKind},
+};
 
 impl WaylandProtocol for DisplayState {}
 
@@ -28,6 +31,21 @@ fn register_object(
         return false;
     }
     true
+}
+
+fn report_shm_error(ctx: &mut Ctx, object_id: ObjectId, error: &ShmError) {
+    let code = match error.kind() {
+        ShmErrorKind::InvalidFormat => WL_SHM_ERROR_INVALID_FORMAT,
+        ShmErrorKind::InvalidStride => WL_SHM_ERROR_INVALID_STRIDE,
+        ShmErrorKind::InvalidFd => WL_SHM_ERROR_INVALID_FD,
+        ShmErrorKind::InvalidObject => WL_DISPLAY_ERROR_INVALID_OBJECT,
+    };
+    debug!("Shared-memory protocol error: {error}");
+    ctx.writer
+        .wl_display_error(DISPLAY_OBJECT_ID)
+        .object_id(object_id)
+        .code(code)
+        .message(&error.to_string());
 }
 
 impl WlDisplay for DisplayState {
@@ -93,13 +111,8 @@ impl WlRegistry for DisplayState {
 
         match interface_name {
             _ if interface_name == InterfaceIndex::WlShm.interface_name() => {
-                // TODO: Get the available formats from the GPU
-                ctx.writer
-                    .wl_shm_format(*params.id().0)
-                    .format(WL_SHM_FORMAT_RGBA8888);
-                ctx.writer
-                    .wl_shm_format(*params.id().0)
-                    .format(WL_SHM_FORMAT_XRGB8888);
+                ctx.writer.wl_shm_format(*id).format(WL_SHM_FORMAT_ARGB8888);
+                ctx.writer.wl_shm_format(*id).format(WL_SHM_FORMAT_XRGB8888);
             }
             _ if interface_name == InterfaceIndex::WlSeat.interface_name() => {
                 if requested_version >= 2 {
@@ -160,21 +173,11 @@ impl WlShm for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::WlShmPool, version) {
             return;
         }
-        if self.shm_manager.create_pool(
-            ctx.client_id,
-            *params.id(),
-            params.fd(),
-            params.size() as usize,
-        ) {
-            debug!(
-                "Failed to mmap shared memory from client {:?}",
-                ctx.client_id
-            );
-            ctx.writer
-                .wl_display_error(DISPLAY_OBJECT_ID)
-                .object_id(*params.id())
-                .code(WL_SHM_ERROR_INVALID_FD)
-                .message("Failed to mmap shared memory");
+        if let Err(error) =
+            self.shm_manager
+                .create_pool(ctx.client_id, *params.id(), params.fd(), params.size())
+        {
+            report_shm_error(ctx, *params.id(), &error);
         }
     }
 
@@ -193,25 +196,17 @@ impl WlShmPool for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::WlBuffer, 1) {
             return;
         }
-        if self.shm_manager.create_buffer(
+        if let Err(error) = self.shm_manager.create_buffer(
             ctx.client_id,
             object_id,
             *params.id(),
-            params.offset() as usize,
-            params.width() as usize,
-            params.height() as usize,
-            params.stride() as usize,
+            params.offset(),
+            params.width(),
+            params.height(),
+            params.stride(),
             params.format(),
         ) {
-            debug!(
-                "Failed to create shm_buffer from client {:?}",
-                ctx.client_id
-            );
-            ctx.writer
-                .wl_display_error(DISPLAY_OBJECT_ID)
-                .object_id(object_id)
-                .code(WL_SHM_ERROR_INVALID_FORMAT)
-                .message("Failed to create shm_buffer");
+            report_shm_error(ctx, object_id, &error);
         }
     }
 
@@ -221,20 +216,11 @@ impl WlShmPool for DisplayState {
     }
 
     fn resize(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlShmPoolResize<'_>) {
-        if !self
+        if let Err(error) = self
             .shm_manager
-            .resize_pool(ctx.client_id, object_id, params.size() as usize)
+            .resize_pool(ctx.client_id, object_id, params.size())
         {
-            debug!(
-                "Failed to resize shm_pool to {} from client {:?}",
-                params.size(),
-                ctx.client_id
-            );
-            ctx.writer
-                .wl_display_error(DISPLAY_OBJECT_ID)
-                .object_id(object_id)
-                .code(WL_SHM_ERROR_INVALID_FD)
-                .message("Failed to resize shm_pool");
+            report_shm_error(ctx, object_id, &error);
         }
     }
 }
@@ -243,7 +229,6 @@ impl WlBuffer for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlBufferDestroy<'_>) {
         ctx.registry.free_object(object_id, &mut ctx.writer);
         self.shm_manager.delete_buffer(ctx.client_id, object_id);
-        ctx.writer.wl_buffer_release(object_id);
     }
 }
 
