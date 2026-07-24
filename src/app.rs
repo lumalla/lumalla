@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     num::NonZeroU32,
     pin::Pin,
-    process::Child,
+    process::{Child, Command},
     sync::mpsc::Receiver,
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -33,6 +33,7 @@ pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 4);
 struct AppData {
     comms: Comms,
     config_child: Option<Child>,
+    startup_child: Option<Child>,
     dbus_join_handle: JoinHandle<()>,
     // `seat_state` must outlive `input_state`; fields drop in reverse declaration order.
     seat_state: Pin<Box<SeatState>>,
@@ -49,6 +50,7 @@ impl AppData {
     fn new(
         comms: Comms,
         config_child: Option<Child>,
+        startup_child: Option<Child>,
         dbus_join_handle: JoinHandle<()>,
         seat_state: Pin<Box<SeatState>>,
         input_state: InputState,
@@ -59,6 +61,7 @@ impl AppData {
         Self {
             comms,
             config_child,
+            startup_child,
             dbus_join_handle,
             seat_state,
             input_state,
@@ -408,6 +411,23 @@ impl AppData {
     /// Returns whether the app should shut down now and the time until
     /// the next shutdown check should be performed.
     fn check_for_shutdown(&mut self) -> (bool, Option<Duration>) {
+        let startup_finished =
+            self.startup_child
+                .as_mut()
+                .is_some_and(|child| match child.try_wait() {
+                    Ok(Some(status)) => {
+                        info!("Startup command exited with {status}");
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(err) => {
+                        warn!("Unable to query startup command: {err}");
+                        true
+                    }
+                });
+        if startup_finished {
+            self.startup_child = None;
+        }
         if !self.shutting_down {
             return (false, None);
         }
@@ -469,9 +489,11 @@ pub(crate) fn run_app(
     comms.dbus(DbusMessage::SetDrmDevices(
         renderer_state.drm_device_states(),
     ));
+    let startup_child = spawn_startup_command(&args.startup_command, wayland.socket_path())?;
     let mut data = AppData::new(
         comms.clone(),
         config_child,
+        startup_child,
         dbus_join_handle,
         seat_state,
         input_state,
@@ -480,6 +502,30 @@ pub(crate) fn run_app(
         renderer_state,
     );
     data.run_event_loop(&mut main_event_loop, main_channel)
+}
+
+fn spawn_startup_command(
+    startup_command: &[String],
+    wayland_socket: &str,
+) -> anyhow::Result<Option<Child>> {
+    let Some((program, program_args)) = startup_command.split_first() else {
+        return Ok(None);
+    };
+    let wayland_display = if wayland_socket.starts_with('/') {
+        wayland_socket.into()
+    } else {
+        std::env::current_dir()?.join(wayland_socket)
+    };
+    info!(
+        "Spawning startup command `{program}` with WAYLAND_DISPLAY={}",
+        wayland_display.display()
+    );
+    let child = Command::new(program)
+        .args(program_args)
+        .env("WAYLAND_DISPLAY", &wayland_display)
+        .spawn()
+        .with_context(|| format!("Failed to spawn startup command `{program}`"))?;
+    Ok(Some(child))
 }
 
 fn init_and_register_renderer_state(main_event_loop: &mut Poll) -> anyhow::Result<RendererState> {

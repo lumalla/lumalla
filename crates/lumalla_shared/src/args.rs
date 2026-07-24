@@ -11,6 +11,8 @@ pub struct GlobalArgs {
     pub config_command: Option<String>,
     /// Do not start any configuration process
     pub no_config: bool,
+    /// Program and arguments to spawn after `--`
+    pub startup_command: Vec<String>,
 }
 
 impl GlobalArgs {
@@ -51,6 +53,15 @@ impl GlobalArgs {
                     if let Some(config_command) = args.next() {
                         global_args.config_command = Some(config_command);
                     }
+                }
+                "--" => {
+                    global_args.startup_command.extend(args);
+                    if global_args.startup_command.is_empty() {
+                        eprintln!("Expected a command after --");
+                        print_help(&program_name);
+                        return None;
+                    }
+                    break;
                 }
                 unknown => {
                     eprintln!("Unknown argument: {}", unknown);
@@ -101,7 +112,7 @@ impl GlobalArgs {
 }
 
 fn print_help(program_name: &str) {
-    println!("Usage: {} [OPTIONS]", program_name);
+    println!("Usage: {} [OPTIONS] [-- COMMAND [ARGS...]]", program_name);
     println!("Options:");
     println!("  -h, --help             Print this help message and exit");
     println!("  -l, --log-file <FILE>  Path to log file");
@@ -109,6 +120,7 @@ fn print_help(program_name: &str) {
     println!("  -s, --socket-path <PATH>");
     println!("      --no-config        Do not start configuration");
     println!("      --config-command <CMD>  Config command (default: lumalla-config)");
+    println!("      -- COMMAND [ARGS...]     Spawn a program after Lumalla starts");
 }
 
 fn print_config_client_help(program_name: &str) {
@@ -117,4 +129,30 @@ fn print_config_client_help(program_name: &str) {
     println!("  -h, --help             Print this help message and exit");
     println!("  -l, --log-file <FILE>  Path to log file");
     println!("  -c, --config <FILE>    Path to lua config file");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_startup_command_after_separator() {
+        let args = ["lumalla", "--no-config", "--", "program", "--flag", "value"]
+            .into_iter()
+            .map(String::from);
+
+        let parsed = GlobalArgs::parse(args).unwrap();
+
+        assert!(parsed.no_config);
+        assert_eq!(
+            parsed.startup_command,
+            ["program", "--flag", "value"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_startup_command() {
+        let args = ["lumalla", "--"].into_iter().map(String::from);
+        assert!(GlobalArgs::parse(args).is_none());
+    }
 }

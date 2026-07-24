@@ -496,30 +496,31 @@ fn prepare_surface_upload(
         output_width > 0 && output_height > 0,
         "Output dimensions must be non-zero"
     );
-    let width = frame.width.min(output_width as usize);
-    let height = frame.height.min(output_height as usize);
+    let width = output_width as usize;
+    let height = output_height as usize;
     let row_bytes = width
         .checked_mul(4)
-        .context("Clipped surface row size overflows")?;
+        .context("Scaled surface row size overflows")?;
     let capacity = row_bytes
         .checked_mul(height)
-        .context("Clipped surface size overflows")?;
-    let mut pixels = Vec::with_capacity(capacity);
-    for row in 0..height {
-        let start = row * frame.stride;
-        let source = &frame.pixels[start..start + row_bytes];
-        pixels.extend_from_slice(source);
-        if frame.format == WL_SHM_FORMAT_XRGB8888 {
-            let row_start = pixels.len() - row_bytes;
-            for alpha in pixels[row_start..].iter_mut().skip(3).step_by(4) {
-                *alpha = u8::MAX;
+        .context("Scaled surface size overflows")?;
+    let mut pixels = vec![0; capacity];
+    for output_y in 0..height {
+        let source_y = ((output_y as u128 * frame.height as u128) / height as u128) as usize;
+        for output_x in 0..width {
+            let source_x = ((output_x as u128 * frame.width as u128) / width as u128) as usize;
+            let source = source_y * frame.stride + source_x * 4;
+            let destination = output_y * row_bytes + output_x * 4;
+            pixels[destination..destination + 4].copy_from_slice(&frame.pixels[source..source + 4]);
+            if frame.format == WL_SHM_FORMAT_XRGB8888 {
+                pixels[destination + 3] = u8::MAX;
             }
         }
     }
     Ok(PreparedSurfaceUpload {
         pixels,
-        width: width as u32,
-        height: height as u32,
+        width: output_width,
+        height: output_height,
     })
 }
 
@@ -581,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn prepares_clipped_xrgb_upload_without_stride_padding() {
+    fn scales_xrgb_upload_without_stride_padding() {
         let frame = SurfaceFrame {
             owner_id: 1,
             surface_id: 2,
@@ -610,7 +611,29 @@ mod tests {
             ..frame()
         };
 
-        let upload = prepare_surface_upload(&frame, 4, 4).unwrap();
+        let upload = prepare_surface_upload(&frame, 1, 1).unwrap();
         assert_eq!(upload.pixels, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn scales_surface_to_fill_output() {
+        let frame = SurfaceFrame {
+            pixels: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            width: 2,
+            height: 1,
+            stride: 8,
+            format: WL_SHM_FORMAT_ARGB8888,
+            ..frame()
+        };
+
+        let upload = prepare_surface_upload(&frame, 4, 2).unwrap();
+        assert_eq!((upload.width, upload.height), (4, 2));
+        assert_eq!(
+            upload.pixels,
+            [
+                1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 5, 6, 7, 8, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8,
+                5, 6, 7, 8,
+            ]
+        );
     }
 }

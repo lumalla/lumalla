@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{Read, Write},
+    io::{self, Read, Write},
     mem,
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -17,7 +17,7 @@ use anyhow::{Context, ensure};
 use lumalla_wayland_protocol::protocols::wayland::{
     WL_COMPOSITOR_CREATE_SURFACE_OPCODE, WL_DISPLAY_GET_REGISTRY_OPCODE, WL_DISPLAY_SYNC_OPCODE,
     WL_REGISTRY_BIND_OPCODE, WL_SHELL_GET_SHELL_SURFACE_OPCODE, WL_SHELL_SURFACE_PONG_OPCODE,
-    WL_SHELL_SURFACE_SET_TOPLEVEL_OPCODE, WL_SHM_CREATE_POOL_OPCODE, WL_SHM_FORMAT_XRGB8888,
+    WL_SHELL_SURFACE_SET_FULLSCREEN_OPCODE, WL_SHM_CREATE_POOL_OPCODE, WL_SHM_FORMAT_XRGB8888,
     WL_SHM_POOL_CREATE_BUFFER_OPCODE, WL_SURFACE_ATTACH_OPCODE, WL_SURFACE_COMMIT_OPCODE,
     WL_SURFACE_DAMAGE_OPCODE, WL_SURFACE_FRAME_OPCODE,
 };
@@ -94,7 +94,14 @@ fn main() -> anyhow::Result<()> {
     )?;
     send(
         &mut stream,
-        request(10, WL_SHELL_SURFACE_SET_TOPLEVEL_OPCODE, Vec::new()),
+        request(
+            10,
+            WL_SHELL_SURFACE_SET_FULLSCREEN_OPCODE,
+            [0u32, 0, 0]
+                .into_iter()
+                .flat_map(u32::to_ne_bytes)
+                .collect(),
+        ),
     )?;
 
     let mut attach_payload = Vec::new();
@@ -125,21 +132,42 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     println!(
-        "Presented a {WIDTH}x{HEIGHT} wl_shell SHM checkerboard on {}. Press Ctrl-C to exit.",
+        "Presented a fullscreen wl_shell SHM checkerboard on {}. Press Ctrl-C to exit.",
         socket_path.display()
     );
     loop {
-        let event = read_event(&mut stream)?;
+        let event = match read_event(&mut stream) {
+            Ok(event) => event,
+            Err(error) if is_disconnect(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         if event.object_id == 1 && event.opcode == 0 {
             anyhow::bail!("Compositor reported a protocol error");
         } else if event.object_id == 10 && event.opcode == 0 {
             let serial = read_u32(&event.payload, 0)?;
-            send(
+            if let Err(error) = send(
                 &mut stream,
                 request(10, WL_SHELL_SURFACE_PONG_OPCODE, u32_arg(serial)),
-            )?;
+            ) {
+                if is_disconnect(&error) {
+                    return Ok(());
+                }
+                return Err(error);
+            }
         }
     }
+}
+
+fn is_disconnect(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::WriteZero
+        )
+    })
 }
 
 fn socket_path() -> anyhow::Result<PathBuf> {
