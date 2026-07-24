@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::Context;
 use lumalla_shared::Comms;
@@ -16,12 +16,25 @@ pub use seat::KeyboardModifiers;
 
 pub struct DisplayMessage;
 
+#[derive(Debug)]
+pub struct CommittedFrame {
+    pub client_id: ClientId,
+    pub surface_id: lumalla_wayland_protocol::ObjectId,
+    pub buffer_id: lumalla_wayland_protocol::ObjectId,
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+    pub format: u32,
+}
+
 pub struct DisplayState {
     _comms: Comms,
     globals: Globals,
     surface_manager: SurfaceManager,
     shm_manager: ShmManager,
     seat_manager: SeatManager,
+    committed_frames: VecDeque<CommittedFrame>,
 }
 
 impl DisplayState {
@@ -32,6 +45,7 @@ impl DisplayState {
             surface_manager: SurfaceManager::default(),
             shm_manager: ShmManager::default(),
             seat_manager: SeatManager::default(),
+            committed_frames: VecDeque::new(),
         })
     }
 
@@ -64,15 +78,13 @@ impl DisplayState {
 
     pub fn remove_client(&mut self, client_id: ClientId) {
         self.shm_manager.delete_client(client_id);
+        self.surface_manager.delete_client(client_id);
+        self.committed_frames
+            .retain(|frame| frame.client_id != client_id);
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn snapshot_shm_buffer(
-        &self,
-        client_id: ClientId,
-        buffer_id: lumalla_wayland_protocol::ObjectId,
-    ) -> Result<shm::ShmBufferSnapshot, shm::ShmError> {
-        self.shm_manager.snapshot_buffer(client_id, buffer_id)
+    pub fn take_committed_frames(&mut self) -> impl Iterator<Item = CommittedFrame> + '_ {
+        self.committed_frames.drain(..)
     }
 
     pub fn activate_main_seat<'connection>(
@@ -123,8 +135,9 @@ impl Default for Globals {
             globals: HashMap::new(),
             next_id: 1,
         };
-        globals.register(InterfaceIndex::WlCompositor, [].into_iter());
-        globals.register(InterfaceIndex::WlShm, [].into_iter());
+        globals.register_version(InterfaceIndex::WlCompositor, 1, [].into_iter());
+        globals.register_version(InterfaceIndex::WlShm, 1, [].into_iter());
+        globals.register_version(InterfaceIndex::WlShell, 1, [].into_iter());
         globals
     }
 }
@@ -137,18 +150,32 @@ impl Globals {
         interface_index: InterfaceIndex,
         client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
     ) -> GlobalId {
+        self.register_version(
+            interface_index,
+            interface_index.interface_version(),
+            client_connections,
+        )
+    }
+
+    fn register_version<'connection>(
+        &mut self,
+        interface_index: InterfaceIndex,
+        version: u32,
+        client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
+    ) -> GlobalId {
+        debug_assert!(version > 0 && version <= interface_index.interface_version());
         let id = self.next_id;
         self.next_id += 1;
         self.globals.insert(
             id,
             Global {
                 name: interface_index.interface_name(),
-                version: interface_index.interface_version(),
+                version,
                 interface_index,
             },
         );
         for client in client_connections {
-            client.broadcast_global(id, interface_index, interface_index.interface_version());
+            client.broadcast_global(id, interface_index, version);
         }
         id
     }

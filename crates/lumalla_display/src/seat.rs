@@ -97,14 +97,17 @@ impl SeatManager {
         &mut self,
         client_id: ClientId,
         keyboard_id: ObjectId,
+        version: u32,
         writer: &mut Writer,
         focus_surface: Option<ObjectId>,
     ) -> anyhow::Result<()> {
         self.send_keymap(writer, keyboard_id)?;
-        writer
-            .wl_keyboard_repeat_info(keyboard_id)
-            .rate(25)
-            .delay(600);
+        if version >= 4 {
+            writer
+                .wl_keyboard_repeat_info(keyboard_id)
+                .rate(25)
+                .delay(600);
+        }
         self.send_modifiers(writer, keyboard_id);
         if let Some(surface) = focus_surface {
             self.send_enter(writer, keyboard_id, surface);

@@ -6,8 +6,9 @@ use lumalla_wayland_protocol::{
 };
 
 use crate::{
-    DisplayState, GlobalId,
+    CommittedFrame, DisplayState, GlobalId,
     shm::{ShmError, ShmErrorKind},
+    surface::{Rectangle, ShellMode, SurfaceError},
 };
 
 impl WaylandProtocol for DisplayState {}
@@ -48,17 +49,32 @@ fn report_shm_error(ctx: &mut Ctx, object_id: ObjectId, error: &ShmError) {
         .message(&error.to_string());
 }
 
+fn report_surface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError) {
+    let (code, message) = match error {
+        SurfaceError::RoleAlreadyAssigned => (WL_SHELL_ERROR_ROLE, "Surface already has a role"),
+        SurfaceError::UnknownSurface => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown surface"),
+        SurfaceError::UnknownBuffer => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown buffer"),
+        SurfaceError::UnknownShellSurface => {
+            (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown shell surface")
+        }
+        SurfaceError::UnknownRegion => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown region"),
+    };
+    ctx.writer
+        .wl_display_error(DISPLAY_OBJECT_ID)
+        .object_id(object_id)
+        .code(code)
+        .message(message);
+}
+
 impl WlDisplay for DisplayState {
-    fn sync(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlDisplaySync<'_>) {
+    fn sync(&mut self, ctx: &mut Ctx, _object_id: ObjectId, params: &WlDisplaySync<'_>) {
         if !register_object(ctx, params.callback(), InterfaceIndex::WlCallback, 1) {
             return;
         }
         ctx.writer
             .wl_callback_done(*params.callback())
             .callback_data(0);
-        ctx.writer
-            .wl_display_delete_id(object_id)
-            .id((*params.callback()).get());
+        ctx.registry.free_object(*params.callback(), ctx.writer);
     }
 
     fn get_registry(
@@ -122,7 +138,7 @@ impl WlRegistry for DisplayState {
                 }
                 ctx.writer
                     .wl_seat_capabilities(*id)
-                    .capabilities(WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+                    .capabilities(WL_SEAT_CAPABILITY_KEYBOARD);
             }
             _ => {}
         }
@@ -146,8 +162,6 @@ impl WlCompositor for DisplayState {
         let surface_id = *params.id();
         self.surface_manager
             .create_surface(ctx.client_id, surface_id);
-        self.seat_manager
-            .focus_keyboards_on_surface(ctx.client_id, surface_id, ctx.writer);
     }
 
     fn create_region(
@@ -160,7 +174,10 @@ impl WlCompositor for DisplayState {
             .registry
             .object_metadata(object_id)
             .map_or(1, |object| object.version.min(WL_REGION_VERSION));
-        register_object(ctx, params.id(), InterfaceIndex::WlRegion, version);
+        if register_object(ctx, params.id(), InterfaceIndex::WlRegion, version) {
+            self.surface_manager
+                .create_region(ctx.client_id, *params.id());
+        }
     }
 }
 
@@ -325,164 +342,289 @@ impl WlDataDeviceManager for DisplayState {
 impl WlShell for DisplayState {
     fn get_shell_surface(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlShellGetShellSurface<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlShellGetShellSurface<'_>,
     ) {
-        todo!()
+        if ctx.registry.interface_index(params.surface()) != Some(InterfaceIndex::WlSurface) {
+            report_surface_error(ctx, params.surface(), SurfaceError::UnknownSurface);
+            return;
+        }
+        if !register_object(ctx, params.id(), InterfaceIndex::WlShellSurface, 1) {
+            return;
+        }
+        if let Err(error) =
+            self.surface_manager
+                .create_shell_surface(ctx.client_id, *params.id(), params.surface())
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 }
 
 impl WlShellSurface for DisplayState {
-    fn pong(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlShellSurfacePong<'_>) {
-        todo!()
-    }
+    fn pong(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlShellSurfacePong<'_>) {}
 
-    fn move_(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlShellSurfaceMove<'_>) {
-        todo!()
-    }
+    fn move_(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlShellSurfaceMove<'_>) {}
 
     fn resize(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlShellSurfaceResize<'_>) {
-        todo!()
     }
 
     fn set_toplevel(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
         _params: &WlShellSurfaceSetToplevel<'_>,
     ) {
-        todo!()
+        if let Err(error) =
+            self.surface_manager
+                .set_shell_mode(ctx.client_id, object_id, ShellMode::Toplevel)
+        {
+            report_surface_error(ctx, object_id, error);
+        } else if let Ok(surface_id) = self
+            .surface_manager
+            .surface_for_shell(ctx.client_id, object_id)
+        {
+            self.seat_manager
+                .focus_keyboards_on_surface(ctx.client_id, surface_id, ctx.writer);
+        }
     }
 
     fn set_transient(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
         _params: &WlShellSurfaceSetTransient<'_>,
     ) {
-        todo!()
+        if let Err(error) =
+            self.surface_manager
+                .set_shell_mode(ctx.client_id, object_id, ShellMode::Transient)
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn set_fullscreen(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
         _params: &WlShellSurfaceSetFullscreen<'_>,
     ) {
-        todo!()
+        if let Err(error) =
+            self.surface_manager
+                .set_shell_mode(ctx.client_id, object_id, ShellMode::Fullscreen)
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn set_popup(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
         _params: &WlShellSurfaceSetPopup<'_>,
     ) {
-        todo!()
+        if let Err(error) =
+            self.surface_manager
+                .set_shell_mode(ctx.client_id, object_id, ShellMode::Popup)
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn set_maximized(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
         _params: &WlShellSurfaceSetMaximized<'_>,
     ) {
-        todo!()
+        if let Err(error) =
+            self.surface_manager
+                .set_shell_mode(ctx.client_id, object_id, ShellMode::Maximized)
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn set_title(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlShellSurfaceSetTitle<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlShellSurfaceSetTitle<'_>,
     ) {
-        todo!()
+        if let Err(error) = self.surface_manager.set_shell_title(
+            ctx.client_id,
+            object_id,
+            params.title().to_owned(),
+        ) {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn set_class(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlShellSurfaceSetClass<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlShellSurfaceSetClass<'_>,
     ) {
-        todo!()
+        if let Err(error) = self.surface_manager.set_shell_class(
+            ctx.client_id,
+            object_id,
+            params.class_().to_owned(),
+        ) {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 }
 
 impl WlSurface for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSurfaceDestroy<'_>) {
+        match self
+            .surface_manager
+            .destroy_surface(ctx.client_id, object_id)
+        {
+            Ok((shell_id, callbacks)) => {
+                for callback in callbacks {
+                    ctx.registry.free_object(callback, ctx.writer);
+                }
+                if let Some(shell_id) = shell_id {
+                    ctx.registry.free_object(shell_id, ctx.writer);
+                }
+            }
+            Err(error) => {
+                report_surface_error(ctx, object_id, error);
+                return;
+            }
+        }
         ctx.registry.free_object(object_id, &mut ctx.writer);
     }
 
     fn attach(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSurfaceAttach<'_>) {
-        let Some(pending_buffer) = params.buffer() else {
-            if !self.surface_manager.set_pending_buffer(
-                ctx.client_id,
-                object_id,
-                None,
-                params.x(),
-                params.y(),
-            ) {
-                ctx.writer
-                    .wl_display_error(DISPLAY_OBJECT_ID)
-                    .object_id(object_id)
-                    .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
-                    .message("Invalid surface");
-            }
-            return;
-        };
-        if ctx.registry.interface_index(pending_buffer) != Some(InterfaceIndex::WlBuffer) {
-            ctx.writer
-                .wl_display_error(DISPLAY_OBJECT_ID)
-                .object_id(pending_buffer)
-                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
-                .message("Invalid buffer");
+        let pending_buffer = params.buffer();
+        if pending_buffer.is_some_and(|buffer| {
+            ctx.registry.interface_index(buffer) != Some(InterfaceIndex::WlBuffer)
+        }) {
+            report_surface_error(ctx, pending_buffer.unwrap(), SurfaceError::UnknownBuffer);
             return;
         }
-        if !self.surface_manager.set_pending_buffer(
+        if let Err(error) = self.surface_manager.attach(
             ctx.client_id,
             object_id,
-            Some(pending_buffer),
+            pending_buffer,
             params.x(),
             params.y(),
         ) {
-            ctx.writer
-                .wl_display_error(DISPLAY_OBJECT_ID)
-                .object_id(object_id)
-                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
-                .message("Invalid surface");
+            report_surface_error(ctx, object_id, error);
         }
     }
 
-    fn damage(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSurfaceDamage<'_>) {
-        // TODO: Implement damage tracking
+    fn damage(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSurfaceDamage<'_>) {
+        let rectangle = Rectangle {
+            x: params.x(),
+            y: params.y(),
+            width: params.width(),
+            height: params.height(),
+        };
+        if let Err(error) = self
+            .surface_manager
+            .damage(ctx.client_id, object_id, rectangle)
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
-    fn frame(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSurfaceFrame<'_>) {
-        todo!()
+    fn frame(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSurfaceFrame<'_>) {
+        if !register_object(ctx, params.callback(), InterfaceIndex::WlCallback, 1) {
+            return;
+        }
+        if let Err(error) =
+            self.surface_manager
+                .add_frame_callback(ctx.client_id, object_id, *params.callback())
+        {
+            ctx.registry.free_object(*params.callback(), ctx.writer);
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn set_opaque_region(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlSurfaceSetOpaqueRegion<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlSurfaceSetOpaqueRegion<'_>,
     ) {
-        todo!()
+        let region = params.region();
+        if region
+            .is_some_and(|id| ctx.registry.interface_index(id) != Some(InterfaceIndex::WlRegion))
+        {
+            report_surface_error(ctx, region.unwrap(), SurfaceError::UnknownRegion);
+            return;
+        }
+        if let Err(error) = self
+            .surface_manager
+            .set_opaque_region(ctx.client_id, object_id, region)
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn set_input_region(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlSurfaceSetInputRegion<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlSurfaceSetInputRegion<'_>,
     ) {
-        todo!()
+        let region = params.region();
+        if region
+            .is_some_and(|id| ctx.registry.interface_index(id) != Some(InterfaceIndex::WlRegion))
+        {
+            report_surface_error(ctx, region.unwrap(), SurfaceError::UnknownRegion);
+            return;
+        }
+        if let Err(error) = self
+            .surface_manager
+            .set_input_region(ctx.client_id, object_id, region)
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
-    fn commit(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSurfaceCommit<'_>) {
-        todo!()
+    fn commit(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSurfaceCommit<'_>) {
+        let commit = match self.surface_manager.commit(ctx.client_id, object_id) {
+            Ok(commit) => commit,
+            Err(error) => {
+                report_surface_error(ctx, object_id, error);
+                return;
+            }
+        };
+
+        if let Some(Some(buffer_id)) = commit.attached_buffer {
+            if commit.mapped {
+                match self.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
+                    Ok(snapshot) => {
+                        self.committed_frames.push_back(CommittedFrame {
+                            client_id: ctx.client_id,
+                            surface_id: commit.surface_id,
+                            buffer_id,
+                            pixels: snapshot.pixels,
+                            width: snapshot.width,
+                            height: snapshot.height,
+                            stride: snapshot.stride,
+                            format: snapshot.format,
+                        });
+                    }
+                    Err(error) => {
+                        report_shm_error(ctx, buffer_id, &error);
+                        return;
+                    }
+                }
+            }
+            ctx.writer.wl_buffer_release(buffer_id);
+        }
+
+        for callback in commit.frame_callbacks {
+            ctx.writer.wl_callback_done(callback).callback_data(0);
+            ctx.registry.free_object(callback, ctx.writer);
+        }
     }
 
     fn set_buffer_transform(
@@ -518,13 +660,12 @@ impl WlSurface for DisplayState {
 }
 
 impl WlSeat for DisplayState {
-    fn get_pointer(
-        &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlSeatGetPointer<'_>,
-    ) {
-        todo!()
+    fn get_pointer(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSeatGetPointer<'_>) {
+        ctx.writer
+            .wl_display_error(DISPLAY_OBJECT_ID)
+            .object_id(object_id)
+            .code(WL_SEAT_ERROR_MISSING_CAPABILITY)
+            .message("Seat has no pointer capability");
     }
 
     fn get_keyboard(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSeatGetKeyboard<'_>) {
@@ -536,16 +677,23 @@ impl WlSeat for DisplayState {
             return;
         }
         let focus = self.surface_manager.first_surface(ctx.client_id);
-        if let Err(err) =
-            self.seat_manager
-                .create_keyboard(ctx.client_id, *params.id(), ctx.writer, focus)
-        {
+        if let Err(err) = self.seat_manager.create_keyboard(
+            ctx.client_id,
+            *params.id(),
+            version,
+            ctx.writer,
+            focus,
+        ) {
             log::error!("Failed to create wl_keyboard: {err:#}");
         }
     }
 
-    fn get_touch(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSeatGetTouch<'_>) {
-        todo!()
+    fn get_touch(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSeatGetTouch<'_>) {
+        ctx.writer
+            .wl_display_error(DISPLAY_OBJECT_ID)
+            .object_id(object_id)
+            .code(WL_SEAT_ERROR_MISSING_CAPABILITY)
+            .message("Seat has no touch capability");
     }
 
     fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSeatRelease<'_>) {
@@ -588,16 +736,45 @@ impl WlOutput for DisplayState {
 }
 
 impl WlRegion for DisplayState {
-    fn destroy(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlRegionDestroy<'_>) {
-        todo!()
+    fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlRegionDestroy<'_>) {
+        if let Err(error) = self
+            .surface_manager
+            .destroy_region(ctx.client_id, object_id)
+        {
+            report_surface_error(ctx, object_id, error);
+            return;
+        }
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 
-    fn add(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlRegionAdd<'_>) {
-        todo!()
+    fn add(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlRegionAdd<'_>) {
+        let rectangle = Rectangle {
+            x: params.x(),
+            y: params.y(),
+            width: params.width(),
+            height: params.height(),
+        };
+        if let Err(error) = self
+            .surface_manager
+            .add_region(ctx.client_id, object_id, rectangle)
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
-    fn subtract(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlRegionSubtract<'_>) {
-        todo!()
+    fn subtract(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlRegionSubtract<'_>) {
+        let rectangle = Rectangle {
+            x: params.x(),
+            y: params.y(),
+            width: params.width(),
+            height: params.height(),
+        };
+        if let Err(error) =
+            self.surface_manager
+                .subtract_region(ctx.client_id, object_id, rectangle)
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 }
 
@@ -691,8 +868,13 @@ impl WlFixes for DisplayState {
 mod tests {
     use std::{
         collections::VecDeque,
+        fs::File,
+        io::Write,
         num::NonZeroU32,
-        os::{fd::AsRawFd, unix::net::UnixStream},
+        os::{
+            fd::{AsRawFd, FromRawFd, IntoRawFd},
+            unix::net::UnixStream,
+        },
     };
 
     use lumalla_shared::{DbusMessage, MainMessage, message_loop_with_channel};
@@ -727,6 +909,29 @@ mod tests {
         DisplayState::new(lumalla_shared::Comms::new(to_main, to_dbus)).unwrap()
     }
 
+    fn memory_file(bytes: &[u8]) -> i32 {
+        let fd = unsafe { libc::memfd_create(c"lumalla-surface-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(bytes.len() as u64).unwrap();
+        file.write_all(bytes).unwrap();
+        file.into_raw_fd()
+    }
+
+    #[test]
+    fn advertises_only_the_minimal_implemented_globals() {
+        let state = display_state();
+        let globals: Vec<_> = state
+            .globals
+            .iter()
+            .map(|(_, global)| (global.name, global.version))
+            .collect();
+
+        assert!(globals.contains(&(WL_COMPOSITOR_NAME, 1)));
+        assert!(globals.contains(&(WL_SHM_NAME, 1)));
+        assert!(globals.contains(&(WL_SHELL_NAME, 1)));
+    }
+
     #[test]
     fn registry_bind_records_requested_version() {
         let (_receiver, sender) = UnixStream::pair().unwrap();
@@ -739,14 +944,14 @@ mod tests {
             client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
         };
         let mut fds = VecDeque::new();
-        let data = bind_data(1, "wl_compositor", 3, 2);
+        let data = bind_data(1, "wl_compositor", 1, 2);
         let params = WlRegistryBind::new(&data, &mut fds);
 
         WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
 
         let metadata = ctx.registry.object_metadata(object_id(2)).unwrap();
         assert_eq!(metadata.interface_index, InterfaceIndex::WlCompositor);
-        assert_eq!(metadata.version, 3);
+        assert_eq!(metadata.version, 1);
     }
 
     #[test]
@@ -772,5 +977,91 @@ mod tests {
 
             assert!(ctx.registry.object_metadata(object_id(2)).is_none());
         }
+    }
+
+    #[test]
+    fn mapped_surface_commit_snapshots_and_releases_buffer() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let client_id = ClientId::new(NonZeroU32::new(1).unwrap());
+        let surface_id = object_id(2);
+        let shell_id = object_id(3);
+        let pool_id = object_id(4);
+        let buffer_id = object_id(5);
+        let callback_id = object_id(6);
+        state.surface_manager.create_surface(client_id, surface_id);
+        state
+            .surface_manager
+            .create_shell_surface(client_id, shell_id, surface_id)
+            .unwrap();
+        state
+            .surface_manager
+            .set_shell_mode(client_id, shell_id, ShellMode::Toplevel)
+            .unwrap();
+        state
+            .shm_manager
+            .create_pool(client_id, pool_id, memory_file(&[1, 2, 3, 4]), 4)
+            .unwrap();
+        state
+            .shm_manager
+            .create_buffer(
+                client_id,
+                pool_id,
+                buffer_id,
+                0,
+                1,
+                1,
+                4,
+                WL_SHM_FORMAT_ARGB8888,
+            )
+            .unwrap();
+        state
+            .surface_manager
+            .attach(client_id, surface_id, Some(buffer_id), 0, 0)
+            .unwrap();
+        state
+            .surface_manager
+            .add_frame_callback(client_id, surface_id, callback_id)
+            .unwrap();
+
+        let mut registry = Registry::new();
+        registry
+            .register_client_object_with_version(
+                NewObjectId::new(surface_id),
+                InterfaceIndex::WlSurface,
+                1,
+            )
+            .unwrap();
+        registry
+            .register_client_object_with_version(
+                NewObjectId::new(buffer_id),
+                InterfaceIndex::WlBuffer,
+                1,
+            )
+            .unwrap();
+        registry
+            .register_client_object_with_version(
+                NewObjectId::new(callback_id),
+                InterfaceIndex::WlCallback,
+                1,
+            )
+            .unwrap();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id,
+        };
+        let mut fds = VecDeque::new();
+        let params = WlSurfaceCommit::new(&[], &mut fds);
+
+        WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
+
+        assert!(ctx.registry.object_metadata(callback_id).is_none());
+        let frames: Vec<_> = state.take_committed_frames().collect();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].surface_id, surface_id);
+        assert_eq!(frames[0].buffer_id, buffer_id);
+        assert_eq!(frames[0].pixels, [1, 2, 3, 4]);
     }
 }

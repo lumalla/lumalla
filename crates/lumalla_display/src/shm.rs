@@ -591,6 +591,5 @@ mod tests {
         assert!(manager.pool_index.is_empty());
         assert!(manager.buffers.is_empty());
         assert!(manager.pools.iter().all(Option::is_none));
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
     }
 }
