@@ -12,10 +12,11 @@ use anyhow::Context;
 use log::{debug, error, info, warn};
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::{
-    ClientConnection, ClientId, DisplayState, KeyboardModifiers, Wayland, create_wayland_display,
+    ClientConnection, ClientId, DisplayState, KeyboardModifiers, SurfaceUpdate, Wayland,
+    create_wayland_display,
 };
 use lumalla_input::{InputState, KeyboardEvent};
-use lumalla_renderer::{RendererState, SOLID_CLEAR_COLOR};
+use lumalla_renderer::{RendererState, SOLID_CLEAR_COLOR, SurfaceFrame};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender,
@@ -307,6 +308,7 @@ impl AppData {
         }
         for client_id in clients_to_remove {
             self.display_state.remove_client(client_id);
+            self.renderer_state.remove_client_frames(client_id.get());
             self.connected_clients.remove(&client_id);
         }
     }
@@ -333,12 +335,43 @@ impl AppData {
                     error!("Unable to deregister client {:?}: {err}", client_id);
                 }
                 self.display_state.remove_client(client_id);
+                self.renderer_state.remove_client_frames(client_id.get());
                 self.connected_clients.remove(&client_id);
+            } else {
+                self.submit_committed_frames();
             }
         } else {
             debug!("Received message for unknown client {:?}", client_id);
         }
         Ok(())
+    }
+
+    fn submit_committed_frames(&mut self) {
+        let updates: Vec<_> = self.display_state.take_surface_updates().collect();
+        for update in updates {
+            match update {
+                SurfaceUpdate::Frame(frame) => {
+                    let frame = SurfaceFrame {
+                        owner_id: frame.client_id.get(),
+                        surface_id: frame.surface_id.get(),
+                        pixels: frame.pixels,
+                        width: frame.width,
+                        height: frame.height,
+                        stride: frame.stride,
+                        format: frame.format,
+                    };
+                    if let Err(err) = self.renderer_state.set_surface_frame(frame) {
+                        error!("Unable to queue committed Wayland surface: {err:#}");
+                    }
+                }
+                SurfaceUpdate::Unmapped {
+                    client_id,
+                    surface_id,
+                } => self
+                    .renderer_state
+                    .remove_surface_frame(client_id.get(), surface_id.get()),
+            }
+        }
     }
 
     fn connect_client(&mut self, event_loop: &mut Poll) {

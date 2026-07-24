@@ -24,6 +24,43 @@ use crate::vulkan::{
 /// Default clear color for enabled outputs (teal).
 pub const SOLID_CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.65, 1.0];
 
+#[derive(Debug)]
+pub struct SurfaceFrame {
+    pub owner_id: u32,
+    pub surface_id: u32,
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+    pub format: u32,
+}
+
+impl SurfaceFrame {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.width > 0 && self.height > 0,
+            "Surface frame dimensions must be non-zero"
+        );
+        let row_bytes = self
+            .width
+            .checked_mul(4)
+            .context("Surface frame width overflows")?;
+        anyhow::ensure!(
+            self.stride >= row_bytes,
+            "Surface frame stride is smaller than one row"
+        );
+        let required = self
+            .stride
+            .checked_mul(self.height)
+            .context("Surface frame size overflows")?;
+        anyhow::ensure!(
+            self.pixels.len() >= required,
+            "Surface frame pixel data is truncated"
+        );
+        Ok(())
+    }
+}
+
 struct OutputScanout {
     drm_path: PathBuf,
     output: ConnectedOutput,
@@ -41,6 +78,7 @@ pub struct RendererState {
     /// Per-connector overrides; missing names use defaults (enabled if connected).
     output_configs: HashMap<String, OutputConfig>,
     scanouts: HashMap<String, OutputScanout>,
+    active_surface_frame: Option<SurfaceFrame>,
 }
 
 impl RendererState {
@@ -51,6 +89,7 @@ impl RendererState {
             render_device: None,
             output_configs: HashMap::new(),
             scanouts: HashMap::new(),
+            active_surface_frame: None,
         })
     }
 
@@ -71,6 +110,35 @@ impl RendererState {
     /// Drain pending udev DRM events; update device paths and/or connectors.
     pub fn dispatch(&mut self) -> anyhow::Result<DrmDispatchResult> {
         self.drm_devices.dispatch()
+    }
+
+    /// Replace the current single-surface scene. Rendering is added by the
+    /// SHM upload path; retaining the latest frame here makes commit handling
+    /// independent from DRM lifecycle events.
+    pub fn set_surface_frame(&mut self, frame: SurfaceFrame) -> anyhow::Result<()> {
+        frame.validate()?;
+        self.active_surface_frame = Some(frame);
+        Ok(())
+    }
+
+    pub fn remove_surface_frame(&mut self, owner_id: u32, surface_id: u32) {
+        if self
+            .active_surface_frame
+            .as_ref()
+            .is_some_and(|frame| frame.owner_id == owner_id && frame.surface_id == surface_id)
+        {
+            self.active_surface_frame = None;
+        }
+    }
+
+    pub fn remove_client_frames(&mut self, owner_id: u32) {
+        if self
+            .active_surface_frame
+            .as_ref()
+            .is_some_and(|frame| frame.owner_id == owner_id)
+        {
+            self.active_surface_frame = None;
+        }
     }
 
     /// Open missing DRM devices via the seat (fresh open after VT resume).
@@ -272,10 +340,7 @@ impl RendererState {
             .opened()
             .get(&target.drm_path)
             .with_context(|| {
-                format!(
-                    "DRM device {} is no longer open",
-                    target.drm_path.display()
-                )
+                format!("DRM device {} is no longer open", target.drm_path.display())
             })?;
 
         let drm_fb = DrmFramebuffer::from_dma_buf(
@@ -293,13 +358,8 @@ impl RendererState {
         let mode_blob = ModeBlob::create(drm_device.fd(), &target.output.mode)
             .context("Failed to create MODE_ID property blob")?;
 
-        atomic_modeset(
-            drm_device.fd(),
-            &target.output,
-            mode_blob.id(),
-            drm_fb.id(),
-        )
-        .context("Failed atomic modeset")?;
+        atomic_modeset(drm_device.fd(), &target.output, mode_blob.id(), drm_fb.id())
+            .context("Failed atomic modeset")?;
 
         Ok(OutputScanout {
             drm_path: target.drm_path.clone(),
@@ -330,11 +390,17 @@ impl RendererState {
             let mut score = if connected { 1000 } else { 0 };
             // Prefer lower card numbers slightly as a stable tie-break.
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if let Some(num) = name.strip_prefix("card").and_then(|s| s.parse::<i32>().ok()) {
+                if let Some(num) = name
+                    .strip_prefix("card")
+                    .and_then(|s| s.parse::<i32>().ok())
+                {
                     score -= num;
                 }
             }
-            if best.as_ref().is_none_or(|(_, best_score)| score > *best_score) {
+            if best
+                .as_ref()
+                .is_none_or(|(_, best_score)| score > *best_score)
+            {
                 best = Some((path.clone(), score));
             }
         }
@@ -390,5 +456,35 @@ impl Source for RendererState {
 
     fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
         self.drm_devices.deregister(registry)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame() -> SurfaceFrame {
+        SurfaceFrame {
+            owner_id: 1,
+            surface_id: 2,
+            pixels: vec![0; 16],
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: 0,
+        }
+    }
+
+    #[test]
+    fn validates_surface_frame_layout() {
+        assert!(frame().validate().is_ok());
+
+        let mut truncated = frame();
+        truncated.pixels.pop();
+        assert!(truncated.validate().is_err());
+
+        let mut short_stride = frame();
+        short_stride.stride = 4;
+        assert!(short_stride.validate().is_err());
     }
 }

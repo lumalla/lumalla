@@ -28,13 +28,22 @@ pub struct CommittedFrame {
     pub format: u32,
 }
 
+#[derive(Debug)]
+pub enum SurfaceUpdate {
+    Frame(CommittedFrame),
+    Unmapped {
+        client_id: ClientId,
+        surface_id: lumalla_wayland_protocol::ObjectId,
+    },
+}
+
 pub struct DisplayState {
     _comms: Comms,
     globals: Globals,
     surface_manager: SurfaceManager,
     shm_manager: ShmManager,
     seat_manager: SeatManager,
-    committed_frames: VecDeque<CommittedFrame>,
+    surface_updates: VecDeque<SurfaceUpdate>,
 }
 
 impl DisplayState {
@@ -45,7 +54,7 @@ impl DisplayState {
             surface_manager: SurfaceManager::default(),
             shm_manager: ShmManager::default(),
             seat_manager: SeatManager::default(),
-            committed_frames: VecDeque::new(),
+            surface_updates: VecDeque::new(),
         })
     }
 
@@ -79,12 +88,16 @@ impl DisplayState {
     pub fn remove_client(&mut self, client_id: ClientId) {
         self.shm_manager.delete_client(client_id);
         self.surface_manager.delete_client(client_id);
-        self.committed_frames
-            .retain(|frame| frame.client_id != client_id);
+        self.surface_updates.retain(|update| match update {
+            SurfaceUpdate::Frame(frame) => frame.client_id != client_id,
+            SurfaceUpdate::Unmapped {
+                client_id: owner, ..
+            } => *owner != client_id,
+        });
     }
 
-    pub fn take_committed_frames(&mut self) -> impl Iterator<Item = CommittedFrame> + '_ {
-        self.committed_frames.drain(..)
+    pub fn take_surface_updates(&mut self) -> impl Iterator<Item = SurfaceUpdate> + '_ {
+        self.surface_updates.drain(..)
     }
 
     pub fn activate_main_seat<'connection>(

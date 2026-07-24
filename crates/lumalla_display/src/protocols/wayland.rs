@@ -6,7 +6,7 @@ use lumalla_wayland_protocol::{
 };
 
 use crate::{
-    CommittedFrame, DisplayState, GlobalId,
+    CommittedFrame, DisplayState, GlobalId, SurfaceUpdate,
     shm::{ShmError, ShmErrorKind},
     surface::{Rectangle, ShellMode, SurfaceError},
 };
@@ -483,12 +483,18 @@ impl WlSurface for DisplayState {
             .surface_manager
             .destroy_surface(ctx.client_id, object_id)
         {
-            Ok((shell_id, callbacks)) => {
+            Ok((shell_id, callbacks, was_mapped)) => {
                 for callback in callbacks {
                     ctx.registry.free_object(callback, ctx.writer);
                 }
                 if let Some(shell_id) = shell_id {
                     ctx.registry.free_object(shell_id, ctx.writer);
+                }
+                if was_mapped {
+                    self.surface_updates.push_back(SurfaceUpdate::Unmapped {
+                        client_id: ctx.client_id,
+                        surface_id: object_id,
+                    });
                 }
             }
             Err(error) => {
@@ -601,16 +607,17 @@ impl WlSurface for DisplayState {
             if commit.mapped {
                 match self.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
                     Ok(snapshot) => {
-                        self.committed_frames.push_back(CommittedFrame {
-                            client_id: ctx.client_id,
-                            surface_id: commit.surface_id,
-                            buffer_id,
-                            pixels: snapshot.pixels,
-                            width: snapshot.width,
-                            height: snapshot.height,
-                            stride: snapshot.stride,
-                            format: snapshot.format,
-                        });
+                        self.surface_updates
+                            .push_back(SurfaceUpdate::Frame(CommittedFrame {
+                                client_id: ctx.client_id,
+                                surface_id: commit.surface_id,
+                                buffer_id,
+                                pixels: snapshot.pixels,
+                                width: snapshot.width,
+                                height: snapshot.height,
+                                stride: snapshot.stride,
+                                format: snapshot.format,
+                            }));
                     }
                     Err(error) => {
                         report_shm_error(ctx, buffer_id, &error);
@@ -619,6 +626,11 @@ impl WlSurface for DisplayState {
                 }
             }
             ctx.writer.wl_buffer_release(buffer_id);
+        } else if commit.attached_buffer == Some(None) {
+            self.surface_updates.push_back(SurfaceUpdate::Unmapped {
+                client_id: ctx.client_id,
+                surface_id: commit.surface_id,
+            });
         }
 
         for callback in commit.frame_callbacks {
@@ -1058,10 +1070,27 @@ mod tests {
         WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
 
         assert!(ctx.registry.object_metadata(callback_id).is_none());
-        let frames: Vec<_> = state.take_committed_frames().collect();
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].surface_id, surface_id);
-        assert_eq!(frames[0].buffer_id, buffer_id);
-        assert_eq!(frames[0].pixels, [1, 2, 3, 4]);
+        let updates: Vec<_> = state.take_surface_updates().collect();
+        assert_eq!(updates.len(), 1);
+        let SurfaceUpdate::Frame(frame) = &updates[0] else {
+            panic!("expected a committed frame");
+        };
+        assert_eq!(frame.surface_id, surface_id);
+        assert_eq!(frame.buffer_id, buffer_id);
+        assert_eq!(frame.pixels, [1, 2, 3, 4]);
+
+        state
+            .surface_manager
+            .attach(client_id, surface_id, None, 0, 0)
+            .unwrap();
+        WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
+        let updates: Vec<_> = state.take_surface_updates().collect();
+        assert!(matches!(
+            updates.as_slice(),
+            [SurfaceUpdate::Unmapped {
+                client_id: owner,
+                surface_id: unmapped,
+            }] if *owner == client_id && *unmapped == surface_id
+        ));
     }
 }

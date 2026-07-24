@@ -49,11 +49,12 @@ impl SurfaceManager {
         &mut self,
         client_id: ClientId,
         id: ObjectId,
-    ) -> Result<(Option<ObjectId>, Vec<ObjectId>), SurfaceError> {
+    ) -> Result<(Option<ObjectId>, Vec<ObjectId>, bool), SurfaceError> {
         let surface = self
             .surfaces
             .remove(&(client_id, id))
             .ok_or(SurfaceError::UnknownSurface)?;
+        let was_mapped = surface.is_mapped();
         let shell_id = match surface.role {
             Some(Role::Shell(shell_id)) => {
                 self.shell_surfaces.remove(&(client_id, shell_id));
@@ -61,7 +62,7 @@ impl SurfaceManager {
             }
             None => None,
         };
-        Ok((shell_id, surface.pending.frame_callbacks))
+        Ok((shell_id, surface.pending.frame_callbacks, was_mapped))
     }
 
     pub fn first_surface(&self, client_id: ClientId) -> Option<ObjectId> {
