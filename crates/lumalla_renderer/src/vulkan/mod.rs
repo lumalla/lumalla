@@ -16,6 +16,7 @@ mod pipeline;
 mod render_pass;
 pub mod shaders;
 mod sync;
+mod upload;
 
 pub use clear::clear_framebuffer_to_color;
 pub use command::{CommandBufferRecorder, CommandPool};
@@ -33,3 +34,4 @@ pub use physical_device::PhysicalDevice;
 pub use pipeline::{GraphicsPipeline, GraphicsPipelineBuilder, ShaderModule};
 pub use render_pass::RenderPass;
 pub use sync::{Fence, Semaphore};
+pub use upload::upload_bgra_to_image;

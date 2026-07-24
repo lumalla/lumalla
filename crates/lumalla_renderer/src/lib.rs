@@ -19,10 +19,13 @@ use crate::drm::{
 };
 use crate::vulkan::{
     DmaBufImage, Framebuffer, RenderPass, VulkanContext, clear_framebuffer_to_color,
+    upload_bgra_to_image,
 };
 
 /// Default clear color for enabled outputs (teal).
 pub const SOLID_CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.65, 1.0];
+const WL_SHM_FORMAT_ARGB8888: u32 = 0;
+const WL_SHM_FORMAT_XRGB8888: u32 = 1;
 
 #[derive(Debug)]
 pub struct SurfaceFrame {
@@ -56,6 +59,11 @@ impl SurfaceFrame {
         anyhow::ensure!(
             self.pixels.len() >= required,
             "Surface frame pixel data is truncated"
+        );
+        anyhow::ensure!(
+            matches!(self.format, WL_SHM_FORMAT_ARGB8888 | WL_SHM_FORMAT_XRGB8888),
+            "Unsupported Wayland SHM format {:#x}",
+            self.format
         );
         Ok(())
     }
@@ -112,13 +120,14 @@ impl RendererState {
         self.drm_devices.dispatch()
     }
 
-    /// Replace the current single-surface scene. Rendering is added by the
-    /// SHM upload path; retaining the latest frame here makes commit handling
-    /// independent from DRM lifecycle events.
+    /// Replace and immediately present the current single-surface scene.
     pub fn set_surface_frame(&mut self, frame: SurfaceFrame) -> anyhow::Result<()> {
         frame.validate()?;
         self.active_surface_frame = Some(frame);
-        Ok(())
+        if self.drm_devices.opened().is_empty() {
+            return Ok(());
+        }
+        self.present_enabled_outputs(SOLID_CLEAR_COLOR)
     }
 
     pub fn remove_surface_frame(&mut self, owner_id: u32, surface_id: u32) {
@@ -128,6 +137,11 @@ impl RendererState {
             .is_some_and(|frame| frame.owner_id == owner_id && frame.surface_id == surface_id)
         {
             self.active_surface_frame = None;
+            if !self.drm_devices.opened().is_empty() {
+                if let Err(error) = self.present_enabled_outputs(SOLID_CLEAR_COLOR) {
+                    error!("Failed to clear removed Wayland surface: {error:#}");
+                }
+            }
         }
     }
 
@@ -138,6 +152,11 @@ impl RendererState {
             .is_some_and(|frame| frame.owner_id == owner_id)
         {
             self.active_surface_frame = None;
+            if !self.drm_devices.opened().is_empty() {
+                if let Err(error) = self.present_enabled_outputs(SOLID_CLEAR_COLOR) {
+                    error!("Failed to clear disconnected Wayland surface: {error:#}");
+                }
+            }
         }
     }
 
@@ -188,6 +207,17 @@ impl RendererState {
     /// Buffers are allocated on the selected render GPU and imported on each
     /// output's DRM card (same- or cross-device). Failures are logged per output.
     pub fn present_enabled_outputs(&mut self, color: [f32; 4]) -> anyhow::Result<()> {
+        let frame = self.active_surface_frame.take();
+        let result = self.present_enabled_outputs_with_frame(color, frame.as_ref());
+        self.active_surface_frame = frame;
+        result
+    }
+
+    fn present_enabled_outputs_with_frame(
+        &mut self,
+        color: [f32; 4],
+        frame: Option<&SurfaceFrame>,
+    ) -> anyhow::Result<()> {
         self.scanouts.clear();
 
         let Some(render_path) = self.resolved_render_device_path() else {
@@ -206,7 +236,7 @@ impl RendererState {
 
         let mut presented = 0usize;
         for target in targets {
-            match self.present_one_output(&target, color) {
+            match self.present_one_output(&target, color, frame) {
                 Ok(scanout) => {
                     info!(
                         "Presented {} on {} (CRTC {}, {}x{}@{}Hz)",
@@ -286,6 +316,7 @@ impl RendererState {
         &mut self,
         target: &PresentTarget,
         color: [f32; 4],
+        frame: Option<&SurfaceFrame>,
     ) -> anyhow::Result<OutputScanout> {
         let width = target.output.mode.width();
         let height = target.output.mode.height();
@@ -326,6 +357,20 @@ impl RendererState {
                 color,
             )
             .context("Failed to clear scanout image")?;
+
+            if let Some(frame) = frame {
+                let upload = prepare_surface_upload(frame, width, height)?;
+                upload_bgra_to_image(
+                    vulkan.device(),
+                    vulkan.physical_device(),
+                    vulkan.graphics_command_pool(),
+                    &dma_image,
+                    &upload.pixels,
+                    upload.width,
+                    upload.height,
+                )
+                .context("Failed to upload Wayland SHM frame")?;
+            }
 
             vulkan.device().wait_idle()?;
             (dma_image, fourcc)
@@ -435,6 +480,49 @@ struct PresentTarget {
     output: ConnectedOutput,
 }
 
+struct PreparedSurfaceUpload {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+fn prepare_surface_upload(
+    frame: &SurfaceFrame,
+    output_width: u32,
+    output_height: u32,
+) -> anyhow::Result<PreparedSurfaceUpload> {
+    frame.validate()?;
+    anyhow::ensure!(
+        output_width > 0 && output_height > 0,
+        "Output dimensions must be non-zero"
+    );
+    let width = frame.width.min(output_width as usize);
+    let height = frame.height.min(output_height as usize);
+    let row_bytes = width
+        .checked_mul(4)
+        .context("Clipped surface row size overflows")?;
+    let capacity = row_bytes
+        .checked_mul(height)
+        .context("Clipped surface size overflows")?;
+    let mut pixels = Vec::with_capacity(capacity);
+    for row in 0..height {
+        let start = row * frame.stride;
+        let source = &frame.pixels[start..start + row_bytes];
+        pixels.extend_from_slice(source);
+        if frame.format == WL_SHM_FORMAT_XRGB8888 {
+            let row_start = pixels.len() - row_bytes;
+            for alpha in pixels[row_start..].iter_mut().skip(3).step_by(4) {
+                *alpha = u8::MAX;
+            }
+        }
+    }
+    Ok(PreparedSurfaceUpload {
+        pixels,
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
 impl Source for RendererState {
     fn register(
         &mut self,
@@ -486,5 +574,43 @@ mod tests {
         let mut short_stride = frame();
         short_stride.stride = 4;
         assert!(short_stride.validate().is_err());
+
+        let mut unknown_format = frame();
+        unknown_format.format = 0xdead_beef;
+        assert!(unknown_format.validate().is_err());
+    }
+
+    #[test]
+    fn prepares_clipped_xrgb_upload_without_stride_padding() {
+        let frame = SurfaceFrame {
+            owner_id: 1,
+            surface_id: 2,
+            pixels: vec![
+                1, 2, 3, 0, 4, 5, 6, 0, 90, 91, 92, 93, 7, 8, 9, 0, 10, 11, 12, 0, 94, 95, 96, 97,
+            ],
+            width: 2,
+            height: 2,
+            stride: 12,
+            format: WL_SHM_FORMAT_XRGB8888,
+        };
+
+        let upload = prepare_surface_upload(&frame, 1, 2).unwrap();
+        assert_eq!((upload.width, upload.height), (1, 2));
+        assert_eq!(upload.pixels, vec![1, 2, 3, 255, 7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn preserves_argb_upload_bytes() {
+        let frame = SurfaceFrame {
+            pixels: vec![1, 2, 3, 4],
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: WL_SHM_FORMAT_ARGB8888,
+            ..frame()
+        };
+
+        let upload = prepare_surface_upload(&frame, 4, 4).unwrap();
+        assert_eq!(upload.pixels, vec![1, 2, 3, 4]);
     }
 }
