@@ -114,7 +114,7 @@ impl SurfaceManager {
                 }
                 (None, Some(subsurface_id))
             }
-            Some(Role::Cursor) | None => (None, None),
+            Some(Role::Cursor) | Some(Role::DndIcon) | None => (None, None),
         };
 
         let mut callbacks = surface.pending.frame_callbacks;
@@ -227,6 +227,40 @@ impl SurfaceManager {
         self.surfaces
             .get(&(client_id, surface_id))
             .is_some_and(|surface| surface.role == Some(Role::Cursor))
+    }
+
+    pub fn assign_dnd_icon_role(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        match surface.role {
+            None => {
+                surface.role = Some(Role::DndIcon);
+                Ok(())
+            }
+            Some(Role::DndIcon) => Ok(()),
+            Some(_) => Err(SurfaceError::RoleAlreadyAssigned),
+        }
+    }
+
+    pub fn clear_dnd_icon_role(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        if surface.role == Some(Role::DndIcon) {
+            surface.role = None;
+        }
+        Ok(())
     }
 
     pub fn attach(
@@ -914,7 +948,7 @@ impl SurfaceManager {
                     .parent;
                 self.is_mapped(client_id, parent)
             }
-            Some(Role::Cursor) | None => Ok(false),
+            Some(Role::Cursor) | Some(Role::DndIcon) | None => Ok(false),
         }
     }
 
@@ -1103,6 +1137,7 @@ enum Role {
     Shell(ObjectId),
     Subsurface(ObjectId),
     Cursor,
+    DndIcon,
 }
 
 #[derive(Debug)]

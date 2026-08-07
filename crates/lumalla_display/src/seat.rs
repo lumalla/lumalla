@@ -229,6 +229,17 @@ impl SeatManager {
         self.serial.next_serial()
     }
 
+    pub fn pointer_position(&self) -> (f64, f64) {
+        (self.pointer_x, self.pointer_y)
+    }
+
+    pub fn pointer_focus_for_client(&self, client_id: ClientId) -> Option<ObjectId> {
+        self.pointers
+            .iter()
+            .find(|p| p.client_id == client_id && p.focus.is_some())
+            .and_then(|p| p.focus)
+    }
+
     pub fn set_cursor(
         &mut self,
         client_id: ClientId,

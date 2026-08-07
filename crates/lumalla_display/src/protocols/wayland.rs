@@ -7,6 +7,7 @@ use lumalla_wayland_protocol::{
 
 use crate::{
     CommittedFrame, DisplayState, GlobalId, SurfaceUpdate,
+    data_device::DataDeviceError,
     shm::{ShmError, ShmErrorKind},
     surface::{Rectangle, ShellMode, SurfaceCommit, SurfaceError},
 };
@@ -104,6 +105,42 @@ fn report_subsurface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceErr
             return;
         }
     };
+    ctx.writer
+        .wl_display_error(DISPLAY_OBJECT_ID)
+        .object_id(object_id)
+        .code(code)
+        .message(message);
+}
+
+fn report_data_device_error(ctx: &mut Ctx, object_id: ObjectId, error: DataDeviceError) {
+    let (code, message) = match error {
+        DataDeviceError::UsedSource => (WL_DATA_DEVICE_ERROR_USED_SOURCE, "Source already used"),
+        DataDeviceError::RoleConflict => (WL_DATA_DEVICE_ERROR_ROLE, "Surface already has a role"),
+        DataDeviceError::InvalidActionMask => {
+            // Prefer source/offer-specific codes when possible; default to offer.
+            (WL_DATA_OFFER_ERROR_INVALID_ACTION_MASK, "Invalid action mask")
+        }
+        DataDeviceError::InvalidAction => {
+            (WL_DATA_OFFER_ERROR_INVALID_ACTION, "Invalid action")
+        }
+        DataDeviceError::InvalidFinish => {
+            (WL_DATA_OFFER_ERROR_INVALID_FINISH, "Invalid finish")
+        }
+        DataDeviceError::InvalidOffer => {
+            (WL_DATA_OFFER_ERROR_INVALID_OFFER, "Invalid offer request")
+        }
+        DataDeviceError::InvalidSource => {
+            (WL_DATA_SOURCE_ERROR_INVALID_SOURCE, "Invalid source request")
+        }
+        DataDeviceError::UnknownSource
+        | DataDeviceError::UnknownDevice
+        | DataDeviceError::UnknownOffer
+        | DataDeviceError::UnknownSeat
+        | DataDeviceError::UnknownSurface => {
+            (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown object")
+        }
+    };
+    debug!("Data device protocol error: {error}");
     ctx.writer
         .wl_display_error(DISPLAY_OBJECT_ID)
         .object_id(object_id)
@@ -379,92 +416,276 @@ impl WlBuffer for DisplayState {
 }
 
 impl WlDataOffer for DisplayState {
-    fn accept(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlDataOfferAccept<'_>) {
-        todo!()
+    fn accept(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlDataOfferAccept<'_>) {
+        if let Err(error) = self.data_device_manager.accept(
+            ctx.client_id,
+            object_id,
+            params.serial(),
+            params.mime_type(),
+            ctx.writer,
+        ) {
+            report_data_device_error(ctx, object_id, error);
+        }
     }
 
-    fn receive(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlDataOfferReceive<'_>) {
-        todo!()
+    fn receive(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlDataOfferReceive<'_>) {
+        if let Err(error) = self.data_device_manager.receive(
+            ctx.client_id,
+            object_id,
+            params.mime_type(),
+            params.fd(),
+            ctx.writer,
+        ) {
+            report_data_device_error(ctx, object_id, error);
+        }
     }
 
-    fn destroy(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlDataOfferDestroy<'_>) {
-        todo!()
+    fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlDataOfferDestroy<'_>) {
+        if let Err(error) = self.data_device_manager.destroy_offer(ctx.client_id, object_id) {
+            report_data_device_error(ctx, object_id, error);
+            return;
+        }
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 
-    fn finish(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlDataOfferFinish<'_>) {
-        todo!()
+    fn finish(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlDataOfferFinish<'_>) {
+        if let Err(error) =
+            self.data_device_manager
+                .finish(ctx.client_id, object_id, ctx.writer)
+        {
+            report_data_device_error(ctx, object_id, error);
+        }
     }
 
     fn set_actions(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlDataOfferSetActions<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlDataOfferSetActions<'_>,
     ) {
-        todo!()
+        if let Err(error) = self.data_device_manager.set_offer_actions(
+            ctx.client_id,
+            object_id,
+            params.dnd_actions(),
+            params.preferred_action(),
+            ctx.writer,
+        ) {
+            // Prefer offer-specific error codes for action issues.
+            let code = match error {
+                DataDeviceError::InvalidActionMask => WL_DATA_OFFER_ERROR_INVALID_ACTION_MASK,
+                DataDeviceError::InvalidAction => WL_DATA_OFFER_ERROR_INVALID_ACTION,
+                DataDeviceError::InvalidOffer => WL_DATA_OFFER_ERROR_INVALID_OFFER,
+                other => {
+                    report_data_device_error(ctx, object_id, other);
+                    return;
+                }
+            };
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(object_id)
+                .code(code)
+                .message(&error.to_string());
+        }
     }
 }
 
 impl WlDataSource for DisplayState {
-    fn offer(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlDataSourceOffer<'_>) {
-        todo!()
+    fn offer(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlDataSourceOffer<'_>) {
+        if let Err(error) =
+            self.data_device_manager
+                .offer(ctx.client_id, object_id, params.mime_type())
+        {
+            report_data_device_error(ctx, object_id, error);
+        }
     }
 
-    fn destroy(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlDataSourceDestroy<'_>) {
-        todo!()
+    fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlDataSourceDestroy<'_>) {
+        if let Err(error) =
+            self.data_device_manager
+                .destroy_source(ctx.client_id, object_id, ctx.writer)
+        {
+            report_data_device_error(ctx, object_id, error);
+            return;
+        }
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 
     fn set_actions(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlDataSourceSetActions<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlDataSourceSetActions<'_>,
     ) {
-        todo!()
+        if let Err(error) = self.data_device_manager.set_source_actions(
+            ctx.client_id,
+            object_id,
+            params.dnd_actions(),
+        ) {
+            let code = match error {
+                DataDeviceError::InvalidActionMask => WL_DATA_SOURCE_ERROR_INVALID_ACTION_MASK,
+                DataDeviceError::InvalidSource => WL_DATA_SOURCE_ERROR_INVALID_SOURCE,
+                other => {
+                    report_data_device_error(ctx, object_id, other);
+                    return;
+                }
+            };
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(object_id)
+                .code(code)
+                .message(&error.to_string());
+        }
     }
 }
 
 impl WlDataDevice for DisplayState {
     fn start_drag(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlDataDeviceStartDrag<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlDataDeviceStartDrag<'_>,
     ) {
-        todo!()
+        if let Some(source) = params.source() {
+            if ctx.registry.interface_index(source) != Some(InterfaceIndex::WlDataSource) {
+                report_data_device_error(ctx, object_id, DataDeviceError::UnknownSource);
+                return;
+            }
+        }
+        if ctx.registry.interface_index(params.origin()) != Some(InterfaceIndex::WlSurface) {
+            report_data_device_error(ctx, object_id, DataDeviceError::UnknownSurface);
+            return;
+        }
+        if let Some(icon) = params.icon() {
+            if ctx.registry.interface_index(icon) != Some(InterfaceIndex::WlSurface) {
+                report_data_device_error(ctx, object_id, DataDeviceError::UnknownSurface);
+                return;
+            }
+            if let Err(error) = self
+                .surface_manager
+                .assign_dnd_icon_role(ctx.client_id, icon)
+            {
+                let mapped = match error {
+                    SurfaceError::RoleAlreadyAssigned => DataDeviceError::RoleConflict,
+                    SurfaceError::UnknownSurface => DataDeviceError::UnknownSurface,
+                    _ => DataDeviceError::RoleConflict,
+                };
+                report_data_device_error(ctx, object_id, mapped);
+                return;
+            }
+        }
+
+        let target = self
+            .seat_manager
+            .pointer_focus_for_client(ctx.client_id)
+            .or_else(|| self.surface_manager.pointer_target(ctx.client_id, 0.0, 0.0));
+        let (px, py) = self.seat_manager.pointer_position();
+
+        if let Err(error) = self.data_device_manager.start_drag(
+            ctx.client_id,
+            object_id,
+            params.source(),
+            params.origin(),
+            params.icon(),
+            params.serial(),
+            target,
+            px as f32,
+            py as f32,
+            ctx.registry,
+            ctx.writer,
+        ) {
+            if let Some(icon) = params.icon() {
+                let _ = self
+                    .surface_manager
+                    .clear_dnd_icon_role(ctx.client_id, icon);
+            }
+            report_data_device_error(ctx, object_id, error);
+        }
     }
 
     fn set_selection(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlDataDeviceSetSelection<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlDataDeviceSetSelection<'_>,
     ) {
-        todo!()
+        if let Some(source) = params.source() {
+            if ctx.registry.interface_index(source) != Some(InterfaceIndex::WlDataSource) {
+                report_data_device_error(ctx, object_id, DataDeviceError::UnknownSource);
+                return;
+            }
+        }
+        if let Err(error) = self.data_device_manager.set_selection(
+            ctx.client_id,
+            object_id,
+            params.source(),
+            params.serial(),
+            ctx.registry,
+            ctx.writer,
+        ) {
+            report_data_device_error(ctx, object_id, error);
+        }
     }
 
-    fn release(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlDataDeviceRelease<'_>) {
-        todo!()
+    fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlDataDeviceRelease<'_>) {
+        if let Some((client_id, icon)) = self.data_device_manager.active_drag_icon()
+            && client_id == ctx.client_id
+        {
+            let _ = self.surface_manager.clear_dnd_icon_role(client_id, icon);
+        }
+        if let Err(error) = self
+            .data_device_manager
+            .release_device(ctx.client_id, object_id)
+        {
+            report_data_device_error(ctx, object_id, error);
+            return;
+        }
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 }
 
 impl WlDataDeviceManager for DisplayState {
     fn create_data_source(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlDataDeviceManagerCreateDataSource<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlDataDeviceManagerCreateDataSource<'_>,
     ) {
-        todo!()
+        let version = ctx
+            .registry
+            .object_metadata(object_id)
+            .map_or(1, |object| object.version.min(WL_DATA_SOURCE_VERSION));
+        if !register_object(ctx, params.id(), InterfaceIndex::WlDataSource, version) {
+            return;
+        }
+        self.data_device_manager
+            .create_data_source(ctx.client_id, *params.id(), version);
     }
 
     fn get_data_device(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlDataDeviceManagerGetDataDevice<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlDataDeviceManagerGetDataDevice<'_>,
     ) {
-        todo!()
+        if ctx.registry.interface_index(params.seat()) != Some(InterfaceIndex::WlSeat) {
+            report_data_device_error(ctx, object_id, DataDeviceError::UnknownSeat);
+            return;
+        }
+        let version = ctx
+            .registry
+            .object_metadata(object_id)
+            .map_or(1, |object| object.version.min(WL_DATA_DEVICE_VERSION));
+        if !register_object(ctx, params.id(), InterfaceIndex::WlDataDevice, version) {
+            return;
+        }
+        self.data_device_manager.create_data_device(
+            ctx.client_id,
+            *params.id(),
+            params.seat(),
+            version,
+            ctx.registry,
+            ctx.writer,
+        );
     }
 }
 
@@ -1345,6 +1566,7 @@ mod tests {
         assert!(globals.contains(&(WL_SUBCOMPOSITOR_NAME, 1)));
         assert!(globals.contains(&(WL_FIXES_NAME, 1)));
         assert!(globals.contains(&(WL_OUTPUT_NAME, 4)));
+        assert!(globals.contains(&(WL_DATA_DEVICE_MANAGER_NAME, 3)));
     }
 
     #[test]

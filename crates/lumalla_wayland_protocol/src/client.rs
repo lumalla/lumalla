@@ -70,6 +70,14 @@ impl ClientConnection {
         &mut self.writer
     }
 
+    pub fn registry_mut(&mut self) -> &mut Registry {
+        &mut self.registry
+    }
+
+    pub fn registry_and_writer_mut(&mut self) -> (&mut Registry, &mut Writer) {
+        (&mut self.registry, &mut self.writer)
+    }
+
     pub fn interest(&self) -> Interest {
         if self.writer.has_pending_output() {
             Interest::READABLE.add(Interest::WRITABLE)

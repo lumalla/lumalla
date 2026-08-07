@@ -5,9 +5,11 @@ use lumalla_shared::Comms;
 use lumalla_wayland_protocol::registry::InterfaceIndex;
 
 use crate::{
-    output::OutputManager, seat::SeatManager, shm::ShmManager, surface::SurfaceManager,
+    data_device::DataDeviceManager, output::OutputManager, seat::SeatManager, shm::ShmManager,
+    surface::SurfaceManager,
 };
 
+mod data_device;
 mod protocols;
 mod seat;
 mod shm;
@@ -52,6 +54,7 @@ pub struct DisplayState {
     shm_manager: ShmManager,
     seat_manager: SeatManager,
     output_manager: OutputManager,
+    data_device_manager: DataDeviceManager,
     surface_updates: VecDeque<SurfaceUpdate>,
 }
 
@@ -67,6 +70,7 @@ impl DisplayState {
             shm_manager: ShmManager::default(),
             seat_manager: SeatManager::default(),
             output_manager,
+            data_device_manager: DataDeviceManager::default(),
             surface_updates: VecDeque::new(),
         })
     }
@@ -200,11 +204,54 @@ impl DisplayState {
         self.seat_manager.handle_touch_cancel(clients);
     }
 
+    /// Drive an active drag's motion for tests / compositor input.
+    pub fn drag_motion(
+        &mut self,
+        client_id: ClientId,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        time_msec: u32,
+        x: f64,
+        y: f64,
+    ) {
+        let target = self
+            .surface_manager
+            .global_pointer_target(Some(client_id), x, y)
+            .filter(|(owner, _)| *owner == client_id)
+            .map(|(_, surface)| surface);
+        let Some(client) = clients.get_mut(&client_id) else {
+            return;
+        };
+        let (registry, writer) = client.registry_and_writer_mut();
+        self.data_device_manager.drag_motion(
+            client_id,
+            time_msec,
+            x as f32,
+            y as f32,
+            target,
+            registry,
+            writer,
+        );
+    }
+
+    /// Complete an active drag with a drop for tests / compositor input.
+    pub fn drag_drop(
+        &mut self,
+        client_id: ClientId,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) {
+        let Some(client) = clients.get_mut(&client_id) else {
+            return;
+        };
+        self.data_device_manager
+            .drag_drop(client_id, client.writer_mut());
+    }
+
     pub fn remove_client(&mut self, client_id: ClientId) {
         self.shm_manager.delete_client(client_id);
         self.surface_manager.delete_client(client_id);
         self.seat_manager.remove_client(client_id);
         self.output_manager.remove_client(client_id);
+        self.data_device_manager.remove_client(client_id);
         self.surface_updates.retain(|update| match update {
             SurfaceUpdate::Frame(frame) => frame.client_id != client_id,
             SurfaceUpdate::Unmapped {
@@ -279,6 +326,7 @@ impl Default for Globals {
         globals.register_version(InterfaceIndex::WlShell, 1, [].into_iter());
         globals.register_version(InterfaceIndex::WlSubcompositor, 1, [].into_iter());
         globals.register_version(InterfaceIndex::WlFixes, 1, [].into_iter());
+        globals.register_version(InterfaceIndex::WlDataDeviceManager, 3, [].into_iter());
         globals
     }
 }
