@@ -88,6 +88,7 @@ impl DisplayState {
     pub fn remove_client(&mut self, client_id: ClientId) {
         self.shm_manager.delete_client(client_id);
         self.surface_manager.delete_client(client_id);
+        self.seat_manager.remove_client(client_id);
         self.surface_updates.retain(|update| match update {
             SurfaceUpdate::Frame(frame) => frame.client_id != client_id,
             SurfaceUpdate::Unmapped {

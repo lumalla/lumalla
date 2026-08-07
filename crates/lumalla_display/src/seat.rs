@@ -126,6 +126,42 @@ impl SeatManager {
             .retain(|kb| !(kb.client_id == client_id && kb.id == keyboard_id));
     }
 
+    pub fn remove_client(&mut self, client_id: ClientId) {
+        self.keyboards.retain(|kb| kb.client_id != client_id);
+    }
+
+    pub fn next_serial(&mut self) -> u32 {
+        self.serial.next_serial()
+    }
+
+    pub fn leave_keyboards_on_surface(
+        &mut self,
+        client_id: ClientId,
+        surface: ObjectId,
+        writer: &mut Writer,
+    ) {
+        let keyboards: Vec<ObjectId> = self
+            .keyboards
+            .iter()
+            .filter(|kb| kb.client_id == client_id && kb.focus == Some(surface))
+            .map(|kb| kb.id)
+            .collect();
+        for keyboard_id in keyboards {
+            let serial = self.serial.next_serial();
+            writer
+                .wl_keyboard_leave(keyboard_id)
+                .serial(serial)
+                .surface(surface);
+            if let Some(keyboard) = self
+                .keyboards
+                .iter_mut()
+                .find(|kb| kb.client_id == client_id && kb.id == keyboard_id)
+            {
+                keyboard.focus = None;
+            }
+        }
+    }
+
     pub fn focus_keyboards_on_surface(
         &mut self,
         client_id: ClientId,
@@ -133,13 +169,23 @@ impl SeatManager {
         writer: &mut Writer,
     ) {
         let modifiers = self.modifiers;
-        let keyboards: Vec<ObjectId> = self
+        let keyboards: Vec<(ObjectId, Option<ObjectId>)> = self
             .keyboards
             .iter()
-            .filter(|kb| kb.client_id == client_id && kb.focus.is_none())
-            .map(|kb| kb.id)
+            .filter(|kb| kb.client_id == client_id)
+            .map(|kb| (kb.id, kb.focus))
             .collect();
-        for keyboard_id in keyboards {
+        for (keyboard_id, previous_focus) in keyboards {
+            if previous_focus == Some(surface) {
+                continue;
+            }
+            if let Some(old_surface) = previous_focus {
+                let serial = self.serial.next_serial();
+                writer
+                    .wl_keyboard_leave(keyboard_id)
+                    .serial(serial)
+                    .surface(old_surface);
+            }
             let serial = self.serial.next_serial();
             writer
                 .wl_keyboard_enter(keyboard_id)

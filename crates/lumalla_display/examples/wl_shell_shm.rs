@@ -145,6 +145,7 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!("Compositor reported a protocol error");
         } else if event.object_id == 10 && event.opcode == 0 {
             let serial = read_u32(&event.payload, 0)?;
+            println!("Responding to wl_shell_surface.ping serial={serial}");
             if let Err(error) = send(
                 &mut stream,
                 request(10, WL_SHELL_SURFACE_PONG_OPCODE, u32_arg(serial)),

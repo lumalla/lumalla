@@ -363,11 +363,59 @@ impl WlShell for DisplayState {
 }
 
 impl WlShellSurface for DisplayState {
-    fn pong(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlShellSurfacePong<'_>) {}
+    fn pong(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlShellSurfacePong<'_>) {
+        match self
+            .surface_manager
+            .acknowledge_shell_ping(ctx.client_id, object_id, params.serial())
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    "Ignoring wl_shell_surface.pong with unknown serial {}",
+                    params.serial()
+                );
+            }
+            Err(error) => report_surface_error(ctx, object_id, error),
+        }
+    }
 
-    fn move_(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlShellSurfaceMove<'_>) {}
+    fn move_(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlShellSurfaceMove<'_>) {
+        if ctx.registry.interface_index(params.seat()) != Some(InterfaceIndex::WlSeat) {
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(params.seat())
+                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                .message("Seat object is not a wl_seat");
+            return;
+        }
+        if let Err(error) = self.surface_manager.record_shell_move(
+            ctx.client_id,
+            object_id,
+            params.seat(),
+            params.serial(),
+        ) {
+            report_surface_error(ctx, object_id, error);
+        }
+    }
 
-    fn resize(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlShellSurfaceResize<'_>) {
+    fn resize(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlShellSurfaceResize<'_>) {
+        if ctx.registry.interface_index(params.seat()) != Some(InterfaceIndex::WlSeat) {
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(params.seat())
+                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                .message("Seat object is not a wl_seat");
+            return;
+        }
+        if let Err(error) = self.surface_manager.record_shell_resize(
+            ctx.client_id,
+            object_id,
+            params.seat(),
+            params.serial(),
+            params.edges(),
+        ) {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn set_toplevel(
@@ -484,6 +532,11 @@ impl WlSurface for DisplayState {
             .destroy_surface(ctx.client_id, object_id)
         {
             Ok((shell_id, callbacks, was_mapped)) => {
+                self.seat_manager.leave_keyboards_on_surface(
+                    ctx.client_id,
+                    object_id,
+                    ctx.writer,
+                );
                 for callback in callbacks {
                     ctx.registry.free_object(callback, ctx.writer);
                 }
@@ -624,9 +677,33 @@ impl WlSurface for DisplayState {
                         return;
                     }
                 }
+                if commit.newly_mapped {
+                    if let Some(shell_id) = commit.shell_id {
+                        let serial = self.seat_manager.next_serial();
+                        if self
+                            .surface_manager
+                            .set_pending_shell_ping(ctx.client_id, shell_id, serial)
+                            .is_ok()
+                        {
+                            ctx.writer
+                                .wl_shell_surface_ping(shell_id)
+                                .serial(serial);
+                        }
+                    }
+                    self.seat_manager.focus_keyboards_on_surface(
+                        ctx.client_id,
+                        commit.surface_id,
+                        ctx.writer,
+                    );
+                }
             }
             ctx.writer.wl_buffer_release(buffer_id);
         } else if commit.attached_buffer == Some(None) {
+            self.seat_manager.leave_keyboards_on_surface(
+                ctx.client_id,
+                commit.surface_id,
+                ctx.writer,
+            );
             self.surface_updates.push_back(SurfaceUpdate::Unmapped {
                 client_id: ctx.client_id,
                 surface_id: commit.surface_id,
@@ -1126,6 +1203,13 @@ mod tests {
         assert_eq!(frame.surface_id, surface_id);
         assert_eq!(frame.buffer_id, buffer_id);
         assert_eq!(frame.pixels, [1, 2, 3, 4]);
+        assert!(
+            state
+                .surface_manager
+                .acknowledge_shell_ping(client_id, shell_id, 1)
+                .unwrap(),
+            "expected pending ping serial 1 after first map"
+        );
 
         state
             .surface_manager

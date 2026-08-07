@@ -30,6 +30,9 @@ pub struct SurfaceCommit {
     pub buffer: Option<ObjectId>,
     pub attached_buffer: Option<Option<ObjectId>>,
     pub mapped: bool,
+    /// True when this commit transitioned the surface from unmapped to mapped.
+    pub newly_mapped: bool,
+    pub shell_id: Option<ObjectId>,
     pub frame_callbacks: Vec<ObjectId>,
 }
 
@@ -159,6 +162,7 @@ impl SurfaceManager {
             .surfaces
             .get_mut(&(client_id, id))
             .ok_or(SurfaceError::UnknownSurface)?;
+        let was_mapped = surface.is_mapped();
         let attached_buffer = surface.pending.buffer.take();
         if let Some(buffer) = attached_buffer {
             surface.current.buffer = buffer;
@@ -174,13 +178,70 @@ impl SurfaceManager {
         }
         surface.current.damage = std::mem::take(&mut surface.pending.damage);
         let frame_callbacks = std::mem::take(&mut surface.pending.frame_callbacks);
+        let mapped = surface.is_mapped();
+        let shell_id = match surface.role {
+            Some(Role::Shell(shell_id)) => Some(shell_id),
+            None => None,
+        };
         Ok(SurfaceCommit {
             surface_id: id,
             buffer: surface.current.buffer,
             attached_buffer,
-            mapped: surface.is_mapped(),
+            mapped,
+            newly_mapped: mapped && !was_mapped,
+            shell_id,
             frame_callbacks,
         })
+    }
+
+    pub fn acknowledge_shell_ping(
+        &mut self,
+        client_id: ClientId,
+        shell_id: ObjectId,
+        serial: u32,
+    ) -> Result<bool, SurfaceError> {
+        let shell = self.shell_state_mut(client_id, shell_id)?;
+        if shell.pending_ping == Some(serial) {
+            shell.pending_ping = None;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn set_pending_shell_ping(
+        &mut self,
+        client_id: ClientId,
+        shell_id: ObjectId,
+        serial: u32,
+    ) -> Result<(), SurfaceError> {
+        self.shell_state_mut(client_id, shell_id)?.pending_ping = Some(serial);
+        Ok(())
+    }
+
+    pub fn record_shell_move(
+        &mut self,
+        client_id: ClientId,
+        shell_id: ObjectId,
+        seat: ObjectId,
+        serial: u32,
+    ) -> Result<(), SurfaceError> {
+        let shell = self.shell_state_mut(client_id, shell_id)?;
+        shell.last_move = Some((seat, serial));
+        Ok(())
+    }
+
+    pub fn record_shell_resize(
+        &mut self,
+        client_id: ClientId,
+        shell_id: ObjectId,
+        seat: ObjectId,
+        serial: u32,
+        edges: u32,
+    ) -> Result<(), SurfaceError> {
+        let shell = self.shell_state_mut(client_id, shell_id)?;
+        shell.last_resize = Some((seat, serial, edges));
+        Ok(())
     }
 
     pub fn create_shell_surface(
@@ -345,6 +406,7 @@ impl Surface {
                 ShellMode::Toplevel
                     | ShellMode::Transient
                     | ShellMode::Fullscreen
+                    | ShellMode::Popup
                     | ShellMode::Maximized
             )
     }
@@ -360,6 +422,9 @@ struct ShellState {
     mode: ShellMode,
     title: String,
     class: String,
+    pending_ping: Option<u32>,
+    last_move: Option<(ObjectId, u32)>,
+    last_resize: Option<(ObjectId, u32, u32)>,
 }
 
 impl Default for ShellState {
@@ -368,6 +433,9 @@ impl Default for ShellState {
             mode: ShellMode::None,
             title: String::new(),
             class: String::new(),
+            pending_ping: None,
+            last_move: None,
+            last_resize: None,
         }
     }
 }
@@ -446,11 +514,53 @@ mod tests {
         assert_eq!(commit.buffer, Some(object(4)));
         assert_eq!(commit.attached_buffer, Some(Some(object(4))));
         assert!(commit.mapped);
+        assert!(commit.newly_mapped);
+        assert_eq!(commit.shell_id, Some(object(3)));
         assert_eq!(commit.frame_callbacks, [object(5)]);
         let second = manager.commit(client(1), object(2)).unwrap();
         assert_eq!(second.buffer, Some(object(4)));
         assert_eq!(second.attached_buffer, None);
+        assert!(!second.newly_mapped);
         assert!(second.frame_callbacks.is_empty());
+    }
+
+    #[test]
+    fn popup_shell_mode_maps_with_buffer() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_shell_surface(client(1), object(3), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(3), ShellMode::Popup)
+            .unwrap();
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0)
+            .unwrap();
+        let commit = manager.commit(client(1), object(2)).unwrap();
+        assert!(commit.mapped);
+        assert!(commit.newly_mapped);
+    }
+
+    #[test]
+    fn shell_ping_serial_is_acknowledged_by_matching_pong() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_shell_surface(client(1), object(3), object(2))
+            .unwrap();
+        manager
+            .set_pending_shell_ping(client(1), object(3), 42)
+            .unwrap();
+        assert!(!manager
+            .acknowledge_shell_ping(client(1), object(3), 7)
+            .unwrap());
+        assert!(manager
+            .acknowledge_shell_ping(client(1), object(3), 42)
+            .unwrap());
+        assert!(!manager
+            .acknowledge_shell_ping(client(1), object(3), 42)
+            .unwrap());
     }
 
     #[test]
