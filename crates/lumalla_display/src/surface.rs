@@ -11,6 +11,9 @@ pub enum SurfaceError {
     UnknownShellSurface,
     UnknownRegion,
     RoleAlreadyAssigned,
+    InvalidScale,
+    InvalidTransform,
+    InvalidOffset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +37,13 @@ pub struct SurfaceCommit {
     pub newly_mapped: bool,
     pub shell_id: Option<ObjectId>,
     pub frame_callbacks: Vec<ObjectId>,
+    pub buffer_scale: i32,
+    pub buffer_transform: u32,
+    pub offset: (i32, i32),
+    #[allow(dead_code)]
+    pub damage: Vec<Rectangle>,
+    #[allow(dead_code)]
+    pub buffer_damage: Vec<Rectangle>,
 }
 
 #[derive(Debug, Default)]
@@ -82,13 +92,84 @@ impl SurfaceManager {
         buffer: Option<ObjectId>,
         x: i32,
         y: i32,
+        surface_version: u32,
     ) -> Result<(), SurfaceError> {
+        if surface_version >= 5 && (x != 0 || y != 0) {
+            return Err(SurfaceError::InvalidOffset);
+        }
         let surface = self
             .surfaces
             .get_mut(&(client_id, id))
             .ok_or(SurfaceError::UnknownSurface)?;
         surface.pending.buffer = Some(buffer);
-        surface.pending.offset = Some((x, y));
+        if surface_version < 5 {
+            surface.pending.offset = Some((x, y));
+        }
+        Ok(())
+    }
+
+    pub fn set_buffer_transform(
+        &mut self,
+        client_id: ClientId,
+        id: ObjectId,
+        transform: i32,
+    ) -> Result<(), SurfaceError> {
+        if !(0..=7).contains(&transform) {
+            return Err(SurfaceError::InvalidTransform);
+        }
+        self.surfaces
+            .get_mut(&(client_id, id))
+            .ok_or(SurfaceError::UnknownSurface)?
+            .pending
+            .buffer_transform = Some(transform as u32);
+        Ok(())
+    }
+
+    pub fn set_buffer_scale(
+        &mut self,
+        client_id: ClientId,
+        id: ObjectId,
+        scale: i32,
+    ) -> Result<(), SurfaceError> {
+        if scale <= 0 {
+            return Err(SurfaceError::InvalidScale);
+        }
+        self.surfaces
+            .get_mut(&(client_id, id))
+            .ok_or(SurfaceError::UnknownSurface)?
+            .pending
+            .buffer_scale = Some(scale);
+        Ok(())
+    }
+
+    pub fn damage_buffer(
+        &mut self,
+        client_id: ClientId,
+        id: ObjectId,
+        rectangle: Rectangle,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        if rectangle.width > 0 && rectangle.height > 0 {
+            surface.pending.buffer_damage.push(rectangle);
+        }
+        Ok(())
+    }
+
+    pub fn offset(
+        &mut self,
+        client_id: ClientId,
+        id: ObjectId,
+        x: i32,
+        y: i32,
+    ) -> Result<(), SurfaceError> {
+        self.surfaces
+            .get_mut(&(client_id, id))
+            .ok_or(SurfaceError::UnknownSurface)?
+            .pending
+            .offset = Some((x, y));
         Ok(())
     }
 
@@ -177,6 +258,13 @@ impl SurfaceManager {
             surface.current.input_region = region;
         }
         surface.current.damage = std::mem::take(&mut surface.pending.damage);
+        surface.current.buffer_damage = std::mem::take(&mut surface.pending.buffer_damage);
+        if let Some(scale) = surface.pending.buffer_scale.take() {
+            surface.current.buffer_scale = scale;
+        }
+        if let Some(transform) = surface.pending.buffer_transform.take() {
+            surface.current.buffer_transform = transform;
+        }
         let frame_callbacks = std::mem::take(&mut surface.pending.frame_callbacks);
         let mapped = surface.is_mapped();
         let shell_id = match surface.role {
@@ -191,6 +279,11 @@ impl SurfaceManager {
             newly_mapped: mapped && !was_mapped,
             shell_id,
             frame_callbacks,
+            buffer_scale: surface.current.buffer_scale,
+            buffer_transform: surface.current.buffer_transform,
+            offset: surface.current.offset,
+            damage: surface.current.damage.clone(),
+            buffer_damage: surface.current.buffer_damage.clone(),
         })
     }
 
@@ -440,13 +533,31 @@ impl Default for ShellState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SurfaceState {
     buffer: Option<ObjectId>,
     offset: (i32, i32),
     damage: Vec<Rectangle>,
+    buffer_damage: Vec<Rectangle>,
+    buffer_scale: i32,
+    buffer_transform: u32,
     opaque_region: Option<Region>,
     input_region: Option<Region>,
+}
+
+impl Default for SurfaceState {
+    fn default() -> Self {
+        Self {
+            buffer: None,
+            offset: (0, 0),
+            damage: Vec::new(),
+            buffer_damage: Vec::new(),
+            buffer_scale: 1,
+            buffer_transform: 0, // WL_OUTPUT_TRANSFORM_NORMAL
+            opaque_region: None,
+            input_region: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -454,6 +565,9 @@ struct PendingState {
     buffer: Option<Option<ObjectId>>,
     offset: Option<(i32, i32)>,
     damage: Vec<Rectangle>,
+    buffer_damage: Vec<Rectangle>,
+    buffer_scale: Option<i32>,
+    buffer_transform: Option<u32>,
     frame_callbacks: Vec<ObjectId>,
     opaque_region: Option<Option<Region>>,
     input_region: Option<Option<Region>>,
@@ -503,7 +617,25 @@ mod tests {
             .set_shell_mode(client(1), object(3), ShellMode::Toplevel)
             .unwrap();
         manager
-            .attach(client(1), object(2), Some(object(4)), 5, 6)
+            .attach(client(1), object(2), Some(object(4)), 5, 6, 1)
+            .unwrap();
+        manager
+            .set_buffer_scale(client(1), object(2), 2)
+            .unwrap();
+        manager
+            .set_buffer_transform(client(1), object(2), 1)
+            .unwrap();
+        manager
+            .damage_buffer(
+                client(1),
+                object(2),
+                Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            )
             .unwrap();
         manager
             .add_frame_callback(client(1), object(2), object(5))
@@ -517,11 +649,42 @@ mod tests {
         assert!(commit.newly_mapped);
         assert_eq!(commit.shell_id, Some(object(3)));
         assert_eq!(commit.frame_callbacks, [object(5)]);
+        assert_eq!(commit.buffer_scale, 2);
+        assert_eq!(commit.buffer_transform, 1);
+        assert_eq!(commit.offset, (5, 6));
+        assert_eq!(
+            commit.buffer_damage,
+            [Rectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }]
+        );
         let second = manager.commit(client(1), object(2)).unwrap();
         assert_eq!(second.buffer, Some(object(4)));
         assert_eq!(second.attached_buffer, None);
         assert!(!second.newly_mapped);
         assert!(second.frame_callbacks.is_empty());
+        assert_eq!(second.buffer_scale, 2);
+    }
+
+    #[test]
+    fn attach_offset_rejected_on_surface_version_5() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        assert_eq!(
+            manager
+                .attach(client(1), object(2), Some(object(4)), 1, 0, 5)
+                .unwrap_err(),
+            SurfaceError::InvalidOffset
+        );
+        manager.offset(client(1), object(2), 1, 2).unwrap();
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 5)
+            .unwrap();
+        let commit = manager.commit(client(1), object(2)).unwrap();
+        assert_eq!(commit.offset, (1, 2));
     }
 
     #[test]
@@ -535,7 +698,7 @@ mod tests {
             .set_shell_mode(client(1), object(3), ShellMode::Popup)
             .unwrap();
         manager
-            .attach(client(1), object(2), Some(object(4)), 0, 0)
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
             .unwrap();
         let commit = manager.commit(client(1), object(2)).unwrap();
         assert!(commit.mapped);
@@ -574,11 +737,11 @@ mod tests {
             .set_shell_mode(client(1), object(3), ShellMode::Toplevel)
             .unwrap();
         manager
-            .attach(client(1), object(2), Some(object(4)), 0, 0)
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
             .unwrap();
         assert!(manager.commit(client(1), object(2)).unwrap().mapped);
 
-        manager.attach(client(1), object(2), None, 0, 0).unwrap();
+        manager.attach(client(1), object(2), None, 0, 0, 1).unwrap();
         let commit = manager.commit(client(1), object(2)).unwrap();
         assert_eq!(commit.buffer, None);
         assert!(!commit.mapped);

@@ -26,6 +26,10 @@ pub struct CommittedFrame {
     pub height: usize,
     pub stride: usize,
     pub format: u32,
+    pub buffer_scale: i32,
+    pub buffer_transform: u32,
+    pub offset_x: i32,
+    pub offset_y: i32,
 }
 
 #[derive(Debug)]
@@ -149,8 +153,8 @@ impl Default for Globals {
             globals: HashMap::new(),
             next_id: 1,
         };
-        globals.register_version(InterfaceIndex::WlCompositor, 1, [].into_iter());
-        globals.register_version(InterfaceIndex::WlShm, 1, [].into_iter());
+        globals.register_version(InterfaceIndex::WlCompositor, 5, [].into_iter());
+        globals.register_version(InterfaceIndex::WlShm, 2, [].into_iter());
         globals.register_version(InterfaceIndex::WlShell, 1, [].into_iter());
         globals
     }

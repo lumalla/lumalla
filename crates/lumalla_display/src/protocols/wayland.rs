@@ -58,6 +58,13 @@ fn report_surface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError)
             (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown shell surface")
         }
         SurfaceError::UnknownRegion => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown region"),
+        SurfaceError::InvalidScale => (WL_SURFACE_ERROR_INVALID_SCALE, "Buffer scale must be > 0"),
+        SurfaceError::InvalidTransform => {
+            (WL_SURFACE_ERROR_INVALID_TRANSFORM, "Invalid buffer transform")
+        }
+        SurfaceError::InvalidOffset => {
+            (WL_SURFACE_ERROR_INVALID_OFFSET, "Attach offset must be zero since version 5")
+        }
     };
     ctx.writer
         .wl_display_error(DISPLAY_OBJECT_ID)
@@ -566,12 +573,17 @@ impl WlSurface for DisplayState {
             report_surface_error(ctx, pending_buffer.unwrap(), SurfaceError::UnknownBuffer);
             return;
         }
+        let version = ctx
+            .registry
+            .object_metadata(object_id)
+            .map_or(1, |object| object.version);
         if let Err(error) = self.surface_manager.attach(
             ctx.client_id,
             object_id,
             pending_buffer,
             params.x(),
             params.y(),
+            version,
         ) {
             report_surface_error(ctx, object_id, error);
         }
@@ -670,6 +682,10 @@ impl WlSurface for DisplayState {
                                 height: snapshot.height,
                                 stride: snapshot.stride,
                                 format: snapshot.format,
+                                buffer_scale: commit.buffer_scale,
+                                buffer_transform: commit.buffer_transform,
+                                offset_x: commit.offset.0,
+                                offset_y: commit.offset.1,
                             }));
                     }
                     Err(error) => {
@@ -718,33 +734,62 @@ impl WlSurface for DisplayState {
 
     fn set_buffer_transform(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlSurfaceSetBufferTransform<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlSurfaceSetBufferTransform<'_>,
     ) {
-        todo!()
+        if let Err(error) = self.surface_manager.set_buffer_transform(
+            ctx.client_id,
+            object_id,
+            params.transform(),
+        ) {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn set_buffer_scale(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlSurfaceSetBufferScale<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlSurfaceSetBufferScale<'_>,
     ) {
-        todo!()
+        if let Err(error) =
+            self.surface_manager
+                .set_buffer_scale(ctx.client_id, object_id, params.scale())
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn damage_buffer(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlSurfaceDamageBuffer<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlSurfaceDamageBuffer<'_>,
     ) {
-        todo!()
+        let rectangle = Rectangle {
+            x: params.x(),
+            y: params.y(),
+            width: params.width(),
+            height: params.height(),
+        };
+        if let Err(error) = self
+            .surface_manager
+            .damage_buffer(ctx.client_id, object_id, rectangle)
+        {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
-    fn offset(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSurfaceOffset) {
-        todo!()
+    fn offset(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSurfaceOffset) {
+        if let Err(error) = self.surface_manager.offset(
+            ctx.client_id,
+            object_id,
+            params.x(),
+            params.y(),
+        ) {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 }
 
@@ -1064,8 +1109,8 @@ mod tests {
             .map(|(_, global)| (global.name, global.version))
             .collect();
 
-        assert!(globals.contains(&(WL_COMPOSITOR_NAME, 1)));
-        assert!(globals.contains(&(WL_SHM_NAME, 1)));
+        assert!(globals.contains(&(WL_COMPOSITOR_NAME, 5)));
+        assert!(globals.contains(&(WL_SHM_NAME, 2)));
         assert!(globals.contains(&(WL_SHELL_NAME, 1)));
     }
 
@@ -1081,14 +1126,14 @@ mod tests {
             client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
         };
         let mut fds = VecDeque::new();
-        let data = bind_data(1, "wl_compositor", 1, 2);
+        let data = bind_data(1, "wl_compositor", 5, 2);
         let params = WlRegistryBind::new(&data, &mut fds);
 
         WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
 
         let metadata = ctx.registry.object_metadata(object_id(2)).unwrap();
         assert_eq!(metadata.interface_index, InterfaceIndex::WlCompositor);
-        assert_eq!(metadata.version, 1);
+        assert_eq!(metadata.version, 5);
     }
 
     #[test]
@@ -1154,7 +1199,7 @@ mod tests {
             .unwrap();
         state
             .surface_manager
-            .attach(client_id, surface_id, Some(buffer_id), 0, 0)
+            .attach(client_id, surface_id, Some(buffer_id), 0, 0, 1)
             .unwrap();
         state
             .surface_manager
@@ -1203,6 +1248,9 @@ mod tests {
         assert_eq!(frame.surface_id, surface_id);
         assert_eq!(frame.buffer_id, buffer_id);
         assert_eq!(frame.pixels, [1, 2, 3, 4]);
+        assert_eq!(frame.buffer_scale, 1);
+        assert_eq!(frame.buffer_transform, 0);
+        assert_eq!((frame.offset_x, frame.offset_y), (0, 0));
         assert!(
             state
                 .surface_manager
@@ -1213,7 +1261,7 @@ mod tests {
 
         state
             .surface_manager
-            .attach(client_id, surface_id, None, 0, 0)
+            .attach(client_id, surface_id, None, 0, 0, 1)
             .unwrap();
         WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
         let updates: Vec<_> = state.take_surface_updates().collect();
