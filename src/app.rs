@@ -15,7 +15,7 @@ use lumalla_display::{
     ClientConnection, ClientId, DisplayState, KeyboardModifiers, SurfaceUpdate, Wayland,
     create_wayland_display,
 };
-use lumalla_input::{InputState, KeyboardEvent};
+use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
 use lumalla_renderer::{RendererState, SOLID_CLEAR_COLOR, SurfaceFrame};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
@@ -126,11 +126,11 @@ impl AppData {
                         ..
                     } = self;
                     if let Err(err) = input_state.dispatch(|event| match event {
-                        KeyboardEvent::Key {
+                        SeatEvent::Keyboard(KeyboardEvent::Key {
                             time_msec,
                             key,
                             pressed,
-                        } => {
+                        }) => {
                             display_state.handle_keyboard_key(
                                 connected_clients,
                                 time_msec,
@@ -138,7 +138,7 @@ impl AppData {
                                 pressed,
                             );
                         }
-                        KeyboardEvent::Modifiers(modifiers) => {
+                        SeatEvent::Keyboard(KeyboardEvent::Modifiers(modifiers)) => {
                             display_state.handle_keyboard_modifiers(
                                 connected_clients,
                                 KeyboardModifiers {
@@ -148,6 +148,91 @@ impl AppData {
                                     group: modifiers.group,
                                 },
                             );
+                        }
+                        SeatEvent::Pointer(PointerEvent::Motion {
+                            time_msec,
+                            dx,
+                            dy,
+                        }) => {
+                            display_state.handle_pointer_motion(
+                                connected_clients,
+                                time_msec,
+                                dx,
+                                dy,
+                            );
+                        }
+                        SeatEvent::Pointer(PointerEvent::Absolute {
+                            time_msec,
+                            x,
+                            y,
+                        }) => {
+                            display_state.handle_pointer_absolute(
+                                connected_clients,
+                                time_msec,
+                                x,
+                                y,
+                            );
+                        }
+                        SeatEvent::Pointer(PointerEvent::Button {
+                            time_msec,
+                            button,
+                            pressed,
+                        }) => {
+                            display_state.handle_pointer_button(
+                                connected_clients,
+                                time_msec,
+                                button,
+                                pressed,
+                            );
+                        }
+                        SeatEvent::Pointer(PointerEvent::Axis {
+                            time_msec,
+                            axis,
+                            value,
+                        }) => {
+                            display_state.handle_pointer_axis(
+                                connected_clients,
+                                time_msec,
+                                axis,
+                                value,
+                            );
+                        }
+                        SeatEvent::Touch(TouchEvent::Down {
+                            time_msec,
+                            id,
+                            x,
+                            y,
+                        }) => {
+                            display_state.handle_touch_down(
+                                connected_clients,
+                                time_msec,
+                                id,
+                                x,
+                                y,
+                            );
+                        }
+                        SeatEvent::Touch(TouchEvent::Up { time_msec, id }) => {
+                            display_state.handle_touch_up(connected_clients, time_msec, id);
+                        }
+                        SeatEvent::Touch(TouchEvent::Motion {
+                            time_msec,
+                            id,
+                            x,
+                            y,
+                        }) => {
+                            display_state.handle_touch_motion(
+                                connected_clients,
+                                time_msec,
+                                id,
+                                x,
+                                y,
+                            );
+                        }
+                        SeatEvent::Touch(TouchEvent::Frame) => {
+                            display_state.handle_touch_frame(connected_clients);
+                        }
+                        SeatEvent::Touch(TouchEvent::Cancel) => {
+                            display_state.handle_touch_cancel(connected_clients);
                         }
                     }) {
                         error!("Unable to dispatch libinput events: {err}");

@@ -39,9 +39,22 @@ pub(crate) mod bindings {
     pub const LIBINPUT_EVENT_POINTER_BUTTON: u32 = 402;
     pub const LIBINPUT_EVENT_POINTER_AXIS: u32 = 403; // Event is deprecated and should be ignored
     pub const LIBINPUT_EVENT_POINTER_SCROLL_WHEEL: u32 = 404;
+    pub const LIBINPUT_EVENT_POINTER_SCROLL_FINGER: u32 = 405;
+    pub const LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS: u32 = 406;
+    pub const LIBINPUT_EVENT_TOUCH_DOWN: u32 = 500;
+    pub const LIBINPUT_EVENT_TOUCH_UP: u32 = 501;
+    pub const LIBINPUT_EVENT_TOUCH_MOTION: u32 = 502;
+    pub const LIBINPUT_EVENT_TOUCH_CANCEL: u32 = 503;
+    pub const LIBINPUT_EVENT_TOUCH_FRAME: u32 = 504;
 
     pub const LIBINPUT_KEY_STATE_RELEASED: u32 = 0;
     pub const LIBINPUT_KEY_STATE_PRESSED: u32 = 1;
+
+    pub const LIBINPUT_BUTTON_STATE_RELEASED: u32 = 0;
+    pub const LIBINPUT_BUTTON_STATE_PRESSED: u32 = 1;
+
+    pub const LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL: u32 = 0;
+    pub const LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL: u32 = 1;
 
     pub const KEY_LEFTCTRL: u32 = 29;
     pub const KEY_RIGHTCTRL: u32 = 97;
@@ -67,6 +80,16 @@ pub(crate) mod bindings {
 
     #[repr(C)]
     pub struct libinput_event_keyboard {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct libinput_event_pointer {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct libinput_event_touch {
         _private: [u8; 0],
     }
 
@@ -97,6 +120,41 @@ pub(crate) mod bindings {
         ) -> *mut libinput_event_keyboard;
         pub fn libinput_event_keyboard_get_key(event: *mut libinput_event_keyboard) -> u32;
         pub fn libinput_event_keyboard_get_key_state(event: *mut libinput_event_keyboard) -> u32;
+        pub fn libinput_event_get_pointer_event(
+            event: *mut libinput_event,
+        ) -> *mut libinput_event_pointer;
+        pub fn libinput_event_pointer_get_dx(event: *mut libinput_event_pointer) -> f64;
+        pub fn libinput_event_pointer_get_dy(event: *mut libinput_event_pointer) -> f64;
+        pub fn libinput_event_pointer_get_absolute_x_transformed(
+            event: *mut libinput_event_pointer,
+            width: u32,
+        ) -> f64;
+        pub fn libinput_event_pointer_get_absolute_y_transformed(
+            event: *mut libinput_event_pointer,
+            height: u32,
+        ) -> f64;
+        pub fn libinput_event_pointer_get_button(event: *mut libinput_event_pointer) -> u32;
+        pub fn libinput_event_pointer_get_button_state(event: *mut libinput_event_pointer) -> u32;
+        pub fn libinput_event_pointer_has_axis(
+            event: *mut libinput_event_pointer,
+            axis: u32,
+        ) -> c_int;
+        pub fn libinput_event_pointer_get_scroll_value(
+            event: *mut libinput_event_pointer,
+            axis: u32,
+        ) -> f64;
+        pub fn libinput_event_get_touch_event(
+            event: *mut libinput_event,
+        ) -> *mut libinput_event_touch;
+        pub fn libinput_event_touch_get_seat_slot(event: *mut libinput_event_touch) -> i32;
+        pub fn libinput_event_touch_get_x_transformed(
+            event: *mut libinput_event_touch,
+            width: u32,
+        ) -> f64;
+        pub fn libinput_event_touch_get_y_transformed(
+            event: *mut libinput_event_touch,
+            height: u32,
+        ) -> f64;
     }
 }
 
@@ -294,9 +352,23 @@ impl Source for LibInput {
 
 pub(crate) const KEY_STATE_PRESSED: u32 = bindings::LIBINPUT_KEY_STATE_PRESSED;
 pub(crate) const KEY_STATE_RELEASED: u32 = bindings::LIBINPUT_KEY_STATE_RELEASED;
+pub(crate) const BUTTON_STATE_PRESSED: u32 = bindings::LIBINPUT_BUTTON_STATE_PRESSED;
+
+/// Default transform size for absolute pointer/touch coordinates (matches virtual output).
+const TRANSFORM_WIDTH: u32 = 800;
+const TRANSFORM_HEIGHT: u32 = 600;
 
 pub(crate) enum InputEvent {
     KeyboardKey { key: u32, state: u32 },
+    PointerMotion { dx: f64, dy: f64 },
+    PointerAbsolute { x: f64, y: f64 },
+    PointerButton { button: u32, pressed: bool },
+    PointerAxis { axis: u32, value: f64 },
+    TouchDown { id: i32, x: f64, y: f64 },
+    TouchUp { id: i32 },
+    TouchMotion { id: i32, x: f64, y: f64 },
+    TouchCancel,
+    TouchFrame,
 }
 
 pub(crate) fn is_modifier_key(key: u32) -> bool {
@@ -363,6 +435,116 @@ impl LibInput {
                         Some(InputEvent::KeyboardKey { key, state })
                     }
                 }
+                bindings::LIBINPUT_EVENT_POINTER_MOTION => {
+                    let pointer = unsafe { bindings::libinput_event_get_pointer_event(event) };
+                    if pointer.is_null() {
+                        None
+                    } else {
+                        let dx = unsafe { bindings::libinput_event_pointer_get_dx(pointer) };
+                        let dy = unsafe { bindings::libinput_event_pointer_get_dy(pointer) };
+                        Some(InputEvent::PointerMotion { dx, dy })
+                    }
+                }
+                bindings::LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE => {
+                    let pointer = unsafe { bindings::libinput_event_get_pointer_event(event) };
+                    if pointer.is_null() {
+                        None
+                    } else {
+                        let x = unsafe {
+                            bindings::libinput_event_pointer_get_absolute_x_transformed(
+                                pointer,
+                                TRANSFORM_WIDTH,
+                            )
+                        };
+                        let y = unsafe {
+                            bindings::libinput_event_pointer_get_absolute_y_transformed(
+                                pointer,
+                                TRANSFORM_HEIGHT,
+                            )
+                        };
+                        Some(InputEvent::PointerAbsolute { x, y })
+                    }
+                }
+                bindings::LIBINPUT_EVENT_POINTER_BUTTON => {
+                    let pointer = unsafe { bindings::libinput_event_get_pointer_event(event) };
+                    if pointer.is_null() {
+                        None
+                    } else {
+                        let button =
+                            unsafe { bindings::libinput_event_pointer_get_button(pointer) };
+                        let state = unsafe {
+                            bindings::libinput_event_pointer_get_button_state(pointer)
+                        };
+                        Some(InputEvent::PointerButton {
+                            button,
+                            pressed: state == BUTTON_STATE_PRESSED,
+                        })
+                    }
+                }
+                bindings::LIBINPUT_EVENT_POINTER_SCROLL_WHEEL
+                | bindings::LIBINPUT_EVENT_POINTER_SCROLL_FINGER
+                | bindings::LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS => {
+                    let pointer = unsafe { bindings::libinput_event_get_pointer_event(event) };
+                    if pointer.is_null() {
+                        None
+                    } else {
+                        parse_scroll_axes(pointer)
+                    }
+                }
+                bindings::LIBINPUT_EVENT_POINTER_AXIS => None,
+                bindings::LIBINPUT_EVENT_TOUCH_DOWN => {
+                    let touch = unsafe { bindings::libinput_event_get_touch_event(event) };
+                    if touch.is_null() {
+                        None
+                    } else {
+                        let id = unsafe { bindings::libinput_event_touch_get_seat_slot(touch) };
+                        let x = unsafe {
+                            bindings::libinput_event_touch_get_x_transformed(
+                                touch,
+                                TRANSFORM_WIDTH,
+                            )
+                        };
+                        let y = unsafe {
+                            bindings::libinput_event_touch_get_y_transformed(
+                                touch,
+                                TRANSFORM_HEIGHT,
+                            )
+                        };
+                        Some(InputEvent::TouchDown { id, x, y })
+                    }
+                }
+                bindings::LIBINPUT_EVENT_TOUCH_UP => {
+                    let touch = unsafe { bindings::libinput_event_get_touch_event(event) };
+                    if touch.is_null() {
+                        None
+                    } else {
+                        let id = unsafe { bindings::libinput_event_touch_get_seat_slot(touch) };
+                        Some(InputEvent::TouchUp { id })
+                    }
+                }
+                bindings::LIBINPUT_EVENT_TOUCH_MOTION => {
+                    let touch = unsafe { bindings::libinput_event_get_touch_event(event) };
+                    if touch.is_null() {
+                        None
+                    } else {
+                        let id = unsafe { bindings::libinput_event_touch_get_seat_slot(touch) };
+                        let x = unsafe {
+                            bindings::libinput_event_touch_get_x_transformed(
+                                touch,
+                                TRANSFORM_WIDTH,
+                            )
+                        };
+                        let y = unsafe {
+                            bindings::libinput_event_touch_get_y_transformed(
+                                touch,
+                                TRANSFORM_HEIGHT,
+                            )
+                        };
+                        Some(InputEvent::TouchMotion { id, x, y })
+                    }
+                }
+                bindings::LIBINPUT_EVENT_TOUCH_CANCEL => Some(InputEvent::TouchCancel),
+                bindings::LIBINPUT_EVENT_TOUCH_FRAME => Some(InputEvent::TouchFrame),
                 event_type => {
                     debug!("Unhandled libinput event type: {event_type}");
                     None
@@ -374,4 +556,19 @@ impl LibInput {
             }
         }
     }
+}
+
+fn parse_scroll_axes(pointer: *mut bindings::libinput_event_pointer) -> Option<InputEvent> {
+    // Prefer vertical, then horizontal; emit one axis event per libinput event.
+    for axis in [
+        bindings::LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL,
+        bindings::LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL,
+    ] {
+        let has = unsafe { bindings::libinput_event_pointer_has_axis(pointer, axis) };
+        if has != 0 {
+            let value = unsafe { bindings::libinput_event_pointer_get_scroll_value(pointer, axis) };
+            return Some(InputEvent::PointerAxis { axis, value });
+        }
+    }
+    None
 }

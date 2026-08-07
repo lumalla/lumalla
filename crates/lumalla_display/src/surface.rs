@@ -114,7 +114,7 @@ impl SurfaceManager {
                 }
                 (None, Some(subsurface_id))
             }
-            None => (None, None),
+            Some(Role::Cursor) | None => (None, None),
         };
 
         let mut callbacks = surface.pending.frame_callbacks;
@@ -139,6 +139,94 @@ impl SurfaceManager {
             .collect();
         ids.into_iter()
             .find(|id| self.is_mapped(client_id, *id).unwrap_or(false))
+    }
+
+    /// MVP pointer hit-test: `x`/`y` are unused (no geometric testing yet).
+    /// Returns the first mapped shell surface for `client_id`.
+    pub fn pointer_target(&self, client_id: ClientId, _x: f64, _y: f64) -> Option<ObjectId> {
+        self.first_mapped_shell_surface(Some(client_id))
+            .filter(|(owner, _)| *owner == client_id)
+            .map(|(_, surface)| surface)
+    }
+
+    /// MVP global hit-test: first mapped shell surface across clients.
+    /// Prefer `preferred_client` when it has a mapped shell surface.
+    pub fn global_pointer_target(
+        &self,
+        preferred_client: Option<ClientId>,
+        _x: f64,
+        _y: f64,
+    ) -> Option<(ClientId, ObjectId)> {
+        self.first_mapped_shell_surface(preferred_client)
+    }
+
+    fn first_mapped_shell_surface(
+        &self,
+        preferred_client: Option<ClientId>,
+    ) -> Option<(ClientId, ObjectId)> {
+        let mut surfaces: Vec<(ClientId, ObjectId)> = self
+            .shell_surfaces
+            .iter()
+            .map(|(&(client_id, _), &surface_id)| (client_id, surface_id))
+            .collect();
+        surfaces.sort_by_key(|(client_id, surface_id)| (client_id.get(), surface_id.get()));
+        if let Some(preferred) = preferred_client {
+            if let Some(found) = surfaces
+                .iter()
+                .copied()
+                .find(|(client_id, surface_id)| {
+                    *client_id == preferred
+                        && self.is_mapped(*client_id, *surface_id).unwrap_or(false)
+                })
+            {
+                return Some(found);
+            }
+        }
+        surfaces
+            .into_iter()
+            .find(|(client_id, surface_id)| {
+                self.is_mapped(*client_id, *surface_id).unwrap_or(false)
+            })
+    }
+
+    pub fn assign_cursor_role(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        match surface.role {
+            None => {
+                surface.role = Some(Role::Cursor);
+                Ok(())
+            }
+            Some(Role::Cursor) => Ok(()),
+            Some(_) => Err(SurfaceError::RoleAlreadyAssigned),
+        }
+    }
+
+    pub fn clear_cursor_role(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        if surface.role == Some(Role::Cursor) {
+            surface.role = None;
+        }
+        Ok(())
+    }
+
+    pub fn surface_role_is_cursor(&self, client_id: ClientId, surface_id: ObjectId) -> bool {
+        self.surfaces
+            .get(&(client_id, surface_id))
+            .is_some_and(|surface| surface.role == Some(Role::Cursor))
     }
 
     pub fn attach(
@@ -826,7 +914,7 @@ impl SurfaceManager {
                     .parent;
                 self.is_mapped(client_id, parent)
             }
-            None => Ok(false),
+            Some(Role::Cursor) | None => Ok(false),
         }
     }
 
@@ -1014,6 +1102,7 @@ struct Surface {
 enum Role {
     Shell(ObjectId),
     Subsurface(ObjectId),
+    Cursor,
 }
 
 #[derive(Debug)]
@@ -1224,6 +1313,48 @@ mod tests {
         let commit = manager.commit(client(1), object(2)).unwrap().primary;
         assert!(commit.mapped);
         assert!(commit.newly_mapped);
+    }
+
+    #[test]
+    fn pointer_target_returns_first_mapped_shell_surface() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(5));
+        manager
+            .create_shell_surface(client(1), object(3), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(3), ShellMode::Toplevel)
+            .unwrap();
+        assert!(manager.pointer_target(client(1), 10.0, 20.0).is_none());
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
+            .unwrap();
+        let _ = manager.commit(client(1), object(2)).unwrap();
+        assert_eq!(
+            manager.pointer_target(client(1), 10.0, 20.0),
+            Some(object(2))
+        );
+        assert_eq!(
+            manager.global_pointer_target(None, 0.0, 0.0),
+            Some((client(1), object(2)))
+        );
+    }
+
+    #[test]
+    fn assign_cursor_role_rejects_shell_surface() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_shell_surface(client(1), object(3), object(2))
+            .unwrap();
+        assert_eq!(
+            manager.assign_cursor_role(client(1), object(2)).unwrap_err(),
+            SurfaceError::RoleAlreadyAssigned
+        );
+        manager.create_surface(client(1), object(4));
+        manager.assign_cursor_role(client(1), object(4)).unwrap();
+        assert!(manager.surface_role_is_cursor(client(1), object(4)));
     }
 
     #[test]

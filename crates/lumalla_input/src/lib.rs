@@ -33,6 +33,62 @@ pub enum KeyboardEvent {
     Modifiers(KeyboardModifiers),
 }
 
+/// Pointer updates for the Wayland seat after libinput dispatch.
+#[derive(Debug, Clone, Copy)]
+pub enum PointerEvent {
+    Motion {
+        time_msec: u32,
+        dx: f64,
+        dy: f64,
+    },
+    Absolute {
+        time_msec: u32,
+        x: f64,
+        y: f64,
+    },
+    Button {
+        time_msec: u32,
+        button: u32,
+        pressed: bool,
+    },
+    Axis {
+        time_msec: u32,
+        axis: u32,
+        value: f32,
+    },
+}
+
+/// Touch updates for the Wayland seat after libinput dispatch.
+#[derive(Debug, Clone, Copy)]
+pub enum TouchEvent {
+    Down {
+        time_msec: u32,
+        id: i32,
+        x: f64,
+        y: f64,
+    },
+    Up {
+        time_msec: u32,
+        id: i32,
+    },
+    Motion {
+        time_msec: u32,
+        id: i32,
+        x: f64,
+        y: f64,
+    },
+    Frame,
+    Cancel,
+}
+
+/// Aggregated seat input events forwarded to the compositor.
+#[derive(Debug, Clone, Copy)]
+pub enum SeatEvent {
+    Keyboard(KeyboardEvent),
+    Pointer(PointerEvent),
+    Touch(TouchEvent),
+}
+
 pub struct InputState {
     comms: Comms,
     libinput: LibInput,
@@ -92,26 +148,87 @@ impl InputState {
         self.keymaps.clear();
     }
 
-    pub fn dispatch(
-        &mut self,
-        mut on_keyboard_event: impl FnMut(KeyboardEvent),
-    ) -> anyhow::Result<()> {
+    pub fn dispatch(&mut self, mut on_event: impl FnMut(SeatEvent)) -> anyhow::Result<()> {
         self.libinput.dispatch()?;
         while let Some(event) = self.libinput.next_event() {
             match event {
                 InputEvent::KeyboardKey { key, state } => {
-                    self.handle_key(key, state, &mut on_keyboard_event);
+                    self.handle_key(key, state, &mut on_event);
+                }
+                InputEvent::PointerMotion { dx, dy } => {
+                    let time_msec = self.now_msec();
+                    on_event(SeatEvent::Pointer(PointerEvent::Motion {
+                        time_msec,
+                        dx,
+                        dy,
+                    }));
+                }
+                InputEvent::PointerAbsolute { x, y } => {
+                    let time_msec = self.now_msec();
+                    on_event(SeatEvent::Pointer(PointerEvent::Absolute {
+                        time_msec,
+                        x,
+                        y,
+                    }));
+                }
+                InputEvent::PointerButton { button, pressed } => {
+                    let time_msec = self.now_msec();
+                    on_event(SeatEvent::Pointer(PointerEvent::Button {
+                        time_msec,
+                        button,
+                        pressed,
+                    }));
+                }
+                InputEvent::PointerAxis { axis, value } => {
+                    let time_msec = self.now_msec();
+                    on_event(SeatEvent::Pointer(PointerEvent::Axis {
+                        time_msec,
+                        axis,
+                        value: value as f32,
+                    }));
+                }
+                InputEvent::TouchDown { id, x, y } => {
+                    let time_msec = self.now_msec();
+                    on_event(SeatEvent::Touch(TouchEvent::Down {
+                        time_msec,
+                        id,
+                        x,
+                        y,
+                    }));
+                }
+                InputEvent::TouchUp { id } => {
+                    let time_msec = self.now_msec();
+                    on_event(SeatEvent::Touch(TouchEvent::Up { time_msec, id }));
+                }
+                InputEvent::TouchMotion { id, x, y } => {
+                    let time_msec = self.now_msec();
+                    on_event(SeatEvent::Touch(TouchEvent::Motion {
+                        time_msec,
+                        id,
+                        x,
+                        y,
+                    }));
+                }
+                InputEvent::TouchCancel => {
+                    on_event(SeatEvent::Touch(TouchEvent::Cancel));
+                }
+                InputEvent::TouchFrame => {
+                    on_event(SeatEvent::Touch(TouchEvent::Frame));
                 }
             }
         }
         Ok(())
     }
 
+    fn now_msec(&self) -> u32 {
+        self.start.elapsed().as_millis() as u32
+    }
+
     fn handle_key(
         &mut self,
         key: u32,
         state: u32,
-        on_keyboard_event: &mut impl FnMut(KeyboardEvent),
+        on_event: &mut impl FnMut(SeatEvent),
     ) {
         let pressed = state == KEY_STATE_PRESSED;
         if pressed {
@@ -136,16 +253,16 @@ impl InputState {
             }
         }
 
-        let time_msec = self.start.elapsed().as_millis() as u32;
-        on_keyboard_event(KeyboardEvent::Key {
+        let time_msec = self.now_msec();
+        on_event(SeatEvent::Keyboard(KeyboardEvent::Key {
             time_msec,
             key,
             pressed,
-        });
+        }));
         if mods_changed {
             let modifiers = self.xkb.modifiers();
             debug!("xkb modifiers: {modifiers:?}");
-            on_keyboard_event(KeyboardEvent::Modifiers(modifiers));
+            on_event(SeatEvent::Keyboard(KeyboardEvent::Modifiers(modifiers)));
         }
 
         if is_modifier_key(key) {

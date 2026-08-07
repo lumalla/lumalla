@@ -98,6 +98,108 @@ impl DisplayState {
         self.seat_manager.handle_modifiers(clients, modifiers);
     }
 
+    pub fn handle_pointer_motion(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        time_msec: u32,
+        dx: f64,
+        dy: f64,
+    ) {
+        self.seat_manager.handle_pointer_motion(
+            clients,
+            &self.surface_manager,
+            time_msec,
+            dx,
+            dy,
+        );
+    }
+
+    pub fn handle_pointer_absolute(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        time_msec: u32,
+        x: f64,
+        y: f64,
+    ) {
+        self.seat_manager.handle_pointer_absolute(
+            clients,
+            &self.surface_manager,
+            time_msec,
+            x,
+            y,
+        );
+    }
+
+    pub fn handle_pointer_button(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        time_msec: u32,
+        button: u32,
+        pressed: bool,
+    ) {
+        self.seat_manager
+            .handle_pointer_button(clients, time_msec, button, pressed);
+    }
+
+    pub fn handle_pointer_axis(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        time_msec: u32,
+        axis: u32,
+        value: f32,
+    ) {
+        self.seat_manager
+            .handle_pointer_axis(clients, time_msec, axis, value);
+    }
+
+    pub fn handle_touch_down(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        time_msec: u32,
+        touch_id: i32,
+        x: f64,
+        y: f64,
+    ) {
+        self.seat_manager.handle_touch_down(
+            clients,
+            &self.surface_manager,
+            time_msec,
+            touch_id,
+            x,
+            y,
+        );
+    }
+
+    pub fn handle_touch_up(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        time_msec: u32,
+        touch_id: i32,
+    ) {
+        self.seat_manager
+            .handle_touch_up(clients, time_msec, touch_id);
+    }
+
+    pub fn handle_touch_motion(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        time_msec: u32,
+        touch_id: i32,
+        x: f64,
+        y: f64,
+    ) {
+        self.seat_manager
+            .handle_touch_motion(clients, time_msec, touch_id, x, y);
+    }
+
+    pub fn handle_touch_frame(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
+        self.seat_manager.handle_touch_frame(clients);
+    }
+
+    pub fn handle_touch_cancel(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
+        self.seat_manager.handle_touch_cancel(clients);
+    }
+
     pub fn remove_client(&mut self, client_id: ClientId) {
         self.shm_manager.delete_client(client_id);
         self.surface_manager.delete_client(client_id);

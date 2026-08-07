@@ -165,6 +165,11 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
             commit.surface_id,
             ctx.writer,
         );
+        state.seat_manager.leave_pointers_on_surface(
+            ctx.client_id,
+            commit.surface_id,
+            ctx.writer,
+        );
         state.surface_updates.push_back(SurfaceUpdate::Unmapped {
             client_id: ctx.client_id,
             surface_id: commit.surface_id,
@@ -247,9 +252,11 @@ impl WlRegistry for DisplayState {
                         .wl_seat_name(*id)
                         .name(self.seat_manager.get_name(global_id).unwrap_or_default());
                 }
-                ctx.writer
-                    .wl_seat_capabilities(*id)
-                    .capabilities(WL_SEAT_CAPABILITY_KEYBOARD);
+                ctx.writer.wl_seat_capabilities(*id).capabilities(
+                    WL_SEAT_CAPABILITY_KEYBOARD
+                        | WL_SEAT_CAPABILITY_POINTER
+                        | WL_SEAT_CAPABILITY_TOUCH,
+                );
             }
             _ if interface_name == InterfaceIndex::WlOutput.interface_name() => {
                 if !self.output_manager.bind_output(
@@ -659,6 +666,11 @@ impl WlSurface for DisplayState {
                     object_id,
                     ctx.writer,
                 );
+                self.seat_manager.leave_pointers_on_surface(
+                    ctx.client_id,
+                    object_id,
+                    ctx.writer,
+                );
                 for callback in destroyed.callbacks {
                     ctx.registry.free_object(callback, ctx.writer);
                 }
@@ -857,12 +869,24 @@ impl WlSurface for DisplayState {
 }
 
 impl WlSeat for DisplayState {
-    fn get_pointer(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSeatGetPointer<'_>) {
-        ctx.writer
-            .wl_display_error(DISPLAY_OBJECT_ID)
-            .object_id(object_id)
-            .code(WL_SEAT_ERROR_MISSING_CAPABILITY)
-            .message("Seat has no pointer capability");
+    fn get_pointer(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSeatGetPointer<'_>) {
+        let version = ctx
+            .registry
+            .object_metadata(object_id)
+            .map_or(1, |object| object.version.min(WL_POINTER_VERSION));
+        if !register_object(ctx, params.id(), InterfaceIndex::WlPointer, version) {
+            return;
+        }
+        let focus = self
+            .surface_manager
+            .pointer_target(ctx.client_id, 0.0, 0.0);
+        self.seat_manager.create_pointer(
+            ctx.client_id,
+            *params.id(),
+            version,
+            ctx.writer,
+            focus,
+        );
     }
 
     fn get_keyboard(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSeatGetKeyboard<'_>) {
@@ -885,12 +909,16 @@ impl WlSeat for DisplayState {
         }
     }
 
-    fn get_touch(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSeatGetTouch<'_>) {
-        ctx.writer
-            .wl_display_error(DISPLAY_OBJECT_ID)
-            .object_id(object_id)
-            .code(WL_SEAT_ERROR_MISSING_CAPABILITY)
-            .message("Seat has no touch capability");
+    fn get_touch(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSeatGetTouch<'_>) {
+        let version = ctx
+            .registry
+            .object_metadata(object_id)
+            .map_or(1, |object| object.version.min(WL_TOUCH_VERSION));
+        if !register_object(ctx, params.id(), InterfaceIndex::WlTouch, version) {
+            return;
+        }
+        self.seat_manager
+            .create_touch(ctx.client_id, *params.id(), version);
     }
 
     fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSeatRelease<'_>) {
@@ -901,15 +929,36 @@ impl WlSeat for DisplayState {
 impl WlPointer for DisplayState {
     fn set_cursor(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlPointerSetCursor<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlPointerSetCursor<'_>,
     ) {
-        todo!()
+        if let Some(surface) = params.surface() {
+            if ctx.registry.interface_index(surface) != Some(InterfaceIndex::WlSurface) {
+                report_surface_error(ctx, surface, SurfaceError::UnknownSurface);
+                return;
+            }
+        }
+        if let Err(error) = self.seat_manager.set_cursor(
+            ctx.client_id,
+            object_id,
+            params.serial(),
+            params.surface(),
+            params.hotspot_x(),
+            params.hotspot_y(),
+            &mut self.surface_manager,
+        ) {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
-    fn release(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlPointerRelease<'_>) {
-        todo!()
+    fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlPointerRelease<'_>) {
+        self.seat_manager.destroy_pointer(
+            ctx.client_id,
+            object_id,
+            &mut self.surface_manager,
+        );
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 }
 
@@ -921,8 +970,9 @@ impl WlKeyboard for DisplayState {
 }
 
 impl WlTouch for DisplayState {
-    fn release(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlTouchRelease<'_>) {
-        todo!()
+    fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlTouchRelease<'_>) {
+        self.seat_manager.destroy_touch(ctx.client_id, object_id);
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 }
 
@@ -1023,6 +1073,11 @@ impl WlSubsurface for DisplayState {
             Ok((surface_id, was_mapped)) => {
                 if was_mapped {
                     self.seat_manager.leave_keyboards_on_surface(
+                        ctx.client_id,
+                        surface_id,
+                        ctx.writer,
+                    );
+                    self.seat_manager.leave_pointers_on_surface(
                         ctx.client_id,
                         surface_id,
                         ctx.writer,
