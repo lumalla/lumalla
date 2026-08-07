@@ -182,6 +182,7 @@ fn init_dbus_keymap(
 }
 
 fn init_dbus_output(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> LuaResult<()> {
+    let layout_client = client.clone();
     module.set(
         "set_layout",
         lua.create_function(move |_, layout: ConfigLayout| {
@@ -202,10 +203,54 @@ fn init_dbus_output(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
                     )
                 })
                 .collect();
-            dbus_result(client.proxy.set_layout(spaces))?;
+            dbus_result(layout_client.proxy.set_layout(spaces))?;
             Ok(())
         })?,
     )?;
+
+    let get_client = client.clone();
+    module.set(
+        "get_outputs",
+        lua.create_function(move |lua, ()| {
+            let outputs = dbus_result(get_client.proxy.get_outputs())?;
+            let table = lua.create_table()?;
+            for (index, output) in outputs.into_iter().enumerate() {
+                table.set(index + 1, ConfigOutput::from(&Output::from(&output)))?;
+            }
+            Ok(table)
+        })?,
+    )?;
+
+    let add_client = client.clone();
+    module.set(
+        "add_output",
+        lua.create_function(move |_, output: ConfigOutput| {
+            dbus_result(add_client.proxy.add_output(OutputInfo {
+                name: output.name,
+                description: output.description,
+                x: output.x,
+                y: output.y,
+                width: output.width,
+                height: output.height,
+                scale: output.scale,
+                refresh_mhz: output.refresh_mhz,
+                physical_width_mm: output.physical_width_mm,
+                physical_height_mm: output.physical_height_mm,
+                is_virtual: output.is_virtual,
+            }))?;
+            Ok(())
+        })?,
+    )?;
+
+    let remove_client = client;
+    module.set(
+        "remove_output",
+        lua.create_function(move |_, name: String| {
+            dbus_result(remove_client.proxy.remove_output(&name))?;
+            Ok(())
+        })?,
+    )?;
+
     Ok(())
 }
 
@@ -580,20 +625,32 @@ impl FromLua for ConfigLayout {
 
 pub(crate) struct ConfigOutput {
     name: String,
+    description: String,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
+    scale: i32,
+    refresh_mhz: i32,
+    physical_width_mm: i32,
+    physical_height_mm: i32,
+    is_virtual: bool,
 }
 
 impl From<&Output> for ConfigOutput {
     fn from(value: &Output) -> Self {
         Self {
             name: value.name.clone(),
+            description: value.description.clone(),
             x: value.location.0,
             y: value.location.1,
             width: value.size.0,
             height: value.size.1,
+            scale: value.scale,
+            refresh_mhz: value.refresh_mhz,
+            physical_width_mm: value.physical_width_mm,
+            physical_height_mm: value.physical_height_mm,
+            is_virtual: value.is_virtual,
         }
     }
 }
@@ -607,10 +664,28 @@ impl FromLua for ConfigOutput {
         })?;
         Ok(Self {
             name: table.get("name")?,
+            description: table
+                .get::<Option<String>>("description")
+                .unwrap_or(None)
+                .unwrap_or_default(),
             x: table.get("x")?,
             y: table.get("y")?,
             width: table.get("width")?,
             height: table.get("height")?,
+            scale: table.get("scale").unwrap_or(1),
+            refresh_mhz: table.get("refresh_mhz").unwrap_or(60_000),
+            physical_width_mm: table
+                .get("mm_width")
+                .or_else(|_| table.get("physical_width_mm"))
+                .unwrap_or(0),
+            physical_height_mm: table
+                .get("mm_height")
+                .or_else(|_| table.get("physical_height_mm"))
+                .unwrap_or(0),
+            is_virtual: table
+                .get("virtual")
+                .or_else(|_| table.get("is_virtual"))
+                .unwrap_or(false),
         })
     }
 }
@@ -619,10 +694,16 @@ impl IntoLua for ConfigOutput {
     fn into_lua(self, lua: &Lua) -> LuaResult<LuaValue> {
         let lua_output = lua.create_table()?;
         lua_output.set("name", self.name)?;
+        lua_output.set("description", self.description)?;
         lua_output.set("x", self.x)?;
         lua_output.set("y", self.y)?;
         lua_output.set("width", self.width)?;
         lua_output.set("height", self.height)?;
+        lua_output.set("scale", self.scale)?;
+        lua_output.set("refresh_mhz", self.refresh_mhz)?;
+        lua_output.set("mm_width", self.physical_width_mm)?;
+        lua_output.set("mm_height", self.physical_height_mm)?;
+        lua_output.set("virtual", self.is_virtual)?;
         lua_output.into_lua(lua)
     }
 }

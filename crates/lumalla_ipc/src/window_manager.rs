@@ -26,6 +26,12 @@ pub trait WindowManagerHandler: Send + Sync {
     /// Merge per-connector output configuration.
     fn set_output_configs(&mut self, configs: Vec<OutputConfigInfo>) -> zbus::fdo::Result<()>;
 
+    /// Add a logical Wayland output.
+    fn add_output(&mut self, output: OutputInfo) -> zbus::fdo::Result<()>;
+
+    /// Remove a logical Wayland output by name.
+    fn remove_output(&mut self, name: &str) -> zbus::fdo::Result<()>;
+
     /// Replace zone definitions.
     fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()>;
 
@@ -125,6 +131,14 @@ impl WindowManager {
 
     fn set_output_configs(&mut self, configs: Vec<OutputConfigInfo>) -> zbus::fdo::Result<()> {
         self.handler.set_output_configs(configs)
+    }
+
+    fn add_output(&mut self, output: OutputInfo) -> zbus::fdo::Result<()> {
+        self.handler.add_output(output)
+    }
+
+    fn remove_output(&mut self, name: &str) -> zbus::fdo::Result<()> {
+        self.handler.remove_output(name)
     }
 
     fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()> {

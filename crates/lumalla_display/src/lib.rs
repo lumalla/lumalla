@@ -60,16 +60,13 @@ pub struct DisplayState {
 
 impl DisplayState {
     pub fn new(comms: Comms) -> anyhow::Result<Self> {
-        let mut globals = Globals::default();
-        let mut output_manager = OutputManager::default();
-        output_manager.add_output(OutputInfo::default(), &mut globals, [].into_iter());
         Ok(Self {
             _comms: comms,
-            globals,
+            globals: Globals::default(),
             surface_manager: SurfaceManager::default(),
             shm_manager: ShmManager::default(),
             seat_manager: SeatManager::default(),
-            output_manager,
+            output_manager: OutputManager::default(),
             data_device_manager: DataDeviceManager::default(),
             surface_updates: VecDeque::new(),
         })
@@ -268,9 +265,22 @@ impl DisplayState {
         &mut self,
         info: OutputInfo,
         client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
-    ) -> GlobalId {
+    ) -> anyhow::Result<GlobalId> {
         self.output_manager
             .add_output(info, &mut self.globals, client_connections)
+    }
+
+    pub fn remove_output<'connection>(
+        &mut self,
+        name: &str,
+        client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
+    ) -> anyhow::Result<()> {
+        self.output_manager
+            .remove_output(name, &mut self.globals, client_connections)
+    }
+
+    pub fn outputs(&self) -> impl Iterator<Item = &OutputInfo> {
+        self.output_manager.outputs()
     }
 
     pub fn activate_main_seat<'connection>(
@@ -346,7 +356,7 @@ impl Globals {
         )
     }
 
-    fn register_version<'connection>(
+    pub(crate) fn register_version<'connection>(
         &mut self,
         interface_index: InterfaceIndex,
         version: u32,
@@ -373,7 +383,20 @@ impl Globals {
         self.globals.iter()
     }
 
-    fn get(&self, id: u32) -> Option<&Global> {
+    pub(crate) fn get(&self, id: u32) -> Option<&Global> {
         self.globals.get(&id)
+    }
+
+    pub(crate) fn unregister<'connection>(
+        &mut self,
+        id: GlobalId,
+        client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
+    ) {
+        if self.globals.remove(&id).is_none() {
+            return;
+        }
+        for client in client_connections {
+            client.broadcast_global_remove(id);
+        }
     }
 }

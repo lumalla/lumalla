@@ -165,6 +165,51 @@ impl ClientConnection {
                 .version(version);
         }
     }
+
+    pub fn broadcast_global_remove(&mut self, global_id: u32) {
+        for registry_object_id in self
+            .registry
+            .iter_object_ids_of_interface(InterfaceIndex::WlRegistry)
+        {
+            self.writer
+                .wl_registry_global_remove(registry_object_id)
+                .name(global_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Read, num::NonZeroU32, os::unix::net::UnixStream};
+
+    use super::*;
+    use crate::{NewObjectId, ObjectId};
+
+    #[test]
+    fn broadcast_global_remove_writes_registry_event() {
+        let (mut receiver, sender) = UnixStream::pair().unwrap();
+        let mut client = ClientConnection::new(sender, ClientId::new(NonZeroU32::new(1).unwrap()))
+            .unwrap();
+        client
+            .registry
+            .register_client_object_with_version(
+                NewObjectId::new(ObjectId::new(NonZeroU32::new(2).unwrap())),
+                InterfaceIndex::WlRegistry,
+                1,
+            )
+            .unwrap();
+        client.broadcast_global_remove(7);
+        client.flush().unwrap();
+        drop(client);
+
+        let mut bytes = Vec::new();
+        receiver.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.windows(12).any(|w| {
+            u32::from_ne_bytes(w[0..4].try_into().unwrap()) == 2
+                && u16::from_ne_bytes(w[4..6].try_into().unwrap()) == 1
+                && u32::from_ne_bytes(w[8..12].try_into().unwrap()) == 7
+        }));
+    }
 }
 
 impl Source for ClientConnection {

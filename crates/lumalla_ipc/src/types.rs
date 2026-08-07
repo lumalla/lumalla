@@ -143,6 +143,16 @@ pub struct OutputInfo {
     pub width: i32,
     /// Height in pixels.
     pub height: i32,
+    /// Buffer scale factor advertised to clients.
+    pub scale: i32,
+    /// Refresh rate in mHz (Wayland `wl_output.mode` units).
+    pub refresh_mhz: i32,
+    /// Physical width in millimeters.
+    pub physical_width_mm: i32,
+    /// Physical height in millimeters.
+    pub physical_height_mm: i32,
+    /// Whether this is a config-created virtual output (no DRM connector).
+    pub is_virtual: bool,
 }
 
 impl From<&Output> for OutputInfo {
@@ -154,6 +164,11 @@ impl From<&Output> for OutputInfo {
             y: output.location.1,
             width: output.size.0,
             height: output.size.1,
+            scale: output.scale,
+            refresh_mhz: output.refresh_mhz,
+            physical_width_mm: output.physical_width_mm,
+            physical_height_mm: output.physical_height_mm,
+            is_virtual: output.is_virtual,
         }
     }
 }
@@ -171,6 +186,11 @@ impl From<&OutputInfo> for Output {
             description: info.description.clone(),
             location: (info.x, info.y),
             size: (info.width, info.height),
+            scale: info.scale,
+            refresh_mhz: info.refresh_mhz,
+            physical_width_mm: info.physical_width_mm,
+            physical_height_mm: info.physical_height_mm,
+            is_virtual: info.is_virtual,
         }
     }
 }

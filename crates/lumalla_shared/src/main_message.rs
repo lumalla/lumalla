@@ -1,4 +1,5 @@
 use crate::Mods;
+use crate::Output;
 use crate::OutputConfig;
 use std::path::PathBuf;
 
@@ -27,4 +28,11 @@ pub enum MainMessage {
     SetRenderDevice(Option<PathBuf>),
     /// Merge per-connector output configuration (enabled / mode).
     SetOutputConfigs(Vec<OutputConfig>),
+    /// Add a logical Wayland output (config-owned).
+    AddOutput(Output),
+    /// Remove a logical Wayland output by name.
+    RemoveOutput {
+        /// Output name previously passed to [`Self::AddOutput`].
+        name: String,
+    },
 }

@@ -83,6 +83,43 @@ impl WindowManagerHandler for CompositorHandler {
         Ok(())
     }
 
+    fn add_output(&mut self, info: OutputInfo) -> zbus::fdo::Result<()> {
+        let output = Output::from(&info);
+        {
+            let mut lookup = self.state.output_lookup.lock().unwrap();
+            if lookup.contains_key(&output.name) {
+                return Err(zbus::fdo::Error::Failed(format!(
+                    "Output already exists: {}",
+                    output.name
+                )));
+            }
+            lookup.insert(output.name.clone(), output.clone());
+            self.state.outputs.lock().unwrap().push(info);
+        }
+        info!("Add output over D-Bus: {}", output.name);
+        self.state.comms.main(MainMessage::AddOutput(output));
+        Ok(())
+    }
+
+    fn remove_output(&mut self, name: &str) -> zbus::fdo::Result<()> {
+        {
+            let mut lookup = self.state.output_lookup.lock().unwrap();
+            if lookup.remove(name).is_none() {
+                return Err(zbus::fdo::Error::Failed(format!("Unknown output: {name}")));
+            }
+            self.state
+                .outputs
+                .lock()
+                .unwrap()
+                .retain(|output| output.name != name);
+        }
+        info!("Remove output over D-Bus: {name}");
+        self.state.comms.main(MainMessage::RemoveOutput {
+            name: name.to_owned(),
+        });
+        Ok(())
+    }
+
     fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()> {
         let _ = zones;
         // self.state.comms.display(DisplayMessage::SetZones(

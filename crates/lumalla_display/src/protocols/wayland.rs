@@ -1436,6 +1436,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::OutputInfo;
 
     fn object_id(id: u32) -> ObjectId {
         ObjectId::new(NonZeroU32::new(id).unwrap())
@@ -1565,8 +1566,71 @@ mod tests {
         assert!(globals.contains(&(WL_SHELL_NAME, 1)));
         assert!(globals.contains(&(WL_SUBCOMPOSITOR_NAME, 1)));
         assert!(globals.contains(&(WL_FIXES_NAME, 1)));
-        assert!(globals.contains(&(WL_OUTPUT_NAME, 4)));
         assert!(globals.contains(&(WL_DATA_DEVICE_MANAGER_NAME, 3)));
+        assert!(
+            !globals.iter().any(|(name, _)| *name == WL_OUTPUT_NAME),
+            "wl_output globals are config-owned and must not be advertised by default"
+        );
+    }
+
+    #[test]
+    fn add_output_advertises_wl_output_global() {
+        let mut state = display_state();
+        state
+            .add_output(OutputInfo::default(), [].into_iter())
+            .unwrap();
+        let globals: Vec<_> = state
+            .globals
+            .iter()
+            .map(|(_, global)| (global.name, global.version))
+            .collect();
+        assert!(globals.contains(&(WL_OUTPUT_NAME, 4)));
+    }
+
+    #[test]
+    fn add_and_remove_outputs_update_display_state() {
+        let mut state = display_state();
+        state
+            .add_output(
+                OutputInfo {
+                    name: "HDMI-A-1".to_owned(),
+                    description: "Main".to_owned(),
+                    is_virtual: false,
+                    width: 1920,
+                    height: 1080,
+                    ..OutputInfo::default()
+                },
+                [].into_iter(),
+            )
+            .unwrap();
+        state
+            .add_output(
+                OutputInfo {
+                    name: "VIRTUAL-1".to_owned(),
+                    is_virtual: true,
+                    ..OutputInfo::default()
+                },
+                [].into_iter(),
+            )
+            .unwrap();
+        assert_eq!(state.outputs().count(), 2);
+        assert!(
+            state
+                .add_output(
+                    OutputInfo {
+                        name: "HDMI-A-1".to_owned(),
+                        ..OutputInfo::default()
+                    },
+                    [].into_iter(),
+                )
+                .is_err()
+        );
+        state
+            .remove_output("VIRTUAL-1", [].into_iter())
+            .unwrap();
+        let names: Vec<_> = state.outputs().map(|output| output.name.as_str()).collect();
+        assert_eq!(names, ["HDMI-A-1"]);
+        assert!(state.remove_output("VIRTUAL-1", [].into_iter()).is_err());
     }
 
     #[test]

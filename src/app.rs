@@ -367,6 +367,25 @@ impl AppData {
                         self.renderer_state.drm_device_states(),
                     ));
                 }
+                MainMessage::AddOutput(output) => {
+                    let name = output.name.clone();
+                    if let Err(err) = self.display_state.add_output(
+                        lumalla_display::OutputInfo::from(&output),
+                        self.connected_clients.values_mut(),
+                    ) {
+                        error!("Unable to add output {name}: {err:#}");
+                    }
+                    self.emit_outputs_changed();
+                }
+                MainMessage::RemoveOutput { name } => {
+                    if let Err(err) = self
+                        .display_state
+                        .remove_output(&name, self.connected_clients.values_mut())
+                    {
+                        error!("Unable to remove output {name}: {err:#}");
+                    }
+                    self.emit_outputs_changed();
+                }
                 MainMessage::Shutdown => {
                     if !self.shutting_down {
                         self.init_shutdown();
@@ -374,6 +393,15 @@ impl AppData {
                 }
             }
         }
+    }
+
+    fn emit_outputs_changed(&self) {
+        let outputs = self
+            .display_state
+            .outputs()
+            .map(lumalla_shared::Output::from)
+            .collect();
+        self.comms.dbus(DbusMessage::EmitOutputChanged(outputs));
     }
 
     fn flush_clients(&mut self, event_loop: &mut Poll) {
