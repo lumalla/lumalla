@@ -984,17 +984,26 @@ impl WlSubsurface for DisplayState {
 }
 
 impl WlFixes for DisplayState {
-    fn destroy(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlFixesDestroy) {
-        todo!()
+    fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlFixesDestroy) {
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 
     fn destroy_registry(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlFixesDestroyRegistry,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlFixesDestroyRegistry,
     ) {
-        todo!()
+        let registry_id = params.registry();
+        if ctx.registry.interface_index(registry_id) != Some(InterfaceIndex::WlRegistry) {
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(object_id)
+                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                .message("destroy_registry target is not a wl_registry");
+            return;
+        }
+        ctx.registry.free_object(registry_id, ctx.writer);
     }
 }
 
@@ -1101,6 +1110,42 @@ mod tests {
     }
 
     #[test]
+    fn wl_fixes_can_destroy_registry() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let mut registry = Registry::new();
+        registry
+            .register_client_object_with_version(
+                NewObjectId::new(object_id(2)),
+                InterfaceIndex::WlRegistry,
+                1,
+            )
+            .unwrap();
+        registry
+            .register_client_object_with_version(
+                NewObjectId::new(object_id(3)),
+                InterfaceIndex::WlFixes,
+                1,
+            )
+            .unwrap();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
+        };
+        let mut fds = VecDeque::new();
+        let registry_arg = 2u32.to_ne_bytes();
+        let params = WlFixesDestroyRegistry::new(&registry_arg, &mut fds);
+        WlFixes::destroy_registry(&mut state, &mut ctx, object_id(3), &params);
+        assert!(ctx.registry.object_metadata(object_id(2)).is_none());
+
+        let params = WlFixesDestroy::new(&[], &mut fds);
+        WlFixes::destroy(&mut state, &mut ctx, object_id(3), &params);
+        assert!(ctx.registry.object_metadata(object_id(3)).is_none());
+    }
+
+    #[test]
     fn advertises_only_the_minimal_implemented_globals() {
         let state = display_state();
         let globals: Vec<_> = state
@@ -1112,6 +1157,7 @@ mod tests {
         assert!(globals.contains(&(WL_COMPOSITOR_NAME, 5)));
         assert!(globals.contains(&(WL_SHM_NAME, 2)));
         assert!(globals.contains(&(WL_SHELL_NAME, 1)));
+        assert!(globals.contains(&(WL_FIXES_NAME, 1)));
     }
 
     #[test]

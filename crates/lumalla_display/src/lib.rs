@@ -156,6 +156,7 @@ impl Default for Globals {
         globals.register_version(InterfaceIndex::WlCompositor, 5, [].into_iter());
         globals.register_version(InterfaceIndex::WlShm, 2, [].into_iter());
         globals.register_version(InterfaceIndex::WlShell, 1, [].into_iter());
+        globals.register_version(InterfaceIndex::WlFixes, 1, [].into_iter());
         globals
     }
 }
