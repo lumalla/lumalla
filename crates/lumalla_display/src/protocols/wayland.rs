@@ -147,6 +147,17 @@ impl WlRegistry for DisplayState {
                     .wl_seat_capabilities(*id)
                     .capabilities(WL_SEAT_CAPABILITY_KEYBOARD);
             }
+            _ if interface_name == InterfaceIndex::WlOutput.interface_name() => {
+                if !self.output_manager.bind_output(
+                    ctx.client_id,
+                    global_id,
+                    *id,
+                    requested_version,
+                    ctx.writer,
+                ) {
+                    debug!("Failed to bind unknown wl_output global {global_id}");
+                }
+            }
             _ => {}
         }
     }
@@ -864,8 +875,9 @@ impl WlTouch for DisplayState {
 }
 
 impl WlOutput for DisplayState {
-    fn release(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlOutputRelease<'_>) {
-        todo!()
+    fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlOutputRelease<'_>) {
+        self.output_manager.release(ctx.client_id, object_id);
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 }
 
@@ -1158,6 +1170,7 @@ mod tests {
         assert!(globals.contains(&(WL_SHM_NAME, 2)));
         assert!(globals.contains(&(WL_SHELL_NAME, 1)));
         assert!(globals.contains(&(WL_FIXES_NAME, 1)));
+        assert!(globals.contains(&(WL_OUTPUT_NAME, 4)));
     }
 
     #[test]

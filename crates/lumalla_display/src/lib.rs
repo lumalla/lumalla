@@ -4,15 +4,19 @@ use anyhow::Context;
 use lumalla_shared::Comms;
 use lumalla_wayland_protocol::registry::InterfaceIndex;
 
-use crate::{seat::SeatManager, shm::ShmManager, surface::SurfaceManager};
+use crate::{
+    output::OutputManager, seat::SeatManager, shm::ShmManager, surface::SurfaceManager,
+};
 
 mod protocols;
 mod seat;
 mod shm;
 mod surface;
+mod output;
 
 pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland};
 pub use seat::KeyboardModifiers;
+pub use output::OutputInfo;
 
 pub struct DisplayMessage;
 
@@ -47,17 +51,22 @@ pub struct DisplayState {
     surface_manager: SurfaceManager,
     shm_manager: ShmManager,
     seat_manager: SeatManager,
+    output_manager: OutputManager,
     surface_updates: VecDeque<SurfaceUpdate>,
 }
 
 impl DisplayState {
     pub fn new(comms: Comms) -> anyhow::Result<Self> {
+        let mut globals = Globals::default();
+        let mut output_manager = OutputManager::default();
+        output_manager.add_output(OutputInfo::default(), &mut globals, [].into_iter());
         Ok(Self {
             _comms: comms,
-            globals: Globals::default(),
+            globals,
             surface_manager: SurfaceManager::default(),
             shm_manager: ShmManager::default(),
             seat_manager: SeatManager::default(),
+            output_manager,
             surface_updates: VecDeque::new(),
         })
     }
@@ -93,6 +102,7 @@ impl DisplayState {
         self.shm_manager.delete_client(client_id);
         self.surface_manager.delete_client(client_id);
         self.seat_manager.remove_client(client_id);
+        self.output_manager.remove_client(client_id);
         self.surface_updates.retain(|update| match update {
             SurfaceUpdate::Frame(frame) => frame.client_id != client_id,
             SurfaceUpdate::Unmapped {
@@ -103,6 +113,15 @@ impl DisplayState {
 
     pub fn take_surface_updates(&mut self) -> impl Iterator<Item = SurfaceUpdate> + '_ {
         self.surface_updates.drain(..)
+    }
+
+    pub fn add_output<'connection>(
+        &mut self,
+        info: OutputInfo,
+        client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
+    ) -> GlobalId {
+        self.output_manager
+            .add_output(info, &mut self.globals, client_connections)
     }
 
     pub fn activate_main_seat<'connection>(
