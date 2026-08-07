@@ -8,7 +8,7 @@ use lumalla_wayland_protocol::{
 use crate::{
     CommittedFrame, DisplayState, GlobalId, SurfaceUpdate,
     shm::{ShmError, ShmErrorKind},
-    surface::{Rectangle, ShellMode, SurfaceError},
+    surface::{Rectangle, ShellMode, SurfaceCommit, SurfaceError},
 };
 
 impl WaylandProtocol for DisplayState {}
@@ -58,6 +58,11 @@ fn report_surface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError)
             (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown shell surface")
         }
         SurfaceError::UnknownRegion => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown region"),
+        SurfaceError::UnknownSubsurface => {
+            (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown subsurface")
+        }
+        SurfaceError::BadParent => (WL_SUBCOMPOSITOR_ERROR_BAD_PARENT, "Invalid subsurface parent"),
+        SurfaceError::BadSurface => (WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE, "Invalid subsurface surface"),
         SurfaceError::InvalidScale => (WL_SURFACE_ERROR_INVALID_SCALE, "Buffer scale must be > 0"),
         SurfaceError::InvalidTransform => {
             (WL_SURFACE_ERROR_INVALID_TRANSFORM, "Invalid buffer transform")
@@ -71,6 +76,105 @@ fn report_surface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError)
         .object_id(object_id)
         .code(code)
         .message(message);
+}
+
+fn report_subcompositor_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError) {
+    let (code, message) = match error {
+        SurfaceError::BadParent => (WL_SUBCOMPOSITOR_ERROR_BAD_PARENT, "Invalid subsurface parent"),
+        SurfaceError::BadSurface | SurfaceError::RoleAlreadyAssigned => {
+            (WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE, "Invalid subsurface surface")
+        }
+        other => {
+            report_surface_error(ctx, object_id, other);
+            return;
+        }
+    };
+    ctx.writer
+        .wl_display_error(DISPLAY_OBJECT_ID)
+        .object_id(object_id)
+        .code(code)
+        .message(message);
+}
+
+fn report_subsurface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError) {
+    let (code, message) = match error {
+        SurfaceError::BadSurface => (WL_SUBSURFACE_ERROR_BAD_SURFACE, "Invalid sibling surface"),
+        other => {
+            report_surface_error(ctx, object_id, other);
+            return;
+        }
+    };
+    ctx.writer
+        .wl_display_error(DISPLAY_OBJECT_ID)
+        .object_id(object_id)
+        .code(code)
+        .message(message);
+}
+
+fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: SurfaceCommit) {
+    if let Some(Some(buffer_id)) = commit.attached_buffer {
+        if commit.mapped {
+            match state.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
+                Ok(snapshot) => {
+                    state
+                        .surface_updates
+                        .push_back(SurfaceUpdate::Frame(CommittedFrame {
+                            client_id: ctx.client_id,
+                            surface_id: commit.surface_id,
+                            buffer_id,
+                            pixels: snapshot.pixels,
+                            width: snapshot.width,
+                            height: snapshot.height,
+                            stride: snapshot.stride,
+                            format: snapshot.format,
+                            buffer_scale: commit.buffer_scale,
+                            buffer_transform: commit.buffer_transform,
+                            offset_x: commit.offset.0,
+                            offset_y: commit.offset.1,
+                        }));
+                }
+                Err(error) => {
+                    report_shm_error(ctx, buffer_id, &error);
+                    return;
+                }
+            }
+            if commit.newly_mapped {
+                if let Some(shell_id) = commit.shell_id {
+                    let serial = state.seat_manager.next_serial();
+                    if state
+                        .surface_manager
+                        .set_pending_shell_ping(ctx.client_id, shell_id, serial)
+                        .is_ok()
+                    {
+                        ctx.writer
+                            .wl_shell_surface_ping(shell_id)
+                            .serial(serial);
+                    }
+                    state.seat_manager.focus_keyboards_on_surface(
+                        ctx.client_id,
+                        commit.surface_id,
+                        ctx.writer,
+                    );
+                }
+            }
+        }
+        ctx.writer.wl_buffer_release(buffer_id);
+    } else if commit.attached_buffer == Some(None) {
+        state.seat_manager.leave_keyboards_on_surface(
+            ctx.client_id,
+            commit.surface_id,
+            ctx.writer,
+        );
+        state.surface_updates.push_back(SurfaceUpdate::Unmapped {
+            client_id: ctx.client_id,
+            surface_id: commit.surface_id,
+        });
+    }
+
+    for callback in commit.frame_callbacks {
+        ctx.writer.wl_callback_done(callback).callback_data(0);
+        ctx.registry.free_object(callback, ctx.writer);
+    }
 }
 
 impl WlDisplay for DisplayState {
@@ -549,19 +653,25 @@ impl WlSurface for DisplayState {
             .surface_manager
             .destroy_surface(ctx.client_id, object_id)
         {
-            Ok((shell_id, callbacks, was_mapped)) => {
+            Ok(destroyed) => {
                 self.seat_manager.leave_keyboards_on_surface(
                     ctx.client_id,
                     object_id,
                     ctx.writer,
                 );
-                for callback in callbacks {
+                for callback in destroyed.callbacks {
                     ctx.registry.free_object(callback, ctx.writer);
                 }
-                if let Some(shell_id) = shell_id {
+                if let Some(shell_id) = destroyed.shell_id {
                     ctx.registry.free_object(shell_id, ctx.writer);
                 }
-                if was_mapped {
+                if let Some(subsurface_id) = destroyed.subsurface_id {
+                    ctx.registry.free_object(subsurface_id, ctx.writer);
+                }
+                for subsurface_id in destroyed.orphaned_subsurface_ids {
+                    ctx.registry.free_object(subsurface_id, ctx.writer);
+                }
+                if destroyed.was_mapped {
                     self.surface_updates.push_back(SurfaceUpdate::Unmapped {
                         client_id: ctx.client_id,
                         surface_id: object_id,
@@ -671,75 +781,17 @@ impl WlSurface for DisplayState {
     }
 
     fn commit(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSurfaceCommit<'_>) {
-        let commit = match self.surface_manager.commit(ctx.client_id, object_id) {
-            Ok(commit) => commit,
+        let result = match self.surface_manager.commit(ctx.client_id, object_id) {
+            Ok(result) => result,
             Err(error) => {
                 report_surface_error(ctx, object_id, error);
                 return;
             }
         };
 
-        if let Some(Some(buffer_id)) = commit.attached_buffer {
-            if commit.mapped {
-                match self.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
-                    Ok(snapshot) => {
-                        self.surface_updates
-                            .push_back(SurfaceUpdate::Frame(CommittedFrame {
-                                client_id: ctx.client_id,
-                                surface_id: commit.surface_id,
-                                buffer_id,
-                                pixels: snapshot.pixels,
-                                width: snapshot.width,
-                                height: snapshot.height,
-                                stride: snapshot.stride,
-                                format: snapshot.format,
-                                buffer_scale: commit.buffer_scale,
-                                buffer_transform: commit.buffer_transform,
-                                offset_x: commit.offset.0,
-                                offset_y: commit.offset.1,
-                            }));
-                    }
-                    Err(error) => {
-                        report_shm_error(ctx, buffer_id, &error);
-                        return;
-                    }
-                }
-                if commit.newly_mapped {
-                    if let Some(shell_id) = commit.shell_id {
-                        let serial = self.seat_manager.next_serial();
-                        if self
-                            .surface_manager
-                            .set_pending_shell_ping(ctx.client_id, shell_id, serial)
-                            .is_ok()
-                        {
-                            ctx.writer
-                                .wl_shell_surface_ping(shell_id)
-                                .serial(serial);
-                        }
-                    }
-                    self.seat_manager.focus_keyboards_on_surface(
-                        ctx.client_id,
-                        commit.surface_id,
-                        ctx.writer,
-                    );
-                }
-            }
-            ctx.writer.wl_buffer_release(buffer_id);
-        } else if commit.attached_buffer == Some(None) {
-            self.seat_manager.leave_keyboards_on_surface(
-                ctx.client_id,
-                commit.surface_id,
-                ctx.writer,
-            );
-            self.surface_updates.push_back(SurfaceUpdate::Unmapped {
-                client_id: ctx.client_id,
-                surface_id: commit.surface_id,
-            });
-        }
-
-        for callback in commit.frame_callbacks {
-            ctx.writer.wl_callback_done(callback).callback_data(0);
-            ctx.registry.free_object(callback, ctx.writer);
+        process_surface_commit(self, ctx, result.primary);
+        for child in result.synchronized_children {
+            process_surface_commit(self, ctx, child);
         }
     }
 
@@ -927,71 +979,137 @@ impl WlRegion for DisplayState {
 impl WlSubcompositor for DisplayState {
     fn destroy(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
         _params: &WlSubcompositorDestroy<'_>,
     ) {
-        todo!()
+        ctx.registry.free_object(object_id, ctx.writer);
     }
 
     fn get_subsurface(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlSubcompositorGetSubsurface<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlSubcompositorGetSubsurface<'_>,
     ) {
-        todo!()
+        if ctx.registry.interface_index(params.surface()) != Some(InterfaceIndex::WlSurface) {
+            report_subcompositor_error(ctx, object_id, SurfaceError::BadSurface);
+            return;
+        }
+        if ctx.registry.interface_index(params.parent()) != Some(InterfaceIndex::WlSurface) {
+            report_subcompositor_error(ctx, object_id, SurfaceError::BadParent);
+            return;
+        }
+        if !register_object(ctx, params.id(), InterfaceIndex::WlSubsurface, 1) {
+            return;
+        }
+        if let Err(error) = self.surface_manager.create_subsurface(
+            ctx.client_id,
+            *params.id(),
+            params.surface(),
+            params.parent(),
+        ) {
+            report_subcompositor_error(ctx, object_id, error);
+        }
     }
 }
 
 impl WlSubsurface for DisplayState {
-    fn destroy(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &WlSubsurfaceDestroy<'_>) {
-        todo!()
+    fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSubsurfaceDestroy<'_>) {
+        match self
+            .surface_manager
+            .destroy_subsurface(ctx.client_id, object_id)
+        {
+            Ok((surface_id, was_mapped)) => {
+                if was_mapped {
+                    self.seat_manager.leave_keyboards_on_surface(
+                        ctx.client_id,
+                        surface_id,
+                        ctx.writer,
+                    );
+                    self.surface_updates.push_back(SurfaceUpdate::Unmapped {
+                        client_id: ctx.client_id,
+                        surface_id,
+                    });
+                }
+                ctx.registry.free_object(object_id, ctx.writer);
+            }
+            Err(error) => report_surface_error(ctx, object_id, error),
+        }
     }
 
     fn set_position(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlSubsurfaceSetPosition<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlSubsurfaceSetPosition<'_>,
     ) {
-        todo!()
+        if let Err(error) = self.surface_manager.set_position(
+            ctx.client_id,
+            object_id,
+            params.x(),
+            params.y(),
+        ) {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn place_above(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlSubsurfacePlaceAbove<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlSubsurfacePlaceAbove<'_>,
     ) {
-        todo!()
+        if ctx.registry.interface_index(params.sibling()) != Some(InterfaceIndex::WlSurface) {
+            report_subsurface_error(ctx, object_id, SurfaceError::BadSurface);
+            return;
+        }
+        if let Err(error) =
+            self.surface_manager
+                .place_above(ctx.client_id, object_id, params.sibling())
+        {
+            report_subsurface_error(ctx, object_id, error);
+        }
     }
 
     fn place_below(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &WlSubsurfacePlaceBelow<'_>,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
+        params: &WlSubsurfacePlaceBelow<'_>,
     ) {
-        todo!()
+        if ctx.registry.interface_index(params.sibling()) != Some(InterfaceIndex::WlSurface) {
+            report_subsurface_error(ctx, object_id, SurfaceError::BadSurface);
+            return;
+        }
+        if let Err(error) =
+            self.surface_manager
+                .place_below(ctx.client_id, object_id, params.sibling())
+        {
+            report_subsurface_error(ctx, object_id, error);
+        }
     }
 
     fn set_sync(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
         _params: &WlSubsurfaceSetSync<'_>,
     ) {
-        todo!()
+        if let Err(error) = self.surface_manager.set_sync(ctx.client_id, object_id) {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 
     fn set_desync(
         &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
+        ctx: &mut Ctx,
+        object_id: ObjectId,
         _params: &WlSubsurfaceSetDesync<'_>,
     ) {
-        todo!()
+        if let Err(error) = self.surface_manager.set_desync(ctx.client_id, object_id) {
+            report_surface_error(ctx, object_id, error);
+        }
     }
 }
 
@@ -1169,6 +1287,7 @@ mod tests {
         assert!(globals.contains(&(WL_COMPOSITOR_NAME, 5)));
         assert!(globals.contains(&(WL_SHM_NAME, 2)));
         assert!(globals.contains(&(WL_SHELL_NAME, 1)));
+        assert!(globals.contains(&(WL_SUBCOMPOSITOR_NAME, 1)));
         assert!(globals.contains(&(WL_FIXES_NAME, 1)));
         assert!(globals.contains(&(WL_OUTPUT_NAME, 4)));
     }

@@ -1,4 +1,7 @@
-//! Smoke client that binds `wl_output` then presents a fullscreen SHM surface.
+//! Minimal `wl_subsurface` + `wl_shell` + `wl_shm` client for compositor smoke testing.
+//!
+//! Creates a parent shell surface and a sync subsurface child, commits the child first,
+//! then the parent so both buffers are applied together.
 
 use std::{
     collections::HashMap,
@@ -17,13 +20,16 @@ use anyhow::{Context, ensure};
 use lumalla_wayland_protocol::protocols::wayland::{
     WL_COMPOSITOR_CREATE_SURFACE_OPCODE, WL_DISPLAY_GET_REGISTRY_OPCODE, WL_DISPLAY_SYNC_OPCODE,
     WL_REGISTRY_BIND_OPCODE, WL_SHELL_GET_SHELL_SURFACE_OPCODE, WL_SHELL_SURFACE_PONG_OPCODE,
-    WL_SHELL_SURFACE_SET_FULLSCREEN_OPCODE, WL_SHM_CREATE_POOL_OPCODE, WL_SHM_FORMAT_XRGB8888,
-    WL_SHM_POOL_CREATE_BUFFER_OPCODE, WL_SURFACE_ATTACH_OPCODE, WL_SURFACE_COMMIT_OPCODE,
-    WL_SURFACE_DAMAGE_OPCODE, WL_SURFACE_FRAME_OPCODE,
+    WL_SHELL_SURFACE_SET_TOPLEVEL_OPCODE, WL_SHM_CREATE_POOL_OPCODE, WL_SHM_FORMAT_XRGB8888,
+    WL_SHM_POOL_CREATE_BUFFER_OPCODE, WL_SUBCOMPOSITOR_GET_SUBSURFACE_OPCODE,
+    WL_SUBSURFACE_SET_POSITION_OPCODE, WL_SUBSURFACE_SET_SYNC_OPCODE, WL_SURFACE_ATTACH_OPCODE,
+    WL_SURFACE_COMMIT_OPCODE, WL_SURFACE_DAMAGE_OPCODE, WL_SURFACE_FRAME_OPCODE,
 };
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 240;
+const PARENT_WIDTH: u32 = 320;
+const PARENT_HEIGHT: u32 = 240;
+const CHILD_WIDTH: u32 = 96;
+const CHILD_HEIGHT: u32 = 96;
 
 fn main() -> anyhow::Result<()> {
     let socket_path = socket_path()?;
@@ -49,86 +55,65 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let compositor = bind(&mut stream, &globals, "wl_compositor", 1, 4)?;
-    let shm = bind(&mut stream, &globals, "wl_shm", 1, 5)?;
-    let shell = bind(&mut stream, &globals, "wl_shell", 1, 6)?;
-    let output = bind(&mut stream, &globals, "wl_output", 4, 12)?;
+    let compositor = bind(&mut stream, &globals, "wl_compositor", 4)?;
+    let shm = bind(&mut stream, &globals, "wl_shm", 5)?;
+    let shell = bind(&mut stream, &globals, "wl_shell", 6)?;
+    let subcompositor = bind(&mut stream, &globals, "wl_subcompositor", 7)?;
 
-    let mut saw_geometry = false;
-    let mut saw_mode = false;
-    let mut saw_done = false;
-    send(&mut stream, request(1, WL_DISPLAY_SYNC_OPCODE, u32_arg(13)))?;
-    loop {
-        let event = read_event(&mut stream)?;
-        if event.object_id == 1 && event.opcode == 0 {
-            anyhow::bail!("Compositor reported a protocol error");
-        }
-        if event.object_id == output {
-            match event.opcode {
-                0 => {
-                    saw_geometry = true;
-                    println!(
-                        "wl_output.geometry x={} y={} pw={} ph={}",
-                        read_i32(&event.payload, 0)?,
-                        read_i32(&event.payload, 4)?,
-                        read_i32(&event.payload, 8)?,
-                        read_i32(&event.payload, 12)?,
-                    );
-                }
-                1 => {
-                    saw_mode = true;
-                    println!(
-                        "wl_output.mode flags={} {}x{} refresh={}",
-                        read_u32(&event.payload, 0)?,
-                        read_i32(&event.payload, 4)?,
-                        read_i32(&event.payload, 8)?,
-                        read_i32(&event.payload, 12)?,
-                    );
-                }
-                2 => saw_done = true,
-                3 => println!("wl_output.scale factor={}", read_i32(&event.payload, 0)?),
-                4 => println!("wl_output.name"),
-                5 => println!("wl_output.description"),
-                _ => {}
-            }
-        }
-        if event.object_id == 13 && event.opcode == 0 {
-            break;
-        }
-    }
-    ensure!(saw_geometry && saw_mode && saw_done, "Missing wl_output events");
-
+    // parent surface = 8, child surface = 9
     send(
         &mut stream,
-        request(compositor, WL_COMPOSITOR_CREATE_SURFACE_OPCODE, u32_arg(7)),
+        request(compositor, WL_COMPOSITOR_CREATE_SURFACE_OPCODE, u32_arg(8)),
+    )?;
+    send(
+        &mut stream,
+        request(compositor, WL_COMPOSITOR_CREATE_SURFACE_OPCODE, u32_arg(9)),
     )?;
 
-    let pixels = checkerboard();
-    let file = memory_file(&pixels)?;
+    let parent_pixels = solid_color(PARENT_WIDTH, PARENT_HEIGHT, [0x40, 0x60, 0x90, 0xff]);
+    let child_pixels = solid_color(CHILD_WIDTH, CHILD_HEIGHT, [0x30, 0xd0, 0xff, 0xff]);
+    let mut pool_bytes = parent_pixels.clone();
+    pool_bytes.extend_from_slice(&child_pixels);
+    let file = memory_file(&pool_bytes)?;
+
     let mut pool_payload = Vec::new();
-    push_u32(&mut pool_payload, 8);
-    push_i32(&mut pool_payload, pixels.len() as i32);
+    push_u32(&mut pool_payload, 10);
+    push_i32(&mut pool_payload, pool_bytes.len() as i32);
     send_with_fd(
         &mut stream,
         &request(shm, WL_SHM_CREATE_POOL_OPCODE, pool_payload),
         file.as_raw_fd(),
     )?;
 
-    let mut buffer_payload = Vec::new();
-    push_u32(&mut buffer_payload, 9);
-    push_i32(&mut buffer_payload, 0);
-    push_i32(&mut buffer_payload, WIDTH as i32);
-    push_i32(&mut buffer_payload, HEIGHT as i32);
-    push_i32(&mut buffer_payload, (WIDTH * 4) as i32);
-    push_u32(&mut buffer_payload, WL_SHM_FORMAT_XRGB8888);
+    // parent buffer = 11
+    let mut parent_buffer = Vec::new();
+    push_u32(&mut parent_buffer, 11);
+    push_i32(&mut parent_buffer, 0);
+    push_i32(&mut parent_buffer, PARENT_WIDTH as i32);
+    push_i32(&mut parent_buffer, PARENT_HEIGHT as i32);
+    push_i32(&mut parent_buffer, (PARENT_WIDTH * 4) as i32);
+    push_u32(&mut parent_buffer, WL_SHM_FORMAT_XRGB8888);
     send(
         &mut stream,
-        request(8, WL_SHM_POOL_CREATE_BUFFER_OPCODE, buffer_payload),
+        request(10, WL_SHM_POOL_CREATE_BUFFER_OPCODE, parent_buffer),
+    )?;
+
+    // child buffer = 12
+    let mut child_buffer = Vec::new();
+    push_u32(&mut child_buffer, 12);
+    push_i32(&mut child_buffer, parent_pixels.len() as i32);
+    push_i32(&mut child_buffer, CHILD_WIDTH as i32);
+    push_i32(&mut child_buffer, CHILD_HEIGHT as i32);
+    push_i32(&mut child_buffer, (CHILD_WIDTH * 4) as i32);
+    push_u32(&mut child_buffer, WL_SHM_FORMAT_XRGB8888);
+    send(
+        &mut stream,
+        request(10, WL_SHM_POOL_CREATE_BUFFER_OPCODE, child_buffer),
     )?;
 
     let mut shell_surface_payload = Vec::new();
-    push_u32(&mut shell_surface_payload, 10);
-    push_u32(&mut shell_surface_payload, 7);
+    push_u32(&mut shell_surface_payload, 13);
+    push_u32(&mut shell_surface_payload, 8);
     send(
         &mut stream,
         request(
@@ -139,44 +124,41 @@ fn main() -> anyhow::Result<()> {
     )?;
     send(
         &mut stream,
+        request(13, WL_SHELL_SURFACE_SET_TOPLEVEL_OPCODE, Vec::new()),
+    )?;
+
+    // subsurface = 14 for child surface 9 under parent 8
+    let mut subsurface_payload = Vec::new();
+    push_u32(&mut subsurface_payload, 14);
+    push_u32(&mut subsurface_payload, 9);
+    push_u32(&mut subsurface_payload, 8);
+    send(
+        &mut stream,
         request(
-            10,
-            WL_SHELL_SURFACE_SET_FULLSCREEN_OPCODE,
-            [0u32, 0, 0]
-                .into_iter()
-                .flat_map(u32::to_ne_bytes)
-                .collect(),
+            subcompositor,
+            WL_SUBCOMPOSITOR_GET_SUBSURFACE_OPCODE,
+            subsurface_payload,
         ),
     )?;
+    send(
+        &mut stream,
+        request(14, WL_SUBSURFACE_SET_SYNC_OPCODE, Vec::new()),
+    )?;
+    let mut position_payload = Vec::new();
+    push_i32(&mut position_payload, 40);
+    push_i32(&mut position_payload, 40);
+    send(
+        &mut stream,
+        request(14, WL_SUBSURFACE_SET_POSITION_OPCODE, position_payload),
+    )?;
 
-    let mut attach_payload = Vec::new();
-    push_u32(&mut attach_payload, 9);
-    push_i32(&mut attach_payload, 0);
-    push_i32(&mut attach_payload, 0);
-    send(
-        &mut stream,
-        request(7, WL_SURFACE_ATTACH_OPCODE, attach_payload),
-    )?;
-    let mut damage_payload = Vec::new();
-    push_i32(&mut damage_payload, 0);
-    push_i32(&mut damage_payload, 0);
-    push_i32(&mut damage_payload, WIDTH as i32);
-    push_i32(&mut damage_payload, HEIGHT as i32);
-    send(
-        &mut stream,
-        request(7, WL_SURFACE_DAMAGE_OPCODE, damage_payload),
-    )?;
-    send(
-        &mut stream,
-        request(7, WL_SURFACE_FRAME_OPCODE, u32_arg(11)),
-    )?;
-    send(
-        &mut stream,
-        request(7, WL_SURFACE_COMMIT_OPCODE, Vec::new()),
-    )?;
+    // Commit child first (sync: cached until parent commit)
+    attach_damage_commit(&mut stream, 9, 12, CHILD_WIDTH, CHILD_HEIGHT, Some(15))?;
+    // Then commit parent (applies parent + synchronized child)
+    attach_damage_commit(&mut stream, 8, 11, PARENT_WIDTH, PARENT_HEIGHT, Some(16))?;
 
     println!(
-        "Presented fullscreen SHM surface using wl_output on {}. Press Ctrl-C to exit.",
+        "Presented a wl_shell parent with sync wl_subsurface child on {}. Press Ctrl-C to exit.",
         socket_path.display()
     );
     loop {
@@ -187,11 +169,12 @@ fn main() -> anyhow::Result<()> {
         };
         if event.object_id == 1 && event.opcode == 0 {
             anyhow::bail!("Compositor reported a protocol error");
-        } else if event.object_id == 10 && event.opcode == 0 {
+        } else if event.object_id == 13 && event.opcode == 0 {
             let serial = read_u32(&event.payload, 0)?;
+            println!("Responding to wl_shell_surface.ping serial={serial}");
             if let Err(error) = send(
                 &mut stream,
-                request(10, WL_SHELL_SURFACE_PONG_OPCODE, u32_arg(serial)),
+                request(13, WL_SHELL_SURFACE_PONG_OPCODE, u32_arg(serial)),
             ) {
                 if is_disconnect(&error) {
                     return Ok(());
@@ -200,6 +183,42 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+fn attach_damage_commit(
+    stream: &mut UnixStream,
+    surface: u32,
+    buffer: u32,
+    width: u32,
+    height: u32,
+    frame: Option<u32>,
+) -> anyhow::Result<()> {
+    let mut attach_payload = Vec::new();
+    push_u32(&mut attach_payload, buffer);
+    push_i32(&mut attach_payload, 0);
+    push_i32(&mut attach_payload, 0);
+    send(
+        stream,
+        request(surface, WL_SURFACE_ATTACH_OPCODE, attach_payload),
+    )?;
+
+    let mut damage_payload = Vec::new();
+    push_i32(&mut damage_payload, 0);
+    push_i32(&mut damage_payload, 0);
+    push_i32(&mut damage_payload, width as i32);
+    push_i32(&mut damage_payload, height as i32);
+    send(
+        stream,
+        request(surface, WL_SURFACE_DAMAGE_OPCODE, damage_payload),
+    )?;
+    if let Some(frame) = frame {
+        send(stream, request(surface, WL_SURFACE_FRAME_OPCODE, u32_arg(frame)))?;
+    }
+    send(
+        stream,
+        request(surface, WL_SURFACE_COMMIT_OPCODE, Vec::new()),
+    )?;
+    Ok(())
 }
 
 fn is_disconnect(error: &anyhow::Error) -> bool {
@@ -231,44 +250,32 @@ fn bind(
     stream: &mut UnixStream,
     globals: &HashMap<String, (u32, u32)>,
     interface: &str,
-    version: u32,
     object_id: u32,
 ) -> anyhow::Result<u32> {
     let &(name, advertised_version) = globals
         .get(interface)
         .with_context(|| format!("Compositor does not advertise {interface}"))?;
-    ensure!(
-        advertised_version >= version,
-        "{interface} advertised version {advertised_version} < required {version}"
-    );
+    ensure!(advertised_version >= 1, "{interface} has invalid version 0");
     let mut payload = Vec::new();
     push_u32(&mut payload, name);
     push_string(&mut payload, interface);
-    push_u32(&mut payload, version);
+    push_u32(&mut payload, 1);
     push_u32(&mut payload, object_id);
     send(stream, request(2, WL_REGISTRY_BIND_OPCODE, payload))?;
     Ok(object_id)
 }
 
-fn checkerboard() -> Vec<u8> {
-    let mut pixels = vec![0; (WIDTH * HEIGHT * 4) as usize];
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            let bright = ((x / 32) + (y / 32)).is_multiple_of(2);
-            let [b, g, r] = if bright {
-                [0x20, 0xa0, 0xe0]
-            } else {
-                [0x60, 0x20, 0x90]
-            };
-            let offset = ((y * WIDTH + x) * 4) as usize;
-            pixels[offset..offset + 4].copy_from_slice(&[b, g, r, 0xff]);
-        }
+fn solid_color(width: u32, height: u32, pixel: [u8; 4]) -> Vec<u8> {
+    let mut pixels = vec![0; (width * height * 4) as usize];
+    for chunk in pixels.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&pixel);
     }
     pixels
 }
 
 fn memory_file(bytes: &[u8]) -> anyhow::Result<File> {
-    let fd = unsafe { libc::memfd_create(c"lumalla-wl-output".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd =
+        unsafe { libc::memfd_create(c"lumalla-wl-subsurface-smoke".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("memfd_create failed");
     }
@@ -372,10 +379,6 @@ fn read_u32(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
         .try_into()
         .unwrap();
     Ok(u32::from_ne_bytes(value))
-}
-
-fn read_i32(bytes: &[u8], offset: usize) -> anyhow::Result<i32> {
-    Ok(read_u32(bytes, offset)? as i32)
 }
 
 fn u32_arg(value: u32) -> Vec<u8> {

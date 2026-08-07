@@ -10,7 +10,10 @@ pub enum SurfaceError {
     UnknownBuffer,
     UnknownShellSurface,
     UnknownRegion,
+    UnknownSubsurface,
     RoleAlreadyAssigned,
+    BadParent,
+    BadSurface,
     InvalidScale,
     InvalidTransform,
     InvalidOffset,
@@ -46,10 +49,26 @@ pub struct SurfaceCommit {
     pub buffer_damage: Vec<Rectangle>,
 }
 
+#[derive(Debug)]
+pub struct CommitResult {
+    pub primary: SurfaceCommit,
+    pub synchronized_children: Vec<SurfaceCommit>,
+}
+
+#[derive(Debug)]
+pub struct DestroyedSurface {
+    pub shell_id: Option<ObjectId>,
+    pub subsurface_id: Option<ObjectId>,
+    pub orphaned_subsurface_ids: Vec<ObjectId>,
+    pub callbacks: Vec<ObjectId>,
+    pub was_mapped: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct SurfaceManager {
     surfaces: HashMap<ResourceKey, Surface>,
     shell_surfaces: HashMap<ResourceKey, ObjectId>,
+    subsurfaces: HashMap<ResourceKey, SubsurfaceState>,
     regions: HashMap<ResourceKey, Region>,
 }
 
@@ -62,27 +81,64 @@ impl SurfaceManager {
         &mut self,
         client_id: ClientId,
         id: ObjectId,
-    ) -> Result<(Option<ObjectId>, Vec<ObjectId>, bool), SurfaceError> {
+    ) -> Result<DestroyedSurface, SurfaceError> {
+        let was_mapped = self.is_mapped(client_id, id)?;
         let surface = self
             .surfaces
             .remove(&(client_id, id))
             .ok_or(SurfaceError::UnknownSurface)?;
-        let was_mapped = surface.is_mapped();
-        let shell_id = match surface.role {
+
+        let mut orphaned_subsurface_ids = Vec::new();
+        let children: Vec<ObjectId> = surface
+            .pending_children
+            .as_ref()
+            .unwrap_or(&surface.current_children)
+            .clone();
+        for child_surface_id in children {
+            if let Some(child) = self.surfaces.get_mut(&(client_id, child_surface_id)) {
+                if let Some(Role::Subsurface(sub_id)) = child.role.take() {
+                    self.subsurfaces.remove(&(client_id, sub_id));
+                    orphaned_subsurface_ids.push(sub_id);
+                }
+            }
+        }
+
+        let (shell_id, subsurface_id) = match surface.role {
             Some(Role::Shell(shell_id)) => {
                 self.shell_surfaces.remove(&(client_id, shell_id));
-                Some(shell_id)
+                (Some(shell_id), None)
             }
-            None => None,
+            Some(Role::Subsurface(subsurface_id)) => {
+                if let Some(sub) = self.subsurfaces.remove(&(client_id, subsurface_id)) {
+                    self.remove_child_from_parent(client_id, sub.parent, id);
+                }
+                (None, Some(subsurface_id))
+            }
+            None => (None, None),
         };
-        Ok((shell_id, surface.pending.frame_callbacks, was_mapped))
+
+        let mut callbacks = surface.pending.frame_callbacks;
+        if let Some(cache) = surface.cache {
+            callbacks.extend(cache.frame_callbacks);
+        }
+
+        Ok(DestroyedSurface {
+            shell_id,
+            subsurface_id,
+            orphaned_subsurface_ids,
+            callbacks,
+            was_mapped,
+        })
     }
 
     pub fn first_surface(&self, client_id: ClientId) -> Option<ObjectId> {
-        self.surfaces
-            .iter()
-            .find(|((owner, _), surface)| *owner == client_id && surface.is_mapped())
-            .map(|((_, id), _)| *id)
+        let ids: Vec<ObjectId> = self
+            .surfaces
+            .keys()
+            .filter_map(|(owner, id)| (*owner == client_id).then_some(*id))
+            .collect();
+        ids.into_iter()
+            .find(|id| self.is_mapped(client_id, *id).unwrap_or(false))
     }
 
     pub fn attach(
@@ -238,53 +294,155 @@ impl SurfaceManager {
         &mut self,
         client_id: ClientId,
         id: ObjectId,
-    ) -> Result<SurfaceCommit, SurfaceError> {
-        let surface = self
-            .surfaces
-            .get_mut(&(client_id, id))
-            .ok_or(SurfaceError::UnknownSurface)?;
-        let was_mapped = surface.is_mapped();
-        let attached_buffer = surface.pending.buffer.take();
-        if let Some(buffer) = attached_buffer {
-            surface.current.buffer = buffer;
+    ) -> Result<CommitResult, SurfaceError> {
+        if !self.surfaces.contains_key(&(client_id, id)) {
+            return Err(SurfaceError::UnknownSurface);
         }
-        if let Some(offset) = surface.pending.offset.take() {
-            surface.current.offset = offset;
+
+        if self.is_effectively_synchronized(client_id, id) {
+            self.cache_pending_commit(client_id, id)?;
+            let primary = self.deferred_commit_result(client_id, id)?;
+            return Ok(CommitResult {
+                primary,
+                synchronized_children: Vec::new(),
+            });
         }
-        if let Some(region) = surface.pending.opaque_region.take() {
-            surface.current.opaque_region = region;
-        }
-        if let Some(region) = surface.pending.input_region.take() {
-            surface.current.input_region = region;
-        }
-        surface.current.damage = std::mem::take(&mut surface.pending.damage);
-        surface.current.buffer_damage = std::mem::take(&mut surface.pending.buffer_damage);
-        if let Some(scale) = surface.pending.buffer_scale.take() {
-            surface.current.buffer_scale = scale;
-        }
-        if let Some(transform) = surface.pending.buffer_transform.take() {
-            surface.current.buffer_transform = transform;
-        }
-        let frame_callbacks = std::mem::take(&mut surface.pending.frame_callbacks);
-        let mapped = surface.is_mapped();
-        let shell_id = match surface.role {
-            Some(Role::Shell(shell_id)) => Some(shell_id),
-            None => None,
-        };
-        Ok(SurfaceCommit {
-            surface_id: id,
-            buffer: surface.current.buffer,
-            attached_buffer,
-            mapped,
-            newly_mapped: mapped && !was_mapped,
-            shell_id,
-            frame_callbacks,
-            buffer_scale: surface.current.buffer_scale,
-            buffer_transform: surface.current.buffer_transform,
-            offset: surface.current.offset,
-            damage: surface.current.damage.clone(),
-            buffer_damage: surface.current.buffer_damage.clone(),
+
+        let primary = self.apply_commit(client_id, id)?;
+        let synchronized_children = self.apply_synchronized_children(client_id, id)?;
+        Ok(CommitResult {
+            primary,
+            synchronized_children,
         })
+    }
+
+    pub fn create_subsurface(
+        &mut self,
+        client_id: ClientId,
+        subsurface_id: ObjectId,
+        surface: ObjectId,
+        parent: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        if surface == parent {
+            return Err(SurfaceError::BadParent);
+        }
+        if !self.surfaces.contains_key(&(client_id, surface)) {
+            return Err(SurfaceError::BadSurface);
+        }
+        if !self.surfaces.contains_key(&(client_id, parent)) {
+            return Err(SurfaceError::BadParent);
+        }
+        if self.would_create_cycle(client_id, surface, parent) {
+            return Err(SurfaceError::BadParent);
+        }
+
+        let child = self
+            .surfaces
+            .get_mut(&(client_id, surface))
+            .ok_or(SurfaceError::BadSurface)?;
+        if child.role.is_some() {
+            return Err(SurfaceError::BadSurface);
+        }
+        child.role = Some(Role::Subsurface(subsurface_id));
+
+        self.subsurfaces.insert(
+            (client_id, subsurface_id),
+            SubsurfaceState {
+                parent,
+                surface,
+                sync: true,
+                current_position: (0, 0),
+                pending_position: None,
+            },
+        );
+
+        let parent_surface = self
+            .surfaces
+            .get_mut(&(client_id, parent))
+            .ok_or(SurfaceError::BadParent)?;
+        let pending = parent_surface
+            .pending_children
+            .get_or_insert_with(|| parent_surface.current_children.clone());
+        pending.push(surface);
+        Ok(())
+    }
+
+    pub fn destroy_subsurface(
+        &mut self,
+        client_id: ClientId,
+        subsurface_id: ObjectId,
+    ) -> Result<(ObjectId, bool), SurfaceError> {
+        let sub = self
+            .subsurfaces
+            .remove(&(client_id, subsurface_id))
+            .ok_or(SurfaceError::UnknownSubsurface)?;
+        let surface_id = sub.surface;
+        self.remove_child_from_parent(client_id, sub.parent, surface_id);
+        let was_mapped = self.is_mapped(client_id, surface_id).unwrap_or(false);
+        if let Some(surface) = self.surfaces.get_mut(&(client_id, surface_id)) {
+            if surface.role == Some(Role::Subsurface(subsurface_id)) {
+                surface.role = None;
+            }
+            // Unmap immediately: clear current buffer.
+            surface.current.buffer = None;
+        }
+        Ok((surface_id, was_mapped))
+    }
+
+    pub fn set_position(
+        &mut self,
+        client_id: ClientId,
+        subsurface_id: ObjectId,
+        x: i32,
+        y: i32,
+    ) -> Result<(), SurfaceError> {
+        self.subsurfaces
+            .get_mut(&(client_id, subsurface_id))
+            .ok_or(SurfaceError::UnknownSubsurface)?
+            .pending_position = Some((x, y));
+        Ok(())
+    }
+
+    pub fn place_above(
+        &mut self,
+        client_id: ClientId,
+        subsurface_id: ObjectId,
+        sibling: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        self.restack(client_id, subsurface_id, sibling, Restack::Above)
+    }
+
+    pub fn place_below(
+        &mut self,
+        client_id: ClientId,
+        subsurface_id: ObjectId,
+        sibling: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        self.restack(client_id, subsurface_id, sibling, Restack::Below)
+    }
+
+    pub fn set_sync(
+        &mut self,
+        client_id: ClientId,
+        subsurface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        self.subsurfaces
+            .get_mut(&(client_id, subsurface_id))
+            .ok_or(SurfaceError::UnknownSubsurface)?
+            .sync = true;
+        Ok(())
+    }
+
+    pub fn set_desync(
+        &mut self,
+        client_id: ClientId,
+        subsurface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        self.subsurfaces
+            .get_mut(&(client_id, subsurface_id))
+            .ok_or(SurfaceError::UnknownSubsurface)?
+            .sync = false;
+        Ok(())
     }
 
     pub fn acknowledge_shell_ping(
@@ -448,7 +606,341 @@ impl SurfaceManager {
         self.surfaces.retain(|(owner, _), _| *owner != client_id);
         self.shell_surfaces
             .retain(|(owner, _), _| *owner != client_id);
+        self.subsurfaces.retain(|(owner, _), _| *owner != client_id);
         self.regions.retain(|(owner, _), _| *owner != client_id);
+    }
+
+    fn cache_pending_commit(
+        &mut self,
+        client_id: ClientId,
+        id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        let pending = std::mem::take(&mut surface.pending);
+        match &mut surface.cache {
+            Some(cache) => merge_pending(cache, pending),
+            None => surface.cache = Some(pending),
+        }
+        Ok(())
+    }
+
+    fn deferred_commit_result(
+        &self,
+        client_id: ClientId,
+        id: ObjectId,
+    ) -> Result<SurfaceCommit, SurfaceError> {
+        let surface = self
+            .surfaces
+            .get(&(client_id, id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        let mapped = self.is_mapped(client_id, id)?;
+        Ok(SurfaceCommit {
+            surface_id: id,
+            buffer: surface.current.buffer,
+            attached_buffer: None,
+            mapped,
+            newly_mapped: false,
+            shell_id: None,
+            frame_callbacks: Vec::new(),
+            buffer_scale: surface.current.buffer_scale,
+            buffer_transform: surface.current.buffer_transform,
+            offset: self.presentation_offset(client_id, surface),
+            damage: surface.current.damage.clone(),
+            buffer_damage: surface.current.buffer_damage.clone(),
+        })
+    }
+
+    fn apply_commit(
+        &mut self,
+        client_id: ClientId,
+        id: ObjectId,
+    ) -> Result<SurfaceCommit, SurfaceError> {
+        let was_mapped = self.is_mapped(client_id, id)?;
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+
+        if surface.cache.is_some() {
+            let pending = std::mem::take(&mut surface.pending);
+            if let Some(cache) = surface.cache.as_mut() {
+                merge_pending(cache, pending);
+            }
+            let cache = surface.cache.take().unwrap();
+            surface.pending = cache;
+        }
+
+        let attached_buffer = surface.pending.buffer.take();
+        if let Some(buffer) = attached_buffer {
+            surface.current.buffer = buffer;
+        }
+        if let Some(offset) = surface.pending.offset.take() {
+            surface.current.offset = offset;
+        }
+        if let Some(region) = surface.pending.opaque_region.take() {
+            surface.current.opaque_region = region;
+        }
+        if let Some(region) = surface.pending.input_region.take() {
+            surface.current.input_region = region;
+        }
+        surface.current.damage = std::mem::take(&mut surface.pending.damage);
+        surface.current.buffer_damage = std::mem::take(&mut surface.pending.buffer_damage);
+        if let Some(scale) = surface.pending.buffer_scale.take() {
+            surface.current.buffer_scale = scale;
+        }
+        if let Some(transform) = surface.pending.buffer_transform.take() {
+            surface.current.buffer_transform = transform;
+        }
+        let frame_callbacks = std::mem::take(&mut surface.pending.frame_callbacks);
+        let shell_id = match surface.role {
+            Some(Role::Shell(shell_id)) => Some(shell_id),
+            _ => None,
+        };
+        let buffer = surface.current.buffer;
+        let buffer_scale = surface.current.buffer_scale;
+        let buffer_transform = surface.current.buffer_transform;
+        let damage = surface.current.damage.clone();
+        let buffer_damage = surface.current.buffer_damage.clone();
+        let surface_offset = surface.current.offset;
+        let subsurface_role = surface.role;
+
+        let offset = match subsurface_role {
+            Some(Role::Subsurface(sub_id)) => self
+                .subsurfaces
+                .get(&(client_id, sub_id))
+                .map(|sub| sub.current_position)
+                .unwrap_or(surface_offset),
+            _ => surface_offset,
+        };
+
+        let mapped = self.is_mapped(client_id, id)?;
+        Ok(SurfaceCommit {
+            surface_id: id,
+            buffer,
+            attached_buffer,
+            mapped,
+            newly_mapped: mapped && !was_mapped,
+            shell_id,
+            frame_callbacks,
+            buffer_scale,
+            buffer_transform,
+            offset,
+            damage,
+            buffer_damage,
+        })
+    }
+
+    fn apply_synchronized_children(
+        &mut self,
+        client_id: ClientId,
+        parent_id: ObjectId,
+    ) -> Result<Vec<SurfaceCommit>, SurfaceError> {
+        self.apply_pending_subsurface_state(client_id, parent_id)?;
+        let children = self
+            .surfaces
+            .get(&(client_id, parent_id))
+            .ok_or(SurfaceError::UnknownSurface)?
+            .current_children
+            .clone();
+
+        let mut commits = Vec::new();
+        for child_id in children {
+            let has_cache = self
+                .surfaces
+                .get(&(client_id, child_id))
+                .is_some_and(|surface| surface.cache.is_some());
+            if has_cache {
+                commits.push(self.apply_commit(client_id, child_id)?);
+            }
+            commits.extend(self.apply_synchronized_children(client_id, child_id)?);
+        }
+        Ok(commits)
+    }
+
+    fn apply_pending_subsurface_state(
+        &mut self,
+        client_id: ClientId,
+        parent_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let children = {
+            let parent = self
+                .surfaces
+                .get_mut(&(client_id, parent_id))
+                .ok_or(SurfaceError::UnknownSurface)?;
+            if let Some(pending) = parent.pending_children.take() {
+                parent.current_children = pending;
+            }
+            parent.current_children.clone()
+        };
+        for child_id in children {
+            let Some(Role::Subsurface(sub_id)) = self
+                .surfaces
+                .get(&(client_id, child_id))
+                .and_then(|surface| surface.role)
+            else {
+                continue;
+            };
+            if let Some(sub) = self.subsurfaces.get_mut(&(client_id, sub_id))
+                && let Some(position) = sub.pending_position.take()
+            {
+                sub.current_position = position;
+            }
+        }
+        Ok(())
+    }
+
+    fn presentation_offset(&self, client_id: ClientId, surface: &Surface) -> (i32, i32) {
+        if let Some(Role::Subsurface(sub_id)) = surface.role
+            && let Some(sub) = self.subsurfaces.get(&(client_id, sub_id))
+        {
+            return sub.current_position;
+        }
+        surface.current.offset
+    }
+
+    fn is_mapped(&self, client_id: ClientId, id: ObjectId) -> Result<bool, SurfaceError> {
+        let surface = self
+            .surfaces
+            .get(&(client_id, id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        if surface.current.buffer.is_none() {
+            return Ok(false);
+        }
+        match surface.role {
+            Some(Role::Shell(_)) => Ok(matches!(
+                surface.shell.mode,
+                ShellMode::Toplevel
+                    | ShellMode::Transient
+                    | ShellMode::Fullscreen
+                    | ShellMode::Popup
+                    | ShellMode::Maximized
+            )),
+            Some(Role::Subsurface(sub_id)) => {
+                let parent = self
+                    .subsurfaces
+                    .get(&(client_id, sub_id))
+                    .ok_or(SurfaceError::UnknownSubsurface)?
+                    .parent;
+                self.is_mapped(client_id, parent)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn is_effectively_synchronized(&self, client_id: ClientId, id: ObjectId) -> bool {
+        let Some(surface) = self.surfaces.get(&(client_id, id)) else {
+            return false;
+        };
+        let Some(Role::Subsurface(sub_id)) = surface.role else {
+            return false;
+        };
+        let Some(sub) = self.subsurfaces.get(&(client_id, sub_id)) else {
+            return false;
+        };
+        if sub.sync {
+            return true;
+        }
+        self.is_effectively_synchronized(client_id, sub.parent)
+    }
+
+    fn would_create_cycle(
+        &self,
+        client_id: ClientId,
+        surface: ObjectId,
+        parent: ObjectId,
+    ) -> bool {
+        let mut current = parent;
+        loop {
+            if current == surface {
+                return true;
+            }
+            let Some(surf) = self.surfaces.get(&(client_id, current)) else {
+                return false;
+            };
+            let Some(Role::Subsurface(sub_id)) = surf.role else {
+                return false;
+            };
+            let Some(sub) = self.subsurfaces.get(&(client_id, sub_id)) else {
+                return false;
+            };
+            current = sub.parent;
+        }
+    }
+
+    fn remove_child_from_parent(
+        &mut self,
+        client_id: ClientId,
+        parent: ObjectId,
+        child: ObjectId,
+    ) {
+        if let Some(parent_surface) = self.surfaces.get_mut(&(client_id, parent)) {
+            parent_surface.current_children.retain(|id| *id != child);
+            if let Some(pending) = parent_surface.pending_children.as_mut() {
+                pending.retain(|id| *id != child);
+            }
+        }
+    }
+
+    fn restack(
+        &mut self,
+        client_id: ClientId,
+        subsurface_id: ObjectId,
+        sibling: ObjectId,
+        mode: Restack,
+    ) -> Result<(), SurfaceError> {
+        let sub = self
+            .subsurfaces
+            .get(&(client_id, subsurface_id))
+            .ok_or(SurfaceError::UnknownSubsurface)?;
+        let parent = sub.parent;
+        let surface = sub.surface;
+        if sibling != parent {
+            let sibling_is_valid = self
+                .surfaces
+                .get(&(client_id, parent))
+                .is_some_and(|parent_surface| {
+                    let stack = parent_surface
+                        .pending_children
+                        .as_ref()
+                        .unwrap_or(&parent_surface.current_children);
+                    stack.contains(&sibling)
+                });
+            if !sibling_is_valid {
+                return Err(SurfaceError::BadSurface);
+            }
+        }
+        if sibling == surface {
+            return Err(SurfaceError::BadSurface);
+        }
+
+        let parent_surface = self
+            .surfaces
+            .get_mut(&(client_id, parent))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        let pending = parent_surface
+            .pending_children
+            .get_or_insert_with(|| parent_surface.current_children.clone());
+        pending.retain(|id| *id != surface);
+        let insert_at = if sibling == parent {
+            match mode {
+                Restack::Above => 0,
+                Restack::Below => 0,
+            }
+        } else {
+            let sibling_index = pending
+                .iter()
+                .position(|id| *id == sibling)
+                .ok_or(SurfaceError::BadSurface)?;
+            match mode {
+                Restack::Above => sibling_index + 1,
+                Restack::Below => sibling_index,
+            }
+        };
+        pending.insert(insert_at, surface);
+        Ok(())
     }
 
     fn copy_region(
@@ -483,31 +975,45 @@ impl SurfaceManager {
     }
 }
 
+fn merge_pending(cache: &mut PendingState, mut pending: PendingState) {
+    if let Some(buffer) = pending.buffer.take() {
+        cache.buffer = Some(buffer);
+    }
+    if let Some(offset) = pending.offset.take() {
+        cache.offset = Some(offset);
+    }
+    if let Some(region) = pending.opaque_region.take() {
+        cache.opaque_region = Some(region);
+    }
+    if let Some(region) = pending.input_region.take() {
+        cache.input_region = Some(region);
+    }
+    if let Some(scale) = pending.buffer_scale.take() {
+        cache.buffer_scale = Some(scale);
+    }
+    if let Some(transform) = pending.buffer_transform.take() {
+        cache.buffer_transform = Some(transform);
+    }
+    cache.damage.append(&mut pending.damage);
+    cache.buffer_damage.append(&mut pending.buffer_damage);
+    cache.frame_callbacks.append(&mut pending.frame_callbacks);
+}
+
 #[derive(Debug, Default)]
 struct Surface {
     role: Option<Role>,
     shell: ShellState,
     current: SurfaceState,
     pending: PendingState,
-}
-
-impl Surface {
-    fn is_mapped(&self) -> bool {
-        self.current.buffer.is_some()
-            && matches!(
-                self.shell.mode,
-                ShellMode::Toplevel
-                    | ShellMode::Transient
-                    | ShellMode::Fullscreen
-                    | ShellMode::Popup
-                    | ShellMode::Maximized
-            )
-    }
+    cache: Option<PendingState>,
+    current_children: Vec<ObjectId>,
+    pending_children: Option<Vec<ObjectId>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     Shell(ObjectId),
+    Subsurface(ObjectId),
 }
 
 #[derive(Debug)]
@@ -571,6 +1077,21 @@ struct PendingState {
     frame_callbacks: Vec<ObjectId>,
     opaque_region: Option<Option<Region>>,
     input_region: Option<Option<Region>>,
+}
+
+#[derive(Debug)]
+struct SubsurfaceState {
+    parent: ObjectId,
+    surface: ObjectId,
+    sync: bool,
+    current_position: (i32, i32),
+    pending_position: Option<(i32, i32)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Restack {
+    Above,
+    Below,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -641,7 +1162,7 @@ mod tests {
             .add_frame_callback(client(1), object(2), object(5))
             .unwrap();
 
-        let commit = manager.commit(client(1), object(2)).unwrap();
+        let commit = manager.commit(client(1), object(2)).unwrap().primary;
 
         assert_eq!(commit.buffer, Some(object(4)));
         assert_eq!(commit.attached_buffer, Some(Some(object(4))));
@@ -661,7 +1182,7 @@ mod tests {
                 height: 1,
             }]
         );
-        let second = manager.commit(client(1), object(2)).unwrap();
+        let second = manager.commit(client(1), object(2)).unwrap().primary;
         assert_eq!(second.buffer, Some(object(4)));
         assert_eq!(second.attached_buffer, None);
         assert!(!second.newly_mapped);
@@ -683,7 +1204,7 @@ mod tests {
         manager
             .attach(client(1), object(2), Some(object(4)), 0, 0, 5)
             .unwrap();
-        let commit = manager.commit(client(1), object(2)).unwrap();
+        let commit = manager.commit(client(1), object(2)).unwrap().primary;
         assert_eq!(commit.offset, (1, 2));
     }
 
@@ -700,7 +1221,7 @@ mod tests {
         manager
             .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
             .unwrap();
-        let commit = manager.commit(client(1), object(2)).unwrap();
+        let commit = manager.commit(client(1), object(2)).unwrap().primary;
         assert!(commit.mapped);
         assert!(commit.newly_mapped);
     }
@@ -739,10 +1260,10 @@ mod tests {
         manager
             .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
             .unwrap();
-        assert!(manager.commit(client(1), object(2)).unwrap().mapped);
+        assert!(manager.commit(client(1), object(2)).unwrap().primary.mapped);
 
         manager.attach(client(1), object(2), None, 0, 0, 1).unwrap();
-        let commit = manager.commit(client(1), object(2)).unwrap();
+        let commit = manager.commit(client(1), object(2)).unwrap().primary;
         assert_eq!(commit.buffer, None);
         assert!(!commit.mapped);
     }
@@ -759,6 +1280,144 @@ mod tests {
                 .create_shell_surface(client(1), object(4), object(2))
                 .unwrap_err(),
             SurfaceError::RoleAlreadyAssigned
+        );
+    }
+
+    #[test]
+    fn subsurface_role_conflicts_with_shell() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(3));
+        manager
+            .create_shell_surface(client(1), object(4), object(2))
+            .unwrap();
+        assert_eq!(
+            manager
+                .create_subsurface(client(1), object(5), object(2), object(3))
+                .unwrap_err(),
+            SurfaceError::BadSurface
+        );
+        manager
+            .create_subsurface(client(1), object(5), object(3), object(2))
+            .unwrap();
+        assert_eq!(
+            manager
+                .create_shell_surface(client(1), object(6), object(3))
+                .unwrap_err(),
+            SurfaceError::RoleAlreadyAssigned
+        );
+    }
+
+    #[test]
+    fn sync_subsurface_commit_is_deferred_until_parent_commit() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(3));
+        manager
+            .create_shell_surface(client(1), object(4), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(4), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .create_subsurface(client(1), object(5), object(3), object(2))
+            .unwrap();
+
+        manager
+            .attach(client(1), object(3), Some(object(6)), 0, 0, 1)
+            .unwrap();
+        manager
+            .add_frame_callback(client(1), object(3), object(7))
+            .unwrap();
+        let child = manager.commit(client(1), object(3)).unwrap();
+        assert_eq!(child.primary.attached_buffer, None);
+        assert!(child.primary.frame_callbacks.is_empty());
+        assert!(child.synchronized_children.is_empty());
+        assert!(!child.primary.mapped);
+
+        manager
+            .attach(client(1), object(2), Some(object(8)), 0, 0, 1)
+            .unwrap();
+        let parent = manager.commit(client(1), object(2)).unwrap();
+        assert!(parent.primary.mapped);
+        assert_eq!(parent.synchronized_children.len(), 1);
+        let child_commit = &parent.synchronized_children[0];
+        assert_eq!(child_commit.surface_id, object(3));
+        assert_eq!(child_commit.attached_buffer, Some(Some(object(6))));
+        assert_eq!(child_commit.frame_callbacks, [object(7)]);
+        assert!(child_commit.mapped);
+        assert!(child_commit.newly_mapped);
+    }
+
+    #[test]
+    fn desync_subsurface_commits_independently() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(3));
+        manager
+            .create_shell_surface(client(1), object(4), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(4), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .create_subsurface(client(1), object(5), object(3), object(2))
+            .unwrap();
+        manager.set_desync(client(1), object(5)).unwrap();
+
+        manager
+            .attach(client(1), object(2), Some(object(8)), 0, 0, 1)
+            .unwrap();
+        assert!(manager.commit(client(1), object(2)).unwrap().primary.mapped);
+
+        manager
+            .attach(client(1), object(3), Some(object(6)), 0, 0, 1)
+            .unwrap();
+        manager
+            .add_frame_callback(client(1), object(3), object(7))
+            .unwrap();
+        let child = manager.commit(client(1), object(3)).unwrap();
+        assert_eq!(child.primary.attached_buffer, Some(Some(object(6))));
+        assert_eq!(child.primary.frame_callbacks, [object(7)]);
+        assert!(child.primary.mapped);
+        assert!(child.synchronized_children.is_empty());
+    }
+
+    #[test]
+    fn set_position_is_applied_on_parent_commit() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(3));
+        manager
+            .create_shell_surface(client(1), object(4), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(4), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .create_subsurface(client(1), object(5), object(3), object(2))
+            .unwrap();
+        manager
+            .set_position(client(1), object(5), 12, 34)
+            .unwrap();
+
+        manager
+            .attach(client(1), object(3), Some(object(6)), 0, 0, 1)
+            .unwrap();
+        manager.commit(client(1), object(3)).unwrap();
+
+        manager
+            .attach(client(1), object(2), Some(object(8)), 0, 0, 1)
+            .unwrap();
+        let parent = manager.commit(client(1), object(2)).unwrap();
+        assert_eq!(parent.synchronized_children[0].offset, (12, 34));
+        assert_eq!(
+            manager
+                .subsurfaces
+                .get(&(client(1), object(5)))
+                .unwrap()
+                .current_position,
+            (12, 34)
         );
     }
 
