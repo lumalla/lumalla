@@ -46,8 +46,26 @@
           LIBRARY_PATH = "${pkgs.libgbm}/lib";
           RUSTFLAGS = "-L ${pkgs.libgbm}/lib -L ${pkgs.libdrm}/lib";
         };
+
+        runLocal = pkgs.writeShellApplication {
+          name = "lumalla-run-local";
+          runtimeInputs = with pkgs; [
+            cargo
+            rustc
+            pkg-config
+            clang
+            libclang
+          ];
+          text = builtins.readFile ./run-local.sh;
+        };
       in {
         packages.default = naersk'.buildPackage commonBuildArgs;
+        packages.run-local = runLocal;
+
+        apps.run-local = {
+          type = "app";
+          program = "${runLocal}/bin/lumalla-run-local";
+        };
 
         checks.default = naersk'.buildPackage (commonBuildArgs
           // {
@@ -74,6 +92,7 @@
             clang
             libclang
             libdrm.dev
+            runLocal
           ];
           buildInputs = with pkgs; [
             seatd
