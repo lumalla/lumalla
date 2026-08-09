@@ -160,6 +160,18 @@ impl RendererState {
         }
     }
 
+    /// Geometry of the first enabled present target, if DRM outputs are resolvable.
+    pub fn primary_output_geometry(&self) -> Option<(String, i32, i32, i32)> {
+        let target = self.collect_present_targets().into_iter().next()?;
+        let refresh_mhz = (target.output.mode.refresh_hz() as i32).saturating_mul(1000);
+        Some((
+            target.connector_name,
+            target.output.mode.width() as i32,
+            target.output.mode.height() as i32,
+            refresh_mhz.max(60_000),
+        ))
+    }
+
     /// Open missing DRM devices via the seat (fresh open after VT resume).
     pub fn activate_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
         self.drm_devices.activate(seat)

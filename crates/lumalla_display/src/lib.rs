@@ -289,6 +289,17 @@ impl DisplayState {
         }
     }
 
+    /// Updates the primary `wl_output` geometry (e.g. from DRM mode) and notifies binders.
+    pub fn update_primary_output(
+        &mut self,
+        info: OutputInfo,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) {
+        if let Some(global_id) = self.output_manager.primary_global_id() {
+            self.output_manager.update_output(global_id, info, clients);
+        }
+    }
+
     pub fn add_output<'connection>(
         &mut self,
         info: OutputInfo,

@@ -177,6 +177,50 @@ impl OutputManager {
         }
     }
 
+    pub fn primary_global_id(&self) -> Option<GlobalId> {
+        self.outputs.keys().copied().min()
+    }
+
+    pub fn update_output(
+        &mut self,
+        global_id: GlobalId,
+        info: OutputInfo,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) -> bool {
+        if !self.outputs.contains_key(&global_id) {
+            return false;
+        }
+        self.outputs.insert(global_id, info.clone());
+        for ((client_id, object_id), bound_global) in &self.bindings {
+            if *bound_global != global_id {
+                continue;
+            }
+            let Some(client) = clients.get_mut(client_id) else {
+                continue;
+            };
+            let (registry, writer) = client.registry_and_writer_mut();
+            let version = registry
+                .object_metadata(*object_id)
+                .map(|meta| meta.version)
+                .unwrap_or(1);
+            Self::send_events(writer, *object_id, version, &info);
+        }
+        true
+    }
+
+    /// Bound wl_output object ids for a client, sorted.
+    pub fn bound_outputs_for_client(&self, client_id: ClientId) -> Vec<ObjectId> {
+        let mut ids: Vec<ObjectId> = self
+            .client_bindings
+            .get(&client_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        ids.sort_by_key(|id| id.get());
+        ids
+    }
+
     pub fn remove_client(&mut self, client_id: ClientId) {
         if let Some(ids) = self.client_bindings.remove(&client_id) {
             for object_id in ids {

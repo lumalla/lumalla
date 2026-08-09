@@ -193,6 +193,14 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                     commit.surface_id,
                     ctx.writer,
                 );
+                for output in state
+                    .output_manager
+                    .bound_outputs_for_client(ctx.client_id)
+                {
+                    ctx.writer
+                        .wl_surface_enter(commit.surface_id)
+                        .output(output);
+                }
             }
         }
         ctx.writer.wl_buffer_release(buffer_id);
@@ -211,6 +219,14 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
             client_id: ctx.client_id,
             surface_id: commit.surface_id,
         });
+        for output in state
+            .output_manager
+            .bound_outputs_for_client(ctx.client_id)
+        {
+            ctx.writer
+                .wl_surface_leave(commit.surface_id)
+                .output(output);
+        }
     }
 
     for callback in commit.frame_callbacks {
@@ -915,6 +931,12 @@ impl WlSurface for DisplayState {
                     ctx.registry.free_object(subsurface_id, ctx.writer);
                 }
                 if destroyed.was_mapped {
+                    for output in self
+                        .output_manager
+                        .bound_outputs_for_client(ctx.client_id)
+                    {
+                        ctx.writer.wl_surface_leave(object_id).output(output);
+                    }
                     self.surface_updates.push_back(SurfaceUpdate::Unmapped {
                         client_id: ctx.client_id,
                         surface_id: object_id,

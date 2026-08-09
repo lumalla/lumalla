@@ -12,8 +12,8 @@ use anyhow::Context;
 use log::{debug, error, info, warn};
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::{
-    ClientConnection, ClientId, DisplayState, KeyboardModifiers, SurfaceUpdate, Wayland,
-    create_wayland_display,
+    ClientConnection, ClientId, DisplayState, KeyboardModifiers, OutputInfo, SurfaceUpdate,
+    Wayland, create_wayland_display,
 };
 use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
 use lumalla_renderer::{RendererState, SOLID_CLEAR_COLOR, SurfaceFrame};
@@ -257,6 +257,7 @@ impl AppData {
                                     error!("Unable to reconcile DRM devices: {err}");
                                 }
                             }
+                            self.sync_wayland_output_from_drm();
                             if let Err(err) = self
                                 .renderer_state
                                 .present_enabled_outputs(SOLID_CLEAR_COLOR)
@@ -311,6 +312,7 @@ impl AppData {
                     {
                         error!("Unable to activate DRM devices: {err}");
                     } else {
+                        self.sync_wayland_output_from_drm();
                         self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                             self.renderer_state.drm_device_states(),
                         ));
@@ -462,6 +464,28 @@ impl AppData {
             debug!("Received message for unknown client {:?}", client_id);
         }
         Ok(())
+    }
+
+    fn sync_wayland_output_from_drm(&mut self) {
+        let Some((name, width, height, refresh_mhz)) =
+            self.renderer_state.primary_output_geometry()
+        else {
+            return;
+        };
+        let info = OutputInfo {
+            name: name.clone(),
+            description: format!("Lumalla output {name}"),
+            x: 0,
+            y: 0,
+            physical_width_mm: 300,
+            physical_height_mm: 200,
+            width,
+            height,
+            refresh_mhz,
+            scale: 1,
+        };
+        self.display_state
+            .update_primary_output(info, &mut self.connected_clients);
     }
 
     fn submit_committed_frames(&mut self) {
