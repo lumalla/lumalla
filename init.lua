@@ -90,4 +90,5 @@ end)
 
 lum.on_startup(function()
 	enable_all_outputs(lum.get_drm_devices())
+	lum.spawn({ command = "qalculate-qt" })
 end)

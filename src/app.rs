@@ -614,6 +614,8 @@ pub(crate) fn run_app(
         init_and_register_input_state(comms.clone(), &mut main_event_loop, seat_state.as_ref())?;
     let wayland =
         init_and_register_wayland_display(args.socket_path.clone(), &mut main_event_loop)?;
+    let wayland_display = wayland_display_env(wayland.socket_path())?;
+    comms.dbus(DbusMessage::SetWaylandDisplay(wayland_display.clone()));
     let mut display_state = DisplayState::new(comms.clone())?;
     match input_state.keymap_memfd() {
         Ok(keymap) => {
@@ -632,7 +634,7 @@ pub(crate) fn run_app(
     comms.dbus(DbusMessage::SetDrmDevices(
         renderer_state.drm_device_states(),
     ));
-    let startup_child = spawn_startup_command(&args.startup_command, wayland.socket_path())?;
+    let startup_child = spawn_startup_command(&args.startup_command, &wayland_display)?;
     let mut data = AppData::new(
         comms.clone(),
         config_child,
@@ -647,25 +649,29 @@ pub(crate) fn run_app(
     data.run_event_loop(&mut main_event_loop, main_channel)
 }
 
+fn wayland_display_env(wayland_socket: &str) -> anyhow::Result<String> {
+    let wayland_display = if wayland_socket.starts_with('/') {
+        wayland_socket.to_owned()
+    } else {
+        std::env::current_dir()?
+            .join(wayland_socket)
+            .to_string_lossy()
+            .into_owned()
+    };
+    Ok(wayland_display)
+}
+
 fn spawn_startup_command(
     startup_command: &[String],
-    wayland_socket: &str,
+    wayland_display: &str,
 ) -> anyhow::Result<Option<Child>> {
     let Some((program, program_args)) = startup_command.split_first() else {
         return Ok(None);
     };
-    let wayland_display = if wayland_socket.starts_with('/') {
-        wayland_socket.into()
-    } else {
-        std::env::current_dir()?.join(wayland_socket)
-    };
-    info!(
-        "Spawning startup command `{program}` with WAYLAND_DISPLAY={}",
-        wayland_display.display()
-    );
+    info!("Spawning startup command `{program}` with WAYLAND_DISPLAY={wayland_display}");
     let child = Command::new(program)
         .args(program_args)
-        .env("WAYLAND_DISPLAY", &wayland_display)
+        .env("WAYLAND_DISPLAY", wayland_display)
         .spawn()
         .with_context(|| format!("Failed to spawn startup command `{program}`"))?;
     Ok(Some(child))

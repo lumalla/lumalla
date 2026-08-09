@@ -17,4 +17,6 @@ pub enum DbusMessage {
     EmitDrmDevicesChanged(Vec<DrmDeviceState>),
     /// Broadcast that a custom key binding was activated.
     EmitBindingActivated(String),
+    /// Set `WAYLAND_DISPLAY` used for processes spawned over D-Bus.
+    SetWaylandDisplay(String),
 }

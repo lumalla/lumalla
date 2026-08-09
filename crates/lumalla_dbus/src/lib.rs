@@ -28,6 +28,7 @@ pub struct DbusService {
     outputs: Arc<Mutex<Vec<OutputInfo>>>,
     output_lookup: Arc<Mutex<HashMap<String, Output>>>,
     drm_devices: Arc<Mutex<Vec<DrmDeviceInfo>>>,
+    wayland_display: Arc<Mutex<Option<String>>>,
 }
 
 impl DbusService {
@@ -36,11 +37,13 @@ impl DbusService {
         let outputs = Arc::new(Mutex::new(Vec::new()));
         let output_lookup = Arc::new(Mutex::new(HashMap::new()));
         let drm_devices = Arc::new(Mutex::new(Vec::new()));
+        let wayland_display = Arc::new(Mutex::new(None));
         let state = Arc::new(ServiceState {
             comms: comms.clone(),
             outputs: Arc::clone(&outputs),
             output_lookup: Arc::clone(&output_lookup),
             drm_devices: Arc::clone(&drm_devices),
+            wayland_display: Arc::clone(&wayland_display),
             extra_env: Arc::new(Mutex::new(HashMap::new())),
             keymaps: Arc::new(Mutex::new(Vec::new())),
         });
@@ -72,6 +75,7 @@ impl DbusService {
             outputs,
             output_lookup,
             drm_devices,
+            wayland_display,
         })
     }
 
@@ -89,6 +93,7 @@ struct DbusState {
     outputs: Arc<Mutex<Vec<OutputInfo>>>,
     output_lookup: Arc<Mutex<HashMap<String, Output>>>,
     drm_devices: Arc<Mutex<Vec<DrmDeviceInfo>>>,
+    wayland_display: Arc<Mutex<Option<String>>>,
 }
 
 impl DbusState {
@@ -101,6 +106,7 @@ impl DbusState {
             outputs: service.outputs,
             output_lookup: service.output_lookup,
             drm_devices: service.drm_devices,
+            wayland_display: service.wayland_display,
         }
     }
 
@@ -160,6 +166,10 @@ impl DbusState {
                     signals::BINDING_ACTIVATED,
                     &(&binding_id,),
                 )?;
+            }
+            DbusMessage::SetWaylandDisplay(wayland_display) => {
+                info!("Setting WAYLAND_DISPLAY for D-Bus spawns to {wayland_display}");
+                *self.wayland_display.lock().unwrap() = Some(wayland_display);
             }
         }
 

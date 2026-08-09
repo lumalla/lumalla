@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use log::{error, info};
+use log::{error, info, warn};
 use lumalla_ipc::{
     INTERFACE_NAME, KeyBindingInfo, OBJECT_PATH, WindowManagerHandler,
     types::{
@@ -41,6 +41,7 @@ pub(crate) struct ServiceState {
     pub outputs: Arc<Mutex<Vec<OutputInfo>>>,
     pub output_lookup: Arc<Mutex<HashMap<String, Output>>>,
     pub drm_devices: Arc<Mutex<Vec<DrmDeviceInfo>>>,
+    pub wayland_display: Arc<Mutex<Option<String>>>,
     pub extra_env: Arc<Mutex<HashMap<String, String>>>,
     pub keymaps: Arc<Mutex<Vec<KeyBindingInfo>>>,
 }
@@ -178,7 +179,12 @@ impl WindowManagerHandler for CompositorHandler {
     }
 
     fn spawn(&mut self, command: &str, args: Vec<String>) -> zbus::fdo::Result<()> {
-        spawn_process(command, &args, &self.state.extra_env);
+        spawn_process(
+            command,
+            &args,
+            &self.state.wayland_display,
+            &self.state.extra_env,
+        );
         Ok(())
     }
 
@@ -242,13 +248,22 @@ impl WindowManagerHandler for CompositorHandler {
     }
 }
 
-fn spawn_process(command: &str, args: &[String], extra_env: &Arc<Mutex<HashMap<String, String>>>) {
+fn spawn_process(
+    command: &str,
+    args: &[String],
+    wayland_display: &Arc<Mutex<Option<String>>>,
+    extra_env: &Arc<Mutex<HashMap<String, String>>>,
+) {
     info!("Starting program: {command} {args:?}");
-    if let Err(e) = Command::new(command)
-        .args(args)
-        .envs(extra_env.lock().unwrap().iter())
-        .spawn()
-    {
+    let mut cmd = Command::new(command);
+    cmd.args(args).envs(extra_env.lock().unwrap().iter());
+    if let Some(wayland_display) = wayland_display.lock().unwrap().as_ref() {
+        info!("Spawning `{command}` with WAYLAND_DISPLAY={wayland_display}");
+        cmd.env("WAYLAND_DISPLAY", wayland_display);
+    } else {
+        warn!("Spawning `{command}` without WAYLAND_DISPLAY; client may connect to the wrong compositor");
+    }
+    if let Err(e) = cmd.spawn() {
         error!("Failed to start program {command}: {e}");
     }
 }
