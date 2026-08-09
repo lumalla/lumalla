@@ -8,7 +8,9 @@ use crate::{
     NewObjectId, ObjectId,
     buffer::{MessageHeader, Writer},
     client::Ctx,
-    protocols::{WaylandProtocol, WlDisplay, wayland::*},
+    protocols::{
+        WaylandProtocol, WlDisplay, XdgShellProtocol, wayland::*, xdg_shell::*,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,6 +38,11 @@ pub enum InterfaceIndex {
     WlSubcompositor,
     WlSubsurface,
     WlFixes,
+    XdgWmBase,
+    XdgPositioner,
+    XdgSurface,
+    XdgToplevel,
+    XdgPopup,
 }
 
 impl InterfaceIndex {
@@ -64,6 +71,11 @@ impl InterfaceIndex {
             InterfaceIndex::WlSubcompositor => WL_SUBCOMPOSITOR_NAME,
             InterfaceIndex::WlSubsurface => WL_SUBSURFACE_NAME,
             InterfaceIndex::WlFixes => WL_FIXES_NAME,
+            InterfaceIndex::XdgWmBase => XDG_WM_BASE_NAME,
+            InterfaceIndex::XdgPositioner => XDG_POSITIONER_NAME,
+            InterfaceIndex::XdgSurface => XDG_SURFACE_NAME,
+            InterfaceIndex::XdgToplevel => XDG_TOPLEVEL_NAME,
+            InterfaceIndex::XdgPopup => XDG_POPUP_NAME,
         }
     }
 
@@ -92,6 +104,11 @@ impl InterfaceIndex {
             InterfaceIndex::WlSubcompositor => WL_SUBCOMPOSITOR_VERSION,
             InterfaceIndex::WlSubsurface => WL_SUBSURFACE_VERSION,
             InterfaceIndex::WlFixes => WL_FIXES_VERSION,
+            InterfaceIndex::XdgWmBase => XDG_WM_BASE_VERSION,
+            InterfaceIndex::XdgPositioner => XDG_POSITIONER_VERSION,
+            InterfaceIndex::XdgSurface => XDG_SURFACE_VERSION,
+            InterfaceIndex::XdgToplevel => XDG_TOPLEVEL_VERSION,
+            InterfaceIndex::XdgPopup => XDG_POPUP_VERSION,
         }
     }
 }
@@ -256,7 +273,7 @@ pub trait RequestHandler {
 
 impl<T> RequestHandler for T
 where
-    T: WaylandProtocol,
+    T: WaylandProtocol + XdgShellProtocol,
 {
     fn handle_request(
         &mut self,
@@ -336,6 +353,21 @@ where
             }
             InterfaceIndex::WlFixes => {
                 WlFixes::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::XdgWmBase => {
+                XdgWmBase::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::XdgPositioner => {
+                XdgPositioner::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::XdgSurface => {
+                XdgSurface::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::XdgToplevel => {
+                XdgToplevel::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::XdgPopup => {
+                XdgPopup::handle_request(self, ctx, header, data, fds, object.version)
             }
         }
     }

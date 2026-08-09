@@ -64,7 +64,7 @@ pub struct RequestArg {
     #[serde(rename = "@interface")]
     pub interface: Option<String>,
     #[serde(rename = "@summary")]
-    pub summary: String,
+    pub summary: Option<String>,
     #[serde(rename = "@enum")]
     pub arg_enum: Option<String>,
     #[serde(rename = "@allow-null")]
@@ -102,7 +102,7 @@ pub struct EventArg {
     #[serde(rename = "@type")]
     pub arg_type: String,
     #[serde(rename = "@summary")]
-    pub summary: String,
+    pub summary: Option<String>,
     #[serde(rename = "@enum")]
     pub arg_enum: Option<String>,
     #[serde(rename = "@allow-null")]
@@ -143,4 +143,5 @@ pub struct Entry {
     pub summary: Option<String>,
     #[serde(rename = "@since")]
     pub since: Option<String>,
+    pub description: Option<EnumDescription>,
 }

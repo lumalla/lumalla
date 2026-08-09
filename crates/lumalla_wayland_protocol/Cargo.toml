@@ -6,6 +6,7 @@ description = "Wayland protocol implementation for lumalla"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumalla/lumalla"
 include = ["src/**/*", "LICENSE-*"]
+# XML protocol definitions live under src/protocols/*.xml and are included via src/**/*
 
 [dependencies]
 mio = { workspace = true }

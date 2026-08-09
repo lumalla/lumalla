@@ -6,7 +6,7 @@ use lumalla_wayland_protocol::registry::InterfaceIndex;
 
 use crate::{
     data_device::DataDeviceManager, output::OutputManager, seat::SeatManager, shm::ShmManager,
-    surface::SurfaceManager,
+    surface::SurfaceManager, xdg::XdgManager,
 };
 
 mod data_device;
@@ -15,6 +15,7 @@ mod seat;
 mod shm;
 mod surface;
 mod output;
+mod xdg;
 
 pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland};
 pub use seat::KeyboardModifiers;
@@ -55,6 +56,7 @@ pub struct DisplayState {
     seat_manager: SeatManager,
     output_manager: OutputManager,
     data_device_manager: DataDeviceManager,
+    xdg_manager: XdgManager,
     surface_updates: VecDeque<SurfaceUpdate>,
 }
 
@@ -68,6 +70,7 @@ impl DisplayState {
             seat_manager: SeatManager::default(),
             output_manager: OutputManager::default(),
             data_device_manager: DataDeviceManager::default(),
+            xdg_manager: XdgManager::default(),
             surface_updates: VecDeque::new(),
         })
     }
@@ -249,6 +252,7 @@ impl DisplayState {
         self.seat_manager.remove_client(client_id);
         self.output_manager.remove_client(client_id);
         self.data_device_manager.remove_client(client_id);
+        self.xdg_manager.delete_client(client_id);
         self.surface_updates.retain(|update| match update {
             SurfaceUpdate::Frame(frame) => frame.client_id != client_id,
             SurfaceUpdate::Unmapped {
@@ -337,6 +341,7 @@ impl Default for Globals {
         globals.register_version(InterfaceIndex::WlSubcompositor, 1, [].into_iter());
         globals.register_version(InterfaceIndex::WlFixes, 1, [].into_iter());
         globals.register_version(InterfaceIndex::WlDataDeviceManager, 3, [].into_iter());
+        globals.register_version(InterfaceIndex::XdgWmBase, 1, [].into_iter());
         globals
     }
 }

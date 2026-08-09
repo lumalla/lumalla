@@ -187,12 +187,12 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                             .wl_shell_surface_ping(shell_id)
                             .serial(serial);
                     }
-                    state.seat_manager.focus_keyboards_on_surface(
-                        ctx.client_id,
-                        commit.surface_id,
-                        ctx.writer,
-                    );
                 }
+                state.seat_manager.focus_keyboards_on_surface(
+                    ctx.client_id,
+                    commit.surface_id,
+                    ctx.writer,
+                );
             }
         }
         ctx.writer.wl_buffer_release(buffer_id);
@@ -305,6 +305,9 @@ impl WlRegistry for DisplayState {
                 ) {
                     debug!("Failed to bind unknown wl_output global {global_id}");
                 }
+            }
+            _ if interface_name == InterfaceIndex::XdgWmBase.interface_name() => {
+                self.xdg_manager.create_wm_base(ctx.client_id, *id);
             }
             _ => {}
         }
@@ -898,6 +901,12 @@ impl WlSurface for DisplayState {
                 if let Some(shell_id) = destroyed.shell_id {
                     ctx.registry.free_object(shell_id, ctx.writer);
                 }
+                if let Some(xdg_surface_id) = destroyed.xdg_surface_id {
+                    let _ = self
+                        .xdg_manager
+                        .destroy_xdg_surface(ctx.client_id, xdg_surface_id);
+                    ctx.registry.free_object(xdg_surface_id, ctx.writer);
+                }
                 if let Some(subsurface_id) = destroyed.subsurface_id {
                     ctx.registry.free_object(subsurface_id, ctx.writer);
                 }
@@ -1022,6 +1031,17 @@ impl WlSurface for DisplayState {
             }
         };
 
+        let attaching_buffer = matches!(result.primary.attached_buffer, Some(Some(_)));
+        if attaching_buffer
+            && let Err(error) =
+                self.xdg_manager
+                    .check_buffer_commit(ctx.client_id, object_id, true)
+        {
+            crate::protocols::xdg_shell::report_commit_error(ctx, object_id, error);
+            return;
+        }
+
+        crate::protocols::xdg_shell::on_xdg_surface_commit(self, ctx.client_id, object_id);
         process_surface_commit(self, ctx, result.primary);
         for child in result.synchronized_children {
             process_surface_commit(self, ctx, child);
@@ -1571,6 +1591,10 @@ mod tests {
             !globals.iter().any(|(name, _)| *name == WL_OUTPUT_NAME),
             "wl_output globals are config-owned and must not be advertised by default"
         );
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::xdg_shell::XDG_WM_BASE_NAME,
+            1
+        )));
     }
 
     #[test]
@@ -1844,5 +1868,89 @@ mod tests {
         assert_eq!(frame.pixels, [1, 2, 3, 0xff]);
         assert_eq!((frame.width, frame.height, frame.stride), (1, 1, 4));
         assert_eq!(frame.format, WL_SHM_FORMAT_XRGB8888);
+    }
+
+    #[test]
+    fn wire_client_can_commit_an_xdg_shm_toplevel() {
+        use lumalla_wayland_protocol::protocols::xdg_shell::{
+            XDG_SURFACE_ACK_CONFIGURE_OPCODE, XDG_SURFACE_GET_TOPLEVEL_OPCODE,
+            XDG_WM_BASE_GET_XDG_SURFACE_OPCODE, XDG_WM_BASE_NAME,
+        };
+
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(100);
+        let socket_path = std::env::temp_dir().join(format!(
+            "lumalla-xdg-test-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut wayland =
+            lumalla_wayland_protocol::Wayland::new(socket_path.to_string_lossy().into_owned())
+                .unwrap();
+        let mut client_stream = UnixStream::connect(&socket_path).unwrap();
+        let mut client = wayland.next_client().unwrap();
+        let mut state = display_state();
+
+        // Discover xdg_wm_base global name from state.
+        let xdg_global = state
+            .globals
+            .iter()
+            .find(|(_, g)| g.name == XDG_WM_BASE_NAME)
+            .map(|(id, _)| *id)
+            .expect("xdg_wm_base global");
+
+        let mut wire = Vec::new();
+        wire.extend(wire_message(1, WL_DISPLAY_GET_REGISTRY_OPCODE, &[2]));
+        wire.extend(wire_bind(1, "wl_compositor", 3));
+        wire.extend(wire_bind(2, "wl_shm", 4));
+        // Bind xdg_wm_base as object 5
+        {
+            let mut data = bind_data(xdg_global, XDG_WM_BASE_NAME, 1, 5);
+            let size = 8 + data.len();
+            wire.extend_from_slice(&2u32.to_ne_bytes());
+            wire.extend_from_slice(&WL_REGISTRY_BIND_OPCODE.to_ne_bytes());
+            wire.extend_from_slice(&(size as u16).to_ne_bytes());
+            wire.append(&mut data);
+        }
+        wire.extend(wire_message(3, WL_COMPOSITOR_CREATE_SURFACE_OPCODE, &[6]));
+        wire.extend(wire_message(4, WL_SHM_CREATE_POOL_OPCODE, &[7, 4]));
+        wire.extend(wire_message(
+            7,
+            WL_SHM_POOL_CREATE_BUFFER_OPCODE,
+            &[8, 0, 1, 1, 4, WL_SHM_FORMAT_XRGB8888],
+        ));
+        wire.extend(wire_message(
+            5,
+            XDG_WM_BASE_GET_XDG_SURFACE_OPCODE,
+            &[9, 6],
+        ));
+        wire.extend(wire_message(9, XDG_SURFACE_GET_TOPLEVEL_OPCODE, &[10]));
+
+        let fd = memory_file(&[1, 2, 3, 0xff]);
+        send_wire_with_fd(&client_stream, &wire, fd);
+        unsafe {
+            libc::close(fd);
+        }
+        client.handle_messages(&mut state).unwrap();
+        assert!(
+            state.take_surface_updates().next().is_none(),
+            "must not map before ack_configure"
+        );
+
+        let mut wire = Vec::new();
+        wire.extend(wire_message(9, XDG_SURFACE_ACK_CONFIGURE_OPCODE, &[1]));
+        wire.extend(wire_message(6, WL_SURFACE_ATTACH_OPCODE, &[8, 0, 0]));
+        wire.extend(wire_message(6, WL_SURFACE_DAMAGE_OPCODE, &[0, 0, 1, 1]));
+        wire.extend(wire_message(6, WL_SURFACE_COMMIT_OPCODE, &[]));
+        client_stream
+            .write_all(&wire)
+            .unwrap();
+        client.handle_messages(&mut state).unwrap();
+
+        let updates: Vec<_> = state.take_surface_updates().collect();
+        let [SurfaceUpdate::Frame(frame)] = updates.as_slice() else {
+            panic!("expected one committed xdg frame, got {updates:?}");
+        };
+        assert_eq!(frame.surface_id, object_id(6));
+        assert_eq!(frame.pixels, [1, 2, 3, 0xff]);
     }
 }

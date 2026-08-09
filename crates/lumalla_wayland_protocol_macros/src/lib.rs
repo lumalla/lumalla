@@ -308,9 +308,13 @@ fn generate_interface_code_parts(
                 let value = entry.value.parse::<u32>().unwrap_or(0);
 
                 // Generate entry documentation
+                let entry_summary = entry
+                    .summary
+                    .as_deref()
+                    .or_else(|| entry.description.as_ref().map(|d| d.summary.as_str()));
                 let entry_doc = generate_doc_comment(
-                    entry.summary.as_deref(),
-                    None, // Entries don't typically have detailed descriptions
+                    entry_summary,
+                    entry.description.as_ref().and_then(|d| d.text.as_deref()),
                 );
 
                 quote! {
@@ -799,7 +803,7 @@ fn generate_accessor_methods(args: &[schema::RequestArg]) -> Vec<proc_macro2::To
 
         // Generate method documentation from argument summary
         let arg_doc = generate_doc_comment(
-            Some(&arg.summary),
+            arg.summary.as_deref(),
             None, // Arguments don't have detailed descriptions
         );
 

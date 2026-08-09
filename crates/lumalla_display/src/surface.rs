@@ -59,6 +59,7 @@ pub struct CommitResult {
 pub struct DestroyedSurface {
     pub shell_id: Option<ObjectId>,
     pub subsurface_id: Option<ObjectId>,
+    pub xdg_surface_id: Option<ObjectId>,
     pub orphaned_subsurface_ids: Vec<ObjectId>,
     pub callbacks: Vec<ObjectId>,
     pub was_mapped: bool,
@@ -103,18 +104,19 @@ impl SurfaceManager {
             }
         }
 
-        let (shell_id, subsurface_id) = match surface.role {
+        let (shell_id, subsurface_id, xdg_surface_id) = match surface.role {
             Some(Role::Shell(shell_id)) => {
                 self.shell_surfaces.remove(&(client_id, shell_id));
-                (Some(shell_id), None)
+                (Some(shell_id), None, None)
             }
             Some(Role::Subsurface(subsurface_id)) => {
                 if let Some(sub) = self.subsurfaces.remove(&(client_id, subsurface_id)) {
                     self.remove_child_from_parent(client_id, sub.parent, id);
                 }
-                (None, Some(subsurface_id))
+                (None, Some(subsurface_id), None)
             }
-            Some(Role::Cursor) | Some(Role::DndIcon) | None => (None, None),
+            Some(Role::Xdg(xdg_surface_id)) => (None, None, Some(xdg_surface_id)),
+            Some(Role::Cursor) | Some(Role::DndIcon) | None => (None, None, None),
         };
 
         let mut callbacks = surface.pending.frame_callbacks;
@@ -125,6 +127,7 @@ impl SurfaceManager {
         Ok(DestroyedSurface {
             shell_id,
             subsurface_id,
+            xdg_surface_id,
             orphaned_subsurface_ids,
             callbacks,
             was_mapped,
@@ -169,6 +172,11 @@ impl SurfaceManager {
             .iter()
             .map(|(&(client_id, _), &surface_id)| (client_id, surface_id))
             .collect();
+        for (&(client_id, surface_id), surface) in &self.surfaces {
+            if matches!(surface.role, Some(Role::Xdg(_))) {
+                surfaces.push((client_id, surface_id));
+            }
+        }
         surfaces.sort_by_key(|(client_id, surface_id)| (client_id.get(), surface_id.get()));
         if let Some(preferred) = preferred_client {
             if let Some(found) = surfaces
@@ -187,6 +195,54 @@ impl SurfaceManager {
             .find(|(client_id, surface_id)| {
                 self.is_mapped(*client_id, *surface_id).unwrap_or(false)
             })
+    }
+
+    pub fn assign_xdg_role(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        xdg_surface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        if surface.role.is_some() {
+            return Err(SurfaceError::RoleAlreadyAssigned);
+        }
+        surface.role = Some(Role::Xdg(xdg_surface_id));
+        surface.xdg_map_ready = false;
+        Ok(())
+    }
+
+    pub fn clear_xdg_role(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        if matches!(surface.role, Some(Role::Xdg(_))) {
+            surface.role = None;
+            surface.xdg_map_ready = false;
+        }
+        Ok(())
+    }
+
+    pub fn set_xdg_map_ready(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        ready: bool,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        surface.xdg_map_ready = ready;
+        Ok(())
     }
 
     pub fn assign_cursor_role(
@@ -940,6 +996,7 @@ impl SurfaceManager {
                     | ShellMode::Popup
                     | ShellMode::Maximized
             )),
+            Some(Role::Xdg(_)) => Ok(surface.xdg_map_ready),
             Some(Role::Subsurface(sub_id)) => {
                 let parent = self
                     .subsurfaces
@@ -1121,23 +1178,26 @@ fn merge_pending(cache: &mut PendingState, mut pending: PendingState) {
     cache.frame_callbacks.append(&mut pending.frame_callbacks);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Shell(ObjectId),
+    Xdg(ObjectId),
+    Subsurface(ObjectId),
+    Cursor,
+    DndIcon,
+}
+
 #[derive(Debug, Default)]
 struct Surface {
     role: Option<Role>,
     shell: ShellState,
+    /// For Role::Xdg: true after an ack_configure has been applied (ready to map with buffer).
+    xdg_map_ready: bool,
     current: SurfaceState,
     pending: PendingState,
     cache: Option<PendingState>,
     current_children: Vec<ObjectId>,
     pending_children: Option<Vec<ObjectId>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Role {
-    Shell(ObjectId),
-    Subsurface(ObjectId),
-    Cursor,
-    DndIcon,
 }
 
 #[derive(Debug)]
