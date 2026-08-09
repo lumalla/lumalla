@@ -37,6 +37,8 @@ pub struct CommittedFrame {
     pub buffer_transform: u32,
     pub offset_x: i32,
     pub offset_y: i32,
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Debug)]

@@ -43,6 +43,7 @@ pub struct SurfaceCommit {
     pub buffer_scale: i32,
     pub buffer_transform: u32,
     pub offset: (i32, i32),
+    pub layout: (i32, i32),
     #[allow(dead_code)]
     pub damage: Vec<Rectangle>,
     #[allow(dead_code)]
@@ -71,6 +72,7 @@ pub struct SurfaceManager {
     shell_surfaces: HashMap<ResourceKey, ObjectId>,
     subsurfaces: HashMap<ResourceKey, SubsurfaceState>,
     regions: HashMap<ResourceKey, Region>,
+    next_cascade: i32,
 }
 
 impl SurfaceManager {
@@ -815,6 +817,7 @@ impl SurfaceManager {
             .get(&(client_id, id))
             .ok_or(SurfaceError::UnknownSurface)?;
         let mapped = self.is_mapped(client_id, id)?;
+        let offset = self.presentation_offset(client_id, surface);
         Ok(SurfaceCommit {
             surface_id: id,
             buffer: surface.current.buffer,
@@ -825,7 +828,8 @@ impl SurfaceManager {
             frame_callbacks: Vec::new(),
             buffer_scale: surface.current.buffer_scale,
             buffer_transform: surface.current.buffer_transform,
-            offset: self.presentation_offset(client_id, surface),
+            offset,
+            layout: surface.layout,
             damage: surface.current.damage.clone(),
             buffer_damage: surface.current.buffer_damage.clone(),
         })
@@ -895,17 +899,38 @@ impl SurfaceManager {
         };
 
         let mapped = self.is_mapped(client_id, id)?;
+        let newly_mapped = mapped && !was_mapped;
+        if newly_mapped {
+            let surface = self
+                .surfaces
+                .get_mut(&(client_id, id))
+                .ok_or(SurfaceError::UnknownSurface)?;
+            if matches!(
+                surface.role,
+                Some(Role::Shell(_)) | Some(Role::Xdg(_))
+            ) {
+                let pos = self.next_cascade;
+                self.next_cascade = self.next_cascade.wrapping_add(32);
+                surface.layout = (pos, pos);
+            }
+        }
+        let layout = self
+            .surfaces
+            .get(&(client_id, id))
+            .map(|s| s.layout)
+            .unwrap_or((0, 0));
         Ok(SurfaceCommit {
             surface_id: id,
             buffer,
             attached_buffer,
             mapped,
-            newly_mapped: mapped && !was_mapped,
+            newly_mapped,
             shell_id,
             frame_callbacks,
             buffer_scale,
             buffer_transform,
             offset,
+            layout,
             damage,
             buffer_damage,
         })
@@ -1191,6 +1216,8 @@ enum Role {
 struct Surface {
     role: Option<Role>,
     shell: ShellState,
+    /// Layout position for mapped shell/xdg surfaces (compositor space).
+    layout: (i32, i32),
     /// For Role::Xdg: true after an ack_configure has been applied (ready to map with buffer).
     xdg_map_ready: bool,
     current: SurfaceState,

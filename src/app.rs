@@ -502,6 +502,9 @@ impl AppData {
                         height: frame.height,
                         stride: frame.stride,
                         format: frame.format,
+                        x: frame.x,
+                        y: frame.y,
+                        buffer_scale: frame.buffer_scale,
                     };
                     if let Err(err) = self.renderer_state.set_surface_frame(frame) {
                         error!("Unable to queue committed Wayland surface: {err:#}");

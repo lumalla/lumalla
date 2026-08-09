@@ -168,6 +168,8 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                             buffer_transform: commit.buffer_transform,
                             offset_x: commit.offset.0,
                             offset_y: commit.offset.1,
+                            x: commit.layout.0 + commit.offset.0,
+                            y: commit.layout.1 + commit.offset.1,
                         }));
                 }
                 Err(error) => {

@@ -36,6 +36,9 @@ pub struct SurfaceFrame {
     pub height: usize,
     pub stride: usize,
     pub format: u32,
+    pub x: i32,
+    pub y: i32,
+    pub buffer_scale: i32,
 }
 
 impl SurfaceFrame {
@@ -86,7 +89,9 @@ pub struct RendererState {
     /// Per-connector overrides; missing names use defaults (enabled if connected).
     output_configs: HashMap<String, OutputConfig>,
     scanouts: HashMap<String, OutputScanout>,
-    active_surface_frame: Option<SurfaceFrame>,
+    /// Mapped surfaces in paint order (back to front).
+    surface_frames: HashMap<(u32, u32), SurfaceFrame>,
+    surface_order: Vec<(u32, u32)>,
 }
 
 impl RendererState {
@@ -97,7 +102,8 @@ impl RendererState {
             render_device: None,
             output_configs: HashMap::new(),
             scanouts: HashMap::new(),
-            active_surface_frame: None,
+            surface_frames: HashMap::new(),
+            surface_order: Vec::new(),
         })
     }
 
@@ -120,10 +126,14 @@ impl RendererState {
         self.drm_devices.dispatch()
     }
 
-    /// Replace and immediately present the current single-surface scene.
+    /// Replace or insert a surface frame and present the scene.
     pub fn set_surface_frame(&mut self, frame: SurfaceFrame) -> anyhow::Result<()> {
         frame.validate()?;
-        self.active_surface_frame = Some(frame);
+        let key = (frame.owner_id, frame.surface_id);
+        if !self.surface_frames.contains_key(&key) {
+            self.surface_order.push(key);
+        }
+        self.surface_frames.insert(key, frame);
         if self.drm_devices.opened().is_empty() {
             return Ok(());
         }
@@ -131,12 +141,9 @@ impl RendererState {
     }
 
     pub fn remove_surface_frame(&mut self, owner_id: u32, surface_id: u32) {
-        if self
-            .active_surface_frame
-            .as_ref()
-            .is_some_and(|frame| frame.owner_id == owner_id && frame.surface_id == surface_id)
-        {
-            self.active_surface_frame = None;
+        let key = (owner_id, surface_id);
+        if self.surface_frames.remove(&key).is_some() {
+            self.surface_order.retain(|k| *k != key);
             if !self.drm_devices.opened().is_empty() {
                 if let Err(error) = self.present_enabled_outputs(SOLID_CLEAR_COLOR) {
                     error!("Failed to clear removed Wayland surface: {error:#}");
@@ -146,16 +153,12 @@ impl RendererState {
     }
 
     pub fn remove_client_frames(&mut self, owner_id: u32) {
-        if self
-            .active_surface_frame
-            .as_ref()
-            .is_some_and(|frame| frame.owner_id == owner_id)
-        {
-            self.active_surface_frame = None;
-            if !self.drm_devices.opened().is_empty() {
-                if let Err(error) = self.present_enabled_outputs(SOLID_CLEAR_COLOR) {
-                    error!("Failed to clear disconnected Wayland surface: {error:#}");
-                }
+        let before = self.surface_frames.len();
+        self.surface_frames.retain(|(owner, _), _| *owner != owner_id);
+        self.surface_order.retain(|(owner, _)| *owner != owner_id);
+        if self.surface_frames.len() != before && !self.drm_devices.opened().is_empty() {
+            if let Err(error) = self.present_enabled_outputs(SOLID_CLEAR_COLOR) {
+                error!("Failed to clear disconnected Wayland surface: {error:#}");
             }
         }
     }
@@ -219,17 +222,6 @@ impl RendererState {
     /// Buffers are allocated on the selected render GPU and imported on each
     /// output's DRM card (same- or cross-device). Failures are logged per output.
     pub fn present_enabled_outputs(&mut self, color: [f32; 4]) -> anyhow::Result<()> {
-        let frame = self.active_surface_frame.take();
-        let result = self.present_enabled_outputs_with_frame(color, frame.as_ref());
-        self.active_surface_frame = frame;
-        result
-    }
-
-    fn present_enabled_outputs_with_frame(
-        &mut self,
-        color: [f32; 4],
-        frame: Option<&SurfaceFrame>,
-    ) -> anyhow::Result<()> {
         self.scanouts.clear();
 
         let Some(render_path) = self.resolved_render_device_path() else {
@@ -248,7 +240,7 @@ impl RendererState {
 
         let mut presented = 0usize;
         for target in targets {
-            match self.present_one_output(&target, color, frame) {
+            match self.present_one_output(&target, color) {
                 Ok(scanout) => {
                     info!(
                         "Presented {} on {} (CRTC {}, {}x{}@{}Hz)",
@@ -328,7 +320,6 @@ impl RendererState {
         &mut self,
         target: &PresentTarget,
         color: [f32; 4],
-        frame: Option<&SurfaceFrame>,
     ) -> anyhow::Result<OutputScanout> {
         let width = target.output.mode.width();
         let height = target.output.mode.height();
@@ -370,8 +361,13 @@ impl RendererState {
             )
             .context("Failed to clear scanout image")?;
 
-            if let Some(frame) = frame {
-                let upload = prepare_surface_upload(frame, width, height)?;
+            let frames: Vec<&SurfaceFrame> = self
+                .surface_order
+                .iter()
+                .filter_map(|key| self.surface_frames.get(key))
+                .collect();
+            if !frames.is_empty() {
+                let upload = composite_surface_upload(&frames, width, height, color)?;
                 upload_bgra_to_image(
                     vulkan.device(),
                     vulkan.physical_device(),
@@ -381,7 +377,7 @@ impl RendererState {
                     upload.width,
                     upload.height,
                 )
-                .context("Failed to upload Wayland SHM frame")?;
+                .context("Failed to upload Wayland SHM scene")?;
             }
 
             vulkan.device().wait_idle()?;
@@ -498,12 +494,12 @@ struct PreparedSurfaceUpload {
     height: u32,
 }
 
-fn prepare_surface_upload(
-    frame: &SurfaceFrame,
+fn composite_surface_upload(
+    frames: &[&SurfaceFrame],
     output_width: u32,
     output_height: u32,
+    clear: [f32; 4],
 ) -> anyhow::Result<PreparedSurfaceUpload> {
-    frame.validate()?;
     anyhow::ensure!(
         output_width > 0 && output_height > 0,
         "Output dimensions must be non-zero"
@@ -516,19 +512,45 @@ fn prepare_surface_upload(
     let capacity = row_bytes
         .checked_mul(height)
         .context("Scaled surface size overflows")?;
-    let mut pixels = vec![0; capacity];
-    for output_y in 0..height {
-        let source_y = ((output_y as u128 * frame.height as u128) / height as u128) as usize;
-        for output_x in 0..width {
-            let source_x = ((output_x as u128 * frame.width as u128) / width as u128) as usize;
-            let source = source_y * frame.stride + source_x * 4;
-            let destination = output_y * row_bytes + output_x * 4;
-            pixels[destination..destination + 4].copy_from_slice(&frame.pixels[source..source + 4]);
-            if frame.format == WL_SHM_FORMAT_XRGB8888 {
-                pixels[destination + 3] = u8::MAX;
+    let clear_b = (clear[2].clamp(0.0, 1.0) * 255.0) as u8;
+    let clear_g = (clear[1].clamp(0.0, 1.0) * 255.0) as u8;
+    let clear_r = (clear[0].clamp(0.0, 1.0) * 255.0) as u8;
+    let mut pixels = vec![0u8; capacity];
+    for chunk in pixels.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&[clear_b, clear_g, clear_r, 0xff]);
+    }
+
+    for frame in frames {
+        frame.validate()?;
+        let scale = frame.buffer_scale.max(1) as usize;
+        let dest_w = frame.width / scale;
+        let dest_h = frame.height / scale;
+        if dest_w == 0 || dest_h == 0 {
+            continue;
+        }
+        for dy in 0..dest_h {
+            let out_y = frame.y + dy as i32;
+            if out_y < 0 || out_y as usize >= height {
+                continue;
+            }
+            let source_y = ((dy as u128 * frame.height as u128) / dest_h as u128) as usize;
+            for dx in 0..dest_w {
+                let out_x = frame.x + dx as i32;
+                if out_x < 0 || out_x as usize >= width {
+                    continue;
+                }
+                let source_x = ((dx as u128 * frame.width as u128) / dest_w as u128) as usize;
+                let source = source_y * frame.stride + source_x * 4;
+                let destination = out_y as usize * row_bytes + out_x as usize * 4;
+                pixels[destination..destination + 4]
+                    .copy_from_slice(&frame.pixels[source..source + 4]);
+                if frame.format == WL_SHM_FORMAT_XRGB8888 {
+                    pixels[destination + 3] = u8::MAX;
+                }
             }
         }
     }
+
     Ok(PreparedSurfaceUpload {
         pixels,
         width: output_width,
@@ -573,6 +595,9 @@ mod tests {
             height: 2,
             stride: 8,
             format: 0,
+            x: 0,
+            y: 0,
+            buffer_scale: 1,
         }
     }
 
@@ -594,58 +619,44 @@ mod tests {
     }
 
     #[test]
-    fn scales_xrgb_upload_without_stride_padding() {
+    fn composites_xrgb_at_origin_with_clear() {
         let frame = SurfaceFrame {
             owner_id: 1,
             surface_id: 2,
-            pixels: vec![
-                1, 2, 3, 0, 4, 5, 6, 0, 90, 91, 92, 93, 7, 8, 9, 0, 10, 11, 12, 0, 94, 95, 96, 97,
-            ],
+            pixels: vec![1, 2, 3, 0, 4, 5, 6, 0],
             width: 2,
-            height: 2,
-            stride: 12,
+            height: 1,
+            stride: 8,
             format: WL_SHM_FORMAT_XRGB8888,
+            x: 0,
+            y: 0,
+            buffer_scale: 1,
         };
 
-        let upload = prepare_surface_upload(&frame, 1, 2).unwrap();
-        assert_eq!((upload.width, upload.height), (1, 2));
-        assert_eq!(upload.pixels, vec![1, 2, 3, 255, 7, 8, 9, 255]);
+        let upload =
+            composite_surface_upload(&[&frame], 3, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
+        assert_eq!((upload.width, upload.height), (3, 1));
+        assert_eq!(
+            upload.pixels,
+            vec![1, 2, 3, 255, 4, 5, 6, 255, 0, 0, 0, 255]
+        );
     }
 
     #[test]
-    fn preserves_argb_upload_bytes() {
+    fn composites_frame_at_offset() {
         let frame = SurfaceFrame {
-            pixels: vec![1, 2, 3, 4],
+            pixels: vec![9, 8, 7, 6],
             width: 1,
             height: 1,
             stride: 4,
             format: WL_SHM_FORMAT_ARGB8888,
+            x: 1,
+            y: 0,
+            buffer_scale: 1,
             ..frame()
         };
-
-        let upload = prepare_surface_upload(&frame, 1, 1).unwrap();
-        assert_eq!(upload.pixels, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn scales_surface_to_fill_output() {
-        let frame = SurfaceFrame {
-            pixels: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            width: 2,
-            height: 1,
-            stride: 8,
-            format: WL_SHM_FORMAT_ARGB8888,
-            ..frame()
-        };
-
-        let upload = prepare_surface_upload(&frame, 4, 2).unwrap();
-        assert_eq!((upload.width, upload.height), (4, 2));
-        assert_eq!(
-            upload.pixels,
-            [
-                1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 5, 6, 7, 8, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8,
-                5, 6, 7, 8,
-            ]
-        );
+        let upload =
+            composite_surface_upload(&[&frame], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(upload.pixels, vec![0, 0, 0, 255, 9, 8, 7, 6]);
     }
 }
