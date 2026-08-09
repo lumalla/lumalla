@@ -214,8 +214,9 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
     }
 
     for callback in commit.frame_callbacks {
-        ctx.writer.wl_callback_done(callback).callback_data(0);
-        ctx.registry.free_object(callback, ctx.writer);
+        state
+            .pending_frame_callbacks
+            .push_back((ctx.client_id, callback));
     }
 }
 
@@ -1782,7 +1783,11 @@ mod tests {
 
         WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
 
-        assert!(ctx.registry.object_metadata(callback_id).is_none());
+        assert!(
+            ctx.registry.object_metadata(callback_id).is_some(),
+            "frame callback must remain until present"
+        );
+        assert_eq!(state.pending_frame_callback_count(), 1);
         let updates: Vec<_> = state.take_surface_updates().collect();
         assert_eq!(updates.len(), 1);
         let SurfaceUpdate::Frame(frame) = &updates[0] else {
@@ -1801,6 +1806,14 @@ mod tests {
                 .unwrap(),
             "expected pending ping serial 1 after first map"
         );
+
+        // Present-time completion: drain queued callbacks onto the same writer/registry.
+        while let Some((owner, callback)) = state.pending_frame_callbacks.pop_front() {
+            assert_eq!(owner, client_id);
+            ctx.writer.wl_callback_done(callback).callback_data(16);
+            ctx.registry.free_object(callback, ctx.writer);
+        }
+        assert!(ctx.registry.object_metadata(callback_id).is_none());
 
         state
             .surface_manager

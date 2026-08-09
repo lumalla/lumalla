@@ -44,6 +44,7 @@ struct AppData {
     connected_clients: HashMap<ClientId, ClientConnection>,
     display_state: DisplayState,
     renderer_state: RendererState,
+    frame_clock: Instant,
 }
 
 impl AppData {
@@ -71,6 +72,7 @@ impl AppData {
             connected_clients: HashMap::new(),
             display_state,
             renderer_state,
+            frame_clock: Instant::now(),
         }
     }
 
@@ -464,6 +466,7 @@ impl AppData {
 
     fn submit_committed_frames(&mut self) {
         let updates: Vec<_> = self.display_state.take_surface_updates().collect();
+        let mut presented = false;
         for update in updates {
             match update {
                 SurfaceUpdate::Frame(frame) => {
@@ -478,6 +481,8 @@ impl AppData {
                     };
                     if let Err(err) = self.renderer_state.set_surface_frame(frame) {
                         error!("Unable to queue committed Wayland surface: {err:#}");
+                    } else {
+                        presented = true;
                     }
                 }
                 SurfaceUpdate::Unmapped {
@@ -487,6 +492,13 @@ impl AppData {
                     .renderer_state
                     .remove_surface_frame(client_id.get(), surface_id.get()),
             }
+        }
+        if presented || self.display_state.pending_frame_callback_count() > 0 {
+            let time_msec = self.frame_clock.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+            // Avoid zero so clients that treat 0 as "unset" still see a clock.
+            let time_msec = time_msec.max(1);
+            self.display_state
+                .complete_frame_callbacks(&mut self.connected_clients, time_msec);
         }
     }
 

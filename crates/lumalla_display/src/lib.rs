@@ -58,6 +58,7 @@ pub struct DisplayState {
     data_device_manager: DataDeviceManager,
     xdg_manager: XdgManager,
     surface_updates: VecDeque<SurfaceUpdate>,
+    pending_frame_callbacks: VecDeque<(ClientId, lumalla_wayland_protocol::ObjectId)>,
 }
 
 impl DisplayState {
@@ -72,6 +73,7 @@ impl DisplayState {
             data_device_manager: DataDeviceManager::default(),
             xdg_manager: XdgManager::default(),
             surface_updates: VecDeque::new(),
+            pending_frame_callbacks: VecDeque::new(),
         })
     }
 
@@ -253,6 +255,8 @@ impl DisplayState {
         self.output_manager.remove_client(client_id);
         self.data_device_manager.remove_client(client_id);
         self.xdg_manager.delete_client(client_id);
+        self.pending_frame_callbacks
+            .retain(|(owner, _)| *owner != client_id);
         self.surface_updates.retain(|update| match update {
             SurfaceUpdate::Frame(frame) => frame.client_id != client_id,
             SurfaceUpdate::Unmapped {
@@ -263,6 +267,26 @@ impl DisplayState {
 
     pub fn take_surface_updates(&mut self) -> impl Iterator<Item = SurfaceUpdate> + '_ {
         self.surface_updates.drain(..)
+    }
+
+    pub fn pending_frame_callback_count(&self) -> usize {
+        self.pending_frame_callbacks.len()
+    }
+
+    /// Completes deferred `wl_surface.frame` callbacks after presentation.
+    pub fn complete_frame_callbacks(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        time_msec: u32,
+    ) {
+        while let Some((client_id, callback)) = self.pending_frame_callbacks.pop_front() {
+            let Some(client) = clients.get_mut(&client_id) else {
+                continue;
+            };
+            let (registry, writer) = client.registry_and_writer_mut();
+            writer.wl_callback_done(callback).callback_data(time_msec);
+            registry.free_object(callback, writer);
+        }
     }
 
     pub fn add_output<'connection>(

@@ -565,6 +565,7 @@ impl XdgManager {
     }
 
     /// Returns whether the wl_surface may map (has role + acked configure).
+    #[allow(dead_code)]
     pub fn can_map_wl_surface(&self, client_id: ClientId, wl_surface: ObjectId) -> bool {
         let Some(xdg_id) = self.surface_to_xdg.get(&(client_id, wl_surface)) else {
             return false;
@@ -614,6 +615,7 @@ impl XdgManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_xdg_toplevel_mapped_role(
         &self,
         client_id: ClientId,
