@@ -151,11 +151,7 @@ impl AppData {
                                 },
                             );
                         }
-                        SeatEvent::Pointer(PointerEvent::Motion {
-                            time_msec,
-                            dx,
-                            dy,
-                        }) => {
+                        SeatEvent::Pointer(PointerEvent::Motion { time_msec, dx, dy }) => {
                             display_state.handle_pointer_motion(
                                 connected_clients,
                                 time_msec,
@@ -163,11 +159,7 @@ impl AppData {
                                 dy,
                             );
                         }
-                        SeatEvent::Pointer(PointerEvent::Absolute {
-                            time_msec,
-                            x,
-                            y,
-                        }) => {
+                        SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {
                             display_state.handle_pointer_absolute(
                                 connected_clients,
                                 time_msec,
@@ -205,13 +197,7 @@ impl AppData {
                             x,
                             y,
                         }) => {
-                            display_state.handle_touch_down(
-                                connected_clients,
-                                time_msec,
-                                id,
-                                x,
-                                y,
-                            );
+                            display_state.handle_touch_down(connected_clients, time_msec, id, x, y);
                         }
                         SeatEvent::Touch(TouchEvent::Up { time_msec, id }) => {
                             display_state.handle_touch_up(connected_clients, time_msec, id);
@@ -483,6 +469,7 @@ impl AppData {
             height,
             refresh_mhz,
             scale: 1,
+            is_virtual: false,
         };
         self.display_state
             .update_primary_output(info, &mut self.connected_clients);
@@ -521,7 +508,11 @@ impl AppData {
             }
         }
         if presented || self.display_state.pending_frame_callback_count() > 0 {
-            let time_msec = self.frame_clock.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+            let time_msec = self
+                .frame_clock
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u32::MAX)) as u32;
             // Avoid zero so clients that treat 0 as "unset" still see a clock.
             let time_msec = time_msec.max(1);
             self.display_state
