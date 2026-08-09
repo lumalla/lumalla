@@ -17,6 +17,26 @@ pub struct ModeInfo {
     raw: sys::drmModeModeInfo,
 }
 
+impl PartialEq for ModeInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw.clock == other.raw.clock
+            && self.raw.hdisplay == other.raw.hdisplay
+            && self.raw.hsync_start == other.raw.hsync_start
+            && self.raw.hsync_end == other.raw.hsync_end
+            && self.raw.htotal == other.raw.htotal
+            && self.raw.hskew == other.raw.hskew
+            && self.raw.vdisplay == other.raw.vdisplay
+            && self.raw.vsync_start == other.raw.vsync_start
+            && self.raw.vsync_end == other.raw.vsync_end
+            && self.raw.vtotal == other.raw.vtotal
+            && self.raw.vscan == other.raw.vscan
+            && self.raw.vrefresh == other.raw.vrefresh
+            && self.raw.flags == other.raw.flags
+    }
+}
+
+impl Eq for ModeInfo {}
+
 impl std::fmt::Debug for ModeInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModeInfo")
@@ -307,6 +327,32 @@ pub fn atomic_modeset(
         fb_id,
         output.connector_name,
         output.mode.name()
+    );
+    Ok(())
+}
+
+/// Blocking primary-plane FB update without a modeset.
+///
+/// Use this for subsequent frames once connector/CRTC/mode are already active.
+/// Unlike a full modeset, this does not reprogram the link and will not drop the
+/// DisplayPort connection when called every frame.
+pub fn atomic_set_plane_fb(
+    drm_fd: BorrowedFd<'_>,
+    output: &ConnectedOutput,
+    fb_id: u32,
+) -> anyhow::Result<()> {
+    let fd = drm_fd.as_raw_fd();
+    let width = output.mode.width();
+    let height = output.mode.height();
+    let props = &output.props;
+
+    let req = AtomicRequest::new()?;
+    add_plane_fb_props(&req, output, props, fb_id, width, height)?;
+    req.commit(fd, 0, ptr::null_mut())?;
+
+    debug!(
+        "Atomic plane FB update: plane {} -> FB {} on {}",
+        output.plane_id, fb_id, output.connector_name
     );
     Ok(())
 }

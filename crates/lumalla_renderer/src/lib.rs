@@ -15,7 +15,7 @@ pub mod vulkan;
 
 use crate::drm::{
     ConnectedOutput, DrmDevices, DrmDispatchResult, DrmFramebuffer, ModeBlob, atomic_modeset,
-    resolve_connected_output,
+    atomic_set_plane_fb, resolve_connected_output,
 };
 use crate::vulkan::{
     DmaBufImage, Framebuffer, RenderPass, VulkanContext, clear_framebuffer_to_color,
@@ -75,9 +75,11 @@ impl SurfaceFrame {
 struct OutputScanout {
     drm_path: PathBuf,
     output: ConnectedOutput,
-    _mode_blob: ModeBlob,
-    _drm_fb: DrmFramebuffer,
-    _dma_image: DmaBufImage,
+    /// Owned so the CRTC's MODE_ID blob is not destroyed while still active.
+    #[allow(dead_code)]
+    mode_blob: ModeBlob,
+    drm_fb: DrmFramebuffer,
+    dma_image: DmaBufImage,
 }
 
 pub struct RendererState {
@@ -221,9 +223,11 @@ impl RendererState {
     ///
     /// Buffers are allocated on the selected render GPU and imported on each
     /// output's DRM card (same- or cross-device). Failures are logged per output.
+    ///
+    /// Active scanouts are retained across presents: the previous FB / mode blob
+    /// stay alive until the new commit succeeds, and unchanged modes use a
+    /// plane-only update instead of a full modeset.
     pub fn present_enabled_outputs(&mut self, color: [f32; 4]) -> anyhow::Result<()> {
-        self.scanouts.clear();
-
         let Some(render_path) = self.resolved_render_device_path() else {
             warn!("No render device available; skipping presentation");
             return Ok(());
@@ -235,24 +239,26 @@ impl RendererState {
         let targets = self.collect_present_targets();
         if targets.is_empty() {
             warn!("No enabled connected outputs to present");
+            self.scanouts.clear();
             return Ok(());
         }
 
+        let keep: HashSet<String> = targets.iter().map(|t| t.connector_name.clone()).collect();
         let mut presented = 0usize;
         for target in targets {
             match self.present_one_output(&target, color) {
-                Ok(scanout) => {
-                    info!(
-                        "Presented {} on {} (CRTC {}, {}x{}@{}Hz)",
-                        scanout.output.connector_name,
-                        scanout.drm_path.display(),
-                        scanout.output.crtc_id,
-                        scanout.output.mode.width(),
-                        scanout.output.mode.height(),
-                        scanout.output.mode.refresh_hz()
-                    );
-                    self.scanouts
-                        .insert(scanout.output.connector_name.clone(), scanout);
+                Ok(()) => {
+                    if let Some(scanout) = self.scanouts.get(&target.connector_name) {
+                        info!(
+                            "Presented {} on {} (CRTC {}, {}x{}@{}Hz)",
+                            scanout.output.connector_name,
+                            scanout.drm_path.display(),
+                            scanout.output.crtc_id,
+                            scanout.output.mode.width(),
+                            scanout.output.mode.height(),
+                            scanout.output.mode.refresh_hz()
+                        );
+                    }
                     presented += 1;
                 }
                 Err(err) => {
@@ -265,6 +271,7 @@ impl RendererState {
             }
         }
 
+        self.scanouts.retain(|name, _| keep.contains(name));
         info!("Presented {presented} output(s)");
         Ok(())
     }
@@ -320,7 +327,7 @@ impl RendererState {
         &mut self,
         target: &PresentTarget,
         color: [f32; 4],
-    ) -> anyhow::Result<OutputScanout> {
+    ) -> anyhow::Result<()> {
         let width = target.output.mode.width();
         let height = target.output.mode.height();
         let format = vk::Format::B8G8R8A8_UNORM;
@@ -408,19 +415,58 @@ impl RendererState {
         )
         .context("Failed to import DMA-BUF as DRM framebuffer")?;
 
+        let reuse_mode = self.scanouts.get(&target.connector_name).is_some_and(|prev| {
+            prev.drm_path == target.drm_path
+                && prev.output.connector_id == target.output.connector_id
+                && prev.output.crtc_id == target.output.crtc_id
+                && prev.output.plane_id == target.output.plane_id
+                && prev.output.mode == target.output.mode
+        });
+
+        if reuse_mode {
+            match atomic_set_plane_fb(drm_device.fd(), &target.output, drm_fb.id()) {
+                Ok(()) => {
+                    let mut prev = self
+                        .scanouts
+                        .remove(&target.connector_name)
+                        .expect("reuse_mode requires an existing scanout");
+                    prev.drm_path = target.drm_path.clone();
+                    prev.output = target.output.clone();
+                    // Replace FB/image only after the plane update succeeded so the
+                    // CRTC never loses its active framebuffer.
+                    prev.drm_fb = drm_fb;
+                    prev.dma_image = dma_image;
+                    self.scanouts
+                        .insert(target.connector_name.clone(), prev);
+                    return Ok(());
+                }
+                Err(err) => {
+                    warn!(
+                        "Plane FB update failed on {}: {err:#}; falling back to modeset",
+                        target.connector_name
+                    );
+                }
+            }
+        }
+
         let mode_blob = ModeBlob::create(drm_device.fd(), &target.output.mode)
             .context("Failed to create MODE_ID property blob")?;
 
         atomic_modeset(drm_device.fd(), &target.output, mode_blob.id(), drm_fb.id())
             .context("Failed atomic modeset")?;
 
-        Ok(OutputScanout {
-            drm_path: target.drm_path.clone(),
-            output: target.output.clone(),
-            _mode_blob: mode_blob,
-            _drm_fb: drm_fb,
-            _dma_image: dma_image,
-        })
+        // Only drop the previous scanout after the new modeset is active.
+        let _previous = self.scanouts.insert(
+            target.connector_name.clone(),
+            OutputScanout {
+                drm_path: target.drm_path.clone(),
+                output: target.output.clone(),
+                mode_blob,
+                drm_fb,
+                dma_image,
+            },
+        );
+        Ok(())
     }
 
     fn resolved_render_device_path(&self) -> Option<PathBuf> {
