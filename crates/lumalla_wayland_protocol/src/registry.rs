@@ -9,7 +9,8 @@ use crate::{
     buffer::{MessageHeader, Writer},
     client::Ctx,
     protocols::{
-        WaylandProtocol, WlDisplay, XdgShellProtocol, wayland::*, xdg_shell::*,
+        LinuxDmabufV1Protocol, WaylandProtocol, WlDisplay, XdgShellProtocol, linux_dmabuf::*,
+        wayland::*, xdg_shell::*,
     },
 };
 
@@ -43,6 +44,9 @@ pub enum InterfaceIndex {
     XdgSurface,
     XdgToplevel,
     XdgPopup,
+    ZwpLinuxDmabufV1,
+    ZwpLinuxBufferParamsV1,
+    ZwpLinuxDmabufFeedbackV1,
 }
 
 impl InterfaceIndex {
@@ -76,6 +80,9 @@ impl InterfaceIndex {
             InterfaceIndex::XdgSurface => XDG_SURFACE_NAME,
             InterfaceIndex::XdgToplevel => XDG_TOPLEVEL_NAME,
             InterfaceIndex::XdgPopup => XDG_POPUP_NAME,
+            InterfaceIndex::ZwpLinuxDmabufV1 => ZWP_LINUX_DMABUF_V1_NAME,
+            InterfaceIndex::ZwpLinuxBufferParamsV1 => ZWP_LINUX_BUFFER_PARAMS_V1_NAME,
+            InterfaceIndex::ZwpLinuxDmabufFeedbackV1 => ZWP_LINUX_DMABUF_FEEDBACK_V1_NAME,
         }
     }
 
@@ -109,6 +116,9 @@ impl InterfaceIndex {
             InterfaceIndex::XdgSurface => XDG_SURFACE_VERSION,
             InterfaceIndex::XdgToplevel => XDG_TOPLEVEL_VERSION,
             InterfaceIndex::XdgPopup => XDG_POPUP_VERSION,
+            InterfaceIndex::ZwpLinuxDmabufV1 => ZWP_LINUX_DMABUF_V1_VERSION,
+            InterfaceIndex::ZwpLinuxBufferParamsV1 => ZWP_LINUX_BUFFER_PARAMS_V1_VERSION,
+            InterfaceIndex::ZwpLinuxDmabufFeedbackV1 => ZWP_LINUX_DMABUF_FEEDBACK_V1_VERSION,
         }
     }
 }
@@ -273,7 +283,7 @@ pub trait RequestHandler {
 
 impl<T> RequestHandler for T
 where
-    T: WaylandProtocol + XdgShellProtocol,
+    T: WaylandProtocol + XdgShellProtocol + LinuxDmabufV1Protocol,
 {
     fn handle_request(
         &mut self,
@@ -368,6 +378,22 @@ where
             }
             InterfaceIndex::XdgPopup => {
                 XdgPopup::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ZwpLinuxDmabufV1 => {
+                ZwpLinuxDmabufV1::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ZwpLinuxBufferParamsV1 => {
+                ZwpLinuxBufferParamsV1::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ZwpLinuxDmabufFeedbackV1 => {
+                ZwpLinuxDmabufFeedbackV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
             }
         }
     }

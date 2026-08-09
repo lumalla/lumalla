@@ -151,38 +151,66 @@ fn report_data_device_error(ctx: &mut Ctx, object_id: ObjectId, error: DataDevic
 fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: SurfaceCommit) {
     if let Some(Some(buffer_id)) = commit.attached_buffer {
         if commit.mapped {
-            match state.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
-                Ok(snapshot) => {
-                    let _ = state.surface_manager.set_committed_buffer_size(
-                        ctx.client_id,
-                        commit.surface_id,
-                        snapshot.width as i32,
-                        snapshot.height as i32,
-                    );
-                    state
-                        .surface_updates
-                        .push_back(SurfaceUpdate::Frame(CommittedFrame {
-                            client_id: ctx.client_id,
-                            surface_id: commit.surface_id,
-                            buffer_id,
-                            pixels: snapshot.pixels,
-                            width: snapshot.width,
-                            height: snapshot.height,
-                            stride: snapshot.stride,
-                            format: snapshot.format,
-                            buffer_scale: commit.buffer_scale,
-                            buffer_transform: commit.buffer_transform,
-                            offset_x: commit.offset.0,
-                            offset_y: commit.offset.1,
-                            x: commit.layout.0 + commit.offset.0,
-                            y: commit.layout.1 + commit.offset.1,
-                        }));
-                }
-                Err(error) => {
-                    report_shm_error(ctx, buffer_id, &error);
-                    return;
-                }
-            }
+            let (pixels, width, height, stride, format) =
+                if state.dmabuf_manager.has_buffer(ctx.client_id, buffer_id) {
+                    match state.dmabuf_manager.snapshot_buffer(ctx.client_id, buffer_id) {
+                        Ok(snapshot) => (
+                            snapshot.pixels,
+                            snapshot.width,
+                            snapshot.height,
+                            snapshot.stride,
+                            snapshot.format,
+                        ),
+                        Err(error) => {
+                            debug!("dmabuf snapshot failed: {error}");
+                            let message = error.to_string();
+                            ctx.writer
+                                .wl_display_error(DISPLAY_OBJECT_ID)
+                                .object_id(buffer_id)
+                                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                                .message(&message);
+                            return;
+                        }
+                    }
+                } else {
+                    match state.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
+                        Ok(snapshot) => (
+                            snapshot.pixels,
+                            snapshot.width,
+                            snapshot.height,
+                            snapshot.stride,
+                            snapshot.format,
+                        ),
+                        Err(error) => {
+                            report_shm_error(ctx, buffer_id, &error);
+                            return;
+                        }
+                    }
+                };
+            let _ = state.surface_manager.set_committed_buffer_size(
+                ctx.client_id,
+                commit.surface_id,
+                width as i32,
+                height as i32,
+            );
+            state
+                .surface_updates
+                .push_back(SurfaceUpdate::Frame(CommittedFrame {
+                    client_id: ctx.client_id,
+                    surface_id: commit.surface_id,
+                    buffer_id,
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    format,
+                    buffer_scale: commit.buffer_scale,
+                    buffer_transform: commit.buffer_transform,
+                    offset_x: commit.offset.0,
+                    offset_y: commit.offset.1,
+                    x: commit.layout.0 + commit.offset.0,
+                    y: commit.layout.1 + commit.offset.1,
+                }));
             if commit.newly_mapped {
                 if let Some(shell_id) = commit.shell_id {
                     let serial = state.seat_manager.next_serial();
@@ -334,6 +362,9 @@ impl WlRegistry for DisplayState {
             _ if interface_name == InterfaceIndex::XdgWmBase.interface_name() => {
                 self.xdg_manager.create_wm_base(ctx.client_id, *id);
             }
+            _ if interface_name == InterfaceIndex::ZwpLinuxDmabufV1.interface_name() => {
+                super::linux_dmabuf::send_dmabuf_formats(ctx.writer, *id);
+            }
             _ => {}
         }
     }
@@ -440,6 +471,7 @@ impl WlBuffer for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlBufferDestroy<'_>) {
         ctx.registry.free_object(object_id, &mut ctx.writer);
         self.shm_manager.delete_buffer(ctx.client_id, object_id);
+        self.dmabuf_manager.delete_buffer(ctx.client_id, object_id);
     }
 }
 
@@ -1626,6 +1658,10 @@ mod tests {
             lumalla_wayland_protocol::protocols::xdg_shell::XDG_WM_BASE_NAME,
             1
         )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::linux_dmabuf::ZWP_LINUX_DMABUF_V1_NAME,
+            3
+        )));
     }
 
     #[test]
@@ -1995,5 +2031,110 @@ mod tests {
         };
         assert_eq!(frame.surface_id, object_id(6));
         assert_eq!(frame.pixels, [1, 2, 3, 0xff]);
+    }
+
+    #[test]
+    fn wire_client_can_commit_an_xdg_dmabuf_toplevel() {
+        use lumalla_wayland_protocol::protocols::{
+            linux_dmabuf::{
+                ZWP_LINUX_BUFFER_PARAMS_V1_ADD_OPCODE,
+                ZWP_LINUX_BUFFER_PARAMS_V1_CREATE_IMMED_OPCODE,
+                ZWP_LINUX_DMABUF_V1_CREATE_PARAMS_OPCODE, ZWP_LINUX_DMABUF_V1_NAME,
+            },
+            xdg_shell::{
+                XDG_SURFACE_ACK_CONFIGURE_OPCODE, XDG_SURFACE_GET_TOPLEVEL_OPCODE,
+                XDG_WM_BASE_GET_XDG_SURFACE_OPCODE, XDG_WM_BASE_NAME,
+            },
+        };
+        use crate::dmabuf::DRM_FORMAT_XRGB8888;
+
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(200);
+        let socket_path = std::env::temp_dir().join(format!(
+            "lumalla-dmabuf-test-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut wayland =
+            lumalla_wayland_protocol::Wayland::new(socket_path.to_string_lossy().into_owned())
+                .unwrap();
+        let mut client_stream = UnixStream::connect(&socket_path).unwrap();
+        let mut client = wayland.next_client().unwrap();
+        let mut state = display_state();
+
+        let xdg_global = state
+            .globals
+            .iter()
+            .find(|(_, g)| g.name == XDG_WM_BASE_NAME)
+            .map(|(id, _)| *id)
+            .expect("xdg_wm_base global");
+        let dmabuf_global = state
+            .globals
+            .iter()
+            .find(|(_, g)| g.name == ZWP_LINUX_DMABUF_V1_NAME)
+            .map(|(id, _)| *id)
+            .expect("zwp_linux_dmabuf_v1 global");
+
+        let mut wire = Vec::new();
+        wire.extend(wire_message(1, WL_DISPLAY_GET_REGISTRY_OPCODE, &[2]));
+        wire.extend(wire_bind(1, "wl_compositor", 3));
+        {
+            let mut data = bind_data(xdg_global, XDG_WM_BASE_NAME, 1, 4);
+            let size = 8 + data.len();
+            wire.extend_from_slice(&2u32.to_ne_bytes());
+            wire.extend_from_slice(&WL_REGISTRY_BIND_OPCODE.to_ne_bytes());
+            wire.extend_from_slice(&(size as u16).to_ne_bytes());
+            wire.append(&mut data);
+        }
+        {
+            let mut data = bind_data(dmabuf_global, ZWP_LINUX_DMABUF_V1_NAME, 3, 5);
+            let size = 8 + data.len();
+            wire.extend_from_slice(&2u32.to_ne_bytes());
+            wire.extend_from_slice(&WL_REGISTRY_BIND_OPCODE.to_ne_bytes());
+            wire.extend_from_slice(&(size as u16).to_ne_bytes());
+            wire.append(&mut data);
+        }
+        wire.extend(wire_message(3, WL_COMPOSITOR_CREATE_SURFACE_OPCODE, &[6]));
+        wire.extend(wire_message(
+            4,
+            XDG_WM_BASE_GET_XDG_SURFACE_OPCODE,
+            &[7, 6],
+        ));
+        wire.extend(wire_message(7, XDG_SURFACE_GET_TOPLEVEL_OPCODE, &[8]));
+        client_stream.write_all(&wire).unwrap();
+        client.handle_messages(&mut state).unwrap();
+
+        let mut wire = Vec::new();
+        wire.extend(wire_message(7, XDG_SURFACE_ACK_CONFIGURE_OPCODE, &[1]));
+        wire.extend(wire_message(5, ZWP_LINUX_DMABUF_V1_CREATE_PARAMS_OPCODE, &[9]));
+        // add: plane_idx, offset, stride, modifier_hi, modifier_lo (+ fd)
+        wire.extend(wire_message(
+            9,
+            ZWP_LINUX_BUFFER_PARAMS_V1_ADD_OPCODE,
+            &[0, 0, 4, 0, 0],
+        ));
+        wire.extend(wire_message(
+            9,
+            ZWP_LINUX_BUFFER_PARAMS_V1_CREATE_IMMED_OPCODE,
+            &[10, 1, 1, DRM_FORMAT_XRGB8888, 0],
+        ));
+        wire.extend(wire_message(6, WL_SURFACE_ATTACH_OPCODE, &[10, 0, 0]));
+        wire.extend(wire_message(6, WL_SURFACE_DAMAGE_OPCODE, &[0, 0, 1, 1]));
+        wire.extend(wire_message(6, WL_SURFACE_COMMIT_OPCODE, &[]));
+
+        let fd = memory_file(&[0xaa, 0xbb, 0xcc, 0xff]);
+        send_wire_with_fd(&client_stream, &wire, fd);
+        unsafe {
+            libc::close(fd);
+        }
+        client.handle_messages(&mut state).unwrap();
+
+        let updates: Vec<_> = state.take_surface_updates().collect();
+        let [SurfaceUpdate::Frame(frame)] = updates.as_slice() else {
+            panic!("expected one committed dmabuf frame, got {updates:?}");
+        };
+        assert_eq!(frame.surface_id, object_id(6));
+        assert_eq!(frame.buffer_id, object_id(10));
+        assert_eq!(frame.pixels, [0xaa, 0xbb, 0xcc, 0xff]);
+        assert_eq!(frame.format, WL_SHM_FORMAT_XRGB8888);
     }
 }

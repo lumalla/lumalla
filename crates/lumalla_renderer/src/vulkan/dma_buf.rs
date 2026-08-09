@@ -1,6 +1,6 @@
 //! Vulkan-allocated images exported as DMA-BUFs for KMS scanout.
 
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use anyhow::Context;
 use ash::vk;
@@ -191,6 +191,132 @@ impl DmaBufImage {
             .context("Failed to export DMA-BUF from Vulkan memory")?;
 
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Imports a client DMA-BUF as a sampled Vulkan image (linear modifier).
+    pub fn import_from_dma_buf(
+        device: &Device,
+        physical_device: &PhysicalDevice,
+        fd: OwnedFd,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        modifier: u64,
+        offset: u64,
+        stride: u32,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(width > 0 && height > 0, "Image dimensions must be non-zero");
+        anyhow::ensure!(stride > 0, "Stride must be non-zero");
+
+        let extent = vk::Extent2D { width, height };
+        let mut plane_layouts = [vk::SubresourceLayout {
+            offset,
+            size: 0,
+            row_pitch: stride as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        }];
+        let mut modifier_explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&mut plane_layouts);
+        let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external_memory_info)
+            .push_next(&mut modifier_explicit);
+
+        let image = unsafe { device.handle().create_image(&image_info, None) }
+            .context("Failed to create Vulkan image for DMA-BUF import")?;
+
+        let mut dedicated_requirements = vk::MemoryDedicatedRequirements::default();
+        let mut memory_requirements2 =
+            vk::MemoryRequirements2::default().push_next(&mut dedicated_requirements);
+        let image_requirements_info = vk::ImageMemoryRequirementsInfo2::default().image(image);
+        unsafe {
+            device.handle().get_image_memory_requirements2(
+                &image_requirements_info,
+                &mut memory_requirements2,
+            );
+        }
+        let mem_requirements = memory_requirements2.memory_requirements;
+
+        let memory_type_index = find_memory_type_index(
+            physical_device.memory_properties(),
+            mem_requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::empty(),
+        )
+        .context("No memory type for imported DMA-BUF")?;
+
+        let mut import_fd_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(fd.as_raw_fd());
+        let mut dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let mut alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_requirements.size.max(1))
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_fd_info);
+
+        if dedicated_requirements.requires_dedicated_allocation == vk::TRUE
+            || dedicated_requirements.prefers_dedicated_allocation == vk::TRUE
+        {
+            alloc_info = alloc_info.push_next(&mut dedicated_alloc_info);
+        }
+
+        let memory = unsafe { device.handle().allocate_memory(&alloc_info, None) }
+            .context("Failed to import DMA-BUF into Vulkan memory")?;
+        // Ownership of the FD transferred to Vulkan on success.
+        std::mem::forget(fd);
+
+        unsafe { device.handle().bind_image_memory(image, memory, 0) }
+            .context("Failed to bind imported DMA-BUF memory")?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .components(vk::ComponentMapping::default())
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = unsafe { device.handle().create_image_view(&view_info, None) }
+            .context("Failed to create image view for imported DMA-BUF")?;
+
+        debug!(
+            "Imported DMA-BUF as Vulkan image: {}x{} format={:?} modifier={:#x} stride={}",
+            width, height, format, modifier, stride
+        );
+
+        Ok(Self {
+            image,
+            memory,
+            view,
+            format,
+            extent,
+            modifier,
+            stride,
+            offset: offset as u32,
+            device: device.handle().clone(),
+            external_memory_fd: device.external_memory_fd().clone(),
+        })
     }
 
     pub fn image(&self) -> vk::Image {

@@ -5,11 +5,12 @@ use lumalla_shared::Comms;
 use lumalla_wayland_protocol::registry::InterfaceIndex;
 
 use crate::{
-    data_device::DataDeviceManager, output::OutputManager, seat::SeatManager, shm::ShmManager,
-    surface::SurfaceManager, xdg::XdgManager,
+    data_device::DataDeviceManager, dmabuf::DmabufManager, output::OutputManager,
+    seat::SeatManager, shm::ShmManager, surface::SurfaceManager, xdg::XdgManager,
 };
 
 mod data_device;
+mod dmabuf;
 mod protocols;
 mod seat;
 mod shm;
@@ -55,6 +56,7 @@ pub struct DisplayState {
     globals: Globals,
     surface_manager: SurfaceManager,
     shm_manager: ShmManager,
+    dmabuf_manager: DmabufManager,
     seat_manager: SeatManager,
     output_manager: OutputManager,
     data_device_manager: DataDeviceManager,
@@ -70,6 +72,7 @@ impl DisplayState {
             globals: Globals::default(),
             surface_manager: SurfaceManager::default(),
             shm_manager: ShmManager::default(),
+            dmabuf_manager: DmabufManager::default(),
             seat_manager: SeatManager::default(),
             output_manager: OutputManager::default(),
             data_device_manager: DataDeviceManager::default(),
@@ -252,6 +255,7 @@ impl DisplayState {
 
     pub fn remove_client(&mut self, client_id: ClientId) {
         self.shm_manager.delete_client(client_id);
+        self.dmabuf_manager.delete_client(client_id);
         self.surface_manager.delete_client(client_id);
         self.seat_manager.remove_client(client_id);
         self.output_manager.remove_client(client_id);
@@ -379,6 +383,9 @@ impl Default for Globals {
         globals.register_version(InterfaceIndex::WlFixes, 1, [].into_iter());
         globals.register_version(InterfaceIndex::WlDataDeviceManager, 3, [].into_iter());
         globals.register_version(InterfaceIndex::XdgWmBase, 1, [].into_iter());
+        // Stable linux-dmabuf keeps the zwp_ interface name; advertise v3 for
+        // format/modifier events + create_immed without requiring feedback.
+        globals.register_version(InterfaceIndex::ZwpLinuxDmabufV1, 3, [].into_iter());
         globals
     }
 }
