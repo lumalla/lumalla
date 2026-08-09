@@ -146,57 +146,65 @@ impl SurfaceManager {
             .find(|id| self.is_mapped(client_id, *id).unwrap_or(false))
     }
 
-    /// MVP pointer hit-test: `x`/`y` are unused (no geometric testing yet).
-    /// Returns the first mapped shell surface for `client_id`.
-    pub fn pointer_target(&self, client_id: ClientId, _x: f64, _y: f64) -> Option<ObjectId> {
-        self.first_mapped_shell_surface(Some(client_id))
+    /// Geometry hit-test for a client: top-most mapped surface containing (x, y).
+    pub fn pointer_target(&self, client_id: ClientId, x: f64, y: f64) -> Option<ObjectId> {
+        self.hit_test(Some(client_id), x, y)
             .filter(|(owner, _)| *owner == client_id)
             .map(|(_, surface)| surface)
     }
 
-    /// MVP global hit-test: first mapped shell surface across clients.
-    /// Prefer `preferred_client` when it has a mapped shell surface.
+    /// Geometry hit-test across clients. Prefer `preferred_client` when it owns the hit.
     pub fn global_pointer_target(
         &self,
         preferred_client: Option<ClientId>,
-        _x: f64,
-        _y: f64,
+        x: f64,
+        y: f64,
     ) -> Option<(ClientId, ObjectId)> {
-        self.first_mapped_shell_surface(preferred_client)
+        if let Some(preferred) = preferred_client
+            && let Some(hit) = self.hit_test(Some(preferred), x, y)
+        {
+            return Some(hit);
+        }
+        self.hit_test(None, x, y)
     }
 
-    fn first_mapped_shell_surface(
+    fn hit_test(
         &self,
         preferred_client: Option<ClientId>,
+        x: f64,
+        y: f64,
     ) -> Option<(ClientId, ObjectId)> {
-        let mut surfaces: Vec<(ClientId, ObjectId)> = self
-            .shell_surfaces
-            .iter()
-            .map(|(&(client_id, _), &surface_id)| (client_id, surface_id))
-            .collect();
+        let mut candidates: Vec<(ClientId, ObjectId, i32)> = Vec::new();
         for (&(client_id, surface_id), surface) in &self.surfaces {
-            if matches!(surface.role, Some(Role::Xdg(_))) {
-                surfaces.push((client_id, surface_id));
-            }
-        }
-        surfaces.sort_by_key(|(client_id, surface_id)| (client_id.get(), surface_id.get()));
-        if let Some(preferred) = preferred_client {
-            if let Some(found) = surfaces
-                .iter()
-                .copied()
-                .find(|(client_id, surface_id)| {
-                    *client_id == preferred
-                        && self.is_mapped(*client_id, *surface_id).unwrap_or(false)
-                })
+            if let Some(preferred) = preferred_client
+                && client_id != preferred
             {
-                return Some(found);
+                continue;
+            }
+            if !self.is_mapped(client_id, surface_id).unwrap_or(false) {
+                continue;
+            }
+            if !matches!(surface.role, Some(Role::Shell(_)) | Some(Role::Xdg(_))) {
+                continue;
+            }
+            let Some((bw, bh)) = surface.buffer_size else {
+                continue;
+            };
+            let scale = surface.current.buffer_scale.max(1);
+            let width = (bw / scale).max(0);
+            let height = (bh / scale).max(0);
+            let (lx, ly) = surface.layout;
+            if x >= lx as f64
+                && y >= ly as f64
+                && x < (lx + width) as f64
+                && y < (ly + height) as f64
+            {
+                // Higher layout cascade / object id paints later; prefer later.
+                candidates.push((client_id, surface_id, lx.saturating_add(ly)));
             }
         }
-        surfaces
-            .into_iter()
-            .find(|(client_id, surface_id)| {
-                self.is_mapped(*client_id, *surface_id).unwrap_or(false)
-            })
+        candidates.sort_by_key(|(c, s, cascade)| (*cascade, c.get(), s.get()));
+        candidates.pop().map(|(c, s, _)| (c, s))
     }
 
     pub fn assign_xdg_role(
@@ -244,6 +252,21 @@ impl SurfaceManager {
             .get_mut(&(client_id, surface_id))
             .ok_or(SurfaceError::UnknownSurface)?;
         surface.xdg_map_ready = ready;
+        Ok(())
+    }
+
+    pub fn set_committed_buffer_size(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        width: i32,
+        height: i32,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        surface.buffer_size = Some((width, height));
         Ok(())
     }
 
@@ -1218,6 +1241,8 @@ struct Surface {
     shell: ShellState,
     /// Layout position for mapped shell/xdg surfaces (compositor space).
     layout: (i32, i32),
+    /// Last committed buffer size in surface-local pixels (before scale).
+    buffer_size: Option<(i32, i32)>,
     /// For Role::Xdg: true after an ack_configure has been applied (ready to map with buffer).
     xdg_map_ready: bool,
     current: SurfaceState,
@@ -1438,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_target_returns_first_mapped_shell_surface() {
+    fn pointer_target_uses_buffer_geometry() {
         let mut manager = SurfaceManager::default();
         manager.create_surface(client(1), object(2));
         manager.create_surface(client(1), object(5));
@@ -1448,19 +1473,39 @@ mod tests {
         manager
             .set_shell_mode(client(1), object(3), ShellMode::Toplevel)
             .unwrap();
-        assert!(manager.pointer_target(client(1), 10.0, 20.0).is_none());
+        manager
+            .create_shell_surface(client(1), object(6), object(5))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(6), ShellMode::Toplevel)
+            .unwrap();
+
         manager
             .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
             .unwrap();
-        let _ = manager.commit(client(1), object(2)).unwrap();
+        assert!(manager.commit(client(1), object(2)).unwrap().primary.mapped);
+        manager
+            .set_committed_buffer_size(client(1), object(2), 100, 100)
+            .unwrap();
+
+        manager
+            .attach(client(1), object(5), Some(object(7)), 0, 0, 1)
+            .unwrap();
+        assert!(manager.commit(client(1), object(5)).unwrap().primary.mapped);
+        manager
+            .set_committed_buffer_size(client(1), object(5), 100, 100)
+            .unwrap();
+
         assert_eq!(
-            manager.pointer_target(client(1), 10.0, 20.0),
+            manager.pointer_target(client(1), 10.0, 10.0),
             Some(object(2))
         );
+        // Overlap region prefers the later-cascaded surface.
         assert_eq!(
-            manager.global_pointer_target(None, 0.0, 0.0),
-            Some((client(1), object(2)))
+            manager.pointer_target(client(1), 40.0, 40.0),
+            Some(object(5))
         );
+        assert!(manager.pointer_target(client(1), 200.0, 200.0).is_none());
     }
 
     #[test]

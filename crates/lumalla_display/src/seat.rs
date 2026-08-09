@@ -1000,6 +1000,9 @@ mod tests {
             .unwrap();
         surfaces.attach(client_id, surface, Some(object(40)), 0, 0, 1).unwrap();
         let _ = surfaces.commit(client_id, surface).unwrap();
+        surfaces
+            .set_committed_buffer_size(client_id, surface, 200, 200)
+            .unwrap();
 
         seat.create_touch(client_id, object(50), 5);
         // ClientConnection is heavy; exercise SeatManager state without a full client map.

@@ -153,6 +153,12 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
         if commit.mapped {
             match state.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
                 Ok(snapshot) => {
+                    let _ = state.surface_manager.set_committed_buffer_size(
+                        ctx.client_id,
+                        commit.surface_id,
+                        snapshot.width as i32,
+                        snapshot.height as i32,
+                    );
                     state
                         .surface_updates
                         .push_back(SurfaceUpdate::Frame(CommittedFrame {
