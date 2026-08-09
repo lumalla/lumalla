@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
+    io,
     num::NonZeroU32,
+    os::fd::RawFd,
+    path::PathBuf,
     pin::Pin,
     process::{Child, Command},
     sync::mpsc::Receiver,
@@ -16,18 +19,25 @@ use lumalla_display::{
     Wayland, create_wayland_display,
 };
 use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
-use lumalla_renderer::{RendererState, SOLID_CLEAR_COLOR, SurfaceFrame};
+use lumalla_renderer::{PresentStatus, RendererState, SOLID_CLEAR_COLOR, SurfaceFrame};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender,
     message_loop_with_channel,
 };
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Registry, Token, event::Source, unix::SourceFd};
 
 pub const LIBSEAT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 1);
 pub const LIBINPUT_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 2);
 pub const UDEV_DRM_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 3);
 pub const WAYLAND_SOCKET_TOKEN: Token = Token(MESSAGE_CHANNEL_TOKEN.0 + 4);
+/// DRM primary-node fds use this high token range to avoid Wayland client tokens.
+pub const DRM_DEVICE_TOKEN_BASE: Token = Token(1 << 16);
+
+struct DrmDeviceRegistration {
+    fd: RawFd,
+    token: Token,
+}
 
 /// Represents the data for the main app thread
 struct AppData {
@@ -45,6 +55,8 @@ struct AppData {
     display_state: DisplayState,
     renderer_state: RendererState,
     frame_clock: Instant,
+    drm_device_poll: HashMap<PathBuf, DrmDeviceRegistration>,
+    next_drm_device_token: usize,
 }
 
 impl AppData {
@@ -73,6 +85,8 @@ impl AppData {
             display_state,
             renderer_state,
             frame_clock: Instant::now(),
+            drm_device_poll: HashMap::new(),
+            next_drm_device_token: 0,
         }
     }
 
@@ -99,6 +113,9 @@ impl AppData {
         if let Err(err) = self.input_state.disable_seat() {
             warn!("Unable to suspend libinput during shutdown: {err}");
         }
+        if let Err(err) = self.clear_drm_device_poll(event_loop.registry()) {
+            warn!("Unable to deregister DRM device fds during shutdown: {err}");
+        }
         self.renderer_state
             .deactivate_drm(self.seat_state.as_ref().get_ref());
         Ok(())
@@ -113,7 +130,7 @@ impl AppData {
         for event in events {
             match event.token() {
                 MESSAGE_CHANNEL_TOKEN => {
-                    self.handle_channel_messages(main_channel);
+                    self.handle_channel_messages(main_channel, event_loop)?;
                 }
                 LIBSEAT_TOKEN => {
                     if let Err(err) = self.seat_state.dispatch() {
@@ -242,13 +259,20 @@ impl AppData {
                                 {
                                     error!("Unable to reconcile DRM devices: {err}");
                                 }
+                                if let Err(err) = self.sync_drm_device_poll(event_loop.registry())
+                                {
+                                    error!("Unable to refresh DRM device poll fds: {err}");
+                                }
                             }
                             self.sync_wayland_output_from_drm();
-                            if let Err(err) = self
+                            match self
                                 .renderer_state
                                 .present_enabled_outputs(SOLID_CLEAR_COLOR)
                             {
-                                error!("Unable to present outputs after DRM change: {err:#}");
+                                Ok(status) => self.maybe_complete_frame_callbacks(status),
+                                Err(err) => {
+                                    error!("Unable to present outputs after DRM change: {err:#}");
+                                }
                             }
                         }
                         self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
@@ -264,14 +288,26 @@ impl AppData {
                     self.connect_client(event_loop);
                 }
                 token => {
-                    self.handle_client_messages(token, event_loop)?;
+                    if self
+                        .drm_device_poll
+                        .values()
+                        .any(|registration| registration.token == token)
+                    {
+                        self.handle_drm_device_events()?;
+                    } else {
+                        self.handle_client_messages(token, event_loop)?;
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    fn handle_channel_messages(&mut self, main_channel: &Receiver<MainMessage>) {
+    fn handle_channel_messages(
+        &mut self,
+        main_channel: &Receiver<MainMessage>,
+        event_loop: &mut Poll,
+    ) -> anyhow::Result<()> {
         while let Ok(msg) = main_channel.try_recv() {
             match msg {
                 MainMessage::MainSeatEnabled => {
@@ -298,15 +334,21 @@ impl AppData {
                     {
                         error!("Unable to activate DRM devices: {err}");
                     } else {
+                        if let Err(err) = self.sync_drm_device_poll(event_loop.registry()) {
+                            error!("Unable to register DRM device poll fds: {err}");
+                        }
                         self.sync_wayland_output_from_drm();
                         self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                             self.renderer_state.drm_device_states(),
                         ));
-                        if let Err(err) = self
+                        match self
                             .renderer_state
                             .present_enabled_outputs(SOLID_CLEAR_COLOR)
                         {
-                            error!("Unable to present enabled outputs: {err:#}");
+                            Ok(status) => self.maybe_complete_frame_callbacks(status),
+                            Err(err) => {
+                                error!("Unable to present enabled outputs: {err:#}");
+                            }
                         }
                         self.comms.dbus(DbusMessage::EmitReady);
                     }
@@ -321,6 +363,9 @@ impl AppData {
                     // Suspend input before releasing DRM; close may fail after disable.
                     if let Err(err) = self.input_state.disable_seat() {
                         error!("Unable to disable libinput: {err}");
+                    }
+                    if let Err(err) = self.clear_drm_device_poll(event_loop.registry()) {
+                        error!("Unable to deregister DRM device poll fds: {err}");
                     }
                     self.renderer_state
                         .deactivate_drm(self.seat_state.as_ref().get_ref());
@@ -342,16 +387,18 @@ impl AppData {
                     self.input_state.clear_keymaps();
                 }
                 MainMessage::SetRenderDevice(path) => {
-                    if let Err(err) = self.renderer_state.set_render_device(path) {
-                        error!("Unable to set render device: {err:#}");
+                    match self.renderer_state.set_render_device(path) {
+                        Ok(status) => self.maybe_complete_frame_callbacks(status),
+                        Err(err) => error!("Unable to set render device: {err:#}"),
                     }
                     self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                         self.renderer_state.drm_device_states(),
                     ));
                 }
                 MainMessage::SetOutputConfigs(configs) => {
-                    if let Err(err) = self.renderer_state.set_output_configs(configs) {
-                        error!("Unable to set output configs: {err:#}");
+                    match self.renderer_state.set_output_configs(configs) {
+                        Ok(status) => self.maybe_complete_frame_callbacks(status),
+                        Err(err) => error!("Unable to set output configs: {err:#}"),
                     }
                     self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                         self.renderer_state.drm_device_states(),
@@ -383,6 +430,7 @@ impl AppData {
                 }
             }
         }
+        Ok(())
     }
 
     fn emit_outputs_changed(&self) {
@@ -414,7 +462,10 @@ impl AppData {
         }
         for client_id in clients_to_remove {
             self.display_state.remove_client(client_id);
-            self.renderer_state.remove_client_frames(client_id.get());
+            match self.renderer_state.remove_client_frames(client_id.get()) {
+                Ok(status) => self.maybe_complete_frame_callbacks(status),
+                Err(err) => error!("Unable to clear frames for disconnected client: {err:#}"),
+            }
             self.connected_clients.remove(&client_id);
         }
     }
@@ -441,7 +492,12 @@ impl AppData {
                     error!("Unable to deregister client {:?}: {err}", client_id);
                 }
                 self.display_state.remove_client(client_id);
-                self.renderer_state.remove_client_frames(client_id.get());
+                match self.renderer_state.remove_client_frames(client_id.get()) {
+                    Ok(status) => self.maybe_complete_frame_callbacks(status),
+                    Err(err) => {
+                        error!("Unable to clear frames for disconnected client: {err:#}")
+                    }
+                }
                 self.connected_clients.remove(&client_id);
             } else {
                 self.submit_committed_frames();
@@ -477,8 +533,10 @@ impl AppData {
 
     fn submit_committed_frames(&mut self) {
         let updates: Vec<_> = self.display_state.take_surface_updates().collect();
-        let mut presented = false;
+        let mut last_status = PresentStatus { idle: true };
+        let mut had_updates = false;
         for update in updates {
+            had_updates = true;
             match update {
                 SurfaceUpdate::Frame(frame) => {
                     let frame = SurfaceFrame {
@@ -493,31 +551,92 @@ impl AppData {
                         y: frame.y,
                         buffer_scale: frame.buffer_scale,
                     };
-                    if let Err(err) = self.renderer_state.set_surface_frame(frame) {
-                        error!("Unable to queue committed Wayland surface: {err:#}");
-                    } else {
-                        presented = true;
+                    match self.renderer_state.set_surface_frame(frame) {
+                        Ok(status) => last_status = status,
+                        Err(err) => error!("Unable to queue committed Wayland surface: {err:#}"),
                     }
                 }
                 SurfaceUpdate::Unmapped {
                     client_id,
                     surface_id,
-                } => self
+                } => match self
                     .renderer_state
-                    .remove_surface_frame(client_id.get(), surface_id.get()),
+                    .remove_surface_frame(client_id.get(), surface_id.get())
+                {
+                    Ok(status) => last_status = status,
+                    Err(err) => error!("Unable to clear unmapped Wayland surface: {err:#}"),
+                },
             }
         }
-        if presented || self.display_state.pending_frame_callback_count() > 0 {
-            let time_msec = self
-                .frame_clock
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u32::MAX)) as u32;
-            // Avoid zero so clients that treat 0 as "unset" still see a clock.
-            let time_msec = time_msec.max(1);
-            self.display_state
-                .complete_frame_callbacks(&mut self.connected_clients, time_msec);
+        if had_updates {
+            self.maybe_complete_frame_callbacks(last_status);
+        } else if self.display_state.pending_frame_callback_count() > 0 && last_status.idle {
+            self.maybe_complete_frame_callbacks(last_status);
         }
+    }
+
+    fn handle_drm_device_events(&mut self) -> anyhow::Result<()> {
+        match self.renderer_state.dispatch_page_flips() {
+            Ok(status) => self.maybe_complete_frame_callbacks(status),
+            Err(err) => error!("Unable to dispatch DRM page-flip events: {err:#}"),
+        }
+        Ok(())
+    }
+
+    fn maybe_complete_frame_callbacks(&mut self, status: PresentStatus) {
+        if !status.idle || self.display_state.pending_frame_callback_count() == 0 {
+            return;
+        }
+        let time_msec = self
+            .frame_clock
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32;
+        // Avoid zero so clients that treat 0 as "unset" still see a clock.
+        let time_msec = time_msec.max(1);
+        self.display_state
+            .complete_frame_callbacks(&mut self.connected_clients, time_msec);
+    }
+
+    fn sync_drm_device_poll(&mut self, registry: &Registry) -> io::Result<()> {
+        let opened: HashMap<PathBuf, RawFd> =
+            self.renderer_state.opened_drm_fds().into_iter().collect();
+
+        let stale: Vec<PathBuf> = self
+            .drm_device_poll
+            .keys()
+            .filter(|path| !opened.contains_key(*path))
+            .cloned()
+            .collect();
+        for path in stale {
+            if let Some(registration) = self.drm_device_poll.remove(&path) {
+                let fd = registration.fd;
+                let mut source = SourceFd(&fd);
+                source.deregister(registry)?;
+            }
+        }
+
+        for (path, fd) in opened {
+            if self.drm_device_poll.contains_key(&path) {
+                continue;
+            }
+            let token = Token(DRM_DEVICE_TOKEN_BASE.0 + self.next_drm_device_token);
+            self.next_drm_device_token += 1;
+            let mut source = SourceFd(&fd);
+            source.register(registry, token, Interest::READABLE)?;
+            self.drm_device_poll
+                .insert(path, DrmDeviceRegistration { fd, token });
+        }
+        Ok(())
+    }
+
+    fn clear_drm_device_poll(&mut self, registry: &Registry) -> io::Result<()> {
+        for (_, registration) in self.drm_device_poll.drain() {
+            let fd = registration.fd;
+            let mut source = SourceFd(&fd);
+            source.deregister(registry)?;
+        }
+        Ok(())
     }
 
     fn connect_client(&mut self, event_loop: &mut Poll) {

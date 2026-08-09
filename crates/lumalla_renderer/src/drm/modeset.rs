@@ -1,15 +1,53 @@
 //! DRM modesetting via the atomic API: planes, property blobs, and page-flips.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, c_void};
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::debug;
 
 use super::sys;
+
+/// A completed DRM page-flip reported by `page_flip_handler2`.
+#[derive(Debug, Clone, Copy)]
+pub struct CompletedPageFlip {
+    /// CRTC that finished the flip.
+    pub crtc_id: u32,
+    /// MSC sequence number from the kernel event.
+    pub sequence: u32,
+    /// Timestamp seconds from the kernel event.
+    pub tv_sec: u32,
+    /// Timestamp microseconds from the kernel event.
+    pub tv_usec: u32,
+}
+
+/// Queue of page-flip completions filled by the DRM event handler.
+///
+/// Interior mutability is single-threaded: handlers run synchronously inside
+/// `drmHandleEvent` on the compositor thread.
+#[derive(Debug, Default)]
+pub struct FlipEventQueue {
+    completed: RefCell<Vec<CompletedPageFlip>>,
+}
+
+impl FlipEventQueue {
+    /// Create an empty completion queue.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drain all flip completions received since the last drain.
+    pub fn drain(&self) -> Vec<CompletedPageFlip> {
+        std::mem::take(&mut *self.completed.borrow_mut())
+    }
+
+    fn push(&self, flip: CompletedPageFlip) {
+        self.completed.borrow_mut().push(flip);
+    }
+}
 
 /// Full kernel mode info required for atomic MODE_ID blobs.
 #[derive(Clone)]
@@ -124,13 +162,9 @@ impl DrmFramebuffer {
     ) -> anyhow::Result<Self> {
         let fd = drm_fd.as_raw_fd();
         let mut gem_handle = 0u32;
-        let result =
-            unsafe { sys::drmPrimeFDToHandle(fd, dma_buf.as_raw_fd(), &mut gem_handle) };
+        let result = unsafe { sys::drmPrimeFDToHandle(fd, dma_buf.as_raw_fd(), &mut gem_handle) };
         if result != 0 {
-            anyhow::bail!(
-                "drmPrimeFDToHandle failed: {}",
-                io::Error::last_os_error()
-            );
+            anyhow::bail!("drmPrimeFDToHandle failed: {}", io::Error::last_os_error());
         }
 
         let handles = [gem_handle, 0, 0, 0];
@@ -253,8 +287,7 @@ impl Drop for ModeBlob {
 
 /// Enable atomic + universal planes on a freshly opened DRM primary node.
 pub fn enable_atomic_client_caps(fd: RawFd) -> anyhow::Result<()> {
-    let result =
-        unsafe { sys::drmSetClientCap(fd, sys::DRM_CLIENT_CAP_ATOMIC, 1) };
+    let result = unsafe { sys::drmSetClientCap(fd, sys::DRM_CLIENT_CAP_ATOMIC, 1) };
     if result != 0 {
         anyhow::bail!(
             "drmSetClientCap(ATOMIC) failed: {}",
@@ -309,16 +342,16 @@ pub fn atomic_modeset(
     let props = &output.props;
 
     let req = AtomicRequest::new()?;
-    req.add(output.connector_id, props.connector_crtc_id, u64::from(output.crtc_id))?;
+    req.add(
+        output.connector_id,
+        props.connector_crtc_id,
+        u64::from(output.crtc_id),
+    )?;
     req.add(output.crtc_id, props.crtc_active, 1u64)?;
     req.add(output.crtc_id, props.crtc_mode_id, u64::from(mode_blob_id))?;
     add_plane_fb_props(&req, output, props, fb_id, width, height)?;
 
-    req.commit(
-        fd,
-        sys::DRM_MODE_ATOMIC_ALLOW_MODESET,
-        ptr::null_mut(),
-    )?;
+    req.commit(fd, sys::DRM_MODE_ATOMIC_ALLOW_MODESET, ptr::null_mut())?;
 
     debug!(
         "Atomic modeset: CRTC {} plane {} FB {} on {} ({})",
@@ -359,19 +392,18 @@ pub fn atomic_set_plane_fb(
 
 /// Non-blocking page-flip of the primary plane FB, requesting a flip event.
 ///
-/// `flip_done` is set to `true` by the DRM page-flip handler when the flip completes.
+/// Completions are delivered to `flip_events` via [`dispatch_drm_events`] using
+/// `page_flip_handler2` (identified by CRTC id).
 pub fn atomic_page_flip(
     drm_fd: BorrowedFd<'_>,
     output: &ConnectedOutput,
     fb_id: u32,
-    flip_done: &AtomicBool,
+    flip_events: &FlipEventQueue,
 ) -> anyhow::Result<()> {
     let fd = drm_fd.as_raw_fd();
     let width = output.mode.width();
     let height = output.mode.height();
     let props = &output.props;
-
-    flip_done.store(false, Ordering::SeqCst);
 
     let req = AtomicRequest::new()?;
     add_plane_fb_props(&req, output, props, fb_id, width, height)?;
@@ -379,48 +411,54 @@ pub fn atomic_page_flip(
     req.commit(
         fd,
         sys::DRM_MODE_PAGE_FLIP_EVENT | sys::DRM_MODE_ATOMIC_NONBLOCK,
-        flip_done as *const AtomicBool as *mut c_void,
+        flip_events as *const FlipEventQueue as *mut c_void,
     )?;
 
     debug!(
-        "Atomic page-flip scheduled: plane {} -> FB {}",
-        output.plane_id, fb_id
+        "Atomic page-flip scheduled: plane {} -> FB {} (CRTC {})",
+        output.plane_id, fb_id, output.crtc_id
     );
     Ok(())
 }
 
 /// Drain pending DRM events on `fd` (page-flip completions, etc.).
+///
+/// Completions are pushed into the [`FlipEventQueue`] pointer that was passed to
+/// [`atomic_page_flip`] as commit `user_data`.
 pub fn dispatch_drm_events(fd: RawFd) -> anyhow::Result<()> {
     let mut ctx = sys::drmEventContext {
         version: sys::DRM_EVENT_CONTEXT_VERSION,
         vblank_handler: ptr::null_mut(),
-        page_flip_handler: Some(page_flip_handler),
-        page_flip_handler2: None,
+        page_flip_handler: None,
+        page_flip_handler2: Some(page_flip_handler2),
         sequence_handler: ptr::null_mut(),
     };
 
     let result = unsafe { sys::drmHandleEvent(fd, &mut ctx) };
     if result != 0 {
-        anyhow::bail!(
-            "drmHandleEvent failed: {}",
-            io::Error::last_os_error()
-        );
+        anyhow::bail!("drmHandleEvent failed: {}", io::Error::last_os_error());
     }
     Ok(())
 }
 
-unsafe extern "C" fn page_flip_handler(
+unsafe extern "C" fn page_flip_handler2(
     _fd: std::ffi::c_int,
-    _sequence: u32,
-    _tv_sec: u32,
-    _tv_usec: u32,
+    sequence: u32,
+    tv_sec: u32,
+    tv_usec: u32,
+    crtc_id: u32,
     user_data: *mut c_void,
 ) {
     if user_data.is_null() {
         return;
     }
-    let flag = unsafe { &*(user_data as *const AtomicBool) };
-    flag.store(true, Ordering::SeqCst);
+    let queue = unsafe { &*(user_data as *const FlipEventQueue) };
+    queue.push(CompletedPageFlip {
+        crtc_id,
+        sequence,
+        tv_sec,
+        tv_usec,
+    });
 }
 
 fn add_plane_fb_props(
@@ -432,7 +470,11 @@ fn add_plane_fb_props(
     height: u32,
 ) -> anyhow::Result<()> {
     req.add(output.plane_id, props.plane_fb_id, u64::from(fb_id))?;
-    req.add(output.plane_id, props.plane_crtc_id, u64::from(output.crtc_id))?;
+    req.add(
+        output.plane_id,
+        props.plane_crtc_id,
+        u64::from(output.crtc_id),
+    )?;
     req.add(output.plane_id, props.plane_src_x, 0u64)?;
     req.add(output.plane_id, props.plane_src_y, 0u64)?;
     req.add(output.plane_id, props.plane_src_w, u64::from(width) << 16)?;
@@ -527,7 +569,12 @@ fn probe_connected_output(
     used_crtcs.insert(crtc_id);
 
     let props = AtomicProps {
-        connector_crtc_id: find_prop_id(fd, connector_id, sys::DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID")?,
+        connector_crtc_id: find_prop_id(
+            fd,
+            connector_id,
+            sys::DRM_MODE_OBJECT_CONNECTOR,
+            "CRTC_ID",
+        )?,
         crtc_active: find_prop_id(fd, crtc_id, sys::DRM_MODE_OBJECT_CRTC, "ACTIVE")?,
         crtc_mode_id: find_prop_id(fd, crtc_id, sys::DRM_MODE_OBJECT_CRTC, "MODE_ID")?,
         plane_fb_id: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "FB_ID")?,
@@ -688,10 +735,7 @@ fn connector_type_name(connector_type: u32) -> Option<String> {
 fn get_resources(fd: RawFd) -> anyhow::Result<DrmModeResources> {
     let ptr = unsafe { sys::drmModeGetResources(fd) };
     if ptr.is_null() {
-        anyhow::bail!(
-            "drmModeGetResources failed: {}",
-            io::Error::last_os_error()
-        );
+        anyhow::bail!("drmModeGetResources failed: {}", io::Error::last_os_error());
     }
     Ok(DrmModeResources { ptr })
 }
@@ -992,6 +1036,10 @@ mod tests {
         assert_eq!(
             std::mem::offset_of!(sys::drmEventContext, page_flip_handler),
             16
+        );
+        assert_eq!(
+            std::mem::offset_of!(sys::drmEventContext, page_flip_handler2),
+            16 + std::mem::size_of::<*mut ()>()
         );
     }
 }

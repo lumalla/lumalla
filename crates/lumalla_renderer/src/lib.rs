@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use ash::vk;
@@ -14,8 +15,9 @@ pub mod drm;
 pub mod vulkan;
 
 use crate::drm::{
-    ConnectedOutput, DrmDevices, DrmDispatchResult, DrmFramebuffer, ModeBlob, atomic_modeset,
-    atomic_set_plane_fb, resolve_connected_output,
+    ConnectedOutput, DrmDevices, DrmDispatchResult, DrmFramebuffer, FlipEventQueue, ModeBlob,
+    atomic_modeset, atomic_page_flip, atomic_set_plane_fb, dispatch_drm_events,
+    resolve_connected_output,
 };
 use crate::vulkan::{
     DmaBufImage, Framebuffer, RenderPass, VulkanContext, clear_framebuffer_to_color,
@@ -26,6 +28,13 @@ use crate::vulkan::{
 pub const SOLID_CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.65, 1.0];
 const WL_SHM_FORMAT_ARGB8888: u32 = 0;
 const WL_SHM_FORMAT_XRGB8888: u32 = 1;
+
+/// Outcome of a present or page-flip dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentStatus {
+    /// No page-flips are currently in flight.
+    pub idle: bool,
+}
 
 #[derive(Debug)]
 pub struct SurfaceFrame {
@@ -72,14 +81,25 @@ impl SurfaceFrame {
     }
 }
 
+struct ScanoutBuffer {
+    drm_fb: DrmFramebuffer,
+    /// Kept alive so the exported DMA-BUF backing `drm_fb` remains valid.
+    #[allow(dead_code)]
+    dma_image: DmaBufImage,
+}
+
 struct OutputScanout {
     drm_path: PathBuf,
     output: ConnectedOutput,
     /// Owned so the CRTC's MODE_ID blob is not destroyed while still active.
     #[allow(dead_code)]
     mode_blob: ModeBlob,
-    drm_fb: DrmFramebuffer,
-    dma_image: DmaBufImage,
+    /// Buffer currently owned by the CRTC (or last committed).
+    current: ScanoutBuffer,
+    /// Buffer waiting for page-flip completion; must not be dropped yet.
+    pending: Option<ScanoutBuffer>,
+    /// Newest buffer to flip after `pending` completes.
+    queued: Option<ScanoutBuffer>,
 }
 
 pub struct RendererState {
@@ -91,6 +111,8 @@ pub struct RendererState {
     /// Per-connector overrides; missing names use defaults (enabled if connected).
     output_configs: HashMap<String, OutputConfig>,
     scanouts: HashMap<String, OutputScanout>,
+    /// Heap-stable queue pointer passed to DRM as page-flip `user_data`.
+    flip_events: Box<FlipEventQueue>,
     /// Mapped surfaces in paint order (back to front).
     surface_frames: HashMap<(u32, u32), SurfaceFrame>,
     surface_order: Vec<(u32, u32)>,
@@ -104,6 +126,7 @@ impl RendererState {
             render_device: None,
             output_configs: HashMap::new(),
             scanouts: HashMap::new(),
+            flip_events: Box::new(FlipEventQueue::new()),
             surface_frames: HashMap::new(),
             surface_order: Vec::new(),
         })
@@ -128,8 +151,35 @@ impl RendererState {
         self.drm_devices.dispatch()
     }
 
+    /// Opened DRM primary-node paths and fds for event-loop registration.
+    pub fn opened_drm_fds(&self) -> Vec<(PathBuf, RawFd)> {
+        self.drm_devices
+            .opened()
+            .iter()
+            .map(|(path, device)| (path.clone(), device.fd().as_raw_fd()))
+            .collect()
+    }
+
+    /// Drain DRM page-flip events, retire buffers, and schedule queued flips.
+    pub fn dispatch_page_flips(&mut self) -> anyhow::Result<PresentStatus> {
+        let fds: Vec<RawFd> = self
+            .drm_devices
+            .opened()
+            .values()
+            .map(|device| device.fd().as_raw_fd())
+            .collect();
+        for fd in fds {
+            dispatch_drm_events(fd)?;
+        }
+        let completed = self.flip_events.drain();
+        for flip in completed {
+            self.retire_page_flip(flip.crtc_id)?;
+        }
+        Ok(self.present_status())
+    }
+
     /// Replace or insert a surface frame and present the scene.
-    pub fn set_surface_frame(&mut self, frame: SurfaceFrame) -> anyhow::Result<()> {
+    pub fn set_surface_frame(&mut self, frame: SurfaceFrame) -> anyhow::Result<PresentStatus> {
         frame.validate()?;
         let key = (frame.owner_id, frame.surface_id);
         if !self.surface_frames.contains_key(&key) {
@@ -137,32 +187,34 @@ impl RendererState {
         }
         self.surface_frames.insert(key, frame);
         if self.drm_devices.opened().is_empty() {
-            return Ok(());
+            return Ok(self.present_status());
         }
         self.present_enabled_outputs(SOLID_CLEAR_COLOR)
     }
 
-    pub fn remove_surface_frame(&mut self, owner_id: u32, surface_id: u32) {
+    pub fn remove_surface_frame(
+        &mut self,
+        owner_id: u32,
+        surface_id: u32,
+    ) -> anyhow::Result<PresentStatus> {
         let key = (owner_id, surface_id);
         if self.surface_frames.remove(&key).is_some() {
             self.surface_order.retain(|k| *k != key);
             if !self.drm_devices.opened().is_empty() {
-                if let Err(error) = self.present_enabled_outputs(SOLID_CLEAR_COLOR) {
-                    error!("Failed to clear removed Wayland surface: {error:#}");
-                }
+                return self.present_enabled_outputs(SOLID_CLEAR_COLOR);
             }
         }
+        Ok(self.present_status())
     }
 
-    pub fn remove_client_frames(&mut self, owner_id: u32) {
+    pub fn remove_client_frames(&mut self, owner_id: u32) -> anyhow::Result<PresentStatus> {
         let before = self.surface_frames.len();
         self.surface_frames.retain(|(owner, _), _| *owner != owner_id);
         self.surface_order.retain(|(owner, _)| *owner != owner_id);
         if self.surface_frames.len() != before && !self.drm_devices.opened().is_empty() {
-            if let Err(error) = self.present_enabled_outputs(SOLID_CLEAR_COLOR) {
-                error!("Failed to clear disconnected Wayland surface: {error:#}");
-            }
+            return self.present_enabled_outputs(SOLID_CLEAR_COLOR);
         }
+        Ok(self.present_status())
     }
 
     /// Geometry of the first enabled present target, if DRM outputs are resolvable.
@@ -185,27 +237,29 @@ impl RendererState {
     /// Close seat-opened DRM devices after session disable was acknowledged.
     pub fn deactivate_drm(&mut self, seat: &SeatState) {
         self.scanouts.clear();
+        let _ = self.flip_events.drain();
         self.drm_devices.deactivate(seat);
     }
 
     /// Close removed / open newly discovered DRM devices while the seat is active.
     pub fn reconcile_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
         self.scanouts.clear();
+        let _ = self.flip_events.drain();
         self.drm_devices.reconcile(seat)
     }
 
     /// Select the Vulkan render device (`None` = auto). Re-presents if the seat is active.
-    pub fn set_render_device(&mut self, path: Option<PathBuf>) -> anyhow::Result<()> {
+    pub fn set_render_device(&mut self, path: Option<PathBuf>) -> anyhow::Result<PresentStatus> {
         info!("Render device config: {path:?}");
         self.render_device = path;
         if !self.drm_devices.opened().is_empty() {
-            self.present_enabled_outputs(SOLID_CLEAR_COLOR)?;
+            return self.present_enabled_outputs(SOLID_CLEAR_COLOR);
         }
-        Ok(())
+        Ok(self.present_status())
     }
 
     /// Merge per-connector output config. Re-presents if the seat is active.
-    pub fn set_output_configs(&mut self, configs: Vec<OutputConfig>) -> anyhow::Result<()> {
+    pub fn set_output_configs(&mut self, configs: Vec<OutputConfig>) -> anyhow::Result<PresentStatus> {
         for config in configs {
             info!(
                 "Output config: {} enabled={} mode={:?}",
@@ -214,9 +268,9 @@ impl RendererState {
             self.output_configs.insert(config.name.clone(), config);
         }
         if !self.drm_devices.opened().is_empty() {
-            self.present_enabled_outputs(SOLID_CLEAR_COLOR)?;
+            return self.present_enabled_outputs(SOLID_CLEAR_COLOR);
         }
-        Ok(())
+        Ok(self.present_status())
     }
 
     /// Present a solid clear on every enabled connected output (any card).
@@ -224,13 +278,12 @@ impl RendererState {
     /// Buffers are allocated on the selected render GPU and imported on each
     /// output's DRM card (same- or cross-device). Failures are logged per output.
     ///
-    /// Active scanouts are retained across presents: the previous FB / mode blob
-    /// stay alive until the new commit succeeds, and unchanged modes use a
-    /// plane-only update instead of a full modeset.
-    pub fn present_enabled_outputs(&mut self, color: [f32; 4]) -> anyhow::Result<()> {
+    /// Unchanged modes schedule a non-blocking page-flip; the previous FB stays
+    /// alive until [`Self::dispatch_page_flips`] reports completion.
+    pub fn present_enabled_outputs(&mut self, color: [f32; 4]) -> anyhow::Result<PresentStatus> {
         let Some(render_path) = self.resolved_render_device_path() else {
             warn!("No render device available; skipping presentation");
-            return Ok(());
+            return Ok(self.present_status());
         };
 
         info!("Using render device {}", render_path.display());
@@ -240,7 +293,7 @@ impl RendererState {
         if targets.is_empty() {
             warn!("No enabled connected outputs to present");
             self.scanouts.clear();
-            return Ok(());
+            return Ok(self.present_status());
         }
 
         let keep: HashSet<String> = targets.iter().map(|t| t.connector_name.clone()).collect();
@@ -273,7 +326,7 @@ impl RendererState {
 
         self.scanouts.retain(|name, _| keep.contains(name));
         info!("Presented {presented} output(s)");
-        Ok(())
+        Ok(self.present_status())
     }
 
     fn collect_present_targets(&self) -> Vec<PresentTarget> {
@@ -323,11 +376,81 @@ impl RendererState {
         targets
     }
 
+    fn present_status(&self) -> PresentStatus {
+        PresentStatus {
+            idle: !self.has_pending_flips(),
+        }
+    }
+
+    fn has_pending_flips(&self) -> bool {
+        self.scanouts.values().any(|scanout| scanout.pending.is_some())
+    }
+
     fn present_one_output(
         &mut self,
         target: &PresentTarget,
         color: [f32; 4],
     ) -> anyhow::Result<()> {
+        let buffer = self.render_scanout_buffer(target, color)?;
+
+        let reuse_mode = self.scanouts.get(&target.connector_name).is_some_and(|prev| {
+            prev.drm_path == target.drm_path
+                && prev.output.connector_id == target.output.connector_id
+                && prev.output.crtc_id == target.output.crtc_id
+                && prev.output.plane_id == target.output.plane_id
+                && prev.output.mode == target.output.mode
+        });
+
+        if reuse_mode {
+            return self.schedule_or_queue_flip(&target.connector_name, buffer);
+        }
+
+        if self
+            .scanouts
+            .get(&target.connector_name)
+            .is_some_and(|scanout| scanout.pending.is_some())
+        {
+            self.wait_for_connector_flip(&target.connector_name)?;
+        }
+
+        let drm_device = self
+            .drm_devices
+            .opened()
+            .get(&target.drm_path)
+            .with_context(|| {
+                format!("DRM device {} is no longer open", target.drm_path.display())
+            })?;
+
+        let mode_blob = ModeBlob::create(drm_device.fd(), &target.output.mode)
+            .context("Failed to create MODE_ID property blob")?;
+
+        atomic_modeset(
+            drm_device.fd(),
+            &target.output,
+            mode_blob.id(),
+            buffer.drm_fb.id(),
+        )
+        .context("Failed atomic modeset")?;
+
+        let _previous = self.scanouts.insert(
+            target.connector_name.clone(),
+            OutputScanout {
+                drm_path: target.drm_path.clone(),
+                output: target.output.clone(),
+                mode_blob,
+                current: buffer,
+                pending: None,
+                queued: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn render_scanout_buffer(
+        &mut self,
+        target: &PresentTarget,
+        color: [f32; 4],
+    ) -> anyhow::Result<ScanoutBuffer> {
         let width = target.output.mode.width();
         let height = target.output.mode.height();
         let format = vk::Format::B8G8R8A8_UNORM;
@@ -415,58 +538,142 @@ impl RendererState {
         )
         .context("Failed to import DMA-BUF as DRM framebuffer")?;
 
-        let reuse_mode = self.scanouts.get(&target.connector_name).is_some_and(|prev| {
-            prev.drm_path == target.drm_path
-                && prev.output.connector_id == target.output.connector_id
-                && prev.output.crtc_id == target.output.crtc_id
-                && prev.output.plane_id == target.output.plane_id
-                && prev.output.mode == target.output.mode
-        });
+        Ok(ScanoutBuffer { drm_fb, dma_image })
+    }
 
-        if reuse_mode {
-            match atomic_set_plane_fb(drm_device.fd(), &target.output, drm_fb.id()) {
-                Ok(()) => {
-                    let mut prev = self
-                        .scanouts
-                        .remove(&target.connector_name)
-                        .expect("reuse_mode requires an existing scanout");
-                    prev.drm_path = target.drm_path.clone();
-                    prev.output = target.output.clone();
-                    // Replace FB/image only after the plane update succeeded so the
-                    // CRTC never loses its active framebuffer.
-                    prev.drm_fb = drm_fb;
-                    prev.dma_image = dma_image;
-                    self.scanouts
-                        .insert(target.connector_name.clone(), prev);
-                    return Ok(());
+    fn schedule_or_queue_flip(
+        &mut self,
+        connector_name: &str,
+        buffer: ScanoutBuffer,
+    ) -> anyhow::Result<()> {
+        let (drm_path, output, flip_busy) = {
+            let scanout = self
+                .scanouts
+                .get(connector_name)
+                .context("Missing scanout for page-flip")?;
+            (
+                scanout.drm_path.clone(),
+                scanout.output.clone(),
+                scanout.pending.is_some(),
+            )
+        };
+
+        if flip_busy {
+            let scanout = self
+                .scanouts
+                .get_mut(connector_name)
+                .context("Missing scanout while queueing flip")?;
+            scanout.queued = Some(buffer);
+            return Ok(());
+        }
+
+        let fb_id = buffer.drm_fb.id();
+        let flip_result = {
+            let device = self
+                .drm_devices
+                .opened()
+                .get(&drm_path)
+                .with_context(|| format!("DRM device {} is no longer open", drm_path.display()))?;
+            atomic_page_flip(device.fd(), &output, fb_id, self.flip_events.as_ref())
+        };
+
+        match flip_result {
+            Ok(()) => {
+                let scanout = self
+                    .scanouts
+                    .get_mut(connector_name)
+                    .context("Missing scanout after scheduling flip")?;
+                scanout.pending = Some(buffer);
+                Ok(())
+            }
+            Err(err) => {
+                warn!(
+                    "Async page-flip failed on {connector_name}: {err:#}; using blocking update"
+                );
+                {
+                    let device = self.drm_devices.opened().get(&drm_path).with_context(|| {
+                        format!("DRM device {} is no longer open", drm_path.display())
+                    })?;
+                    atomic_set_plane_fb(device.fd(), &output, fb_id)
+                        .context("Failed blocking plane FB update after page-flip error")?;
                 }
-                Err(err) => {
-                    warn!(
-                        "Plane FB update failed on {}: {err:#}; falling back to modeset",
-                        target.connector_name
-                    );
-                }
+                let scanout = self
+                    .scanouts
+                    .get_mut(connector_name)
+                    .context("Missing scanout after blocking flip fallback")?;
+                scanout.current = buffer;
+                scanout.pending = None;
+                scanout.queued = None;
+                Ok(())
+            }
+        }
+    }
+
+    fn retire_page_flip(&mut self, crtc_id: u32) -> anyhow::Result<()> {
+        let Some(connector_name) = self
+            .scanouts
+            .iter()
+            .find_map(|(name, scanout)| (scanout.output.crtc_id == crtc_id).then(|| name.clone()))
+        else {
+            warn!("Ignoring page-flip completion for unknown CRTC {crtc_id}");
+            return Ok(());
+        };
+
+        let queued = {
+            let scanout = self
+                .scanouts
+                .get_mut(&connector_name)
+                .context("Missing scanout during flip retirement")?;
+            let Some(new_current) = scanout.pending.take() else {
+                warn!("Page-flip completion without pending buffer on {connector_name}");
+                return Ok(());
+            };
+            let old = std::mem::replace(&mut scanout.current, new_current);
+            drop(old);
+            scanout.queued.take()
+        };
+
+        if let Some(queued) = queued {
+            self.schedule_or_queue_flip(&connector_name, queued)?;
+        }
+        Ok(())
+    }
+
+    fn wait_for_connector_flip(&mut self, connector_name: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.scanouts.contains_key(connector_name),
+            "Missing scanout while waiting for flip"
+        );
+
+        for _ in 0..1_000 {
+            if !self
+                .scanouts
+                .get(connector_name)
+                .is_some_and(|scanout| scanout.pending.is_some())
+            {
+                return Ok(());
+            }
+
+            let fds: Vec<RawFd> = self
+                .drm_devices
+                .opened()
+                .values()
+                .map(|device| device.fd().as_raw_fd())
+                .collect();
+            for fd in fds {
+                dispatch_drm_events(fd)?;
+            }
+            let completed = self.flip_events.drain();
+            if completed.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            for flip in completed {
+                self.retire_page_flip(flip.crtc_id)?;
             }
         }
 
-        let mode_blob = ModeBlob::create(drm_device.fd(), &target.output.mode)
-            .context("Failed to create MODE_ID property blob")?;
-
-        atomic_modeset(drm_device.fd(), &target.output, mode_blob.id(), drm_fb.id())
-            .context("Failed atomic modeset")?;
-
-        // Only drop the previous scanout after the new modeset is active.
-        let _previous = self.scanouts.insert(
-            target.connector_name.clone(),
-            OutputScanout {
-                drm_path: target.drm_path.clone(),
-                output: target.output.clone(),
-                mode_blob,
-                drm_fb,
-                dma_image,
-            },
-        );
-        Ok(())
+        anyhow::bail!("Timed out waiting for page-flip on {connector_name}")
     }
 
     fn resolved_render_device_path(&self) -> Option<PathBuf> {
