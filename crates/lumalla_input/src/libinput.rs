@@ -169,6 +169,8 @@ pub struct LibInput {
     _seat_state_lifetime: PhantomData<*const SeatState>,
     seat_assigned: bool,
     suspended: bool,
+    transform_width: u32,
+    transform_height: u32,
 }
 
 impl LibInput {
@@ -256,7 +258,14 @@ impl LibInput {
             _seat_state_lifetime: PhantomData,
             seat_assigned: false,
             suspended: true,
+            transform_width: TRANSFORM_WIDTH,
+            transform_height: TRANSFORM_HEIGHT,
         })
+    }
+
+    pub fn set_coordinate_transform(&mut self, width: u32, height: u32) {
+        self.transform_width = width.max(1);
+        self.transform_height = height.max(1);
     }
 
     /// Assign the udev seat used for device discovery.
@@ -453,13 +462,13 @@ impl LibInput {
                         let x = unsafe {
                             bindings::libinput_event_pointer_get_absolute_x_transformed(
                                 pointer,
-                                TRANSFORM_WIDTH,
+                                self.transform_width,
                             )
                         };
                         let y = unsafe {
                             bindings::libinput_event_pointer_get_absolute_y_transformed(
                                 pointer,
-                                TRANSFORM_HEIGHT,
+                                self.transform_height,
                             )
                         };
                         Some(InputEvent::PointerAbsolute { x, y })
@@ -501,13 +510,13 @@ impl LibInput {
                         let x = unsafe {
                             bindings::libinput_event_touch_get_x_transformed(
                                 touch,
-                                TRANSFORM_WIDTH,
+                                self.transform_width,
                             )
                         };
                         let y = unsafe {
                             bindings::libinput_event_touch_get_y_transformed(
                                 touch,
-                                TRANSFORM_HEIGHT,
+                                self.transform_height,
                             )
                         };
                         Some(InputEvent::TouchDown { id, x, y })
@@ -531,13 +540,13 @@ impl LibInput {
                         let x = unsafe {
                             bindings::libinput_event_touch_get_x_transformed(
                                 touch,
-                                TRANSFORM_WIDTH,
+                                self.transform_width,
                             )
                         };
                         let y = unsafe {
                             bindings::libinput_event_touch_get_y_transformed(
                                 touch,
-                                TRANSFORM_HEIGHT,
+                                self.transform_height,
                             )
                         };
                         Some(InputEvent::TouchMotion { id, x, y })

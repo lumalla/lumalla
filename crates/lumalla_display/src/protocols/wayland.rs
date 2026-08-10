@@ -150,7 +150,10 @@ fn report_data_device_error(ctx: &mut Ctx, object_id: ObjectId, error: DataDevic
 
 fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: SurfaceCommit) {
     if let Some(Some(buffer_id)) = commit.attached_buffer {
-        if commit.mapped {
+        let is_cursor = state
+            .surface_manager
+            .surface_role_is_cursor(ctx.client_id, commit.surface_id);
+        if is_cursor || commit.mapped {
             let (pixels, width, height, stride, format) =
                 if state.dmabuf_manager.has_buffer(ctx.client_id, buffer_id) {
                     match state.dmabuf_manager.snapshot_buffer(ctx.client_id, buffer_id) {
@@ -193,24 +196,45 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                 width as i32,
                 height as i32,
             );
-            state
-                .surface_updates
-                .push_back(SurfaceUpdate::Frame(CommittedFrame {
-                    client_id: ctx.client_id,
-                    surface_id: commit.surface_id,
-                    buffer_id,
-                    pixels,
-                    width,
-                    height,
-                    stride,
-                    format,
-                    buffer_scale: commit.buffer_scale,
-                    buffer_transform: commit.buffer_transform,
-                    offset_x: commit.offset.0,
-                    offset_y: commit.offset.1,
-                    x: commit.layout.0 + commit.offset.0,
-                    y: commit.layout.1 + commit.offset.1,
-                }));
+            if is_cursor {
+                state
+                    .surface_updates
+                    .push_back(SurfaceUpdate::Cursor(CommittedFrame {
+                        client_id: ctx.client_id,
+                        surface_id: commit.surface_id,
+                        buffer_id,
+                        pixels,
+                        width,
+                        height,
+                        stride,
+                        format,
+                        buffer_scale: commit.buffer_scale,
+                        buffer_transform: commit.buffer_transform,
+                        offset_x: commit.offset.0,
+                        offset_y: commit.offset.1,
+                        x: 0,
+                        y: 0,
+                    }));
+            } else {
+                state
+                    .surface_updates
+                    .push_back(SurfaceUpdate::Frame(CommittedFrame {
+                        client_id: ctx.client_id,
+                        surface_id: commit.surface_id,
+                        buffer_id,
+                        pixels,
+                        width,
+                        height,
+                        stride,
+                        format,
+                        buffer_scale: commit.buffer_scale,
+                        buffer_transform: commit.buffer_transform,
+                        offset_x: commit.offset.0,
+                        offset_y: commit.offset.1,
+                        x: commit.layout.0 + commit.offset.0,
+                        y: commit.layout.1 + commit.offset.1,
+                    }));
+            }
             if commit.newly_mapped {
                 if let Some(shell_id) = commit.shell_id {
                     let serial = state.seat_manager.next_serial();
@@ -1181,15 +1205,17 @@ impl WlSeat for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::WlPointer, version) {
             return;
         }
+        let (px, py) = self.seat_manager.pointer_position();
         let focus = self
             .surface_manager
-            .pointer_target(ctx.client_id, 0.0, 0.0);
+            .pointer_target(ctx.client_id, px, py);
         self.seat_manager.create_pointer(
             ctx.client_id,
             *params.id(),
             version,
             ctx.writer,
             focus,
+            &self.surface_manager,
         );
     }
 

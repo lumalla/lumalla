@@ -148,6 +148,10 @@ impl InputState {
         self.keymaps.clear();
     }
 
+    pub fn set_output_geometry(&mut self, width: u32, height: u32) {
+        self.libinput.set_coordinate_transform(width, height);
+    }
+
     pub fn dispatch(&mut self, mut on_event: impl FnMut(SeatEvent)) -> anyhow::Result<()> {
         self.libinput.dispatch()?;
         while let Some(event) = self.libinput.next_event() {

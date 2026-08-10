@@ -19,7 +19,7 @@ mod output;
 mod xdg;
 
 pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland};
-pub use seat::KeyboardModifiers;
+pub use seat::{ActiveCursor, KeyboardModifiers};
 pub use output::OutputInfo;
 
 pub struct DisplayMessage;
@@ -45,6 +45,7 @@ pub struct CommittedFrame {
 #[derive(Debug)]
 pub enum SurfaceUpdate {
     Frame(CommittedFrame),
+    Cursor(CommittedFrame),
     Unmapped {
         client_id: ClientId,
         surface_id: lumalla_wayland_protocol::ObjectId,
@@ -141,6 +142,18 @@ impl DisplayState {
         );
     }
 
+    pub fn set_output_geometry(&mut self, width: u32, height: u32) {
+        self.seat_manager.set_output_geometry(width, height);
+    }
+
+    pub fn pointer_position(&self) -> (f64, f64) {
+        self.seat_manager.pointer_position()
+    }
+
+    pub fn active_cursor(&self) -> Option<ActiveCursor> {
+        self.seat_manager.active_cursor()
+    }
+
     pub fn handle_pointer_button(
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,
@@ -148,8 +161,13 @@ impl DisplayState {
         button: u32,
         pressed: bool,
     ) {
-        self.seat_manager
-            .handle_pointer_button(clients, time_msec, button, pressed);
+        self.seat_manager.handle_pointer_button(
+            clients,
+            &self.surface_manager,
+            time_msec,
+            button,
+            pressed,
+        );
     }
 
     pub fn handle_pointer_axis(
@@ -199,8 +217,14 @@ impl DisplayState {
         x: f64,
         y: f64,
     ) {
-        self.seat_manager
-            .handle_touch_motion(clients, time_msec, touch_id, x, y);
+        self.seat_manager.handle_touch_motion(
+            clients,
+            &self.surface_manager,
+            time_msec,
+            touch_id,
+            x,
+            y,
+        );
     }
 
     pub fn handle_touch_frame(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
@@ -264,7 +288,9 @@ impl DisplayState {
         self.pending_frame_callbacks
             .retain(|(owner, _)| *owner != client_id);
         self.surface_updates.retain(|update| match update {
-            SurfaceUpdate::Frame(frame) => frame.client_id != client_id,
+            SurfaceUpdate::Frame(frame) | SurfaceUpdate::Cursor(frame) => {
+                frame.client_id != client_id
+            }
             SurfaceUpdate::Unmapped {
                 client_id: owner, ..
             } => *owner != client_id,

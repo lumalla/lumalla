@@ -73,6 +73,8 @@ pub struct SurfaceManager {
     subsurfaces: HashMap<ResourceKey, SubsurfaceState>,
     regions: HashMap<ResourceKey, Region>,
     next_cascade: i32,
+    /// Mapped surfaces in paint order (back to front).
+    paint_order: Vec<(ClientId, ObjectId)>,
 }
 
 impl SurfaceManager {
@@ -146,6 +148,32 @@ impl SurfaceManager {
             .find(|id| self.is_mapped(client_id, *id).unwrap_or(false))
     }
 
+    /// Global coordinates → surface-local coordinates for a mapped surface.
+    pub fn surface_local_coords(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        global_x: f64,
+        global_y: f64,
+    ) -> Option<(f32, f32)> {
+        let (origin_x, origin_y) = self.surface_origin(client_id, surface_id)?;
+        Some((
+            (global_x - origin_x as f64) as f32,
+            (global_y - origin_y as f64) as f32,
+        ))
+    }
+
+    pub fn record_painted_surface(&mut self, client_id: ClientId, surface_id: ObjectId) {
+        self.paint_order
+            .retain(|entry| *entry != (client_id, surface_id));
+        self.paint_order.push((client_id, surface_id));
+    }
+
+    pub fn remove_painted_surface(&mut self, client_id: ClientId, surface_id: ObjectId) {
+        self.paint_order
+            .retain(|entry| *entry != (client_id, surface_id));
+    }
+
     /// Geometry hit-test for a client: top-most mapped surface containing (x, y).
     pub fn pointer_target(&self, client_id: ClientId, x: f64, y: f64) -> Option<ObjectId> {
         self.hit_test(Some(client_id), x, y)
@@ -174,8 +202,7 @@ impl SurfaceManager {
         x: f64,
         y: f64,
     ) -> Option<(ClientId, ObjectId)> {
-        let mut candidates: Vec<(ClientId, ObjectId, i32)> = Vec::new();
-        for (&(client_id, surface_id), surface) in &self.surfaces {
+        for &(client_id, surface_id) in self.paint_order.iter().rev() {
             if let Some(preferred) = preferred_client
                 && client_id != preferred
             {
@@ -184,6 +211,7 @@ impl SurfaceManager {
             if !self.is_mapped(client_id, surface_id).unwrap_or(false) {
                 continue;
             }
+            let surface = self.surfaces.get(&(client_id, surface_id))?;
             if !matches!(surface.role, Some(Role::Shell(_)) | Some(Role::Xdg(_))) {
                 continue;
             }
@@ -193,18 +221,43 @@ impl SurfaceManager {
             let scale = surface.current.buffer_scale.max(1);
             let width = (bw / scale).max(0);
             let height = (bh / scale).max(0);
-            let (lx, ly) = surface.layout;
-            if x >= lx as f64
-                && y >= ly as f64
-                && x < (lx + width) as f64
-                && y < (ly + height) as f64
+            let (origin_x, origin_y) = self.surface_origin(client_id, surface_id)?;
+            if x < origin_x as f64
+                || y < origin_y as f64
+                || x >= (origin_x + width) as f64
+                || y >= (origin_y + height) as f64
             {
-                // Higher layout cascade / object id paints later; prefer later.
-                candidates.push((client_id, surface_id, lx.saturating_add(ly)));
+                continue;
             }
+            let local_x = (x - origin_x as f64) as i32;
+            let local_y = (y - origin_y as f64) as i32;
+            if !self.surface_accepts_input_at(surface, local_x, local_y) {
+                continue;
+            }
+            return Some((client_id, surface_id));
         }
-        candidates.sort_by_key(|(c, s, cascade)| (*cascade, c.get(), s.get()));
-        candidates.pop().map(|(c, s, _)| (c, s))
+        None
+    }
+
+    fn surface_origin(&self, client_id: ClientId, surface_id: ObjectId) -> Option<(i32, i32)> {
+        let surface = self.surfaces.get(&(client_id, surface_id))?;
+        let (layout_x, layout_y) = surface.layout;
+        let (offset_x, offset_y) = match surface.role {
+            Some(Role::Subsurface(sub_id)) => self
+                .subsurfaces
+                .get(&(client_id, sub_id))
+                .map(|sub| sub.current_position)
+                .unwrap_or(surface.current.offset),
+            _ => surface.current.offset,
+        };
+        Some((layout_x + offset_x, layout_y + offset_y))
+    }
+
+    fn surface_accepts_input_at(&self, surface: &Surface, local_x: i32, local_y: i32) -> bool {
+        match &surface.current.input_region {
+            None => true,
+            Some(region) => region.contains(local_x, local_y),
+        }
     }
 
     pub fn assign_xdg_role(
@@ -942,6 +995,11 @@ impl SurfaceManager {
             .get(&(client_id, id))
             .map(|s| s.layout)
             .unwrap_or((0, 0));
+        if mapped {
+            self.record_painted_surface(client_id, id);
+        } else if was_mapped {
+            self.remove_painted_surface(client_id, id);
+        }
         Ok(SurfaceCommit {
             surface_id: id,
             buffer,
@@ -1343,6 +1401,37 @@ struct Region {
     operations: Vec<RegionOperation>,
 }
 
+impl Region {
+    fn contains(&self, x: i32, y: i32) -> bool {
+        if self.operations.is_empty() {
+            return false;
+        }
+        let mut inside = false;
+        for operation in &self.operations {
+            match operation {
+                RegionOperation::Add(rect) => {
+                    if rect_contains(rect, x, y) {
+                        inside = true;
+                    }
+                }
+                RegionOperation::Subtract(rect) => {
+                    if rect_contains(rect, x, y) {
+                        inside = false;
+                    }
+                }
+            }
+        }
+        inside
+    }
+}
+
+fn rect_contains(rect: &Rectangle, x: i32, y: i32) -> bool {
+    x >= rect.x
+        && y >= rect.y
+        && x < rect.x + rect.width
+        && y < rect.y + rect.height
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegionOperation {
     Add(Rectangle),
@@ -1506,6 +1595,35 @@ mod tests {
             Some(object(5))
         );
         assert!(manager.pointer_target(client(1), 200.0, 200.0).is_none());
+    }
+
+    #[test]
+    fn surface_local_coords_subtracts_layout() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_shell_surface(client(1), object(3), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(3), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
+            .unwrap();
+        assert!(manager.commit(client(1), object(2)).unwrap().primary.mapped);
+        manager
+            .set_committed_buffer_size(client(1), object(2), 100, 100)
+            .unwrap();
+        let layout = manager
+            .surfaces
+            .get(&(client(1), object(2)))
+            .unwrap()
+            .layout;
+        let (local_x, local_y) = manager
+            .surface_local_coords(client(1), object(2), layout.0 as f64 + 20.0, layout.1 as f64 + 30.0)
+            .unwrap();
+        assert!((local_x - 20.0).abs() < f32::EPSILON);
+        assert!((local_y - 30.0).abs() < f32::EPSILON);
     }
 
     #[test]

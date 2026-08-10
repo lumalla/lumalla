@@ -17,6 +17,15 @@ use crate::{
     surface::{SurfaceError, SurfaceManager},
 };
 
+/// Active client cursor for compositor rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveCursor {
+    pub client_id: ClientId,
+    pub surface_id: ObjectId,
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+}
+
 pub struct SeatManager {
     has_main_seat: bool,
     known_seats: HashSet<String>,
@@ -27,9 +36,11 @@ pub struct SeatManager {
     keyboards: Vec<SeatKeyboard>,
     pointers: Vec<SeatPointer>,
     touches: Vec<SeatTouch>,
-    /// Layout-local pointer position.
+    /// Output-local pointer position in pixels.
     pointer_x: f64,
     pointer_y: f64,
+    output_width: u32,
+    output_height: u32,
     /// Active touch points: seat slot -> (client, surface).
     active_touches: HashMap<i32, (ClientId, ObjectId)>,
     serial: Serial,
@@ -79,6 +90,8 @@ impl Default for SeatManager {
             touches: Vec::new(),
             pointer_x: 0.0,
             pointer_y: 0.0,
+            output_width: 0,
+            output_height: 0,
             active_touches: HashMap::new(),
             serial: Serial::new(),
         }
@@ -166,10 +179,17 @@ impl SeatManager {
         version: u32,
         writer: &mut Writer,
         focus_surface: Option<ObjectId>,
+        surface_manager: &SurfaceManager,
     ) {
         let mut enter_serial = None;
         if let Some(surface) = focus_surface {
-            enter_serial = Some(self.send_pointer_enter(writer, pointer_id, surface));
+            enter_serial = Some(self.send_pointer_enter(
+                writer,
+                pointer_id,
+                surface,
+                surface_manager,
+                client_id,
+            ));
             if version >= 5 {
                 writer.wl_pointer_frame(pointer_id);
             }
@@ -229,8 +249,27 @@ impl SeatManager {
         self.serial.next_serial()
     }
 
+    pub fn set_output_geometry(&mut self, width: u32, height: u32) {
+        self.output_width = width;
+        self.output_height = height;
+        self.clamp_pointer();
+    }
+
     pub fn pointer_position(&self) -> (f64, f64) {
         (self.pointer_x, self.pointer_y)
+    }
+
+    pub fn active_cursor(&self) -> Option<ActiveCursor> {
+        let pointer = self
+            .pointers
+            .iter()
+            .find(|p| p.focus.is_some() && p.cursor_surface.is_some())?;
+        Some(ActiveCursor {
+            client_id: pointer.client_id,
+            surface_id: pointer.cursor_surface?,
+            hotspot_x: pointer.hotspot.0,
+            hotspot_y: pointer.hotspot.1,
+        })
     }
 
     pub fn pointer_focus_for_client(&self, client_id: ClientId) -> Option<ObjectId> {
@@ -473,6 +512,7 @@ impl SeatManager {
     ) {
         self.pointer_x += dx;
         self.pointer_y += dy;
+        self.clamp_pointer();
         self.update_pointer_focus_and_motion(clients, surface_manager, time_msec, true);
     }
 
@@ -486,16 +526,29 @@ impl SeatManager {
     ) {
         self.pointer_x = x;
         self.pointer_y = y;
+        self.clamp_pointer();
         self.update_pointer_focus_and_motion(clients, surface_manager, time_msec, true);
     }
 
     pub fn handle_pointer_button(
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,
+        _surface_manager: &SurfaceManager,
         time_msec: u32,
         button: u32,
         pressed: bool,
     ) {
+        if pressed {
+            if let Some((client_id, surface)) = self
+                .pointers
+                .iter()
+                .find_map(|pointer| pointer.focus.map(|surface| (pointer.client_id, surface)))
+            {
+                if let Some(client) = clients.get_mut(&client_id) {
+                    self.focus_keyboards_on_surface(client_id, surface, client.writer_mut());
+                }
+            }
+        }
         let state = if pressed {
             WL_POINTER_BUTTON_STATE_PRESSED
         } else {
@@ -579,6 +632,9 @@ impl SeatManager {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
             };
+            let (local_x, local_y) = surface_manager
+                .surface_local_coords(client_id, surface, x, y)
+                .unwrap_or((x as f32, y as f32));
             let serial = self.serial.next_serial();
             client
                 .writer_mut()
@@ -587,8 +643,8 @@ impl SeatManager {
                 .time(time_msec)
                 .surface(surface)
                 .id(touch_id)
-                .x(x as f32)
-                .y(y as f32);
+                .x(local_x)
+                .y(local_y);
         }
     }
 
@@ -624,12 +680,13 @@ impl SeatManager {
     pub fn handle_touch_motion(
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,
+        surface_manager: &SurfaceManager,
         time_msec: u32,
         touch_id: i32,
         x: f64,
         y: f64,
     ) {
-        let Some((client_id, _)) = self.active_touches.get(&touch_id).copied() else {
+        let Some((client_id, surface)) = self.active_touches.get(&touch_id).copied() else {
             return;
         };
         let touches: Vec<ObjectId> = self
@@ -638,6 +695,9 @@ impl SeatManager {
             .filter(|t| t.client_id == client_id)
             .map(|t| t.id)
             .collect();
+        let (local_x, local_y) = surface_manager
+            .surface_local_coords(client_id, surface, x, y)
+            .unwrap_or((x as f32, y as f32));
         for object_id in touches {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
@@ -647,8 +707,8 @@ impl SeatManager {
                 .wl_touch_motion(object_id)
                 .time(time_msec)
                 .id(touch_id)
-                .x(x as f32)
-                .y(y as f32);
+                .x(local_x)
+                .y(local_y);
         }
     }
 
@@ -747,8 +807,9 @@ impl SeatManager {
             return;
         };
 
-        let sx = self.pointer_x as f32;
-        let sy = self.pointer_y as f32;
+        let (sx, sy) = surface_manager
+            .surface_local_coords(target_client, target_surface, self.pointer_x, self.pointer_y)
+            .unwrap_or((self.pointer_x as f32, self.pointer_y as f32));
 
         let enter_list: Vec<(ObjectId, u32, bool)> = self
             .pointers
@@ -835,15 +896,30 @@ impl SeatManager {
         writer: &mut Writer,
         pointer_id: ObjectId,
         surface: ObjectId,
+        surface_manager: &SurfaceManager,
+        client_id: ClientId,
     ) -> u32 {
         let serial = self.serial.next_serial();
+        let (surface_x, surface_y) = surface_manager
+            .surface_local_coords(client_id, surface, self.pointer_x, self.pointer_y)
+            .unwrap_or((self.pointer_x as f32, self.pointer_y as f32));
         writer
             .wl_pointer_enter(pointer_id)
             .serial(serial)
             .surface(surface)
-            .surface_x(self.pointer_x as f32)
-            .surface_y(self.pointer_y as f32);
+            .surface_x(surface_x)
+            .surface_y(surface_y);
         serial
+    }
+
+    fn clamp_pointer(&mut self) {
+        if self.output_width == 0 || self.output_height == 0 {
+            return;
+        }
+        let max_x = (self.output_width.saturating_sub(1)) as f64;
+        let max_y = (self.output_height.saturating_sub(1)) as f64;
+        self.pointer_x = self.pointer_x.clamp(0.0, max_x);
+        self.pointer_y = self.pointer_y.clamp(0.0, max_y);
     }
 }
 
@@ -893,7 +969,7 @@ mod tests {
     fn create_pointer_tracks_object() {
         let mut seat = SeatManager::default();
         let (_keep, mut writer) = writer();
-        seat.create_pointer(client(1), object(10), 5, &mut writer, None);
+        seat.create_pointer(client(1), object(10), 5, &mut writer, None, &SurfaceManager::default());
         assert_eq!(seat.pointers.len(), 1);
         assert_eq!(seat.pointers[0].id, object(10));
         seat.destroy_pointer(client(1), object(10), &mut SurfaceManager::default());
@@ -921,7 +997,7 @@ mod tests {
         surfaces.attach(client_id, surface, Some(object(40)), 0, 0, 1).unwrap();
         let _ = surfaces.commit(client_id, surface).unwrap();
 
-        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface));
+        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces);
         let enter_serial = seat.pointers[0].enter_serial.unwrap();
 
         seat.set_cursor(
@@ -952,7 +1028,7 @@ mod tests {
         surfaces
             .create_shell_surface(client_id, object(30), surface)
             .unwrap();
-        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface));
+        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces);
         let enter_serial = seat.pointers[0].enter_serial.unwrap();
 
         let err = seat
@@ -976,7 +1052,14 @@ mod tests {
         let client_id = client(1);
         let pointer = object(10);
         let surface = object(20);
-        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface));
+        seat.create_pointer(
+            client_id,
+            pointer,
+            5,
+            &mut writer,
+            Some(surface),
+            &SurfaceManager::default(),
+        );
         assert_eq!(seat.pointers[0].focus, Some(surface));
         seat.leave_pointers_on_surface(client_id, surface, &mut writer);
         assert!(seat.pointers[0].focus.is_none());

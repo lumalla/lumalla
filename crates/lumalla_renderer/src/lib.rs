@@ -14,6 +14,9 @@ use mio::{Interest, Registry, Token, event::Source};
 pub mod drm;
 pub mod vulkan;
 
+mod default_cursor;
+
+use crate::default_cursor::default_cursor_frame;
 use crate::drm::{
     ConnectedOutput, DrmDevices, DrmDispatchResult, DrmFramebuffer, FlipEventQueue, ModeBlob,
     atomic_modeset, atomic_page_flip, atomic_set_plane_fb, dispatch_drm_events,
@@ -81,6 +84,51 @@ impl SurfaceFrame {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CursorFrame {
+    pub owner_id: u32,
+    pub surface_id: u32,
+    pub pixels: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub stride: usize,
+    pub format: u32,
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+    pub buffer_scale: i32,
+}
+
+impl CursorFrame {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.width > 0 && self.height > 0,
+            "Cursor frame dimensions must be non-zero"
+        );
+        let row_bytes = self
+            .width
+            .checked_mul(4)
+            .context("Cursor frame width overflows")?;
+        anyhow::ensure!(
+            self.stride >= row_bytes,
+            "Cursor frame stride is smaller than one row"
+        );
+        let required = self
+            .stride
+            .checked_mul(self.height)
+            .context("Cursor frame size overflows")?;
+        anyhow::ensure!(
+            self.pixels.len() >= required,
+            "Cursor frame pixel data is truncated"
+        );
+        anyhow::ensure!(
+            matches!(self.format, WL_SHM_FORMAT_ARGB8888 | WL_SHM_FORMAT_XRGB8888),
+            "Unsupported cursor SHM format {:#x}",
+            self.format
+        );
+        Ok(())
+    }
+}
+
 struct ScanoutBuffer {
     drm_fb: DrmFramebuffer,
     /// Kept alive so the exported DMA-BUF backing `drm_fb` remains valid.
@@ -116,6 +164,9 @@ pub struct RendererState {
     /// Mapped surfaces in paint order (back to front).
     surface_frames: HashMap<(u32, u32), SurfaceFrame>,
     surface_order: Vec<(u32, u32)>,
+    cursor_frame: Option<CursorFrame>,
+    pointer_x: i32,
+    pointer_y: i32,
 }
 
 impl RendererState {
@@ -129,6 +180,9 @@ impl RendererState {
             flip_events: Box::new(FlipEventQueue::new()),
             surface_frames: HashMap::new(),
             surface_order: Vec::new(),
+            cursor_frame: None,
+            pointer_x: 0,
+            pointer_y: 0,
         })
     }
 
@@ -211,10 +265,72 @@ impl RendererState {
         let before = self.surface_frames.len();
         self.surface_frames.retain(|(owner, _), _| *owner != owner_id);
         self.surface_order.retain(|(owner, _)| *owner != owner_id);
-        if self.surface_frames.len() != before && !self.drm_devices.opened().is_empty() {
+        let cursor_removed = self
+            .cursor_frame
+            .as_ref()
+            .is_some_and(|cursor| cursor.owner_id == owner_id);
+        if cursor_removed {
+            self.cursor_frame = None;
+        }
+        if (self.surface_frames.len() != before || cursor_removed)
+            && !self.drm_devices.opened().is_empty()
+        {
             return self.present_enabled_outputs(SOLID_CLEAR_COLOR);
         }
         Ok(self.present_status())
+    }
+
+    pub fn cursor_surface_key(&self) -> Option<(u32, u32)> {
+        self.cursor_frame
+            .as_ref()
+            .map(|cursor| (cursor.owner_id, cursor.surface_id))
+    }
+
+    pub fn set_cursor_frame(&mut self, frame: CursorFrame) -> anyhow::Result<PresentStatus> {
+        frame.validate()?;
+        self.cursor_frame = Some(frame);
+        if self.drm_devices.opened().is_empty() {
+            return Ok(self.present_status());
+        }
+        self.present_enabled_outputs(SOLID_CLEAR_COLOR)
+    }
+
+    pub fn clear_cursor_frame(&mut self) -> anyhow::Result<PresentStatus> {
+        if self.cursor_frame.is_none() {
+            return Ok(self.present_status());
+        }
+        self.cursor_frame = None;
+        if self.drm_devices.opened().is_empty() {
+            return Ok(self.present_status());
+        }
+        self.present_enabled_outputs(SOLID_CLEAR_COLOR)
+    }
+
+    pub fn update_pointer_position(&mut self, x: i32, y: i32) -> anyhow::Result<PresentStatus> {
+        if self.pointer_x == x && self.pointer_y == y {
+            return Ok(self.present_status());
+        }
+        self.pointer_x = x;
+        self.pointer_y = y;
+        if self.drm_devices.opened().is_empty() {
+            return Ok(self.present_status());
+        }
+        self.present_enabled_outputs(SOLID_CLEAR_COLOR)
+    }
+
+    pub fn update_cursor_hotspot(&mut self, hotspot_x: i32, hotspot_y: i32) -> anyhow::Result<PresentStatus> {
+        let Some(cursor) = self.cursor_frame.as_mut() else {
+            return Ok(self.present_status());
+        };
+        if cursor.hotspot_x == hotspot_x && cursor.hotspot_y == hotspot_y {
+            return Ok(self.present_status());
+        }
+        cursor.hotspot_x = hotspot_x;
+        cursor.hotspot_y = hotspot_y;
+        if self.drm_devices.opened().is_empty() {
+            return Ok(self.present_status());
+        }
+        self.present_enabled_outputs(SOLID_CLEAR_COLOR)
     }
 
     /// Geometry of the first enabled present target, if DRM outputs are resolvable.
@@ -496,19 +612,25 @@ impl RendererState {
                 .iter()
                 .filter_map(|key| self.surface_frames.get(key))
                 .collect();
-            if !frames.is_empty() {
-                let upload = composite_surface_upload(&frames, width, height, color)?;
-                upload_bgra_to_image(
-                    vulkan.device(),
-                    vulkan.physical_device(),
-                    vulkan.graphics_command_pool(),
-                    &dma_image,
-                    &upload.pixels,
-                    upload.width,
-                    upload.height,
-                )
-                .context("Failed to upload Wayland SHM scene")?;
-            }
+            let upload = composite_scene_upload(
+                &frames,
+                self.cursor_frame.as_ref(),
+                self.pointer_x,
+                self.pointer_y,
+                width,
+                height,
+                color,
+            )?;
+            upload_bgra_to_image(
+                vulkan.device(),
+                vulkan.physical_device(),
+                vulkan.graphics_command_pool(),
+                &dma_image,
+                &upload.pixels,
+                upload.width,
+                upload.height,
+            )
+            .context("Failed to upload Wayland SHM scene")?;
 
             vulkan.device().wait_idle()?;
             (dma_image, fourcc)
@@ -747,6 +869,100 @@ struct PreparedSurfaceUpload {
     height: u32,
 }
 
+fn composite_scene_upload(
+    frames: &[&SurfaceFrame],
+    cursor: Option<&CursorFrame>,
+    pointer_x: i32,
+    pointer_y: i32,
+    output_width: u32,
+    output_height: u32,
+    clear: [f32; 4],
+) -> anyhow::Result<PreparedSurfaceUpload> {
+    let mut upload = composite_surface_upload(frames, output_width, output_height, clear)?;
+    match cursor {
+        Some(client) => composite_cursor(
+            &mut upload.pixels,
+            output_width as usize,
+            output_height as usize,
+            client,
+            pointer_x,
+            pointer_y,
+        )?,
+        None => composite_cursor(
+            &mut upload.pixels,
+            output_width as usize,
+            output_height as usize,
+            default_cursor_frame(),
+            pointer_x,
+            pointer_y,
+        )?,
+    }
+    Ok(upload)
+}
+
+fn composite_cursor(
+    pixels: &mut [u8],
+    output_width: usize,
+    output_height: usize,
+    cursor: &CursorFrame,
+    pointer_x: i32,
+    pointer_y: i32,
+) -> anyhow::Result<()> {
+    cursor.validate()?;
+    let row_bytes = output_width
+        .checked_mul(4)
+        .context("Output row size overflows")?;
+    let scale = cursor.buffer_scale.max(1) as usize;
+    let dest_w = cursor.width / scale;
+    let dest_h = cursor.height / scale;
+    if dest_w == 0 || dest_h == 0 {
+        return Ok(());
+    }
+    let dest_x = pointer_x - cursor.hotspot_x;
+    let dest_y = pointer_y - cursor.hotspot_y;
+    for dy in 0..dest_h {
+        let out_y = dest_y + dy as i32;
+        if out_y < 0 || out_y as usize >= output_height {
+            continue;
+        }
+        let source_y = ((dy as u128 * cursor.height as u128) / dest_h as u128) as usize;
+        for dx in 0..dest_w {
+            let out_x = dest_x + dx as i32;
+            if out_x < 0 || out_x as usize >= output_width {
+                continue;
+            }
+            let source_x = ((dx as u128 * cursor.width as u128) / dest_w as u128) as usize;
+            let source = source_y * cursor.stride + source_x * 4;
+            let destination = out_y as usize * row_bytes + out_x as usize * 4;
+            let src = &cursor.pixels[source..source + 4];
+            let alpha = if cursor.format == WL_SHM_FORMAT_ARGB8888 {
+                src[3] as u16
+            } else {
+                255
+            };
+            if alpha == 0 {
+                continue;
+            }
+            if alpha == 255 {
+                pixels[destination..destination + 4].copy_from_slice(src);
+                if cursor.format == WL_SHM_FORMAT_XRGB8888 {
+                    pixels[destination + 3] = u8::MAX;
+                }
+                continue;
+            }
+            let inv = 255 - alpha;
+            for channel in 0..3 {
+                let dst = pixels[destination + channel] as u16;
+                let src_channel = src[channel] as u16;
+                pixels[destination + channel] =
+                    ((src_channel * alpha + dst * inv) / 255) as u8;
+            }
+            pixels[destination + 3] = u8::MAX;
+        }
+    }
+    Ok(())
+}
+
 fn composite_surface_upload(
     frames: &[&SurfaceFrame],
     output_width: u32,
@@ -911,5 +1127,24 @@ mod tests {
         let upload =
             composite_surface_upload(&[&frame], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
         assert_eq!(upload.pixels, vec![0, 0, 0, 255, 9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn composites_cursor_with_hotspot() {
+        let cursor = CursorFrame {
+            owner_id: 1,
+            surface_id: 3,
+            pixels: vec![10, 20, 30, 255],
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: WL_SHM_FORMAT_ARGB8888,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            buffer_scale: 1,
+        };
+        let upload = composite_scene_upload(&[], Some(&cursor), 1, 0, 2, 1, [0.0, 0.0, 0.0, 1.0])
+            .unwrap();
+        assert_eq!(upload.pixels, vec![0, 0, 0, 255, 10, 20, 30, 255]);
     }
 }

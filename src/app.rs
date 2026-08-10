@@ -19,7 +19,7 @@ use lumalla_display::{
     Wayland, create_wayland_display,
 };
 use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
-use lumalla_renderer::{PresentStatus, RendererState, SOLID_CLEAR_COLOR, SurfaceFrame};
+use lumalla_renderer::{CursorFrame, PresentStatus, RendererState, SOLID_CLEAR_COLOR, SurfaceFrame};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender,
@@ -142,8 +142,10 @@ impl AppData {
                         input_state,
                         display_state,
                         connected_clients,
+                        renderer_state,
                         ..
                     } = self;
+                    let mut pointer_changed = false;
                     if let Err(err) = input_state.dispatch(|event| match event {
                         SeatEvent::Keyboard(KeyboardEvent::Key {
                             time_msec,
@@ -169,6 +171,7 @@ impl AppData {
                             );
                         }
                         SeatEvent::Pointer(PointerEvent::Motion { time_msec, dx, dy }) => {
+                            pointer_changed = true;
                             display_state.handle_pointer_motion(
                                 connected_clients,
                                 time_msec,
@@ -177,6 +180,7 @@ impl AppData {
                             );
                         }
                         SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {
+                            pointer_changed = true;
                             display_state.handle_pointer_absolute(
                                 connected_clients,
                                 time_msec,
@@ -241,6 +245,14 @@ impl AppData {
                         }
                     }) {
                         error!("Unable to dispatch libinput events: {err}");
+                    } else if pointer_changed {
+                        match renderer_state.update_pointer_position(
+                            display_state.pointer_position().0.round() as i32,
+                            display_state.pointer_position().1.round() as i32,
+                        ) {
+                            Ok(status) => self.maybe_complete_frame_callbacks(status),
+                            Err(err) => error!("Unable to update pointer position: {err:#}"),
+                        }
                     }
                 }
                 UDEV_DRM_TOKEN => match self.renderer_state.dispatch() {
@@ -501,6 +513,7 @@ impl AppData {
                 self.connected_clients.remove(&client_id);
             } else {
                 self.submit_committed_frames();
+                self.sync_pointer_cursor();
             }
         } else {
             debug!("Received message for unknown client {:?}", client_id);
@@ -514,6 +527,12 @@ impl AppData {
         else {
             return;
         };
+        let width_u = width.max(1) as u32;
+        let height_u = height.max(1) as u32;
+        self.input_state
+            .set_output_geometry(width_u, height_u);
+        self.display_state
+            .set_output_geometry(width_u, height_u);
         let info = OutputInfo {
             name: name.clone(),
             description: format!("Lumalla output {name}"),
@@ -529,6 +548,27 @@ impl AppData {
         };
         self.display_state
             .update_primary_output(info, &mut self.connected_clients);
+    }
+
+    fn sync_pointer_cursor(&mut self) {
+        if let Some(active) = self.display_state.active_cursor() {
+            let key = (active.client_id.get(), active.surface_id.get());
+            if self.renderer_state.cursor_surface_key() == Some(key) {
+                match self.renderer_state.update_cursor_hotspot(
+                    active.hotspot_x,
+                    active.hotspot_y,
+                ) {
+                    Ok(status) => self.maybe_complete_frame_callbacks(status),
+                    Err(err) => error!("Unable to update cursor hotspot: {err:#}"),
+                }
+            }
+        } else if self.renderer_state.cursor_surface_key().is_some() {
+            // Client hid its cursor; fall back to the compositor default.
+            match self.renderer_state.clear_cursor_frame() {
+                Ok(status) => self.maybe_complete_frame_callbacks(status),
+                Err(err) => error!("Unable to clear client cursor frame: {err:#}"),
+            }
+        }
     }
 
     fn submit_committed_frames(&mut self) {
@@ -554,6 +594,33 @@ impl AppData {
                     match self.renderer_state.set_surface_frame(frame) {
                         Ok(status) => last_status = status,
                         Err(err) => error!("Unable to queue committed Wayland surface: {err:#}"),
+                    }
+                }
+                SurfaceUpdate::Cursor(frame) => {
+                    let hotspot = self
+                        .display_state
+                        .active_cursor()
+                        .filter(|cursor| {
+                            cursor.client_id == frame.client_id
+                                && cursor.surface_id == frame.surface_id
+                        })
+                        .map(|cursor| (cursor.hotspot_x, cursor.hotspot_y))
+                        .unwrap_or((0, 0));
+                    let cursor = CursorFrame {
+                        owner_id: frame.client_id.get(),
+                        surface_id: frame.surface_id.get(),
+                        pixels: frame.pixels,
+                        width: frame.width,
+                        height: frame.height,
+                        stride: frame.stride,
+                        format: frame.format,
+                        hotspot_x: hotspot.0,
+                        hotspot_y: hotspot.1,
+                        buffer_scale: frame.buffer_scale,
+                    };
+                    match self.renderer_state.set_cursor_frame(cursor) {
+                        Ok(status) => last_status = status,
+                        Err(err) => error!("Unable to queue committed cursor surface: {err:#}"),
                     }
                 }
                 SurfaceUpdate::Unmapped {
