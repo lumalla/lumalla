@@ -1,12 +1,15 @@
 use std::{
     collections::HashMap,
     fmt,
+    io::Write,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    path::Path,
 };
 
 use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, fstat, mmap, munmap, stat};
 use lumalla_wayland_protocol::{
     ClientId, ObjectId,
+    buffer::Writer,
     protocols::wayland::{WL_SHM_FORMAT_ARGB8888, WL_SHM_FORMAT_XRGB8888},
 };
 
@@ -104,12 +107,34 @@ struct DmabufBuffer {
     flags: u32,
 }
 
+/// Packed format+modifier entry for `zwp_linux_dmabuf_feedback_v1.format_table`.
+const FORMAT_TABLE_ENTRY_SIZE: usize = 16;
+
+#[derive(Debug)]
+struct FormatTable {
+    fd: OwnedFd,
+    size: u32,
+    /// Number of `(format, modifier)` rows in the table.
+    entry_count: u32,
+}
+
+#[derive(Debug)]
+struct FeedbackObject {
+    version: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct DmabufManager {
     params: HashMap<ResourceKey, Params>,
     buffers: HashMap<ResourceKey, DmabufBuffer>,
     /// Advertised `(drm_fourcc, modifier)` pairs. Empty means built-in linear defaults.
     supported: Vec<(u32, u64)>,
+    /// Cached read-only format table for feedback objects.
+    format_table: Option<FormatTable>,
+    /// DRM `dev_t` of the preferred main/sampling device (`st_rdev`).
+    main_device: Option<libc::dev_t>,
+    /// Active `zwp_linux_dmabuf_feedback_v1` objects.
+    feedbacks: HashMap<ResourceKey, FeedbackObject>,
 }
 
 impl DmabufManager {
@@ -125,8 +150,133 @@ impl DmabufManager {
         }
     }
 
-    pub fn set_supported_formats(&mut self, formats: Vec<(u32, u64)>) {
+    /// Update advertised formats and optional main DRM device for feedback.
+    ///
+    /// Rebuilds the format table memfd. Call [`Self::send_all_feedback`] afterward
+    /// if clients already hold feedback objects.
+    pub fn set_supported_formats(
+        &mut self,
+        formats: Vec<(u32, u64)>,
+        device_path: Option<&Path>,
+    ) {
         self.supported = formats;
+        self.main_device = device_path.and_then(device_rdev);
+        self.format_table = match build_format_table(self.supported_formats()) {
+            Ok(table) => Some(table),
+            Err(err) => {
+                log::warn!("Failed to build linux-dmabuf format table: {err}");
+                None
+            }
+        };
+    }
+
+    pub fn create_feedback(
+        &mut self,
+        client_id: ClientId,
+        object_id: ObjectId,
+        version: u32,
+    ) -> Result<()> {
+        self.ensure_format_table();
+        let key = (client_id, object_id);
+        if self.feedbacks.contains_key(&key) {
+            return Err(DmabufError::new(
+                DmabufErrorKind::InvalidObject,
+                "dmabuf feedback object already exists",
+            ));
+        }
+        self.feedbacks
+            .insert(key, FeedbackObject { version });
+        Ok(())
+    }
+
+    fn ensure_format_table(&mut self) {
+        if self.format_table.is_some() {
+            return;
+        }
+        match build_format_table(self.supported_formats()) {
+            Ok(table) => self.format_table = Some(table),
+            Err(err) => log::warn!("Failed to build linux-dmabuf format table: {err}"),
+        }
+    }
+
+    pub fn destroy_feedback(&mut self, client_id: ClientId, object_id: ObjectId) {
+        self.feedbacks.remove(&(client_id, object_id));
+    }
+
+    /// Send full feedback parameters for one object.
+    pub fn send_feedback(&self, writer: &mut Writer, object_id: ObjectId, version: u32) {
+        let Some(table) = self.format_table.as_ref() else {
+            // Still finish the feedback sequence so clients do not hang.
+            writer.zwp_linux_dmabuf_feedback_v1_done(object_id);
+            return;
+        };
+
+        writer
+            .zwp_linux_dmabuf_feedback_v1_format_table(object_id)
+            .fd(table.fd.as_raw_fd())
+            .size(table.size);
+
+        let device = encode_dev_t(self.main_device.unwrap_or(0));
+        // `main_device` is required below v6; deprecated (and unused) from v6 on.
+        if version < 6 {
+            writer
+                .zwp_linux_dmabuf_feedback_v1_main_device(object_id)
+                .device(&device);
+        }
+
+        writer
+            .zwp_linux_dmabuf_feedback_v1_tranche_target_device(object_id)
+            .device(&device);
+
+        let mut flags = 0u32;
+        if version >= 6 {
+            flags |= lumalla_wayland_protocol::protocols::linux_dmabuf::ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SAMPLING;
+        }
+        writer
+            .zwp_linux_dmabuf_feedback_v1_tranche_flags(object_id)
+            .flags(flags);
+
+        let indices = tranche_indices(table.entry_count);
+        // Protocol allows multiple tranche_formats; one event is enough for our table size.
+        writer
+            .zwp_linux_dmabuf_feedback_v1_tranche_formats(object_id)
+            .indices(&indices);
+
+        writer.zwp_linux_dmabuf_feedback_v1_tranche_done(object_id);
+        writer.zwp_linux_dmabuf_feedback_v1_done(object_id);
+    }
+
+    /// Re-send feedback to every live feedback object (e.g. after format refresh).
+    pub fn send_all_feedback<'a>(
+        &self,
+        clients: impl Iterator<Item = &'a mut lumalla_wayland_protocol::ClientConnection>,
+    ) {
+        let feedbacks: Vec<(ClientId, ObjectId, u32)> = self
+            .feedbacks
+            .iter()
+            .map(|(&(client_id, object_id), feedback)| (client_id, object_id, feedback.version))
+            .collect();
+        if feedbacks.is_empty() {
+            return;
+        }
+
+        let mut by_client: HashMap<ClientId, Vec<(ObjectId, u32)>> = HashMap::new();
+        for (client_id, object_id, version) in feedbacks {
+            by_client
+                .entry(client_id)
+                .or_default()
+                .push((object_id, version));
+        }
+
+        for client in clients {
+            let Some(objects) = by_client.get(&client.client_id()) else {
+                continue;
+            };
+            let writer = client.writer_mut();
+            for &(object_id, version) in objects {
+                self.send_feedback(writer, object_id, version);
+            }
+        }
     }
 
     fn supports_format_modifier(&self, format: u32, modifier: u64) -> bool {
@@ -445,6 +595,72 @@ impl DmabufManager {
     }
 }
 
+fn device_rdev(path: &Path) -> Option<libc::dev_t> {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe {
+        let mut st: stat = std::mem::zeroed();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        if libc::stat(c_path.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        Some(st.st_rdev)
+    }
+}
+
+fn encode_dev_t(dev: libc::dev_t) -> Vec<u8> {
+    let mut bytes = vec![0u8; std::mem::size_of::<libc::dev_t>()];
+    bytes.copy_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            (&raw const dev).cast::<u8>(),
+            std::mem::size_of::<libc::dev_t>(),
+        )
+    });
+    bytes
+}
+
+fn tranche_indices(entry_count: u32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(entry_count as usize * 2);
+    for index in 0..entry_count {
+        bytes.extend_from_slice(&(index as u16).to_ne_bytes());
+    }
+    bytes
+}
+
+fn build_format_table(formats: &[(u32, u64)]) -> std::io::Result<FormatTable> {
+    let size = formats
+        .len()
+        .checked_mul(FORMAT_TABLE_ENTRY_SIZE)
+        .ok_or_else(|| std::io::Error::other("format table too large"))?;
+    let fd = unsafe { libc::memfd_create(c"lumalla-dmabuf-format-table".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut packed = Vec::with_capacity(size);
+    for &(format, modifier) in formats {
+        packed.extend_from_slice(&format.to_ne_bytes());
+        packed.extend_from_slice(&0u32.to_ne_bytes());
+        packed.extend_from_slice(&modifier.to_ne_bytes());
+    }
+    file.write_all(&packed)?;
+    // Prevent later mutation; protocol forbids changing table contents after send.
+    let raw = file.as_raw_fd();
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) } != 0 {
+        // Sealing is best-effort; keep the table even if the kernel rejects seals.
+        log::debug!(
+            "Unable to seal dmabuf format table: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let owned = OwnedFd::from(file);
+    Ok(FormatTable {
+        fd: owned,
+        size: size as u32,
+        entry_count: formats.len() as u32,
+    })
+}
+
 fn dup_fd(fd: RawFd) -> Result<OwnedFd> {
     let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if dup < 0 {
@@ -562,5 +778,44 @@ mod tests {
         assert_eq!(exported.drm_fourcc, DRM_FORMAT_XRGB8888);
         let snap = manager.snapshot_buffer(client_id, object(3)).unwrap();
         assert_eq!(snap.pixels, pixels);
+    }
+
+    #[test]
+    fn format_table_packs_format_modifier_pairs() {
+        let mut manager = DmabufManager::default();
+        manager.set_supported_formats(
+            vec![
+                (DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR),
+                (DRM_FORMAT_ARGB8888, 0x0100_0000_0000_0001),
+            ],
+            None,
+        );
+        let table = manager.format_table.as_ref().expect("format table");
+        assert_eq!(table.size, 32);
+        assert_eq!(table.entry_count, 2);
+
+        let mut mapped = vec![0u8; table.size as usize];
+        unsafe {
+            let len = libc::pread(
+                table.fd.as_raw_fd(),
+                mapped.as_mut_ptr().cast(),
+                mapped.len(),
+                0,
+            );
+            assert_eq!(len as usize, mapped.len());
+        }
+        assert_eq!(&mapped[0..4], &DRM_FORMAT_XRGB8888.to_ne_bytes());
+        assert_eq!(&mapped[4..8], &0u32.to_ne_bytes());
+        assert_eq!(&mapped[8..16], &DRM_FORMAT_MOD_LINEAR.to_ne_bytes());
+        assert_eq!(&mapped[16..20], &DRM_FORMAT_ARGB8888.to_ne_bytes());
+        assert_eq!(&mapped[24..32], &0x0100_0000_0000_0001u64.to_ne_bytes());
+
+        let indices = tranche_indices(2);
+        assert_eq!(indices, {
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&0u16.to_ne_bytes());
+            expected.extend_from_slice(&1u16.to_ne_bytes());
+            expected
+        });
     }
 }

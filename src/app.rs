@@ -294,6 +294,7 @@ impl AppData {
                                 if let Err(err) = configure_dmabuf_formats(
                                     &mut self.display_state,
                                     &mut self.renderer_state,
+                                    &mut self.connected_clients,
                                 ) {
                                     warn!(
                                         "Unable to refresh GPU dmabuf formats after DRM reconcile: {err:#}"
@@ -369,6 +370,7 @@ impl AppData {
                         if let Err(err) = configure_dmabuf_formats(
                             &mut self.display_state,
                             &mut self.renderer_state,
+                            &mut self.connected_clients,
                         ) {
                             warn!(
                                 "Unable to refresh GPU dmabuf formats after DRM activate: {err:#}"
@@ -912,7 +914,10 @@ pub(crate) fn run_app(
         Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
     }
     let mut renderer_state = init_and_register_renderer_state(&mut main_event_loop)?;
-    if let Err(err) = configure_dmabuf_formats(&mut display_state, &mut renderer_state) {
+    let mut no_clients = HashMap::new();
+    if let Err(err) =
+        configure_dmabuf_formats(&mut display_state, &mut renderer_state, &mut no_clients)
+    {
         warn!("Unable to query GPU dmabuf formats; using linear defaults: {err:#}");
     }
     let render_scheduler = RenderScheduler::default();
@@ -975,13 +980,18 @@ fn init_and_register_renderer_state(main_event_loop: &mut Poll) -> anyhow::Resul
 fn configure_dmabuf_formats(
     display_state: &mut DisplayState,
     renderer_state: &mut RendererState,
+    clients: &mut std::collections::HashMap<
+        lumalla_display::ClientId,
+        lumalla_display::ClientConnection,
+    >,
 ) -> anyhow::Result<()> {
     let formats = renderer_state.supported_dmabuf_formats()?;
+    let device_path = renderer_state.dmabuf_feedback_device_path();
     info!(
         "Advertising {} linux-dmabuf format/modifier pairs",
         formats.len()
     );
-    display_state.set_dmabuf_formats(formats);
+    display_state.set_dmabuf_formats(formats, device_path.as_deref(), clients);
     Ok(())
 }
 

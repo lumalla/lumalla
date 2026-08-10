@@ -99,9 +99,17 @@ impl DisplayState {
         self.seat_manager.set_modifiers(modifiers);
     }
 
-    /// Configure linux-dmabuf format/modifier pairs advertised to clients.
-    pub fn set_dmabuf_formats(&mut self, formats: Vec<(u32, u64)>) {
-        self.dmabuf_manager.set_supported_formats(formats);
+    /// Configure linux-dmabuf format/modifier pairs and main DRM device advertised to clients.
+    pub fn set_dmabuf_formats(
+        &mut self,
+        formats: Vec<(u32, u64)>,
+        device_path: Option<&std::path::Path>,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) {
+        self.dmabuf_manager
+            .set_supported_formats(formats, device_path);
+        self.dmabuf_manager
+            .send_all_feedback(clients.values_mut());
     }
 
     pub fn handle_keyboard_key(
@@ -422,9 +430,9 @@ impl Default for Globals {
         globals.register_version(InterfaceIndex::WlFixes, 1, [].into_iter());
         globals.register_version(InterfaceIndex::WlDataDeviceManager, 3, [].into_iter());
         globals.register_version(InterfaceIndex::XdgWmBase, 1, [].into_iter());
-        // Stable linux-dmabuf keeps the zwp_ interface name; advertise v3 for
-        // format/modifier events + create_immed without requiring feedback.
-        globals.register_version(InterfaceIndex::ZwpLinuxDmabufV1, 3, [].into_iter());
+        // Stable linux-dmabuf keeps the zwp_ interface name; advertise v4 for
+        // format/modifier events, create_immed, and feedback format_table.
+        globals.register_version(InterfaceIndex::ZwpLinuxDmabufV1, 4, [].into_iter());
         globals
     }
 }

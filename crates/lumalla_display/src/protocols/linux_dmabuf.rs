@@ -130,9 +130,20 @@ impl ZwpLinuxDmabufV1 for DisplayState {
         ) {
             return;
         }
-        // Minimal no-op feedback: done without formats (clients should use v3 events).
-        ctx.writer
-            .zwp_linux_dmabuf_feedback_v1_done(*params.id());
+        if let Err(error) = self
+            .dmabuf_manager
+            .create_feedback(ctx.client_id, *params.id(), version)
+        {
+            debug!("linux-dmabuf feedback create failed: {error}");
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(object_id)
+                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                .message("Failed to create dmabuf feedback");
+            return;
+        }
+        self.dmabuf_manager
+            .send_feedback(ctx.writer, *params.id(), version);
     }
 
     fn get_surface_feedback(
@@ -162,8 +173,21 @@ impl ZwpLinuxDmabufV1 for DisplayState {
         ) {
             return;
         }
-        ctx.writer
-            .zwp_linux_dmabuf_feedback_v1_done(*params.id());
+        if let Err(error) = self
+            .dmabuf_manager
+            .create_feedback(ctx.client_id, *params.id(), version)
+        {
+            debug!("linux-dmabuf feedback create failed: {error}");
+            ctx.writer
+                .wl_display_error(DISPLAY_OBJECT_ID)
+                .object_id(object_id)
+                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                .message("Failed to create dmabuf feedback");
+            return;
+        }
+        // Surface-specific preferences are not tracked yet; advertise the default tranche.
+        self.dmabuf_manager
+            .send_feedback(ctx.writer, *params.id(), version);
     }
 }
 
@@ -287,6 +311,8 @@ impl ZwpLinuxDmabufFeedbackV1 for DisplayState {
         object_id: ObjectId,
         _params: &ZwpLinuxDmabufFeedbackV1Destroy<'_>,
     ) {
+        self.dmabuf_manager
+            .destroy_feedback(ctx.client_id, object_id);
         ctx.registry.free_object(object_id, ctx.writer);
     }
 }

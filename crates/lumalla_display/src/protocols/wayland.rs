@@ -1762,7 +1762,7 @@ mod tests {
         )));
         assert!(globals.contains(&(
             lumalla_wayland_protocol::protocols::linux_dmabuf::ZWP_LINUX_DMABUF_V1_NAME,
-            3
+            4
         )));
     }
 

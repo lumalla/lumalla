@@ -533,6 +533,11 @@ impl RendererState {
         Ok(vulkan.supported_dmabuf_formats())
     }
 
+    /// DRM device path used for linux-dmabuf feedback `main_device` / tranche target.
+    pub fn dmabuf_feedback_device_path(&mut self) -> Option<PathBuf> {
+        self.resolved_render_device_path()
+    }
+
     /// Open missing DRM devices via the seat (fresh open after VT resume).
     pub fn activate_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
         self.drm_devices.activate(seat)
