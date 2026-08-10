@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -16,18 +16,17 @@ pub mod vulkan;
 
 mod default_cursor;
 pub mod scheduler;
+mod scanout_pool;
 
 use crate::default_cursor::default_cursor_frame;
+use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
 use crate::drm::{
-    CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, DrmFramebuffer,
-    FlipEventQueue, ModeBlob, atomic_modeset, atomic_page_flip, atomic_set_plane_fb,
-    dispatch_drm_events, resolve_connected_output,
+    CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, FlipEventQueue, ModeBlob,
+    atomic_modeset, atomic_page_flip, atomic_set_plane_fb, dispatch_drm_events,
+    resolve_connected_output,
 };
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
-use crate::vulkan::{
-    DmaBufImage, Framebuffer, RenderPass, VulkanContext, clear_framebuffer_to_color,
-    upload_bgra_to_image,
-};
+use crate::vulkan::{VulkanContext, clear_framebuffer_to_color, upload_bgra_to_image, vulkan_to_drm_fourcc};
 
 /// Default clear color for enabled outputs (teal).
 pub const SOLID_CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.65, 1.0];
@@ -147,13 +146,6 @@ impl CursorFrame {
     }
 }
 
-struct ScanoutBuffer {
-    drm_fb: DrmFramebuffer,
-    /// Kept alive so the exported DMA-BUF backing `drm_fb` remains valid.
-    #[allow(dead_code)]
-    dma_image: DmaBufImage,
-}
-
 struct OutputScanout {
     drm_path: PathBuf,
     output: ConnectedOutput,
@@ -169,9 +161,10 @@ struct OutputScanout {
 }
 
 pub struct RendererState {
-    // Drop order: scanouts → vulkan → drm_devices.
+    // Drop order: scanouts → scanout_pool → vulkan → drm_devices.
     drm_devices: DrmDevices,
     vulkan: Option<VulkanContext>,
+    scanout_pool: ScanoutBufferPool,
     /// Configured render device (`None` = auto).
     render_device: Option<PathBuf>,
     /// Per-connector overrides; missing names use defaults (enabled if connected).
@@ -193,6 +186,7 @@ impl RendererState {
         Ok(Self {
             drm_devices: DrmDevices::new()?,
             vulkan: None,
+            scanout_pool: ScanoutBufferPool::new(),
             render_device: None,
             output_configs: HashMap::new(),
             scanouts: HashMap::new(),
@@ -375,16 +369,34 @@ impl RendererState {
 
     /// Close seat-opened DRM devices after session disable was acknowledged.
     pub fn deactivate_drm(&mut self, seat: &SeatState) {
-        self.scanouts.clear();
+        self.drain_scanouts();
         let _ = self.flip_events.drain();
         self.drm_devices.deactivate(seat);
     }
 
     /// Close removed / open newly discovered DRM devices while the seat is active.
     pub fn reconcile_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
-        self.scanouts.clear();
+        self.drain_scanouts();
         let _ = self.flip_events.drain();
         self.drm_devices.reconcile(seat)
+    }
+
+    fn drain_scanouts(&mut self) {
+        let scanouts: Vec<OutputScanout> = self.scanouts.drain().map(|(_, s)| s).collect();
+        for scanout in scanouts {
+            self.release_output_scanout(scanout);
+        }
+        self.scanout_pool.clear();
+    }
+
+    fn release_output_scanout(&mut self, scanout: OutputScanout) {
+        self.scanout_pool.release(scanout.current);
+        if let Some(pending) = scanout.pending {
+            self.scanout_pool.release(pending);
+        }
+        if let Some(queued) = scanout.queued {
+            self.scanout_pool.release(queued);
+        }
     }
 
     /// Select the Vulkan render device (`None` = auto).
@@ -480,7 +492,17 @@ impl RendererState {
             }
         }
 
-        self.scanouts.retain(|name, _| keep.contains(name));
+        let stale: Vec<String> = self
+            .scanouts
+            .keys()
+            .filter(|name| !keep.contains(*name))
+            .cloned()
+            .collect();
+        for name in stale {
+            if let Some(scanout) = self.scanouts.remove(&name) {
+                self.release_output_scanout(scanout);
+            }
+        }
         debug!("Presented {presented} output(s)");
         Ok(self.present_status())
     }
@@ -588,7 +610,10 @@ impl RendererState {
         )
         .context("Failed atomic modeset")?;
 
-        let _previous = self.scanouts.insert(
+        let _previous = if let Some(old) = self.scanouts.remove(&target.connector_name) {
+            self.release_output_scanout(old);
+        };
+        self.scanouts.insert(
             target.connector_name.clone(),
             OutputScanout {
                 drm_path: target.drm_path.clone(),
@@ -610,39 +635,53 @@ impl RendererState {
         let width = target.output.mode.width();
         let height = target.output.mode.height();
         let format = vk::Format::B8G8R8A8_UNORM;
+        let fourcc = vulkan_to_drm_fourcc(format)
+            .with_context(|| format!("Vulkan format {format:?} has no DRM fourcc mapping"))?;
 
-        let (dma_image, fourcc) = {
+        let drm_device = self
+            .drm_devices
+            .opened()
+            .get(&target.drm_path)
+            .with_context(|| {
+                format!("DRM device {} is no longer open", target.drm_path.display())
+            })?;
+
+        let buffer = {
+            let vulkan = self
+                .vulkan
+                .as_mut()
+                .context("VulkanContext missing during present")?;
+            self.scanout_pool.acquire(
+                vulkan,
+                &target.drm_path,
+                drm_device.fd(),
+                width,
+                height,
+                format,
+                fourcc,
+            )?
+        };
+
+        {
+            let vulkan = self
+                .vulkan
+                .as_mut()
+                .context("VulkanContext missing during present")?;
+            vulkan.ensure_scanout_render_pass()?;
+        }
+
+        {
             let vulkan = self
                 .vulkan
                 .as_ref()
                 .context("VulkanContext missing during present")?;
-
-            let dma_image = DmaBufImage::allocate(
-                vulkan.device(),
-                vulkan.physical_device(),
-                width,
-                height,
-                format,
-            )
-            .context("Failed to allocate exportable scanout image")?;
-
-            let fourcc = dma_image
-                .drm_fourcc()
-                .context("Vulkan format has no DRM fourcc mapping")?;
-
-            let render_pass = RenderPass::new_for_scanout(vulkan.device(), format)?;
-            let framebuffer = Framebuffer::from_view(
-                vulkan.device(),
-                &render_pass,
-                dma_image.view(),
-                dma_image.extent(),
-            )?;
+            let render_pass = vulkan.scanout_render_pass()?;
 
             clear_framebuffer_to_color(
                 vulkan.device(),
                 vulkan.graphics_command_pool(),
-                &render_pass,
-                &framebuffer,
+                render_pass,
+                &buffer.framebuffer,
                 color,
             )
             .context("Failed to clear scanout image")?;
@@ -665,41 +704,15 @@ impl RendererState {
                 vulkan.device(),
                 vulkan.physical_device(),
                 vulkan.graphics_command_pool(),
-                &dma_image,
+                &buffer.dma_image,
                 &upload.pixels,
                 upload.width,
                 upload.height,
             )
             .context("Failed to upload Wayland SHM scene")?;
+        }
 
-            (dma_image, fourcc)
-        };
-
-        let dma_buf = dma_image
-            .export_dma_buf()
-            .context("Failed to export DMA-BUF for scanout")?;
-
-        let drm_device = self
-            .drm_devices
-            .opened()
-            .get(&target.drm_path)
-            .with_context(|| {
-                format!("DRM device {} is no longer open", target.drm_path.display())
-            })?;
-
-        let drm_fb = DrmFramebuffer::from_dma_buf(
-            drm_device.fd(),
-            dma_buf.as_fd(),
-            width,
-            height,
-            dma_image.stride(),
-            dma_image.offset(),
-            dma_image.modifier(),
-            fourcc,
-        )
-        .context("Failed to import DMA-BUF as DRM framebuffer")?;
-
-        Ok(ScanoutBuffer { drm_fb, dma_image })
+        Ok(buffer)
     }
 
     fn schedule_or_queue_flip(
@@ -724,11 +737,13 @@ impl RendererState {
                 .scanouts
                 .get_mut(connector_name)
                 .context("Missing scanout while queueing flip")?;
-            scanout.queued = Some(buffer);
+            if let Some(old) = scanout.queued.replace(buffer) {
+                self.scanout_pool.release(old);
+            }
             return Ok(());
         }
 
-        let fb_id = buffer.drm_fb.id();
+        let fb_id = buffer.drm_fb_id();
         let flip_result = {
             let device = self
                 .drm_devices
@@ -762,7 +777,8 @@ impl RendererState {
                     .scanouts
                     .get_mut(connector_name)
                     .context("Missing scanout after blocking flip fallback")?;
-                scanout.current = buffer;
+                let old = std::mem::replace(&mut scanout.current, buffer);
+                self.scanout_pool.release(old);
                 scanout.pending = None;
                 scanout.queued = None;
                 Ok(())
@@ -790,7 +806,7 @@ impl RendererState {
                 return Ok(());
             };
             let old = std::mem::replace(&mut scanout.current, new_current);
-            drop(old);
+            self.scanout_pool.release(old);
             scanout.queued.take()
         };
 
@@ -884,7 +900,7 @@ impl RendererState {
         };
 
         if needs_recreate {
-            self.scanouts.clear();
+            self.drain_scanouts();
             info!(
                 "Initializing Vulkan for DRM device {}",
                 preferred_drm_path.display()

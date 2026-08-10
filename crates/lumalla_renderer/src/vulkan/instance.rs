@@ -6,7 +6,7 @@ use anyhow::Context;
 use ash::vk;
 use log::{debug, info, warn};
 
-use super::{CommandPool, Device, MemoryAllocator, PhysicalDevice};
+use super::{CommandPool, Device, MemoryAllocator, PhysicalDevice, RenderPass};
 
 /// Holds the core Vulkan objects needed for rendering.
 ///
@@ -25,6 +25,8 @@ pub struct VulkanContext {
     graphics_command_pool: Option<CommandPool>,
     /// Memory allocator (must be destroyed before device)
     memory_allocator: Option<MemoryAllocator>,
+    /// Cached render pass for KMS scanout clears (dropped before device).
+    scanout_render_pass: Option<RenderPass>,
     /// Debug messenger (only present in debug builds with validation layers)
     #[cfg(debug_assertions)]
     debug_utils: Option<DebugUtils>,
@@ -178,9 +180,28 @@ impl VulkanContext {
             device: Some(device),
             graphics_command_pool: Some(graphics_command_pool),
             memory_allocator: Some(memory_allocator),
+            scanout_render_pass: None,
             #[cfg(debug_assertions)]
             debug_utils,
         })
+    }
+
+    /// Ensures the cached scanout render pass exists.
+    pub fn ensure_scanout_render_pass(&mut self) -> anyhow::Result<()> {
+        if self.scanout_render_pass.is_none() {
+            self.scanout_render_pass = Some(RenderPass::new_for_scanout(
+                self.device(),
+                vk::Format::B8G8R8A8_UNORM,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Returns the cached scanout render pass.
+    pub fn scanout_render_pass(&self) -> anyhow::Result<&RenderPass> {
+        self.scanout_render_pass
+            .as_ref()
+            .context("Scanout render pass not initialized")
     }
 
     /// Sets up the Vulkan debug messenger for validation layer output.
