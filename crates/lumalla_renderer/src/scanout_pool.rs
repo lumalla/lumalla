@@ -27,6 +27,8 @@ pub(crate) struct ScanoutBuffer {
     pub drm_fb: DrmFramebuffer,
     pub dma_image: DmaBufImage,
     pub framebuffer: Framebuffer,
+    /// True until the first GPU upload fills the buffer.
+    pub fresh: bool,
 }
 
 impl ScanoutBuffer {
@@ -136,6 +138,7 @@ fn create_scanout_buffer(
         drm_fb,
         dma_image,
         framebuffer,
+        fresh: true,
     })
 }
 

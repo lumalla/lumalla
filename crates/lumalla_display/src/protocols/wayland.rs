@@ -148,6 +148,67 @@ fn report_data_device_error(ctx: &mut Ctx, object_id: ObjectId, error: DataDevic
         .message(message);
 }
 
+fn div_ceil_i32(value: i32, divisor: i32) -> i32 {
+    let divisor = divisor.max(1);
+    (value + divisor - 1) / divisor
+}
+
+/// Maps commit damage hints to output-space rectangles.
+fn commit_output_damage(
+    commit: &SurfaceCommit,
+    output_x: i32,
+    output_y: i32,
+    buffer_width: usize,
+    buffer_height: usize,
+) -> (Vec<Rectangle>, bool) {
+    let full_surface = commit.newly_mapped
+        || (commit.damage.is_empty() && commit.buffer_damage.is_empty());
+    if full_surface {
+        return (Vec::new(), true);
+    }
+
+    let scale = commit.buffer_scale.max(1);
+    let mut damage = Vec::new();
+    if !commit.buffer_damage.is_empty() {
+        for rect in &commit.buffer_damage {
+            if rect.width <= 0 || rect.height <= 0 {
+                continue;
+            }
+            damage.push(Rectangle {
+                x: output_x + rect.x / scale,
+                y: output_y + rect.y / scale,
+                width: div_ceil_i32(rect.width, scale),
+                height: div_ceil_i32(rect.height, scale),
+            });
+        }
+    } else {
+        for rect in &commit.damage {
+            if rect.width <= 0 || rect.height <= 0 {
+                continue;
+            }
+            damage.push(Rectangle {
+                x: output_x + rect.x,
+                y: output_y + rect.y,
+                width: rect.width,
+                height: rect.height,
+            });
+        }
+    }
+
+    if damage.is_empty() {
+        let width = div_ceil_i32(buffer_width as i32, scale);
+        let height = div_ceil_i32(buffer_height as i32, scale);
+        damage.push(Rectangle {
+            x: output_x,
+            y: output_y,
+            width,
+            height,
+        });
+    }
+
+    (damage, false)
+}
+
 fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: SurfaceCommit) {
     if let Some(Some(buffer_id)) = commit.attached_buffer {
         let is_cursor = state
@@ -196,6 +257,10 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                 width as i32,
                 height as i32,
             );
+            let output_x = commit.layout.0 + commit.offset.0;
+            let output_y = commit.layout.1 + commit.offset.1;
+            let (damage, full_surface) =
+                commit_output_damage(&commit, output_x, output_y, width, height);
             if is_cursor {
                 state
                     .surface_updates
@@ -214,6 +279,8 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                         offset_y: commit.offset.1,
                         x: 0,
                         y: 0,
+                        damage,
+                        full_surface: true,
                     }));
             } else {
                 state
@@ -231,8 +298,10 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                         buffer_transform: commit.buffer_transform,
                         offset_x: commit.offset.0,
                         offset_y: commit.offset.1,
-                        x: commit.layout.0 + commit.offset.0,
-                        y: commit.layout.1 + commit.offset.1,
+                        x: output_x,
+                        y: output_y,
+                        damage,
+                        full_surface,
                     }));
             }
             if commit.newly_mapped {

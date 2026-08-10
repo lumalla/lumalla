@@ -34,4 +34,4 @@ pub use physical_device::PhysicalDevice;
 pub use pipeline::{GraphicsPipeline, GraphicsPipelineBuilder, ShaderModule};
 pub use render_pass::RenderPass;
 pub use sync::{Fence, Semaphore};
-pub use upload::upload_bgra_to_image;
+pub use upload::{UploadRegion, upload_bgra_regions_from_backing, upload_bgra_to_image};

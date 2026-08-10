@@ -21,6 +21,7 @@ mod xdg;
 pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland};
 pub use seat::{ActiveCursor, KeyboardModifiers};
 pub use output::OutputInfo;
+pub use surface::Rectangle;
 
 pub struct DisplayMessage;
 
@@ -40,6 +41,10 @@ pub struct CommittedFrame {
     pub offset_y: i32,
     pub x: i32,
     pub y: i32,
+    /// Output-space regions that changed this commit.
+    pub damage: Vec<Rectangle>,
+    /// When true, the entire surface area must be recomposited.
+    pub full_surface: bool,
 }
 
 #[derive(Debug)]

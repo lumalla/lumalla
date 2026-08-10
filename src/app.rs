@@ -20,7 +20,8 @@ use lumalla_display::{
 };
 use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
 use lumalla_renderer::{
-    CursorFrame, PresentStatus, RenderScheduler, RendererState, SOLID_CLEAR_COLOR, SurfaceFrame,
+    CursorFrame, OutputDamageRect, PresentStatus, RenderScheduler, RendererState, SOLID_CLEAR_COLOR,
+    SurfaceFrame,
 };
 use lumalla_seat::SeatState;
 use lumalla_shared::{
@@ -592,6 +593,17 @@ impl AppData {
                         x: frame.x,
                         y: frame.y,
                         buffer_scale: frame.buffer_scale,
+                        damage: frame
+                            .damage
+                            .into_iter()
+                            .map(|rect| OutputDamageRect {
+                                x: rect.x,
+                                y: rect.y,
+                                width: rect.width,
+                                height: rect.height,
+                            })
+                            .collect(),
+                        full_surface: frame.full_surface,
                     };
                     if let Err(err) = self.renderer_state.set_surface_frame(frame) {
                         error!("Unable to queue committed Wayland surface: {err:#}");

@@ -16,24 +16,114 @@ pub fn upload_bgra_to_image(
     width: u32,
     height: u32,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        width > 0 && height > 0,
-        "Upload dimensions must be non-zero"
-    );
-    anyhow::ensure!(
-        width <= image.extent().width && height <= image.extent().height,
-        "Upload exceeds destination image"
-    );
-    let required_size = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|size| size.checked_mul(4))
-        .context("Upload size overflows")?;
-    anyhow::ensure!(
-        pixels.len() as u64 >= required_size,
-        "Upload pixel data is truncated"
-    );
+    upload_bgra_regions_from_backing(
+        device,
+        physical_device,
+        command_pool,
+        image,
+        pixels,
+        width,
+        &[UploadRegion {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }],
+    )
+}
 
-    let staging = StagingBuffer::new(device, physical_device, &pixels[..required_size as usize])?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Uploads one or more sub-rectangles from a full output backing store.
+pub fn upload_bgra_regions_from_backing(
+    device: &Device,
+    physical_device: &PhysicalDevice,
+    command_pool: &CommandPool,
+    image: &DmaBufImage,
+    backing: &[u8],
+    backing_width: u32,
+    regions: &[UploadRegion],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!regions.is_empty(), "Upload region list must be non-empty");
+    anyhow::ensure!(backing_width > 0, "Backing width must be non-zero");
+
+    let backing_row_bytes = usize::try_from(backing_width)
+        .context("Backing width overflows")?
+        .checked_mul(4)
+        .context("Backing row size overflows")?;
+
+    let mut staging_bytes = Vec::new();
+    let mut copies = Vec::with_capacity(regions.len());
+    for region in regions {
+        anyhow::ensure!(
+            region.width > 0 && region.height > 0,
+            "Upload region dimensions must be non-zero"
+        );
+        let end_x = region
+            .x
+            .checked_add(region.width)
+            .context("Upload region x overflow")?;
+        let end_y = region
+            .y
+            .checked_add(region.height)
+            .context("Upload region y overflow")?;
+        anyhow::ensure!(
+            end_x <= backing_width && end_y <= image.extent().height,
+            "Upload region exceeds backing or destination image"
+        );
+
+        let region_row_bytes = usize::try_from(region.width)
+            .context("Region width overflows")?
+            .checked_mul(4)
+            .context("Region row size overflows")?;
+        let region_size = region_row_bytes
+            .checked_mul(region.height as usize)
+            .context("Region size overflows")?;
+        let buffer_offset = staging_bytes.len() as u64;
+        staging_bytes.reserve(region_size);
+
+        for row in 0..region.height {
+            let src_y = region.y + row;
+            let src_start = src_y as usize * backing_row_bytes + region.x as usize * 4;
+            let src_end = src_start + region_row_bytes;
+            anyhow::ensure!(
+                src_end <= backing.len(),
+                "Upload region exceeds backing pixel data"
+            );
+            staging_bytes.extend_from_slice(&backing[src_start..src_end]);
+        }
+
+        copies.push(
+            vk::BufferImageCopy::default()
+                .buffer_offset(buffer_offset)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D {
+                    x: region.x as i32,
+                    y: region.y as i32,
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width: region.width,
+                    height: region.height,
+                    depth: 1,
+                }),
+        );
+    }
+
+    let staging = StagingBuffer::new(device, physical_device, &staging_bytes)?;
     let command_buffer = command_pool
         .allocate_command_buffer(device)
         .context("Failed to allocate upload command buffer")?;
@@ -61,29 +151,14 @@ pub fn upload_bgra_to_image(
             );
         }
 
-        let copy = vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(0)
-            .buffer_image_height(0)
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_offset(vk::Offset3D::default())
-            .image_extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            });
+        let copy = copies.as_slice();
         unsafe {
             device.handle().cmd_copy_buffer_to_image(
                 recorder.command_buffer(),
                 staging.buffer,
                 image.image(),
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[copy],
+                copy,
             );
         }
 

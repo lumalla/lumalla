@@ -17,16 +17,20 @@ pub mod vulkan;
 mod default_cursor;
 pub mod scheduler;
 mod scanout_pool;
+mod scene_backing;
 
-use crate::default_cursor::default_cursor_frame;
 use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
+use crate::scene_backing::{
+    DamageRect, cursor_damage_rects, cursor_damage_rects_default, prepare_composite, SceneBacking,
+};
+pub use crate::scene_backing::DamageRect as OutputDamageRect;
 use crate::drm::{
     CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, FlipEventQueue, ModeBlob,
     atomic_modeset, atomic_page_flip, atomic_set_plane_fb, dispatch_drm_events,
     resolve_connected_output,
 };
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
-use crate::vulkan::{VulkanContext, clear_framebuffer_to_color, upload_bgra_to_image, vulkan_to_drm_fourcc};
+use crate::vulkan::{VulkanContext, upload_bgra_to_image, vulkan_to_drm_fourcc};
 
 /// Default clear color for enabled outputs (teal).
 pub const SOLID_CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.65, 1.0];
@@ -68,6 +72,10 @@ pub struct SurfaceFrame {
     pub x: i32,
     pub y: i32,
     pub buffer_scale: i32,
+    /// Output-space regions updated by this commit.
+    pub damage: Vec<DamageRect>,
+    /// When true, the entire output backing must be recomposited.
+    pub full_surface: bool,
 }
 
 impl SurfaceFrame {
@@ -179,6 +187,10 @@ pub struct RendererState {
     pointer_x: i32,
     pointer_y: i32,
     scene_dirty: bool,
+    scene_backing: Option<SceneBacking>,
+    pending_damage: Vec<DamageRect>,
+    pending_full_redraw: bool,
+    pending_pointer_damage: bool,
 }
 
 impl RendererState {
@@ -197,7 +209,42 @@ impl RendererState {
             pointer_x: 0,
             pointer_y: 0,
             scene_dirty: false,
+            scene_backing: None,
+            pending_damage: Vec::new(),
+            pending_full_redraw: false,
+            pending_pointer_damage: false,
         })
+    }
+
+    fn invalidate_scene_backing(&mut self) {
+        self.scene_backing = None;
+        self.pending_damage.clear();
+        self.pending_full_redraw = true;
+        self.pending_pointer_damage = false;
+    }
+
+    fn note_pointer_damage(&mut self, new_x: i32, new_y: i32) {
+        let old = (self.pointer_x, self.pointer_y);
+        let damage = match self.cursor_frame.as_ref() {
+            Some(cursor) => cursor_damage_rects(cursor, old, (new_x, new_y)),
+            None => cursor_damage_rects_default(old, (new_x, new_y)),
+        };
+        self.pending_damage.extend(damage);
+        self.pending_pointer_damage = true;
+    }
+
+    fn note_cursor_redraw(&mut self) {
+        let rect = match self.cursor_frame.as_ref() {
+            Some(cursor) => {
+                cursor_damage_rects(cursor, (self.pointer_x, self.pointer_y), (self.pointer_x, self.pointer_y))
+            }
+            None => cursor_damage_rects_default(
+                (self.pointer_x, self.pointer_y),
+                (self.pointer_x, self.pointer_y),
+            ),
+        };
+        self.pending_damage.extend(rect);
+        self.pending_pointer_damage = true;
     }
 
     pub fn scene_dirty(&self) -> bool {
@@ -270,6 +317,12 @@ impl RendererState {
         if !self.surface_frames.contains_key(&key) {
             self.surface_order.push(key);
         }
+        if frame.full_surface {
+            self.pending_full_redraw = true;
+            self.pending_damage.clear();
+        } else {
+            self.pending_damage.extend(frame.damage.iter().copied());
+        }
         self.surface_frames.insert(key, frame);
         self.mark_dirty_if_active();
         Ok(())
@@ -279,6 +332,8 @@ impl RendererState {
         let key = (owner_id, surface_id);
         if self.surface_frames.remove(&key).is_some() {
             self.surface_order.retain(|k| *k != key);
+            self.pending_full_redraw = true;
+            self.pending_damage.clear();
             self.mark_dirty_if_active();
         }
         Ok(())
@@ -296,6 +351,8 @@ impl RendererState {
             self.cursor_frame = None;
         }
         if self.surface_frames.len() != before || cursor_removed {
+            self.pending_full_redraw = true;
+            self.pending_damage.clear();
             self.mark_dirty_if_active();
         }
         Ok(())
@@ -310,6 +367,8 @@ impl RendererState {
     pub fn set_cursor_frame(&mut self, frame: CursorFrame) -> anyhow::Result<()> {
         frame.validate()?;
         self.cursor_frame = Some(frame);
+        self.pending_full_redraw = true;
+        self.pending_damage.clear();
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -318,6 +377,7 @@ impl RendererState {
         if self.cursor_frame.is_none() {
             return Ok(());
         }
+        self.note_cursor_redraw();
         self.cursor_frame = None;
         self.mark_dirty_if_active();
         Ok(())
@@ -327,6 +387,7 @@ impl RendererState {
         if self.pointer_x == x && self.pointer_y == y {
             return Ok(());
         }
+        self.note_pointer_damage(x, y);
         self.pointer_x = x;
         self.pointer_y = y;
         self.mark_dirty_if_active();
@@ -334,14 +395,29 @@ impl RendererState {
     }
 
     pub fn update_cursor_hotspot(&mut self, hotspot_x: i32, hotspot_y: i32) -> anyhow::Result<()> {
-        let Some(cursor) = self.cursor_frame.as_mut() else {
+        let Some(cursor) = self.cursor_frame.as_ref() else {
             return Ok(());
         };
         if cursor.hotspot_x == hotspot_x && cursor.hotspot_y == hotspot_y {
             return Ok(());
         }
-        cursor.hotspot_x = hotspot_x;
-        cursor.hotspot_y = hotspot_y;
+        let old_hotspot = (cursor.hotspot_x, cursor.hotspot_y);
+        let pointer = (self.pointer_x, self.pointer_y);
+        let mut old_cursor = cursor.clone();
+        old_cursor.hotspot_x = old_hotspot.0;
+        old_cursor.hotspot_y = old_hotspot.1;
+        let damage = cursor_damage_rects(&old_cursor, pointer, pointer);
+        let mut new_cursor = old_cursor.clone();
+        new_cursor.hotspot_x = hotspot_x;
+        new_cursor.hotspot_y = hotspot_y;
+        let new_damage = cursor_damage_rects(&new_cursor, pointer, pointer);
+        self.pending_damage.extend(damage);
+        self.pending_damage.extend(new_damage);
+        self.pending_pointer_damage = true;
+        if let Some(cursor) = self.cursor_frame.as_mut() {
+            cursor.hotspot_x = hotspot_x;
+            cursor.hotspot_y = hotspot_y;
+        }
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -387,6 +463,7 @@ impl RendererState {
             self.release_output_scanout(scanout);
         }
         self.scanout_pool.clear();
+        self.invalidate_scene_backing();
     }
 
     fn release_output_scanout(&mut self, scanout: OutputScanout) {
@@ -646,7 +723,7 @@ impl RendererState {
                 format!("DRM device {} is no longer open", target.drm_path.display())
             })?;
 
-        let buffer = {
+        let mut buffer = {
             let vulkan = self
                 .vulkan
                 .as_mut()
@@ -665,51 +742,52 @@ impl RendererState {
         {
             let vulkan = self
                 .vulkan
-                .as_mut()
-                .context("VulkanContext missing during present")?;
-            vulkan.ensure_scanout_render_pass()?;
-        }
-
-        {
-            let vulkan = self
-                .vulkan
                 .as_ref()
                 .context("VulkanContext missing during present")?;
-            let render_pass = vulkan.scanout_render_pass()?;
-
-            clear_framebuffer_to_color(
-                vulkan.device(),
-                vulkan.graphics_command_pool(),
-                render_pass,
-                &buffer.framebuffer,
-                color,
-            )
-            .context("Failed to clear scanout image")?;
 
             let frames: Vec<&SurfaceFrame> = self
                 .surface_order
                 .iter()
                 .filter_map(|key| self.surface_frames.get(key))
                 .collect();
-            let upload = composite_scene_upload(
+
+            let pending_damage = std::mem::take(&mut self.pending_damage);
+            let force_full = self.pending_full_redraw || self.pending_pointer_damage;
+            self.pending_full_redraw = false;
+            self.pending_pointer_damage = false;
+
+            let _composite = prepare_composite(
+                &mut self.scene_backing,
+                width,
+                height,
+                color,
+                &pending_damage,
+                force_full,
                 &frames,
                 self.cursor_frame.as_ref(),
                 self.pointer_x,
                 self.pointer_y,
-                width,
-                height,
-                color,
             )?;
+
+            let backing = self
+                .scene_backing
+                .as_ref()
+                .context("Scene backing missing after composite")?;
+
+            // Always upload the full backing: with page-flipped pool buffers, partial
+            // uploads leave stale cursor pixels on regions outside the damage rects.
             upload_bgra_to_image(
                 vulkan.device(),
                 vulkan.physical_device(),
                 vulkan.graphics_command_pool(),
                 &buffer.dma_image,
-                &upload.pixels,
-                upload.width,
-                upload.height,
+                &backing.pixels,
+                width,
+                height,
             )
-            .context("Failed to upload Wayland SHM scene")?;
+            .context("Failed to upload scene to scanout buffer")?;
+
+            buffer.fresh = false;
         }
 
         Ok(buffer)
@@ -918,170 +996,6 @@ struct PresentTarget {
     output: ConnectedOutput,
 }
 
-struct PreparedSurfaceUpload {
-    pixels: Vec<u8>,
-    width: u32,
-    height: u32,
-}
-
-fn composite_scene_upload(
-    frames: &[&SurfaceFrame],
-    cursor: Option<&CursorFrame>,
-    pointer_x: i32,
-    pointer_y: i32,
-    output_width: u32,
-    output_height: u32,
-    clear: [f32; 4],
-) -> anyhow::Result<PreparedSurfaceUpload> {
-    let mut upload = composite_surface_upload(frames, output_width, output_height, clear)?;
-    match cursor {
-        Some(client) => composite_cursor(
-            &mut upload.pixels,
-            output_width as usize,
-            output_height as usize,
-            client,
-            pointer_x,
-            pointer_y,
-        )?,
-        None => composite_cursor(
-            &mut upload.pixels,
-            output_width as usize,
-            output_height as usize,
-            default_cursor_frame(),
-            pointer_x,
-            pointer_y,
-        )?,
-    }
-    Ok(upload)
-}
-
-fn composite_cursor(
-    pixels: &mut [u8],
-    output_width: usize,
-    output_height: usize,
-    cursor: &CursorFrame,
-    pointer_x: i32,
-    pointer_y: i32,
-) -> anyhow::Result<()> {
-    cursor.validate()?;
-    let row_bytes = output_width
-        .checked_mul(4)
-        .context("Output row size overflows")?;
-    let scale = cursor.buffer_scale.max(1) as usize;
-    let dest_w = cursor.width / scale;
-    let dest_h = cursor.height / scale;
-    if dest_w == 0 || dest_h == 0 {
-        return Ok(());
-    }
-    let dest_x = pointer_x - cursor.hotspot_x;
-    let dest_y = pointer_y - cursor.hotspot_y;
-    for dy in 0..dest_h {
-        let out_y = dest_y + dy as i32;
-        if out_y < 0 || out_y as usize >= output_height {
-            continue;
-        }
-        let source_y = ((dy as u128 * cursor.height as u128) / dest_h as u128) as usize;
-        for dx in 0..dest_w {
-            let out_x = dest_x + dx as i32;
-            if out_x < 0 || out_x as usize >= output_width {
-                continue;
-            }
-            let source_x = ((dx as u128 * cursor.width as u128) / dest_w as u128) as usize;
-            let source = source_y * cursor.stride + source_x * 4;
-            let destination = out_y as usize * row_bytes + out_x as usize * 4;
-            let src = &cursor.pixels[source..source + 4];
-            let alpha = if cursor.format == WL_SHM_FORMAT_ARGB8888 {
-                src[3] as u16
-            } else {
-                255
-            };
-            if alpha == 0 {
-                continue;
-            }
-            if alpha == 255 {
-                pixels[destination..destination + 4].copy_from_slice(src);
-                if cursor.format == WL_SHM_FORMAT_XRGB8888 {
-                    pixels[destination + 3] = u8::MAX;
-                }
-                continue;
-            }
-            let inv = 255 - alpha;
-            for channel in 0..3 {
-                let dst = pixels[destination + channel] as u16;
-                let src_channel = src[channel] as u16;
-                pixels[destination + channel] =
-                    ((src_channel * alpha + dst * inv) / 255) as u8;
-            }
-            pixels[destination + 3] = u8::MAX;
-        }
-    }
-    Ok(())
-}
-
-fn composite_surface_upload(
-    frames: &[&SurfaceFrame],
-    output_width: u32,
-    output_height: u32,
-    clear: [f32; 4],
-) -> anyhow::Result<PreparedSurfaceUpload> {
-    anyhow::ensure!(
-        output_width > 0 && output_height > 0,
-        "Output dimensions must be non-zero"
-    );
-    let width = output_width as usize;
-    let height = output_height as usize;
-    let row_bytes = width
-        .checked_mul(4)
-        .context("Scaled surface row size overflows")?;
-    let capacity = row_bytes
-        .checked_mul(height)
-        .context("Scaled surface size overflows")?;
-    let clear_b = (clear[2].clamp(0.0, 1.0) * 255.0) as u8;
-    let clear_g = (clear[1].clamp(0.0, 1.0) * 255.0) as u8;
-    let clear_r = (clear[0].clamp(0.0, 1.0) * 255.0) as u8;
-    let mut pixels = vec![0u8; capacity];
-    for chunk in pixels.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&[clear_b, clear_g, clear_r, 0xff]);
-    }
-
-    for frame in frames {
-        frame.validate()?;
-        let scale = frame.buffer_scale.max(1) as usize;
-        let dest_w = frame.width / scale;
-        let dest_h = frame.height / scale;
-        if dest_w == 0 || dest_h == 0 {
-            continue;
-        }
-        for dy in 0..dest_h {
-            let out_y = frame.y + dy as i32;
-            if out_y < 0 || out_y as usize >= height {
-                continue;
-            }
-            let source_y = ((dy as u128 * frame.height as u128) / dest_h as u128) as usize;
-            for dx in 0..dest_w {
-                let out_x = frame.x + dx as i32;
-                if out_x < 0 || out_x as usize >= width {
-                    continue;
-                }
-                let source_x = ((dx as u128 * frame.width as u128) / dest_w as u128) as usize;
-                let source = source_y * frame.stride + source_x * 4;
-                let destination = out_y as usize * row_bytes + out_x as usize * 4;
-                pixels[destination..destination + 4]
-                    .copy_from_slice(&frame.pixels[source..source + 4]);
-                if frame.format == WL_SHM_FORMAT_XRGB8888 {
-                    pixels[destination + 3] = u8::MAX;
-                }
-            }
-        }
-    }
-
-    Ok(PreparedSurfaceUpload {
-        pixels,
-        width: output_width,
-        height: output_height,
-    })
-}
-
 impl Source for RendererState {
     fn register(
         &mut self,
@@ -1109,6 +1023,7 @@ impl Source for RendererState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene_backing::{composite_cursor_into, composite_surface_full};
 
     fn frame() -> SurfaceFrame {
         SurfaceFrame {
@@ -1122,6 +1037,8 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            damage: Vec::new(),
+            full_surface: true,
         }
     }
 
@@ -1155,13 +1072,15 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            damage: Vec::new(),
+            full_surface: true,
         };
 
-        let upload =
-            composite_surface_upload(&[&frame], 3, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
-        assert_eq!((upload.width, upload.height), (3, 1));
+        let mut upload =
+            composite_surface_full(&[&frame], 3, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(upload.len(), 3 * 1 * 4);
         assert_eq!(
-            upload.pixels,
+            upload,
             vec![1, 2, 3, 255, 4, 5, 6, 255, 0, 0, 0, 255]
         );
     }
@@ -1177,11 +1096,13 @@ mod tests {
             x: 1,
             y: 0,
             buffer_scale: 1,
+            damage: Vec::new(),
+            full_surface: true,
             ..frame()
         };
         let upload =
-            composite_surface_upload(&[&frame], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
-        assert_eq!(upload.pixels, vec![0, 0, 0, 255, 9, 8, 7, 6]);
+            composite_surface_full(&[&frame], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(upload, vec![0, 0, 0, 255, 9, 8, 7, 6]);
     }
 
     #[test]
@@ -1198,8 +1119,8 @@ mod tests {
             hotspot_y: 0,
             buffer_scale: 1,
         };
-        let upload = composite_scene_upload(&[], Some(&cursor), 1, 0, 2, 1, [0.0, 0.0, 0.0, 1.0])
-            .unwrap();
-        assert_eq!(upload.pixels, vec![0, 0, 0, 255, 10, 20, 30, 255]);
+        let mut upload = composite_surface_full(&[], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
+        composite_cursor_into(&mut upload, 2, 1, &cursor, 1, 0).unwrap();
+        assert_eq!(upload, vec![0, 0, 0, 255, 10, 20, 30, 255]);
     }
 }
