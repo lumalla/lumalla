@@ -99,6 +99,11 @@ impl DisplayState {
         self.seat_manager.set_modifiers(modifiers);
     }
 
+    /// Configure linux-dmabuf format/modifier pairs advertised to clients.
+    pub fn set_dmabuf_formats(&mut self, formats: Vec<(u32, u64)>) {
+        self.dmabuf_manager.set_supported_formats(formats);
+    }
+
     pub fn handle_keyboard_key(
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,

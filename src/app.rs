@@ -291,6 +291,14 @@ impl AppData {
                                 {
                                     error!("Unable to refresh DRM device poll fds: {err}");
                                 }
+                                if let Err(err) = configure_dmabuf_formats(
+                                    &mut self.display_state,
+                                    &mut self.renderer_state,
+                                ) {
+                                    warn!(
+                                        "Unable to refresh GPU dmabuf formats after DRM reconcile: {err:#}"
+                                    );
+                                }
                             }
                             self.sync_wayland_output_from_drm();
                             self.render_scheduler.request_immediate();
@@ -357,6 +365,14 @@ impl AppData {
                     } else {
                         if let Err(err) = self.sync_drm_device_poll(event_loop.registry()) {
                             error!("Unable to register DRM device poll fds: {err}");
+                        }
+                        if let Err(err) = configure_dmabuf_formats(
+                            &mut self.display_state,
+                            &mut self.renderer_state,
+                        ) {
+                            warn!(
+                                "Unable to refresh GPU dmabuf formats after DRM activate: {err:#}"
+                            );
                         }
                         self.sync_wayland_output_from_drm();
                         self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
@@ -895,7 +911,10 @@ pub(crate) fn run_app(
         }
         Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
     }
-    let renderer_state = init_and_register_renderer_state(&mut main_event_loop)?;
+    let mut renderer_state = init_and_register_renderer_state(&mut main_event_loop)?;
+    if let Err(err) = configure_dmabuf_formats(&mut display_state, &mut renderer_state) {
+        warn!("Unable to query GPU dmabuf formats; using linear defaults: {err:#}");
+    }
     let render_scheduler = RenderScheduler::default();
     comms.dbus(DbusMessage::SetDrmDevices(
         renderer_state.drm_device_states(),
@@ -951,6 +970,19 @@ fn init_and_register_renderer_state(main_event_loop: &mut Poll) -> anyhow::Resul
         .register(&mut renderer_state, UDEV_DRM_TOKEN, Interest::READABLE)
         .context("Unable to listen on DRM udev monitor")?;
     Ok(renderer_state)
+}
+
+fn configure_dmabuf_formats(
+    display_state: &mut DisplayState,
+    renderer_state: &mut RendererState,
+) -> anyhow::Result<()> {
+    let formats = renderer_state.supported_dmabuf_formats()?;
+    info!(
+        "Advertising {} linux-dmabuf format/modifier pairs",
+        formats.len()
+    );
+    display_state.set_dmabuf_formats(formats);
+    Ok(())
 }
 
 fn init_and_register_wayland_display(

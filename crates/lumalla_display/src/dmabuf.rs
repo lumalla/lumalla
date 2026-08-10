@@ -108,14 +108,37 @@ struct DmabufBuffer {
 pub struct DmabufManager {
     params: HashMap<ResourceKey, Params>,
     buffers: HashMap<ResourceKey, DmabufBuffer>,
+    /// Advertised `(drm_fourcc, modifier)` pairs. Empty means built-in linear defaults.
+    supported: Vec<(u32, u64)>,
 }
 
 impl DmabufManager {
-    pub fn supported_formats() -> &'static [(u32, u64)] {
-        &[
-            (DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR),
-            (DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR),
-        ]
+    pub fn supported_formats(&self) -> &[(u32, u64)] {
+        if self.supported.is_empty() {
+            static DEFAULTS: &[(u32, u64)] = &[
+                (DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR),
+                (DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR),
+            ];
+            DEFAULTS
+        } else {
+            &self.supported
+        }
+    }
+
+    pub fn set_supported_formats(&mut self, formats: Vec<(u32, u64)>) {
+        self.supported = formats;
+    }
+
+    fn supports_format_modifier(&self, format: u32, modifier: u64) -> bool {
+        self.supported_formats()
+            .iter()
+            .any(|(fmt, m)| *fmt == format && *m == modifier)
+    }
+
+    fn supports_format(&self, format: u32) -> bool {
+        self.supported_formats()
+            .iter()
+            .any(|(fmt, _)| *fmt == format)
     }
 
     pub fn create_params(&mut self, client_id: ClientId, object_id: ObjectId) -> Result<()> {
@@ -208,10 +231,7 @@ impl DmabufManager {
                 "Invalid dmabuf dimensions",
             ));
         }
-        if !Self::supported_formats()
-            .iter()
-            .any(|(fmt, _)| *fmt == format)
-        {
+        if !self.supports_format(format) {
             return Err(DmabufError::new(
                 DmabufErrorKind::InvalidFormat,
                 "Unsupported dmabuf format",
@@ -224,45 +244,59 @@ impl DmabufManager {
                 "wl_buffer already exists",
             ));
         }
+        let modifier = {
+            let params = self.params.get(&(client_id, params_id)).ok_or_else(|| {
+                DmabufError::new(DmabufErrorKind::InvalidObject, "Unknown dmabuf params")
+            })?;
+            if params.used {
+                return Err(DmabufError::new(
+                    DmabufErrorKind::AlreadyUsed,
+                    "dmabuf params already used",
+                ));
+            }
+            let Some(plane) = params.planes[0].as_ref() else {
+                return Err(DmabufError::new(
+                    DmabufErrorKind::Incomplete,
+                    "Missing plane 0",
+                ));
+            };
+            if params.planes.iter().skip(1).any(|p| p.is_some()) {
+                return Err(DmabufError::new(
+                    DmabufErrorKind::Incomplete,
+                    "Only single-planar formats are supported",
+                ));
+            }
+            plane.modifier
+        };
+        if !self.supports_format_modifier(format, modifier) {
+            return Err(DmabufError::new(
+                DmabufErrorKind::InvalidFormat,
+                "Unsupported dmabuf format/modifier",
+            ));
+        }
         let params = self
             .params
             .get_mut(&(client_id, params_id))
             .ok_or_else(|| {
                 DmabufError::new(DmabufErrorKind::InvalidObject, "Unknown dmabuf params")
             })?;
-        if params.used {
-            return Err(DmabufError::new(
-                DmabufErrorKind::AlreadyUsed,
-                "dmabuf params already used",
-            ));
-        }
-        // Single-planar formats only for this compositor.
         let Some(plane) = params.planes[0].take() else {
             return Err(DmabufError::new(
                 DmabufErrorKind::Incomplete,
                 "Missing plane 0",
             ));
         };
-        if params.planes.iter().any(|p| p.is_some()) {
-            return Err(DmabufError::new(
-                DmabufErrorKind::Incomplete,
-                "Only single-planar formats are supported",
-            ));
-        }
-        if plane.modifier != DRM_FORMAT_MOD_LINEAR {
-            return Err(DmabufError::new(
-                DmabufErrorKind::InvalidFormat,
-                "Only linear modifier is supported",
-            ));
-        }
-        let needed = (plane.offset as u64)
-            .saturating_add((plane.stride as u64).saturating_mul(height as u64));
-        let size = fd_size(plane.fd.as_raw_fd())?;
-        if needed > size {
-            return Err(DmabufError::new(
-                DmabufErrorKind::OutOfBounds,
-                "dmabuf plane is out of bounds",
-            ));
+        // Stride*height is only meaningful for linear layouts.
+        if plane.modifier == DRM_FORMAT_MOD_LINEAR {
+            let needed = (plane.offset as u64)
+                .saturating_add((plane.stride as u64).saturating_mul(height as u64));
+            let size = fd_size(plane.fd.as_raw_fd())?;
+            if needed > size {
+                return Err(DmabufError::new(
+                    DmabufErrorKind::OutOfBounds,
+                    "dmabuf plane is out of bounds",
+                ));
+            }
         }
         params.used = true;
         self.buffers.insert(

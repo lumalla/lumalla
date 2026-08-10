@@ -135,6 +135,11 @@ struct SurfaceTexture {
     wl_format: u32,
     uploaded: bool,
     buffer_id: u32,
+    dmabuf_modifier: u64,
+    dmabuf_stride: u32,
+    dmabuf_offset: u32,
+    dmabuf_width: u32,
+    dmabuf_height: u32,
 }
 
 enum TextureBacking {
@@ -264,6 +269,11 @@ impl SurfaceTextureCache {
                     wl_format: frame.format,
                     uploaded: false,
                     buffer_id: frame.buffer_id,
+                    dmabuf_modifier: 0,
+                    dmabuf_stride: 0,
+                    dmabuf_offset: 0,
+                    dmabuf_width: 0,
+                    dmabuf_height: 0,
                 },
             );
         }
@@ -335,11 +345,33 @@ impl SurfaceTextureCache {
     ) -> anyhow::Result<()> {
         let width = frame.width as u32;
         let height = frame.height as u32;
-        if self.textures.get(&key).is_some_and(|tex| {
+        let stride = frame.stride as u32;
+        let can_reuse = self.textures.get(&key).is_some_and(|tex| {
             matches!(tex.backing, TextureBacking::Dmabuf(_))
                 && tex.buffer_id == dmabuf.buffer_id
                 && tex.wl_format == frame.format
-        }) {
+                && tex.dmabuf_modifier == dmabuf.modifier
+                && tex.dmabuf_stride == stride
+                && tex.dmabuf_offset == dmabuf.offset
+                && tex.dmabuf_width == width
+                && tex.dmabuf_height == height
+        });
+
+        if can_reuse {
+            // Same import identity, but client content may have changed — re-acquire.
+            let image = {
+                let tex = self.textures.get(&key).context("Missing reused DMA-BUF texture")?;
+                match &tex.backing {
+                    TextureBacking::Dmabuf(image) => image.image(),
+                    TextureBacking::Shm(_) => anyhow::bail!("Expected DMA-BUF backing"),
+                }
+            };
+            acquire_dmabuf_for_sample(
+                vulkan.device(),
+                vulkan.graphics_command_pool(),
+                image,
+                false,
+            )?;
             return Ok(());
         }
 
@@ -355,12 +387,13 @@ impl SurfaceTextureCache {
             format,
             dmabuf.modifier,
             dmabuf.offset as u64,
-            frame.stride as u32,
+            stride,
         )?;
-        transition_image_to_shader_read(
+        acquire_dmabuf_for_sample(
             vulkan.device(),
             vulkan.graphics_command_pool(),
             imported.image(),
+            true,
         )?;
 
         let descriptor_set = compositor
@@ -381,6 +414,11 @@ impl SurfaceTextureCache {
                 wl_format: frame.format,
                 uploaded: true,
                 buffer_id: dmabuf.buffer_id,
+                dmabuf_modifier: dmabuf.modifier,
+                dmabuf_stride: stride,
+                dmabuf_offset: dmabuf.offset,
+                dmabuf_width: width,
+                dmabuf_height: height,
             },
         );
         Ok(())
@@ -416,6 +454,11 @@ impl SurfaceTextureCache {
                     wl_format,
                     uploaded: false,
                     buffer_id,
+                    dmabuf_modifier: 0,
+                    dmabuf_stride: 0,
+                    dmabuf_offset: 0,
+                    dmabuf_width: 0,
+                    dmabuf_height: 0,
                 },
             );
         }
@@ -513,27 +556,42 @@ fn dup_fd(fd: std::os::fd::RawFd) -> anyhow::Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) })
 }
 
-fn transition_image_to_shader_read(
+fn acquire_dmabuf_for_sample(
     device: &Device,
     command_pool: &CommandPool,
     image: vk::Image,
+    first_import: bool,
 ) -> anyhow::Result<()> {
     let command_buffer = command_pool.allocate_command_buffer(device)?;
+    let graphics_family = device.graphics_queue_family();
     let record_result = (|| -> anyhow::Result<()> {
         let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
+        let (old_layout, src_access, src_stage) = if first_import {
+            (
+                vk::ImageLayout::UNDEFINED,
+                vk::AccessFlags::empty(),
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+            )
+        } else {
+            (
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            )
+        };
         let barrier = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::empty())
+            .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::UNDEFINED)
+            .old_layout(old_layout)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+            .dst_queue_family_index(graphics_family)
             .image(image)
             .subresource_range(color_subresource_range());
         unsafe {
             device.handle().cmd_pipeline_barrier(
                 recorder.command_buffer(),
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                src_stage,
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -561,7 +619,7 @@ fn transition_image_to_shader_read(
     }
     if let Err(error) = fence
         .wait_default()
-        .context("Timed out transitioning imported DMA-BUF")
+        .context("Timed out acquiring imported DMA-BUF")
     {
         let _ = device.wait_idle();
         command_pool.free_command_buffers(device, &[command_buffer]);

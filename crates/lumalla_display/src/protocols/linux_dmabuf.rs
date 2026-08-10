@@ -11,7 +11,7 @@ use lumalla_wayland_protocol::{
 
 use crate::{
     DisplayState,
-    dmabuf::{DRM_FORMAT_MOD_LINEAR, DmabufError, DmabufErrorKind, DmabufManager},
+    dmabuf::{DmabufError, DmabufErrorKind},
 };
 
 impl LinuxDmabufV1Protocol for DisplayState {}
@@ -59,8 +59,8 @@ fn report_params_error(ctx: &mut Ctx, object_id: ObjectId, error: &DmabufError) 
         .message(&message);
 }
 
-pub(crate) fn send_dmabuf_formats(writer: &mut lumalla_wayland_protocol::buffer::Writer, id: ObjectId) {
-    for &(format, modifier) in DmabufManager::supported_formats() {
+pub(crate) fn send_dmabuf_formats(writer: &mut lumalla_wayland_protocol::buffer::Writer, id: ObjectId, formats: &[(u32, u64)]) {
+    for &(format, modifier) in formats {
         writer
             .zwp_linux_dmabuf_v1_format(id)
             .format(format);
@@ -71,7 +71,6 @@ pub(crate) fn send_dmabuf_formats(writer: &mut lumalla_wayland_protocol::buffer:
             .format(format)
             .modifier_hi(modifier_hi)
             .modifier_lo(modifier_lo);
-        let _ = DRM_FORMAT_MOD_LINEAR;
     }
 }
 

@@ -270,6 +270,11 @@ impl VulkanContext {
         &self.physical_device
     }
 
+    /// DRM format/modifier pairs this GPU can sample from as client DMA-BUFs.
+    pub fn supported_dmabuf_formats(&self) -> Vec<(u32, u64)> {
+        super::query_samplable_dmabuf_formats(self.instance(), self.physical_device().handle())
+    }
+
     /// Returns a reference to the logical device.
     pub fn device(&self) -> &Device {
         self.device

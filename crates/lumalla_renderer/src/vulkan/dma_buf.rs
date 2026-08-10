@@ -194,7 +194,9 @@ impl DmaBufImage {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    /// Imports a client DMA-BUF as a sampled Vulkan image (linear modifier).
+    /// Imports a client DMA-BUF as a sampled Vulkan image.
+    ///
+    /// Supports linear and single-plane tiled modifiers advertised by the GPU.
     pub fn import_from_dma_buf(
         device: &Device,
         physical_device: &PhysicalDevice,
@@ -381,6 +383,71 @@ pub fn vulkan_to_drm_fourcc(format: vk::Format) -> Option<u32> {
         vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => Some(DRM_FORMAT_ABGR8888),
         _ => None,
     }
+}
+
+/// Queries DRM format/modifier pairs the GPU can sample from as DMA-BUF images.
+///
+/// Returns `(drm_fourcc, modifier)` entries suitable for `zwp_linux_dmabuf_v1`.
+pub fn query_samplable_dmabuf_formats(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Vec<(u32, u64)> {
+    const CANDIDATES: &[(u32, vk::Format)] = &[
+        (DRM_FORMAT_ARGB8888, vk::Format::B8G8R8A8_UNORM),
+        (DRM_FORMAT_XRGB8888, vk::Format::B8G8R8A8_UNORM),
+        (DRM_FORMAT_ABGR8888, vk::Format::R8G8B8A8_UNORM),
+        (DRM_FORMAT_XBGR8888, vk::Format::R8G8B8A8_UNORM),
+    ];
+
+    let mut out = Vec::new();
+    for &(fourcc, format) in CANDIDATES {
+        for modifier in query_format_modifiers(instance, physical_device, format) {
+            out.push((fourcc, modifier));
+        }
+    }
+
+    if out.is_empty() {
+        // Safe fallback so clients can still allocate linear buffers.
+        out.extend_from_slice(&[
+            (DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR),
+            (DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR),
+        ]);
+    }
+    out
+}
+
+fn query_format_modifiers(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    format: vk::Format,
+) -> Vec<u64> {
+    let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut props = vk::FormatProperties2::default().push_next(&mut modifier_list);
+    unsafe {
+        instance.get_physical_device_format_properties2(physical_device, format, &mut props);
+    }
+    let count = modifier_list.drm_format_modifier_count as usize;
+    if count == 0 {
+        return vec![DRM_FORMAT_MOD_LINEAR];
+    }
+
+    let mut modifiers = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
+    modifier_list.p_drm_format_modifier_properties = modifiers.as_mut_ptr();
+    modifier_list.drm_format_modifier_count = count as u32;
+    let mut props = vk::FormatProperties2::default().push_next(&mut modifier_list);
+    unsafe {
+        instance.get_physical_device_format_properties2(physical_device, format, &mut props);
+    }
+
+    let required = vk::FormatFeatureFlags::SAMPLED_IMAGE;
+    modifiers
+        .into_iter()
+        .filter(|props| {
+            props.drm_format_modifier_plane_count == 1
+                && props.drm_format_modifier_tiling_features.contains(required)
+        })
+        .map(|props| props.drm_format_modifier)
+        .collect()
 }
 
 fn find_memory_type_index(

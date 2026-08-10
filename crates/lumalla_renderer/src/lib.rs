@@ -508,6 +508,31 @@ impl RendererState {
         ))
     }
 
+    /// DRM format/modifier pairs clients may use with linux-dmabuf.
+    ///
+    /// Ensures Vulkan is initialized against the preferred render device so the
+    /// advertised set matches what import will accept.
+    pub fn supported_dmabuf_formats(&mut self) -> anyhow::Result<Vec<(u32, u64)>> {
+        let Some(path) = self.resolved_render_device_path() else {
+            return Ok(vec![
+                (
+                    crate::vulkan::DRM_FORMAT_XRGB8888,
+                    crate::vulkan::DRM_FORMAT_MOD_LINEAR,
+                ),
+                (
+                    crate::vulkan::DRM_FORMAT_ARGB8888,
+                    crate::vulkan::DRM_FORMAT_MOD_LINEAR,
+                ),
+            ]);
+        };
+        self.ensure_vulkan(&path)?;
+        let vulkan = self
+            .vulkan
+            .as_ref()
+            .context("VulkanContext missing after ensure")?;
+        Ok(vulkan.supported_dmabuf_formats())
+    }
+
     /// Open missing DRM devices via the seat (fresh open after VT resume).
     pub fn activate_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
         self.drm_devices.activate(seat)

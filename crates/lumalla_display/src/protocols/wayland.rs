@@ -459,7 +459,11 @@ impl WlRegistry for DisplayState {
                 self.xdg_manager.create_wm_base(ctx.client_id, *id);
             }
             _ if interface_name == InterfaceIndex::ZwpLinuxDmabufV1.interface_name() => {
-                super::linux_dmabuf::send_dmabuf_formats(ctx.writer, *id);
+                super::linux_dmabuf::send_dmabuf_formats(
+                    ctx.writer,
+                    *id,
+                    self.dmabuf_manager.supported_formats(),
+                );
             }
             _ => {}
         }
