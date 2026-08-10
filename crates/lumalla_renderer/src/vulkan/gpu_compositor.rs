@@ -24,6 +24,94 @@ use super::{
 const MAX_SURFACE_TEXTURES: u32 = 256;
 const CURSOR_TEXTURE_KEY: (u32, u32) = (u32::MAX, u32::MAX);
 
+/// Batched GPU command buffers for one present, submitted together.
+pub struct GpuWorkBatch {
+    command_buffers: Vec<vk::CommandBuffer>,
+    staging: Vec<StagingBuffer>,
+}
+
+impl GpuWorkBatch {
+    pub fn new() -> Self {
+        Self {
+            command_buffers: Vec::new(),
+            staging: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, command_buffer: vk::CommandBuffer, staging: Option<StagingBuffer>) {
+        self.command_buffers.push(command_buffer);
+        if let Some(staging) = staging {
+            self.staging.push(staging);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.command_buffers.is_empty()
+    }
+
+    /// Submits all recorded work with a single fence (does not wait).
+    pub fn submit(
+        self,
+        device: &Device,
+    ) -> anyhow::Result<PendingGpuSubmit> {
+        if self.command_buffers.is_empty() {
+            return Ok(PendingGpuSubmit::empty());
+        }
+        let fence = Fence::new(device, false).context("Failed to create frame GPU fence")?;
+        device
+            .submit_graphics(&self.command_buffers, &[], &[], &[], fence.handle())
+            .context("Failed to submit frame GPU work")?;
+        Ok(PendingGpuSubmit {
+            fence: Some(fence),
+            command_buffers: self.command_buffers,
+            staging: self.staging,
+        })
+    }
+}
+
+/// In-flight GPU work that must complete before a scanout buffer is flipped or reused.
+pub struct PendingGpuSubmit {
+    fence: Option<Fence>,
+    command_buffers: Vec<vk::CommandBuffer>,
+    staging: Vec<StagingBuffer>,
+}
+
+impl PendingGpuSubmit {
+    fn empty() -> Self {
+        Self {
+            fence: None,
+            command_buffers: Vec::new(),
+            staging: Vec::new(),
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.fence.is_some()
+    }
+
+    /// Blocks until GPU work finishes and recycles command buffers.
+    pub fn wait(mut self, device: &Device, command_pool: &CommandPool) -> anyhow::Result<()> {
+        if let Some(fence) = self.fence.take() {
+            if let Err(error) = fence
+                .wait_default()
+                .context("Timed out waiting for GPU frame work")
+            {
+                let _ = device.wait_idle();
+                if !self.command_buffers.is_empty() {
+                    command_pool.free_command_buffers(device, &self.command_buffers);
+                }
+                return Err(error);
+            }
+        }
+        if !self.command_buffers.is_empty() {
+            command_pool.free_command_buffers(device, &self.command_buffers);
+            self.command_buffers.clear();
+        }
+        self.staging.clear();
+        Ok(())
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LayerPushConstants {
@@ -188,6 +276,7 @@ impl SurfaceTextureCache {
         &mut self,
         vulkan: &mut VulkanContext,
         compositor: &GpuCompositor,
+        batch: &mut GpuWorkBatch,
         cursor: Option<&CursorFrame>,
     ) -> anyhow::Result<()> {
         match cursor {
@@ -195,11 +284,12 @@ impl SurfaceTextureCache {
                 let key = (frame.owner_id, frame.surface_id);
                 if let Some(dmabuf) = frame.dmabuf.as_ref() {
                     let surface = cursor_surface_view(frame);
-                    self.sync_dmabuf(vulkan, compositor, key, &surface, dmabuf)
+                    self.sync_dmabuf(vulkan, compositor, batch, key, &surface, dmabuf)
                 } else {
                     self.sync_shm_pixels(
                         vulkan,
                         compositor,
+                        batch,
                         key,
                         frame.buffer_id,
                         &frame.pixels,
@@ -215,6 +305,7 @@ impl SurfaceTextureCache {
                 self.sync_shm_pixels(
                     vulkan,
                     compositor,
+                    batch,
                     CURSOR_TEXTURE_KEY,
                     default.buffer_id,
                     &default.pixels,
@@ -231,13 +322,14 @@ impl SurfaceTextureCache {
         &mut self,
         vulkan: &mut VulkanContext,
         compositor: &GpuCompositor,
+        batch: &mut GpuWorkBatch,
         frame: &SurfaceFrame,
     ) -> anyhow::Result<()> {
         let key = (frame.owner_id, frame.surface_id);
         if let Some(dmabuf) = frame.dmabuf.as_ref() {
-            self.sync_dmabuf(vulkan, compositor, key, frame, dmabuf)
+            self.sync_dmabuf(vulkan, compositor, batch, key, frame, dmabuf)
         } else {
-            self.sync_shm_frame(vulkan, compositor, frame)
+            self.sync_shm_frame(vulkan, compositor, batch, frame)
         }
     }
 
@@ -245,6 +337,7 @@ impl SurfaceTextureCache {
         &mut self,
         vulkan: &mut VulkanContext,
         compositor: &GpuCompositor,
+        batch: &mut GpuWorkBatch,
         frame: &SurfaceFrame,
     ) -> anyhow::Result<()> {
         let key = (frame.owner_id, frame.surface_id);
@@ -295,6 +388,7 @@ impl SurfaceTextureCache {
                 vulkan.device(),
                 vulkan.physical_device(),
                 vulkan.graphics_command_pool(),
+                batch,
                 image,
                 &frame.pixels,
                 width,
@@ -313,6 +407,7 @@ impl SurfaceTextureCache {
                     vulkan.device(),
                     vulkan.physical_device(),
                     vulkan.graphics_command_pool(),
+                    batch,
                     image,
                     &frame.pixels,
                     width,
@@ -339,6 +434,7 @@ impl SurfaceTextureCache {
         &mut self,
         vulkan: &mut VulkanContext,
         compositor: &GpuCompositor,
+        batch: &mut GpuWorkBatch,
         key: (u32, u32),
         frame: &SurfaceFrame,
         dmabuf: &DmabufAttachment,
@@ -358,7 +454,6 @@ impl SurfaceTextureCache {
         });
 
         if can_reuse {
-            // Same import identity, but client content may have changed — re-acquire.
             let image = {
                 let tex = self.textures.get(&key).context("Missing reused DMA-BUF texture")?;
                 match &tex.backing {
@@ -369,6 +464,7 @@ impl SurfaceTextureCache {
             acquire_dmabuf_for_sample(
                 vulkan.device(),
                 vulkan.graphics_command_pool(),
+                batch,
                 image,
                 false,
             )?;
@@ -392,6 +488,7 @@ impl SurfaceTextureCache {
         acquire_dmabuf_for_sample(
             vulkan.device(),
             vulkan.graphics_command_pool(),
+            batch,
             imported.image(),
             true,
         )?;
@@ -428,6 +525,7 @@ impl SurfaceTextureCache {
         &mut self,
         vulkan: &mut VulkanContext,
         compositor: &GpuCompositor,
+        batch: &mut GpuWorkBatch,
         key: (u32, u32),
         buffer_id: u32,
         pixels: &[u8],
@@ -478,6 +576,7 @@ impl SurfaceTextureCache {
             vulkan.device(),
             vulkan.physical_device(),
             vulkan.graphics_command_pool(),
+            batch,
             image,
             pixels,
             width,
@@ -502,6 +601,7 @@ impl SurfaceTextureCache {
         &mut self,
         vulkan: &mut VulkanContext,
         compositor: &GpuCompositor,
+        batch: &mut GpuWorkBatch,
         layers: &[&SurfaceFrame],
         cursor: Option<&CursorFrame>,
         composite_mode: &CompositeMode,
@@ -512,11 +612,11 @@ impl SurfaceTextureCache {
         for frame in layers {
             let key = (frame.owner_id, frame.surface_id);
             if sync_all || dirty_surfaces.contains(&key) {
-                self.sync_frame(vulkan, compositor, frame)?;
+                self.sync_frame(vulkan, compositor, batch, frame)?;
             }
         }
         if sync_all || sync_cursor {
-            self.sync_cursor(vulkan, compositor, cursor)?;
+            self.sync_cursor(vulkan, compositor, batch, cursor)?;
         }
         Ok(())
     }
@@ -559,6 +659,7 @@ fn dup_fd(fd: std::os::fd::RawFd) -> anyhow::Result<std::os::fd::OwnedFd> {
 fn acquire_dmabuf_for_sample(
     device: &Device,
     command_pool: &CommandPool,
+    batch: &mut GpuWorkBatch,
     image: vk::Image,
     first_import: bool,
 ) -> anyhow::Result<()> {
@@ -606,32 +707,14 @@ fn acquire_dmabuf_for_sample(
         command_pool.free_command_buffers(device, &[command_buffer]);
         return Err(error);
     }
-    let fence = match Fence::new(device, false) {
-        Ok(fence) => fence,
-        Err(error) => {
-            command_pool.free_command_buffers(device, &[command_buffer]);
-            return Err(error);
-        }
-    };
-    if let Err(error) = device.submit_graphics(&[command_buffer], &[], &[], &[], fence.handle()) {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
-    }
-    if let Err(error) = fence
-        .wait_default()
-        .context("Timed out acquiring imported DMA-BUF")
-    {
-        let _ = device.wait_idle();
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
-    }
-    command_pool.free_command_buffers(device, &[command_buffer]);
+    batch.push(command_buffer, None);
     Ok(())
 }
 
 /// Copies the displayed scanout image into a back buffer before incremental compositing.
 pub fn copy_scanout_frame(
     vulkan: &VulkanContext,
+    batch: &mut GpuWorkBatch,
     src: &DmaBufImage,
     dst: &DmaBufImage,
     dst_was_fresh: bool,
@@ -759,32 +842,13 @@ pub fn copy_scanout_frame(
         command_pool.free_command_buffers(device, &[command_buffer]);
         return Err(error);
     }
-
-    let fence = match Fence::new(device, false) {
-        Ok(fence) => fence,
-        Err(error) => {
-            command_pool.free_command_buffers(device, &[command_buffer]);
-            return Err(error);
-        }
-    };
-    if let Err(error) = device.submit_graphics(&[command_buffer], &[], &[], &[], fence.handle()) {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
-    }
-    if let Err(error) = fence
-        .wait_default()
-        .context("Timed out copying scanout frame for partial composite")
-    {
-        let _ = device.wait_idle();
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
-    }
-    command_pool.free_command_buffers(device, &[command_buffer]);
+    batch.push(command_buffer, None);
     Ok(())
 }
 
 pub fn composite_to_scanout(
     vulkan: &VulkanContext,
+    batch: &mut GpuWorkBatch,
     compositor: &GpuCompositor,
     cache: &SurfaceTextureCache,
     render_pass: &RenderPass,
@@ -887,27 +951,7 @@ pub fn composite_to_scanout(
         command_pool.free_command_buffers(device, &[command_buffer]);
         return Err(error);
     }
-
-    let fence = match Fence::new(device, false) {
-        Ok(fence) => fence,
-        Err(error) => {
-            command_pool.free_command_buffers(device, &[command_buffer]);
-            return Err(error);
-        }
-    };
-    if let Err(error) = device.submit_graphics(&[command_buffer], &[], &[], &[], fence.handle()) {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
-    }
-    if let Err(error) = fence
-        .wait_default()
-        .context("Timed out waiting for GPU composite to complete")
-    {
-        let _ = device.wait_idle();
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
-    }
-    command_pool.free_command_buffers(device, &[command_buffer]);
+    batch.push(command_buffer, None);
     Ok(())
 }
 
@@ -1087,6 +1131,7 @@ fn upload_bgra_texture(
     device: &Device,
     physical_device: &PhysicalDevice,
     command_pool: &CommandPool,
+    batch: &mut GpuWorkBatch,
     image: &Image,
     pixels: &[u8],
     width: u32,
@@ -1233,24 +1278,7 @@ fn upload_bgra_texture(
         command_pool.free_command_buffers(device, &[command_buffer]);
         return Err(error);
     }
-
-    let fence = match Fence::new(device, false) {
-        Ok(fence) => fence,
-        Err(error) => {
-            command_pool.free_command_buffers(device, &[command_buffer]);
-            return Err(error);
-        }
-    };
-    if let Err(error) = device.submit_graphics(&[command_buffer], &[], &[], &[], fence.handle()) {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
-    }
-    if let Err(error) = fence.wait_default().context("Timed out uploading surface texture") {
-        let _ = device.wait_idle();
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
-    }
-    command_pool.free_command_buffers(device, &[command_buffer]);
+    batch.push(command_buffer, Some(staging));
     Ok(())
 }
 

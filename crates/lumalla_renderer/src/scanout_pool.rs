@@ -29,6 +29,8 @@ pub(crate) struct ScanoutBuffer {
     pub framebuffer: Framebuffer,
     /// True until the first GPU upload fills the buffer.
     pub fresh: bool,
+    /// GPU work that must finish before flip or reuse.
+    pub gpu_pending: Option<crate::vulkan::PendingGpuSubmit>,
 }
 
 impl ScanoutBuffer {
@@ -68,7 +70,10 @@ impl ScanoutBufferPool {
             height,
             fourcc,
         };
-        if let Some(buffer) = self.free.get_mut(&key).and_then(|free| free.pop()) {
+        if let Some(mut buffer) = self.free.get_mut(&key).and_then(|free| free.pop()) {
+            if let Some(pending) = buffer.gpu_pending.take() {
+                pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
+            }
             return Ok(buffer);
         }
         create_scanout_buffer(vulkan, drm_path, drm_fd, width, height, format, fourcc)
@@ -139,6 +144,7 @@ fn create_scanout_buffer(
         dma_image,
         framebuffer,
         fresh: true,
+        gpu_pending: None,
     })
 }
 

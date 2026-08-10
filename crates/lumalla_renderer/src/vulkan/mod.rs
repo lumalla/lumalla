@@ -31,7 +31,8 @@ pub use dma_buf::{
 };
 pub use framebuffer::Framebuffer;
 pub use gpu_compositor::{
-    GpuCompositor, SurfaceTextureCache, composite_to_scanout, copy_scanout_frame,
+    GpuCompositor, GpuWorkBatch, PendingGpuSubmit, SurfaceTextureCache, composite_to_scanout,
+    copy_scanout_frame,
 };
 pub use image::Image;
 pub use instance::VulkanContext;

@@ -32,8 +32,8 @@ use crate::drm::{
 };
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
-    DmaBufImage, GpuCompositor, SurfaceTextureCache, VulkanContext, composite_to_scanout,
-    copy_scanout_frame, vulkan_to_drm_fourcc,
+    DmaBufImage, GpuCompositor, GpuWorkBatch, SurfaceTextureCache, VulkanContext,
+    composite_to_scanout, copy_scanout_frame, vulkan_to_drm_fourcc,
 };
 
 struct GpuRenderResources {
@@ -562,13 +562,20 @@ impl RendererState {
     }
 
     fn release_output_scanout(&mut self, scanout: OutputScanout) {
-        self.scanout_pool.release(scanout.current);
+        self.release_scanout_buffer(scanout.current);
         if let Some(pending) = scanout.pending {
-            self.scanout_pool.release(pending);
+            self.release_scanout_buffer(pending);
         }
         if let Some(queued) = scanout.queued {
-            self.scanout_pool.release(queued);
+            self.release_scanout_buffer(queued);
         }
+    }
+
+    fn release_scanout_buffer(&mut self, mut buffer: ScanoutBuffer) {
+        if let Err(err) = self.wait_scanout_gpu(&mut buffer) {
+            warn!("Failed waiting for GPU work before releasing scanout buffer: {err:#}");
+        }
+        self.scanout_pool.release(buffer);
     }
 
     /// Select the Vulkan render device (`None` = auto).
@@ -741,7 +748,7 @@ impl RendererState {
         target: &PresentTarget,
         color: [f32; 4],
     ) -> anyhow::Result<()> {
-        let buffer = self.render_scanout_buffer(target, color)?;
+        let mut buffer = self.render_scanout_buffer(target, color)?;
 
         let reuse_mode = self.scanouts.get(&target.connector_name).is_some_and(|prev| {
             prev.drm_path == target.drm_path
@@ -762,6 +769,8 @@ impl RendererState {
         {
             self.wait_for_connector_flip(&target.connector_name)?;
         }
+
+        self.wait_scanout_gpu(&mut buffer)?;
 
         let drm_device = self
             .drm_devices
@@ -860,6 +869,8 @@ impl RendererState {
         let pointer_x = self.pointer_x;
         let pointer_y = self.pointer_y;
 
+        let mut batch = GpuWorkBatch::new();
+
         if matches!(composite_mode, CompositeMode::Partial(_)) {
             let src_ptr = self.scanouts.get(&target.connector_name).map(|scanout| {
                 let image = scanout
@@ -878,6 +889,7 @@ impl RendererState {
                     .context("VulkanContext missing during scanout copy")?;
                 copy_scanout_frame(
                     vulkan,
+                    &mut batch,
                     unsafe { &*src_ptr },
                     unsafe { &*dst_ptr },
                     dst_fresh,
@@ -904,6 +916,7 @@ impl RendererState {
             self.gpu.surface_textures.sync_scene(
                 vulkan,
                 &compositor,
+                &mut batch,
                 &layers,
                 cursor,
                 &composite_mode,
@@ -926,6 +939,7 @@ impl RendererState {
             };
             composite_to_scanout(
                 vulkan,
+                &mut batch,
                 &compositor,
                 &self.gpu.surface_textures,
                 render_pass,
@@ -944,6 +958,7 @@ impl RendererState {
             .context("Failed to GPU-composite scene to scanout buffer")?;
             self.gpu.compositor = Some(compositor);
 
+            buffer.gpu_pending = Some(batch.submit(vulkan.device())?);
             buffer.fresh = false;
         }
 
@@ -953,7 +968,7 @@ impl RendererState {
     fn schedule_or_queue_flip(
         &mut self,
         connector_name: &str,
-        buffer: ScanoutBuffer,
+        mut buffer: ScanoutBuffer,
     ) -> anyhow::Result<()> {
         let (drm_path, output, flip_busy) = {
             let scanout = self
@@ -973,10 +988,13 @@ impl RendererState {
                 .get_mut(connector_name)
                 .context("Missing scanout while queueing flip")?;
             if let Some(old) = scanout.queued.replace(buffer) {
-                self.scanout_pool.release(old);
+                self.release_scanout_buffer(old);
             }
             return Ok(());
         }
+
+        // Overlap CPU flip prep with GPU: wait only when the buffer must be scanout-ready.
+        self.wait_scanout_gpu(&mut buffer)?;
 
         let fb_id = buffer.drm_fb_id();
         let flip_result = {
@@ -1008,17 +1026,31 @@ impl RendererState {
                     atomic_set_plane_fb(device.fd(), &output, fb_id)
                         .context("Failed blocking plane FB update after page-flip error")?;
                 }
-                let scanout = self
-                    .scanouts
-                    .get_mut(connector_name)
-                    .context("Missing scanout after blocking flip fallback")?;
-                let old = std::mem::replace(&mut scanout.current, buffer);
-                self.scanout_pool.release(old);
-                scanout.pending = None;
-                scanout.queued = None;
+                let (old, _) = {
+                    let scanout = self
+                        .scanouts
+                        .get_mut(connector_name)
+                        .context("Missing scanout after blocking flip fallback")?;
+                    let old = std::mem::replace(&mut scanout.current, buffer);
+                    scanout.pending = None;
+                    scanout.queued = None;
+                    (old, ())
+                };
+                self.release_scanout_buffer(old);
                 Ok(())
             }
         }
+    }
+
+    fn wait_scanout_gpu(&mut self, buffer: &mut ScanoutBuffer) -> anyhow::Result<()> {
+        let Some(pending) = buffer.gpu_pending.take() else {
+            return Ok(());
+        };
+        let vulkan = self
+            .vulkan
+            .as_mut()
+            .context("VulkanContext missing while waiting for scanout GPU work")?;
+        pending.wait(vulkan.device(), vulkan.graphics_command_pool())
     }
 
     fn retire_page_flip(&mut self, crtc_id: u32) -> anyhow::Result<()> {
@@ -1041,9 +1073,11 @@ impl RendererState {
                 return Ok(());
             };
             let old = std::mem::replace(&mut scanout.current, new_current);
-            self.scanout_pool.release(old);
-            scanout.queued.take()
+            let queued = scanout.queued.take();
+            (old, queued)
         };
+        let (old, queued) = queued;
+        self.release_scanout_buffer(old);
 
         if let Some(queued) = queued {
             self.schedule_or_queue_flip(&connector_name, queued)?;
