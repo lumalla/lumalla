@@ -287,6 +287,38 @@ impl<'a> CommandBufferRecorder<'a> {
         self.set_scissor(&scissor);
     }
 
+    /// Clears the color attachment inside the given rectangles.
+    pub fn clear_color_rects(&mut self, clear_color: [f32; 4], rects: &[vk::Rect2D]) {
+        if rects.is_empty() {
+            return;
+        }
+        let clear_value = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: clear_color,
+            },
+        };
+        let attachment = vk::ClearAttachment {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            color_attachment: 0,
+            clear_value,
+        };
+        let clear_rects: Vec<vk::ClearRect> = rects
+            .iter()
+            .map(|rect| vk::ClearRect {
+                rect: rect.clone(),
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .collect();
+        unsafe {
+            self.device.handle().cmd_clear_attachments(
+                self.command_buffer,
+                &[attachment],
+                &clear_rects,
+            );
+        }
+    }
+
     /// Binds descriptor sets.
     pub fn bind_descriptor_sets(
         &mut self,

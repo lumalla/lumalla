@@ -168,6 +168,47 @@ pub fn prepare_composite(
     Ok(CompositeMode::Partial(upload))
 }
 
+/// Decides whether the GPU scanout path can composite incrementally.
+pub fn prepare_gpu_composite(
+    output_width: u32,
+    output_height: u32,
+    pending_damage: &[DamageRect],
+    force_full: bool,
+    _fresh_scanout: bool,
+) -> CompositeMode {
+    if output_width == 0 || output_height == 0 {
+        return CompositeMode::Full;
+    }
+
+    if force_full || pending_damage.is_empty() {
+        return CompositeMode::Full;
+    }
+
+    let clipped = clip_damage_list(pending_damage, output_width, output_height);
+    if clipped.is_empty() {
+        return CompositeMode::Full;
+    }
+
+    // Coalesce into one bounding rect so multi-move pointer damage cannot leave
+    // stale pixels between separately scissored clear regions.
+    let Some(bounds) = clipped.into_iter().reduce(|a, b| {
+        rect_union(a, b).unwrap_or(a)
+    }) else {
+        return CompositeMode::Full;
+    };
+    let upload = UploadRect {
+        x: bounds.x.max(0) as u32,
+        y: bounds.y.max(0) as u32,
+        width: bounds.width.max(0) as u32,
+        height: bounds.height.max(0) as u32,
+    };
+    if upload.width == 0 || upload.height == 0 {
+        CompositeMode::Full
+    } else {
+        CompositeMode::Partial(vec![upload])
+    }
+}
+
 fn composite_scene_full(
     frames: &[&SurfaceFrame],
     cursor: Option<&CursorFrame>,
@@ -502,7 +543,7 @@ fn clear_pixels(width: u32, height: u32, clear: [f32; 4]) -> anyhow::Result<Vec<
     Ok(pixels)
 }
 
-fn clip_damage_list(
+pub fn clip_damage_list(
     damage: &[DamageRect],
     output_width: u32,
     output_height: u32,
@@ -544,11 +585,13 @@ fn cursor_bounds(cursor: &CursorFrame, pointer_x: i32, pointer_y: i32) -> Option
     if dest_w <= 0 || dest_h <= 0 {
         return None;
     }
+    // Inflate by 1px: GPU rasterization of the cursor quad can cover one extra
+    // pixel on the max edges, which otherwise leaves a trail when moving up/left.
     Some(DamageRect {
-        x: pointer_x - cursor.hotspot_x,
-        y: pointer_y - cursor.hotspot_y,
-        width: dest_w,
-        height: dest_h,
+        x: pointer_x - cursor.hotspot_x - 1,
+        y: pointer_y - cursor.hotspot_y - 1,
+        width: dest_w + 2,
+        height: dest_h + 2,
     })
 }
 
@@ -665,7 +708,8 @@ mod tests {
         };
         let rects = cursor_damage_rects(&cursor, (0, 0), (3, 0));
         assert_eq!(rects.len(), 1);
-        assert_eq!(rects[0].width, 4);
+        // 1x1 cursor at 0 and 3, plus 1px inflation on each side → width 6.
+        assert_eq!(rects[0].width, 6);
     }
 
     #[test]
@@ -702,5 +746,39 @@ mod tests {
                 && rect.y + rect.height >= mid.y + mid.height
         };
         assert!(covers_mid(second[0]));
+    }
+
+    #[test]
+    fn prepare_gpu_composite_uses_partial_for_pointer_damage() {
+        let mode = prepare_gpu_composite(
+            1920,
+            1080,
+            &[DamageRect {
+                x: 10,
+                y: 20,
+                width: 32,
+                height: 32,
+            }],
+            false,
+            false,
+        );
+        assert!(matches!(mode, CompositeMode::Partial(_)));
+    }
+
+    #[test]
+    fn prepare_gpu_composite_falls_back_for_fresh_scanout() {
+        let mode = prepare_gpu_composite(
+            1920,
+            1080,
+            &[DamageRect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+            }],
+            false,
+            true,
+        );
+        assert!(matches!(mode, CompositeMode::Partial(_)));
     }
 }

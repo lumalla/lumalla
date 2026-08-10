@@ -77,6 +77,7 @@ impl DmaBufImage {
             .usage(
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
                     | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC
                     | vk::ImageUsageFlags::TRANSFER_DST,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)

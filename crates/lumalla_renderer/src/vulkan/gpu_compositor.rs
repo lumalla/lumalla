@@ -1,6 +1,7 @@
 //! GPU compositing: surface texture cache and scanout render pass.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::ptr;
@@ -9,6 +10,7 @@ use anyhow::Context;
 use ash::vk;
 
 use crate::default_cursor::default_cursor_frame;
+use crate::scene_backing::{CompositeMode, DamageRect, UploadRect};
 use crate::{CursorFrame, DmabufAttachment, SurfaceFrame};
 
 const WL_SHM_FORMAT_XRGB8888: u32 = 1;
@@ -93,6 +95,7 @@ impl GpuCompositor {
         output_width: u32,
         output_height: u32,
         force_opaque: bool,
+        clip: Option<&vk::Rect2D>,
     ) {
         recorder.bind_pipeline(&self.pipeline);
         recorder.bind_descriptor_sets(
@@ -117,7 +120,11 @@ impl GpuCompositor {
             );
         }
         recorder.set_viewport_fullscreen(output_width, output_height);
-        recorder.set_scissor_fullscreen(output_width, output_height);
+        if let Some(clip) = clip {
+            recorder.set_scissor(clip);
+        } else {
+            recorder.set_scissor_fullscreen(output_width, output_height);
+        }
         recorder.draw_fullscreen_quad();
     }
 }
@@ -225,18 +232,97 @@ impl SurfaceTextureCache {
         if let Some(dmabuf) = frame.dmabuf.as_ref() {
             self.sync_dmabuf(vulkan, compositor, key, frame, dmabuf)
         } else {
-            self.sync_shm_pixels(
-                vulkan,
-                compositor,
-                key,
-                frame.buffer_id,
-                &frame.pixels,
-                frame.width as u32,
-                frame.height as u32,
-                frame.stride as u32,
-                frame.format,
-            )
+            self.sync_shm_frame(vulkan, compositor, frame)
         }
+    }
+
+    fn sync_shm_frame(
+        &mut self,
+        vulkan: &mut VulkanContext,
+        compositor: &GpuCompositor,
+        frame: &SurfaceFrame,
+    ) -> anyhow::Result<()> {
+        let key = (frame.owner_id, frame.surface_id);
+        let width = frame.width as u32;
+        let height = frame.height as u32;
+        let stride = frame.stride as u32;
+        let needs_create = self.textures.get(&key).is_none_or(|tex| {
+            !matches!(tex.backing, TextureBacking::Shm(_))
+                || tex.extent().is_none_or(|extent| extent.width != width || extent.height != height)
+        });
+
+        if needs_create {
+            let image = vulkan.create_sampled_image(width, height)?;
+            let descriptor_set = compositor
+                .descriptor_pool
+                .allocate_sampler_set(vulkan.device(), &compositor.descriptor_layout)?;
+            self.textures.insert(
+                key,
+                SurfaceTexture {
+                    backing: TextureBacking::Shm(image),
+                    descriptor_set,
+                    wl_format: frame.format,
+                    uploaded: false,
+                    buffer_id: frame.buffer_id,
+                },
+            );
+        }
+
+        let texture = self
+            .textures
+            .get_mut(&key)
+            .context("Surface texture missing after create")?;
+        texture.wl_format = frame.format;
+        texture.buffer_id = frame.buffer_id;
+
+        let image = match &texture.backing {
+            TextureBacking::Shm(image) => image,
+            TextureBacking::Dmabuf(_) => anyhow::bail!("SHM upload targeted imported DMA-BUF"),
+        };
+
+        if needs_create || frame.full_surface || frame.damage.is_empty() {
+            upload_bgra_texture(
+                vulkan.device(),
+                vulkan.physical_device(),
+                vulkan.graphics_command_pool(),
+                image,
+                &frame.pixels,
+                width,
+                height,
+                stride,
+                texture.uploaded,
+                None,
+            )?;
+        } else {
+            for region in frame
+                .damage
+                .iter()
+                .filter_map(|rect| output_damage_to_buffer_rect(frame, *rect))
+            {
+                upload_bgra_texture(
+                    vulkan.device(),
+                    vulkan.physical_device(),
+                    vulkan.graphics_command_pool(),
+                    image,
+                    &frame.pixels,
+                    width,
+                    height,
+                    stride,
+                    texture.uploaded,
+                    Some(region),
+                )?;
+            }
+        }
+        texture.uploaded = true;
+
+        write_texture_descriptor(
+            vulkan.device(),
+            texture.descriptor_set,
+            image.view(),
+            compositor.sampler.handle(),
+        );
+
+        Ok(())
     }
 
     fn sync_dmabuf(
@@ -355,6 +441,7 @@ impl SurfaceTextureCache {
             height,
             stride,
             texture.uploaded,
+            None,
         )?;
         texture.uploaded = true;
 
@@ -374,11 +461,21 @@ impl SurfaceTextureCache {
         compositor: &GpuCompositor,
         layers: &[&SurfaceFrame],
         cursor: Option<&CursorFrame>,
+        composite_mode: &CompositeMode,
+        dirty_surfaces: &HashSet<(u32, u32)>,
+        sync_cursor: bool,
     ) -> anyhow::Result<()> {
+        let sync_all = matches!(composite_mode, CompositeMode::Full);
         for frame in layers {
-            self.sync_frame(vulkan, compositor, frame)?;
+            let key = (frame.owner_id, frame.surface_id);
+            if sync_all || dirty_surfaces.contains(&key) {
+                self.sync_frame(vulkan, compositor, frame)?;
+            }
         }
-        self.sync_cursor(vulkan, compositor, cursor)
+        if sync_all || sync_cursor {
+            self.sync_cursor(vulkan, compositor, cursor)?;
+        }
+        Ok(())
     }
 }
 
@@ -474,6 +571,160 @@ fn transition_image_to_shader_read(
     Ok(())
 }
 
+/// Copies the displayed scanout image into a back buffer before incremental compositing.
+pub fn copy_scanout_frame(
+    vulkan: &VulkanContext,
+    src: &DmaBufImage,
+    dst: &DmaBufImage,
+    dst_was_fresh: bool,
+) -> anyhow::Result<()> {
+    let device = vulkan.device();
+    let command_pool = vulkan.graphics_command_pool();
+    let command_buffer = command_pool.allocate_command_buffer(device)?;
+    let extent = src.extent();
+
+    let dst_old_layout = if dst_was_fresh {
+        vk::ImageLayout::UNDEFINED
+    } else {
+        vk::ImageLayout::GENERAL
+    };
+
+    let record_result = (|| -> anyhow::Result<()> {
+        let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
+        let cb = recorder.command_buffer();
+
+        let src_barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(src.image())
+            .subresource_range(color_subresource_range());
+        let (dst_src_access, _dst_src_stage) = if dst_was_fresh {
+            (
+                vk::AccessFlags::empty(),
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+            )
+        } else {
+            (
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+            )
+        };
+        let dst_barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(dst_src_access)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(dst_old_layout)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst.image())
+            .subresource_range(color_subresource_range());
+        unsafe {
+            device.handle().cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[src_barrier, dst_barrier],
+            );
+        }
+
+        let copy_region = vk::ImageCopy::default()
+            .src_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .dst_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            });
+        unsafe {
+            device.handle().cmd_copy_image(
+                cb,
+                src.image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst.image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy_region],
+            );
+        }
+
+        let src_back = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(src.image())
+            .subresource_range(color_subresource_range());
+        let dst_back = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst.image())
+            .subresource_range(color_subresource_range());
+        unsafe {
+            device.handle().cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[src_back, dst_back],
+            );
+        }
+
+        recorder.end()?;
+        Ok(())
+    })();
+
+    if let Err(error) = record_result {
+        command_pool.free_command_buffers(device, &[command_buffer]);
+        return Err(error);
+    }
+
+    let fence = match Fence::new(device, false) {
+        Ok(fence) => fence,
+        Err(error) => {
+            command_pool.free_command_buffers(device, &[command_buffer]);
+            return Err(error);
+        }
+    };
+    if let Err(error) = device.submit_graphics(&[command_buffer], &[], &[], &[], fence.handle()) {
+        command_pool.free_command_buffers(device, &[command_buffer]);
+        return Err(error);
+    }
+    if let Err(error) = fence
+        .wait_default()
+        .context("Timed out copying scanout frame for partial composite")
+    {
+        let _ = device.wait_idle();
+        command_pool.free_command_buffers(device, &[command_buffer]);
+        return Err(error);
+    }
+    command_pool.free_command_buffers(device, &[command_buffer]);
+    Ok(())
+}
+
 pub fn composite_to_scanout(
     vulkan: &VulkanContext,
     compositor: &GpuCompositor,
@@ -485,11 +736,18 @@ pub fn composite_to_scanout(
     output_width: u32,
     output_height: u32,
     clear_color: [f32; 4],
+    composite_mode: CompositeMode,
     layers: &[&SurfaceFrame],
     cursor: Option<&CursorFrame>,
     pointer_x: i32,
     pointer_y: i32,
 ) -> anyhow::Result<()> {
+    let clear_value = vk::ClearValue {
+        color: vk::ClearColorValue {
+            float32: clear_color,
+        },
+    };
+
     let device = vulkan.device();
     let command_pool = vulkan.graphics_command_pool();
     let command_buffer = command_pool.allocate_command_buffer(device)?;
@@ -503,66 +761,61 @@ pub fn composite_to_scanout(
         )?;
 
         let mut recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
-        let clear_value = vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: clear_color,
-            },
-        };
         recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
 
-        for frame in layers {
-            let key = (frame.owner_id, frame.surface_id);
-            let Some(texture) = cache.texture(key) else {
-                continue;
-            };
-            let dest = surface_dest_rect(frame);
-            if dest[2] <= 0.0 || dest[3] <= 0.0 {
-                continue;
+        match composite_mode {
+            CompositeMode::Full => {
+                draw_scene_layers(
+                    compositor,
+                    device,
+                    &mut recorder,
+                    cache,
+                    layers,
+                    output_width,
+                    output_height,
+                    None,
+                );
+                draw_cursor_layer(
+                    compositor,
+                    device,
+                    &mut recorder,
+                    cache,
+                    cursor,
+                    pointer_x,
+                    pointer_y,
+                    output_width,
+                    output_height,
+                    None,
+                );
             }
-            compositor.draw_layer(
-                device,
-                &mut recorder,
-                texture,
-                dest,
-                output_width,
-                output_height,
-                frame.format == WL_SHM_FORMAT_XRGB8888,
-            );
-        }
-
-        let cursor_key = cursor
-            .map(|c| (c.owner_id, c.surface_id))
-            .unwrap_or(CURSOR_TEXTURE_KEY);
-        if let Some(texture) = cache.texture(cursor_key) {
-            match cursor {
-                Some(cursor_frame) => {
-                    let dest = cursor_dest_rect(cursor_frame, pointer_x, pointer_y);
-                    if dest[2] > 0.0 && dest[3] > 0.0 {
-                        compositor.draw_layer(
-                            device,
-                            &mut recorder,
-                            texture,
-                            dest,
-                            output_width,
-                            output_height,
-                            cursor_frame.format == WL_SHM_FORMAT_XRGB8888,
-                        );
-                    }
-                }
-                None => {
-                    let default = default_cursor_frame();
-                    let dest = cursor_dest_rect(default, pointer_x, pointer_y);
-                    if dest[2] > 0.0 && dest[3] > 0.0 {
-                        compositor.draw_layer(
-                            device,
-                            &mut recorder,
-                            texture,
-                            dest,
-                            output_width,
-                            output_height,
-                            default.format == WL_SHM_FORMAT_XRGB8888,
-                        );
-                    }
+            CompositeMode::Partial(regions) => {
+                for region in regions {
+                    let clip = upload_rect_to_vk(region);
+                    // ClearAttachments is clipped by the dynamic scissor.
+                    recorder.set_scissor(&clip);
+                    recorder.clear_color_rects(clear_color, &[clip]);
+                    draw_scene_layers(
+                        compositor,
+                        device,
+                        &mut recorder,
+                        cache,
+                        layers,
+                        output_width,
+                        output_height,
+                        Some(&clip),
+                    );
+                    draw_cursor_layer(
+                        compositor,
+                        device,
+                        &mut recorder,
+                        cache,
+                        cursor,
+                        pointer_x,
+                        pointer_y,
+                        output_width,
+                        output_height,
+                        Some(&clip),
+                    );
                 }
             }
         }
@@ -598,6 +851,102 @@ pub fn composite_to_scanout(
     }
     command_pool.free_command_buffers(device, &[command_buffer]);
     Ok(())
+}
+
+fn draw_scene_layers(
+    compositor: &GpuCompositor,
+    device: &Device,
+    recorder: &mut CommandBufferRecorder<'_>,
+    cache: &SurfaceTextureCache,
+    layers: &[&SurfaceFrame],
+    output_width: u32,
+    output_height: u32,
+    clip: Option<&vk::Rect2D>,
+) {
+    for frame in layers {
+        let key = (frame.owner_id, frame.surface_id);
+        let Some(texture) = cache.texture(key) else {
+            continue;
+        };
+        let dest = surface_dest_rect(frame);
+        if dest[2] <= 0.0 || dest[3] <= 0.0 {
+            continue;
+        }
+        if let Some(clip) = clip {
+            if !dest_intersects_clip(dest, clip) {
+                continue;
+            }
+        }
+        compositor.draw_layer(
+            device,
+            recorder,
+            texture,
+            dest,
+            output_width,
+            output_height,
+            frame.format == WL_SHM_FORMAT_XRGB8888,
+            clip,
+        );
+    }
+}
+
+fn draw_cursor_layer(
+    compositor: &GpuCompositor,
+    device: &Device,
+    recorder: &mut CommandBufferRecorder<'_>,
+    cache: &SurfaceTextureCache,
+    cursor: Option<&CursorFrame>,
+    pointer_x: i32,
+    pointer_y: i32,
+    output_width: u32,
+    output_height: u32,
+    clip: Option<&vk::Rect2D>,
+) {
+    let cursor_key = cursor
+        .map(|c| (c.owner_id, c.surface_id))
+        .unwrap_or(CURSOR_TEXTURE_KEY);
+    let Some(texture) = cache.texture(cursor_key) else {
+        return;
+    };
+    match cursor {
+        Some(cursor_frame) => {
+            let dest = cursor_dest_rect(cursor_frame, pointer_x, pointer_y);
+            if dest[2] > 0.0
+                && dest[3] > 0.0
+                && clip.is_none_or(|clip| dest_intersects_clip(dest, clip))
+            {
+                compositor.draw_layer(
+                    device,
+                    recorder,
+                    texture,
+                    dest,
+                    output_width,
+                    output_height,
+                    cursor_frame.format == WL_SHM_FORMAT_XRGB8888,
+                    clip,
+                );
+            }
+        }
+        None => {
+            let default = default_cursor_frame();
+            let dest = cursor_dest_rect(default, pointer_x, pointer_y);
+            if dest[2] > 0.0
+                && dest[3] > 0.0
+                && clip.is_none_or(|clip| dest_intersects_clip(dest, clip))
+            {
+                compositor.draw_layer(
+                    device,
+                    recorder,
+                    texture,
+                    dest,
+                    output_width,
+                    output_height,
+                    default.format == WL_SHM_FORMAT_XRGB8888,
+                    clip,
+                );
+            }
+        }
+    }
 }
 
 fn surface_dest_rect(frame: &SurfaceFrame) -> [f32; 4] {
@@ -686,14 +1035,66 @@ fn upload_bgra_texture(
     height: u32,
     stride: u32,
     previously_uploaded: bool,
+    region: Option<UploadRect>,
 ) -> anyhow::Result<()> {
     let row_bytes = usize::try_from(stride).context("Stride overflows")?;
-    let size = row_bytes
+    let full_size = row_bytes
         .checked_mul(height as usize)
         .context("Texture size overflows")?;
-    anyhow::ensure!(pixels.len() >= size, "Texture pixel data is truncated");
+    anyhow::ensure!(pixels.len() >= full_size, "Texture pixel data is truncated");
 
-    let staging = StagingBuffer::new(device, physical_device, &pixels[..size])?;
+    let (staging_bytes, copy_stride, copy_height, image_offset, image_extent) =
+        match region {
+            Some(region) => {
+                let region_row_bytes = usize::try_from(region.width)
+                    .context("Region width overflows")?
+                    .checked_mul(4)
+                    .context("Region row bytes overflow")?;
+                let region_size = region_row_bytes
+                    .checked_mul(region.height as usize)
+                    .context("Region size overflows")?;
+                let mut staging_bytes = vec![0u8; region_size];
+                for row in 0..region.height {
+                    let src_row = (region.y + row) as usize;
+                    let src_start = src_row
+                        .checked_mul(row_bytes)
+                        .and_then(|offset| offset.checked_add(region.x as usize * 4))
+                        .context("Region source offset overflows")?;
+                    let dst_start = row as usize * region_row_bytes;
+                    let dst_end = dst_start + region_row_bytes;
+                    staging_bytes[dst_start..dst_end]
+                        .copy_from_slice(&pixels[src_start..src_start + region_row_bytes]);
+                }
+                (
+                    staging_bytes,
+                    region.width,
+                    region.height,
+                    vk::Offset3D {
+                        x: region.x as i32,
+                        y: region.y as i32,
+                        z: 0,
+                    },
+                    vk::Extent3D {
+                        width: region.width,
+                        height: region.height,
+                        depth: 1,
+                    },
+                )
+            }
+            None => (
+                pixels[..full_size].to_vec(),
+                width,
+                height,
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                },
+            ),
+        };
+
+    let staging = StagingBuffer::new(device, physical_device, &staging_bytes)?;
     let command_buffer = command_pool.allocate_command_buffer(device)?;
 
     let record_result = (|| -> anyhow::Result<()> {
@@ -725,19 +1126,17 @@ fn upload_bgra_texture(
         }
 
         let region = vk::BufferImageCopy::default()
-            .buffer_row_length(stride / 4)
-            .buffer_image_height(height)
+            .buffer_offset(0)
+            .buffer_row_length(copy_stride)
+            .buffer_image_height(copy_height)
             .image_subresource(vk::ImageSubresourceLayers {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 mip_level: 0,
                 base_array_layer: 0,
                 layer_count: 1,
             })
-            .image_extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            });
+            .image_offset(image_offset)
+            .image_extent(image_extent);
         unsafe {
             device.handle().cmd_copy_buffer_to_image(
                 recorder.command_buffer(),
@@ -832,6 +1231,82 @@ fn color_subresource_range() -> vk::ImageSubresourceRange {
         base_array_layer: 0,
         layer_count: 1,
     }
+}
+
+fn upload_rect_to_vk(rect: UploadRect) -> vk::Rect2D {
+    vk::Rect2D {
+        offset: vk::Offset2D {
+            x: rect.x as i32,
+            y: rect.y as i32,
+        },
+        extent: vk::Extent2D {
+            width: rect.width,
+            height: rect.height,
+        },
+    }
+}
+
+fn dest_intersects_clip(dest: [f32; 4], clip: &vk::Rect2D) -> bool {
+    let dest_rect = DamageRect {
+        x: dest[0] as i32,
+        y: dest[1] as i32,
+        width: dest[2].ceil() as i32,
+        height: dest[3].ceil() as i32,
+    };
+    let clip_rect = DamageRect {
+        x: clip.offset.x,
+        y: clip.offset.y,
+        width: clip.extent.width as i32,
+        height: clip.extent.height as i32,
+    };
+    rects_intersect(dest_rect, clip_rect)
+}
+
+fn rects_intersect(a: DamageRect, b: DamageRect) -> bool {
+    let ax1 = a.x.saturating_add(a.width);
+    let ay1 = a.y.saturating_add(a.height);
+    let bx1 = b.x.saturating_add(b.width);
+    let by1 = b.y.saturating_add(b.height);
+    a.x < bx1 && ax1 > b.x && a.y < by1 && ay1 > b.y
+}
+
+fn output_damage_to_buffer_rect(frame: &SurfaceFrame, damage: DamageRect) -> Option<UploadRect> {
+    let scale = frame.buffer_scale.max(1);
+    let dest_w = div_ceil_i32(frame.width as i32, scale);
+    let dest_h = div_ceil_i32(frame.height as i32, scale);
+    let dest = DamageRect {
+        x: frame.x,
+        y: frame.y,
+        width: dest_w,
+        height: dest_h,
+    };
+    let intersect = intersect_damage(damage, dest)?;
+    let local_x = intersect.x.saturating_sub(frame.x);
+    let local_y = intersect.y.saturating_sub(frame.y);
+    Some(UploadRect {
+        x: (local_x * scale) as u32,
+        y: (local_y * scale) as u32,
+        width: (intersect.width * scale) as u32,
+        height: (intersect.height * scale) as u32,
+    })
+}
+
+fn intersect_damage(a: DamageRect, b: DamageRect) -> Option<DamageRect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = a.x.saturating_add(a.width).min(b.x.saturating_add(b.width));
+    let y1 = a.y.saturating_add(a.height).min(b.y.saturating_add(b.height));
+    let width = x1 - x0;
+    let height = y1 - y0;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some(DamageRect {
+        x: x0,
+        y: y0,
+        width,
+        height,
+    })
 }
 
 fn spv_from_bytes(bytes: &[u8]) -> Vec<u32> {

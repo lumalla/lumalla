@@ -93,15 +93,34 @@ impl RenderPass {
         Self::new_with_final_layout(device, format, vk::ImageLayout::GENERAL)
     }
 
+    /// Creates a render pass for incremental scanout compositing (load existing pixels).
+    pub fn new_for_scanout_load(device: &Device, format: vk::Format) -> anyhow::Result<Self> {
+        Self::new_with_load_op(
+            device,
+            format,
+            vk::ImageLayout::GENERAL,
+            vk::AttachmentLoadOp::LOAD,
+        )
+    }
+
     fn new_with_final_layout(
         device: &Device,
         format: vk::Format,
         final_layout: vk::ImageLayout,
     ) -> anyhow::Result<Self> {
+        Self::new_with_load_op(device, format, final_layout, vk::AttachmentLoadOp::CLEAR)
+    }
+
+    fn new_with_load_op(
+        device: &Device,
+        format: vk::Format,
+        final_layout: vk::ImageLayout,
+        load_op: vk::AttachmentLoadOp,
+    ) -> anyhow::Result<Self> {
         let color_attachment = vk::AttachmentDescription::default()
             .format(format)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .load_op(load_op)
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)

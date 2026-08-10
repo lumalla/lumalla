@@ -15,6 +15,13 @@ struct In {
 
 @fragment
 fn main(input: In) -> @location(0) vec4f {
+    // The vertex stage emits an oversized triangle; only the unit-square UV
+    // region belongs to the dest rect. Without this discard, clamped edge
+    // samples smear one triangle-leg past the bottom/right of every layer
+    // and leave a trail when the cursor moves up/left.
+    if input.uv.x < 0.0 || input.uv.y < 0.0 || input.uv.x > 1.0 || input.uv.y > 1.0 {
+        discard;
+    }
     var color = textureSample(tex, tex_sampler, input.uv);
     if pc.force_opaque > 0.5 {
         color.a = 1.0;

@@ -20,8 +20,11 @@ mod scanout_pool;
 mod scene_backing;
 
 use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
-use crate::scene_backing::{DamageRect, cursor_damage_rects, cursor_damage_rects_default};
-pub use crate::scene_backing::DamageRect as OutputDamageRect;
+pub use crate::scene_backing::{
+    CompositeMode, DamageRect as OutputDamageRect, UploadRect, clip_damage_list,
+    cursor_damage_rects, cursor_damage_rects_default, prepare_gpu_composite,
+};
+use crate::scene_backing::DamageRect;
 use crate::drm::{
     CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, FlipEventQueue, ModeBlob,
     atomic_modeset, atomic_page_flip, atomic_set_plane_fb, dispatch_drm_events,
@@ -29,7 +32,8 @@ use crate::drm::{
 };
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
-    GpuCompositor, SurfaceTextureCache, VulkanContext, composite_to_scanout, vulkan_to_drm_fourcc,
+    DmaBufImage, GpuCompositor, SurfaceTextureCache, VulkanContext, composite_to_scanout,
+    copy_scanout_frame, vulkan_to_drm_fourcc,
 };
 
 struct GpuRenderResources {
@@ -238,6 +242,8 @@ pub struct RendererState {
     pending_damage: Vec<DamageRect>,
     pending_full_redraw: bool,
     pending_pointer_damage: bool,
+    dirty_surface_keys: HashSet<(u32, u32)>,
+    cursor_buffer_dirty: bool,
 }
 
 impl RendererState {
@@ -260,6 +266,8 @@ impl RendererState {
             pending_damage: Vec::new(),
             pending_full_redraw: false,
             pending_pointer_damage: false,
+            dirty_surface_keys: HashSet::new(),
+            cursor_buffer_dirty: false,
         })
     }
 
@@ -268,6 +276,8 @@ impl RendererState {
         self.pending_damage.clear();
         self.pending_full_redraw = true;
         self.pending_pointer_damage = false;
+        self.dirty_surface_keys.clear();
+        self.cursor_buffer_dirty = false;
     }
 
     fn note_pointer_damage(&mut self, new_x: i32, new_y: i32) {
@@ -370,6 +380,7 @@ impl RendererState {
         } else {
             self.pending_damage.extend(frame.damage.iter().copied());
         }
+        self.dirty_surface_keys.insert(key);
         self.surface_frames.insert(key, frame);
         self.mark_dirty_if_active();
         Ok(())
@@ -380,6 +391,7 @@ impl RendererState {
         if self.surface_frames.remove(&key).is_some() {
             self.surface_order.retain(|k| *k != key);
             self.gpu.surface_textures.remove(key);
+            self.dirty_surface_keys.remove(&key);
             self.pending_full_redraw = true;
             self.pending_damage.clear();
             self.mark_dirty_if_active();
@@ -416,8 +428,8 @@ impl RendererState {
     pub fn set_cursor_frame(&mut self, frame: CursorFrame) -> anyhow::Result<()> {
         frame.validate()?;
         self.cursor_frame = Some(frame);
-        self.pending_full_redraw = true;
-        self.pending_damage.clear();
+        self.cursor_buffer_dirty = true;
+        self.note_cursor_redraw();
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -798,8 +810,21 @@ impl RendererState {
         };
 
         let _pending_damage = std::mem::take(&mut self.pending_damage);
+        let force_full = self.pending_full_redraw;
+        let pointer_damage = self.pending_pointer_damage;
+        let cursor_buffer_dirty = self.cursor_buffer_dirty;
+        let dirty_surfaces = std::mem::take(&mut self.dirty_surface_keys);
         self.pending_full_redraw = false;
         self.pending_pointer_damage = false;
+        self.cursor_buffer_dirty = false;
+
+        let mut composite_mode = prepare_gpu_composite(
+            width,
+            height,
+            &_pending_damage,
+            force_full,
+            buffer.fresh,
+        );
 
         let layers: Vec<&SurfaceFrame> = self
             .surface_order
@@ -809,6 +834,35 @@ impl RendererState {
         let cursor = self.cursor_frame.as_ref();
         let pointer_x = self.pointer_x;
         let pointer_y = self.pointer_y;
+
+        if matches!(composite_mode, CompositeMode::Partial(_)) {
+            let src_ptr = self.scanouts.get(&target.connector_name).map(|scanout| {
+                let image = scanout
+                    .queued
+                    .as_ref()
+                    .or(scanout.pending.as_ref())
+                    .unwrap_or(&scanout.current);
+                &image.dma_image as *const DmaBufImage
+            });
+            let dst_ptr = &buffer.dma_image as *const DmaBufImage;
+            let dst_fresh = buffer.fresh;
+            if let Some(src_ptr) = src_ptr {
+                let vulkan = self
+                    .vulkan
+                    .as_mut()
+                    .context("VulkanContext missing during scanout copy")?;
+                copy_scanout_frame(
+                    vulkan,
+                    unsafe { &*src_ptr },
+                    unsafe { &*dst_ptr },
+                    dst_fresh,
+                )
+                .context("Failed to seed back buffer from current scanout")?;
+                buffer.fresh = false;
+            } else {
+                composite_mode = CompositeMode::Full;
+            }
+        }
 
         {
             let vulkan = self
@@ -827,9 +881,19 @@ impl RendererState {
                 &compositor,
                 &layers,
                 cursor,
+                &composite_mode,
+                &dirty_surfaces,
+                pointer_damage || cursor_buffer_dirty,
             )?;
 
-            let render_pass = vulkan.scanout_render_pass()?;
+            vulkan.ensure_scanout_render_pass()?;
+            let render_pass = match &composite_mode {
+                CompositeMode::Full => vulkan.scanout_render_pass()?,
+                CompositeMode::Partial(_) => {
+                    vulkan.ensure_scanout_render_pass_load()?;
+                    vulkan.scanout_render_pass_load()?
+                }
+            };
             let scanout_old_layout = if buffer.fresh {
                 vk::ImageLayout::UNDEFINED
             } else {
@@ -846,6 +910,7 @@ impl RendererState {
                 width,
                 height,
                 color,
+                composite_mode,
                 &layers,
                 cursor,
                 pointer_x,

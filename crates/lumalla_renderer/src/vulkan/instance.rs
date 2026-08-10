@@ -27,6 +27,8 @@ pub struct VulkanContext {
     memory_allocator: Option<MemoryAllocator>,
     /// Cached render pass for KMS scanout clears (dropped before device).
     scanout_render_pass: Option<RenderPass>,
+    /// Cached render pass for incremental scanout compositing (dropped before device).
+    scanout_render_pass_load: Option<RenderPass>,
     /// Debug messenger (only present in debug builds with validation layers)
     #[cfg(debug_assertions)]
     debug_utils: Option<DebugUtils>,
@@ -181,6 +183,7 @@ impl VulkanContext {
             graphics_command_pool: Some(graphics_command_pool),
             memory_allocator: Some(memory_allocator),
             scanout_render_pass: None,
+            scanout_render_pass_load: None,
             #[cfg(debug_assertions)]
             debug_utils,
         })
@@ -197,11 +200,29 @@ impl VulkanContext {
         Ok(())
     }
 
+    /// Ensures the cached incremental scanout render pass exists.
+    pub fn ensure_scanout_render_pass_load(&mut self) -> anyhow::Result<()> {
+        if self.scanout_render_pass_load.is_none() {
+            self.scanout_render_pass_load = Some(RenderPass::new_for_scanout_load(
+                self.device(),
+                vk::Format::B8G8R8A8_UNORM,
+            )?);
+        }
+        Ok(())
+    }
+
     /// Returns the cached scanout render pass.
     pub fn scanout_render_pass(&self) -> anyhow::Result<&RenderPass> {
         self.scanout_render_pass
             .as_ref()
             .context("Scanout render pass not initialized")
+    }
+
+    /// Returns the cached incremental scanout render pass.
+    pub fn scanout_render_pass_load(&self) -> anyhow::Result<&RenderPass> {
+        self.scanout_render_pass_load
+            .as_ref()
+            .context("Incremental scanout render pass not initialized")
     }
 
     /// Sets up the Vulkan debug messenger for validation layer output.
@@ -310,6 +331,7 @@ impl VulkanContext {
 
 impl Drop for VulkanContext {
     fn drop(&mut self) {
+        drop(self.scanout_render_pass_load.take());
         drop(self.scanout_render_pass.take());
 
         // Command pool must be destroyed before device
