@@ -6,7 +6,7 @@ use anyhow::Context;
 use ash::vk;
 use log::{debug, info, warn};
 
-use super::{CommandPool, Device, MemoryAllocator, PhysicalDevice, RenderPass};
+use super::{CommandPool, Device, Image, MemoryAllocator, PhysicalDevice, RenderPass};
 
 /// Holds the core Vulkan objects needed for rendering.
 ///
@@ -254,6 +254,30 @@ impl VulkanContext {
         self.device
             .as_ref()
             .expect("Device should always be present while VulkanContext is alive")
+    }
+
+    /// Creates a sampled BGRA texture for surface uploads.
+    pub fn create_sampled_image(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<Image> {
+        let device = self
+            .device
+            .as_ref()
+            .expect("Device should always be present while VulkanContext is alive");
+        let allocator = self
+            .memory_allocator
+            .as_mut()
+            .expect("Memory allocator should always be present while VulkanContext is alive");
+        Image::new_2d(
+            device,
+            allocator,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::Extent2D { width, height },
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            vk::SampleCountFlags::TYPE_1,
+        )
     }
 
     /// Returns a reference to the graphics command pool.

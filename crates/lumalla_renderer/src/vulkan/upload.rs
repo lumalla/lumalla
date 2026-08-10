@@ -377,6 +377,8 @@ mod tests {
             vulkan.graphics_command_pool(),
             &render_pass,
             &framebuffer,
+            image.image(),
+            vk::ImageLayout::UNDEFINED,
             [0.0, 0.0, 0.0, 1.0],
         )
         .unwrap();

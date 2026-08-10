@@ -20,9 +20,7 @@ mod scanout_pool;
 mod scene_backing;
 
 use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
-use crate::scene_backing::{
-    DamageRect, cursor_damage_rects, cursor_damage_rects_default, prepare_composite, SceneBacking,
-};
+use crate::scene_backing::{DamageRect, cursor_damage_rects, cursor_damage_rects_default};
 pub use crate::scene_backing::DamageRect as OutputDamageRect;
 use crate::drm::{
     CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, FlipEventQueue, ModeBlob,
@@ -30,7 +28,38 @@ use crate::drm::{
     resolve_connected_output,
 };
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
-use crate::vulkan::{VulkanContext, upload_bgra_to_image, vulkan_to_drm_fourcc};
+use crate::vulkan::{
+    GpuCompositor, SurfaceTextureCache, VulkanContext, composite_to_scanout, vulkan_to_drm_fourcc,
+};
+
+struct GpuRenderResources {
+    compositor: Option<GpuCompositor>,
+    surface_textures: SurfaceTextureCache,
+}
+
+impl GpuRenderResources {
+    fn new() -> Self {
+        Self {
+            compositor: None,
+            surface_textures: SurfaceTextureCache::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.compositor = None;
+        self.surface_textures.clear();
+    }
+
+    fn ensure_compositor(&mut self, vulkan: &mut VulkanContext) -> anyhow::Result<()> {
+        if self.compositor.is_some() {
+            return Ok(());
+        }
+        vulkan.ensure_scanout_render_pass()?;
+        let render_pass = vulkan.scanout_render_pass()?;
+        self.compositor = Some(GpuCompositor::new(vulkan.device(), render_pass)?);
+        Ok(())
+    }
+}
 
 /// Default clear color for enabled outputs (teal).
 pub const SOLID_CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.65, 1.0];
@@ -187,7 +216,7 @@ pub struct RendererState {
     pointer_x: i32,
     pointer_y: i32,
     scene_dirty: bool,
-    scene_backing: Option<SceneBacking>,
+    gpu: GpuRenderResources,
     pending_damage: Vec<DamageRect>,
     pending_full_redraw: bool,
     pending_pointer_damage: bool,
@@ -209,15 +238,15 @@ impl RendererState {
             pointer_x: 0,
             pointer_y: 0,
             scene_dirty: false,
-            scene_backing: None,
+            gpu: GpuRenderResources::new(),
             pending_damage: Vec::new(),
             pending_full_redraw: false,
             pending_pointer_damage: false,
         })
     }
 
-    fn invalidate_scene_backing(&mut self) {
-        self.scene_backing = None;
+    fn invalidate_surface_textures(&mut self) {
+        self.gpu.clear();
         self.pending_damage.clear();
         self.pending_full_redraw = true;
         self.pending_pointer_damage = false;
@@ -332,6 +361,7 @@ impl RendererState {
         let key = (owner_id, surface_id);
         if self.surface_frames.remove(&key).is_some() {
             self.surface_order.retain(|k| *k != key);
+            self.gpu.surface_textures.remove(key);
             self.pending_full_redraw = true;
             self.pending_damage.clear();
             self.mark_dirty_if_active();
@@ -343,6 +373,7 @@ impl RendererState {
         let before = self.surface_frames.len();
         self.surface_frames.retain(|(owner, _), _| *owner != owner_id);
         self.surface_order.retain(|(owner, _)| *owner != owner_id);
+        self.gpu.surface_textures.remove_client(owner_id);
         let cursor_removed = self
             .cursor_frame
             .as_ref()
@@ -463,7 +494,7 @@ impl RendererState {
             self.release_output_scanout(scanout);
         }
         self.scanout_pool.clear();
-        self.invalidate_scene_backing();
+        self.invalidate_surface_textures();
     }
 
     fn release_output_scanout(&mut self, scanout: OutputScanout) {
@@ -739,53 +770,56 @@ impl RendererState {
             )?
         };
 
+        let _pending_damage = std::mem::take(&mut self.pending_damage);
+        self.pending_full_redraw = false;
+        self.pending_pointer_damage = false;
+
+        let layers: Vec<&SurfaceFrame> = self
+            .surface_order
+            .iter()
+            .filter_map(|key| self.surface_frames.get(key))
+            .collect();
+        let cursor = self.cursor_frame.as_ref();
+        let pointer_x = self.pointer_x;
+        let pointer_y = self.pointer_y;
+
         {
             let vulkan = self
                 .vulkan
-                .as_ref()
+                .as_mut()
                 .context("VulkanContext missing during present")?;
 
-            let frames: Vec<&SurfaceFrame> = self
-                .surface_order
-                .iter()
-                .filter_map(|key| self.surface_frames.get(key))
-                .collect();
+            self.gpu.ensure_compositor(vulkan)?;
+            let compositor = self
+                .gpu
+                .compositor
+                .take()
+                .context("GPU compositor missing after init")?;
+            self.gpu.surface_textures.sync_scene(
+                vulkan,
+                &compositor,
+                &layers,
+                cursor,
+            )?;
 
-            let pending_damage = std::mem::take(&mut self.pending_damage);
-            let force_full = self.pending_full_redraw || self.pending_pointer_damage;
-            self.pending_full_redraw = false;
-            self.pending_pointer_damage = false;
-
-            let _composite = prepare_composite(
-                &mut self.scene_backing,
+            let render_pass = vulkan.scanout_render_pass()?;
+            composite_to_scanout(
+                vulkan,
+                &compositor,
+                &self.gpu.surface_textures,
+                render_pass,
+                &buffer.dma_image,
+                &buffer.framebuffer,
                 width,
                 height,
                 color,
-                &pending_damage,
-                force_full,
-                &frames,
-                self.cursor_frame.as_ref(),
-                self.pointer_x,
-                self.pointer_y,
-            )?;
-
-            let backing = self
-                .scene_backing
-                .as_ref()
-                .context("Scene backing missing after composite")?;
-
-            // Always upload the full backing: with page-flipped pool buffers, partial
-            // uploads leave stale cursor pixels on regions outside the damage rects.
-            upload_bgra_to_image(
-                vulkan.device(),
-                vulkan.physical_device(),
-                vulkan.graphics_command_pool(),
-                &buffer.dma_image,
-                &backing.pixels,
-                width,
-                height,
+                &layers,
+                cursor,
+                pointer_x,
+                pointer_y,
             )
-            .context("Failed to upload scene to scanout buffer")?;
+            .context("Failed to GPU-composite scene to scanout buffer")?;
+            self.gpu.compositor = Some(compositor);
 
             buffer.fresh = false;
         }

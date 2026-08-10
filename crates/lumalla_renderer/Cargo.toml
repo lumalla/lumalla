@@ -5,7 +5,7 @@ edition = "2024"
 description = "Renderer handling library for lumalla"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumalla/lumalla"
-include = ["src/**/*", "LICENSE-*", "build.rs"]
+include = ["src/**/*", "shaders/**/*", "LICENSE-*", "build.rs"]
 
 [dependencies]
 lumalla_shared = { path = "../lumalla_shared" }
@@ -16,6 +16,8 @@ log = { workspace = true }
 ash = "0.38"
 gpu-allocator = "0.28"
 libc = "0.2"
+bytemuck = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 pkg-config = { workspace = true }
+naga = { version = "24", features = ["wgsl-in", "spv-out"] }

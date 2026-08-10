@@ -18,7 +18,6 @@ pub struct DescriptorSetLayout {
 }
 
 impl DescriptorSetLayout {
-    /// Creates a new descriptor set layout from bindings.
     pub fn new(
         device: &Device,
         bindings: &[vk::DescriptorSetLayoutBinding],
@@ -43,17 +42,20 @@ impl DescriptorSetLayout {
         })
     }
 
-    /// Creates a simple descriptor set layout for a single combined image sampler.
-    ///
-    /// This is commonly used for texture sampling in fragment shaders.
-    pub fn new_sampler(device: &Device, binding: u32) -> anyhow::Result<Self> {
-        let binding = vk::DescriptorSetLayoutBinding::default()
-            .binding(binding)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+    /// Creates a descriptor set layout for a sampled image + separate sampler.
+    pub fn new_texture_sampler(device: &Device) -> anyhow::Result<Self> {
+        let image_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+        let sampler_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT);
 
-        Self::new(device, &[binding])
+        Self::new(device, &[image_binding, sampler_binding])
     }
 
     /// Returns the descriptor set layout handle.
@@ -68,5 +70,65 @@ impl Drop for DescriptorSetLayout {
             self.device.destroy_descriptor_set_layout(self.handle, None);
         }
         debug!("Destroyed descriptor set layout");
+    }
+}
+
+/// Pool for allocating descriptor sets.
+pub struct DescriptorPool {
+    handle: vk::DescriptorPool,
+    device: ash::Device,
+}
+
+impl DescriptorPool {
+    pub fn new_combined_image_sampler(device: &Device, max_sets: u32) -> anyhow::Result<Self> {
+        let image_pool = vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::SAMPLED_IMAGE,
+            descriptor_count: max_sets,
+        };
+        let sampler_pool = vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::SAMPLER,
+            descriptor_count: max_sets,
+        };
+        let pool_sizes = [image_pool, sampler_pool];
+        let create_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(max_sets)
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
+
+        let handle = unsafe { device.handle().create_descriptor_pool(&create_info, None) }
+            .context("Failed to create descriptor pool")?;
+
+        Ok(Self {
+            handle,
+            device: device.handle().clone(),
+        })
+    }
+
+    pub fn allocate_sampler_set(
+        &self,
+        device: &Device,
+        layout: &DescriptorSetLayout,
+    ) -> anyhow::Result<vk::DescriptorSet> {
+        let layouts = [layout.handle()];
+        let allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.handle)
+            .set_layouts(&layouts);
+
+        let sets = unsafe { device.handle().allocate_descriptor_sets(&allocate_info) }
+            .context("Failed to allocate descriptor set")?;
+        Ok(sets[0])
+    }
+
+    pub fn handle(&self) -> vk::DescriptorPool {
+        self.handle
+    }
+}
+
+impl Drop for DescriptorPool {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_descriptor_pool(self.handle, None);
+        }
+        debug!("Destroyed descriptor pool");
     }
 }
