@@ -19,7 +19,9 @@ use lumalla_display::{
     Wayland, create_wayland_display,
 };
 use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
-use lumalla_renderer::{CursorFrame, PresentStatus, RendererState, SOLID_CLEAR_COLOR, SurfaceFrame};
+use lumalla_renderer::{
+    CursorFrame, PresentStatus, RenderScheduler, RendererState, SOLID_CLEAR_COLOR, SurfaceFrame,
+};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, DbusMessage, GlobalArgs, MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender,
@@ -54,6 +56,7 @@ struct AppData {
     connected_clients: HashMap<ClientId, ClientConnection>,
     display_state: DisplayState,
     renderer_state: RendererState,
+    render_scheduler: RenderScheduler,
     frame_clock: Instant,
     drm_device_poll: HashMap<PathBuf, DrmDeviceRegistration>,
     next_drm_device_token: usize,
@@ -70,6 +73,7 @@ impl AppData {
         wayland: Wayland,
         display_state: DisplayState,
         renderer_state: RendererState,
+        render_scheduler: RenderScheduler,
     ) -> Self {
         Self {
             comms,
@@ -84,6 +88,7 @@ impl AppData {
             connected_clients: HashMap::new(),
             display_state,
             renderer_state,
+            render_scheduler,
             frame_clock: Instant::now(),
             drm_device_poll: HashMap::new(),
             next_drm_device_token: 0,
@@ -97,14 +102,23 @@ impl AppData {
     ) -> anyhow::Result<()> {
         let mut events = Events::with_capacity(1024);
         loop {
+            let now = Instant::now();
             let (shutdown_now, event_loop_timeout) = self.check_for_shutdown();
             if shutdown_now {
                 break;
             }
-            if let Err(err) = event_loop.poll(&mut events, event_loop_timeout) {
+            let render_timeout = self.render_scheduler.poll_timeout(now);
+            let poll_timeout = match (event_loop_timeout, render_timeout) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Err(err) = event_loop.poll(&mut events, poll_timeout) {
                 warn!("Unable to poll event loop: {err}");
             }
             self.handle_events(&events, &main_channel, event_loop)?;
+            self.tick_render_scheduler();
             self.flush_clients(event_loop);
         }
         // Close seat devices while libseat is still valid. If we leave that to
@@ -246,12 +260,13 @@ impl AppData {
                     }) {
                         error!("Unable to dispatch libinput events: {err}");
                     } else if pointer_changed {
-                        match renderer_state.update_pointer_position(
+                        if let Err(err) = renderer_state.update_pointer_position(
                             display_state.pointer_position().0.round() as i32,
                             display_state.pointer_position().1.round() as i32,
                         ) {
-                            Ok(status) => self.maybe_complete_frame_callbacks(status),
-                            Err(err) => error!("Unable to update pointer position: {err:#}"),
+                            error!("Unable to update pointer position: {err:#}");
+                        } else if renderer_state.scene_dirty() {
+                            self.render_scheduler.mark_dirty(Instant::now());
                         }
                     }
                 }
@@ -277,15 +292,8 @@ impl AppData {
                                 }
                             }
                             self.sync_wayland_output_from_drm();
-                            match self
-                                .renderer_state
-                                .present_enabled_outputs(SOLID_CLEAR_COLOR)
-                            {
-                                Ok(status) => self.maybe_complete_frame_callbacks(status),
-                                Err(err) => {
-                                    error!("Unable to present outputs after DRM change: {err:#}");
-                                }
-                            }
+                            self.render_scheduler.request_immediate();
+                            self.renderer_state.mark_scene_dirty();
                         }
                         self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                             self.renderer_state.drm_device_states(),
@@ -353,15 +361,8 @@ impl AppData {
                         self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                             self.renderer_state.drm_device_states(),
                         ));
-                        match self
-                            .renderer_state
-                            .present_enabled_outputs(SOLID_CLEAR_COLOR)
-                        {
-                            Ok(status) => self.maybe_complete_frame_callbacks(status),
-                            Err(err) => {
-                                error!("Unable to present enabled outputs: {err:#}");
-                            }
-                        }
+                        self.render_scheduler.request_immediate();
+                        self.renderer_state.mark_scene_dirty();
                         self.comms.dbus(DbusMessage::EmitReady);
                     }
                 }
@@ -399,18 +400,20 @@ impl AppData {
                     self.input_state.clear_keymaps();
                 }
                 MainMessage::SetRenderDevice(path) => {
-                    match self.renderer_state.set_render_device(path) {
-                        Ok(status) => self.maybe_complete_frame_callbacks(status),
-                        Err(err) => error!("Unable to set render device: {err:#}"),
+                    if let Err(err) = self.renderer_state.set_render_device(path) {
+                        error!("Unable to set render device: {err:#}");
+                    } else {
+                        self.render_scheduler.request_immediate();
                     }
                     self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                         self.renderer_state.drm_device_states(),
                     ));
                 }
                 MainMessage::SetOutputConfigs(configs) => {
-                    match self.renderer_state.set_output_configs(configs) {
-                        Ok(status) => self.maybe_complete_frame_callbacks(status),
-                        Err(err) => error!("Unable to set output configs: {err:#}"),
+                    if let Err(err) = self.renderer_state.set_output_configs(configs) {
+                        error!("Unable to set output configs: {err:#}");
+                    } else {
+                        self.render_scheduler.request_immediate();
                     }
                     self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                         self.renderer_state.drm_device_states(),
@@ -474,9 +477,10 @@ impl AppData {
         }
         for client_id in clients_to_remove {
             self.display_state.remove_client(client_id);
-            match self.renderer_state.remove_client_frames(client_id.get()) {
-                Ok(status) => self.maybe_complete_frame_callbacks(status),
-                Err(err) => error!("Unable to clear frames for disconnected client: {err:#}"),
+            if let Err(err) = self.renderer_state.remove_client_frames(client_id.get()) {
+                error!("Unable to clear frames for disconnected client: {err:#}");
+            } else if self.renderer_state.scene_dirty() {
+                self.render_scheduler.mark_dirty(Instant::now());
             }
             self.connected_clients.remove(&client_id);
         }
@@ -504,11 +508,10 @@ impl AppData {
                     error!("Unable to deregister client {:?}: {err}", client_id);
                 }
                 self.display_state.remove_client(client_id);
-                match self.renderer_state.remove_client_frames(client_id.get()) {
-                    Ok(status) => self.maybe_complete_frame_callbacks(status),
-                    Err(err) => {
-                        error!("Unable to clear frames for disconnected client: {err:#}")
-                    }
+                if let Err(err) = self.renderer_state.remove_client_frames(client_id.get()) {
+                    error!("Unable to clear frames for disconnected client: {err:#}")
+                } else if self.renderer_state.scene_dirty() {
+                    self.render_scheduler.mark_dirty(Instant::now());
                 }
                 self.connected_clients.remove(&client_id);
             } else {
@@ -527,6 +530,7 @@ impl AppData {
         else {
             return;
         };
+        self.render_scheduler.set_refresh_rate(refresh_mhz);
         let width_u = width.max(1) as u32;
         let height_u = height.max(1) as u32;
         self.input_state
@@ -554,29 +558,27 @@ impl AppData {
         if let Some(active) = self.display_state.active_cursor() {
             let key = (active.client_id.get(), active.surface_id.get());
             if self.renderer_state.cursor_surface_key() == Some(key) {
-                match self.renderer_state.update_cursor_hotspot(
+                if let Err(err) = self.renderer_state.update_cursor_hotspot(
                     active.hotspot_x,
                     active.hotspot_y,
                 ) {
-                    Ok(status) => self.maybe_complete_frame_callbacks(status),
-                    Err(err) => error!("Unable to update cursor hotspot: {err:#}"),
+                    error!("Unable to update cursor hotspot: {err:#}");
+                } else if self.renderer_state.scene_dirty() {
+                    self.render_scheduler.mark_dirty(Instant::now());
                 }
             }
         } else if self.renderer_state.cursor_surface_key().is_some() {
-            // Client hid its cursor; fall back to the compositor default.
-            match self.renderer_state.clear_cursor_frame() {
-                Ok(status) => self.maybe_complete_frame_callbacks(status),
-                Err(err) => error!("Unable to clear client cursor frame: {err:#}"),
+            if let Err(err) = self.renderer_state.clear_cursor_frame() {
+                error!("Unable to clear client cursor frame: {err:#}");
+            } else if self.renderer_state.scene_dirty() {
+                self.render_scheduler.mark_dirty(Instant::now());
             }
         }
     }
 
     fn submit_committed_frames(&mut self) {
         let updates: Vec<_> = self.display_state.take_surface_updates().collect();
-        let mut last_status = PresentStatus { idle: true };
-        let mut had_updates = false;
         for update in updates {
-            had_updates = true;
             match update {
                 SurfaceUpdate::Frame(frame) => {
                     let frame = SurfaceFrame {
@@ -591,9 +593,8 @@ impl AppData {
                         y: frame.y,
                         buffer_scale: frame.buffer_scale,
                     };
-                    match self.renderer_state.set_surface_frame(frame) {
-                        Ok(status) => last_status = status,
-                        Err(err) => error!("Unable to queue committed Wayland surface: {err:#}"),
+                    if let Err(err) = self.renderer_state.set_surface_frame(frame) {
+                        error!("Unable to queue committed Wayland surface: {err:#}");
                     }
                 }
                 SurfaceUpdate::Cursor(frame) => {
@@ -618,33 +619,81 @@ impl AppData {
                         hotspot_y: hotspot.1,
                         buffer_scale: frame.buffer_scale,
                     };
-                    match self.renderer_state.set_cursor_frame(cursor) {
-                        Ok(status) => last_status = status,
-                        Err(err) => error!("Unable to queue committed cursor surface: {err:#}"),
+                    if let Err(err) = self.renderer_state.set_cursor_frame(cursor) {
+                        error!("Unable to queue committed cursor surface: {err:#}");
                     }
                 }
                 SurfaceUpdate::Unmapped {
                     client_id,
                     surface_id,
-                } => match self
-                    .renderer_state
-                    .remove_surface_frame(client_id.get(), surface_id.get())
-                {
-                    Ok(status) => last_status = status,
-                    Err(err) => error!("Unable to clear unmapped Wayland surface: {err:#}"),
-                },
+                } => {
+                    if let Err(err) = self
+                        .renderer_state
+                        .remove_surface_frame(client_id.get(), surface_id.get())
+                    {
+                        error!("Unable to clear unmapped Wayland surface: {err:#}");
+                    }
+                }
             }
         }
-        if had_updates {
-            self.maybe_complete_frame_callbacks(last_status);
-        } else if self.display_state.pending_frame_callback_count() > 0 && last_status.idle {
-            self.maybe_complete_frame_callbacks(last_status);
+        if self.renderer_state.scene_dirty()
+            || self.display_state.pending_frame_callback_count() > 0
+        {
+            self.render_scheduler.mark_dirty(Instant::now());
+        }
+    }
+
+    fn tick_render_scheduler(&mut self) {
+        let now = Instant::now();
+        let scene_dirty = self.renderer_state.scene_dirty();
+        let pending_callbacks = self.display_state.pending_frame_callback_count() > 0;
+        let flip_idle = self.renderer_state.flip_idle();
+
+        if !self.render_scheduler.should_present(
+            now,
+            scene_dirty,
+            pending_callbacks,
+            flip_idle,
+        ) {
+            return;
+        }
+
+        let force = pending_callbacks && !scene_dirty;
+        match self
+            .renderer_state
+            .present(SOLID_CLEAR_COLOR, force)
+        {
+            Ok(outcome) => {
+                if outcome.presented {
+                    self.render_scheduler.on_present_started(now);
+                    if let Some(timings) = outcome.timings {
+                        self.render_scheduler
+                            .on_present_finished(timings.render_duration);
+                    }
+                }
+                self.maybe_complete_frame_callbacks(outcome.status);
+            }
+            Err(err) => {
+                self.render_scheduler.on_present_started(now);
+                error!("Unable to present outputs: {err:#}");
+            }
         }
     }
 
     fn handle_drm_device_events(&mut self) -> anyhow::Result<()> {
         match self.renderer_state.dispatch_page_flips() {
-            Ok(status) => self.maybe_complete_frame_callbacks(status),
+            Ok(outcome) => {
+                let now = Instant::now();
+                if !outcome.completed.is_empty() {
+                    self.render_scheduler.after_flip(
+                        now,
+                        self.renderer_state.scene_dirty(),
+                        self.display_state.pending_frame_callback_count() > 0,
+                    );
+                }
+                self.maybe_complete_frame_callbacks(outcome.status);
+                self.tick_render_scheduler();
+            }
             Err(err) => error!("Unable to dispatch DRM page-flip events: {err:#}"),
         }
         Ok(())
@@ -817,6 +866,7 @@ pub(crate) fn run_app(
         Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
     }
     let renderer_state = init_and_register_renderer_state(&mut main_event_loop)?;
+    let render_scheduler = RenderScheduler::default();
     comms.dbus(DbusMessage::SetDrmDevices(
         renderer_state.drm_device_states(),
     ));
@@ -831,6 +881,7 @@ pub(crate) fn run_app(
         wayland,
         display_state,
         renderer_state,
+        render_scheduler,
     );
     data.run_event_loop(&mut main_event_loop, main_channel)
 }

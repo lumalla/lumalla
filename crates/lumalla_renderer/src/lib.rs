@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use ash::vk;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::{DrmDeviceState, OutputConfig};
 use mio::{Interest, Registry, Token, event::Source};
@@ -15,13 +15,15 @@ pub mod drm;
 pub mod vulkan;
 
 mod default_cursor;
+pub mod scheduler;
 
 use crate::default_cursor::default_cursor_frame;
 use crate::drm::{
-    ConnectedOutput, DrmDevices, DrmDispatchResult, DrmFramebuffer, FlipEventQueue, ModeBlob,
-    atomic_modeset, atomic_page_flip, atomic_set_plane_fb, dispatch_drm_events,
-    resolve_connected_output,
+    CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, DrmFramebuffer,
+    FlipEventQueue, ModeBlob, atomic_modeset, atomic_page_flip, atomic_set_plane_fb,
+    dispatch_drm_events, resolve_connected_output,
 };
+pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
     DmaBufImage, Framebuffer, RenderPass, VulkanContext, clear_framebuffer_to_color,
     upload_bgra_to_image,
@@ -37,6 +39,22 @@ const WL_SHM_FORMAT_XRGB8888: u32 = 1;
 pub struct PresentStatus {
     /// No page-flips are currently in flight.
     pub idle: bool,
+}
+
+/// Outcome of a scheduled present pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentOutcome {
+    /// Whether GPU/DRM work was submitted this call.
+    pub presented: bool,
+    pub status: PresentStatus,
+    pub timings: Option<FrameTimings>,
+}
+
+/// Page-flip events drained from DRM fds.
+#[derive(Debug, Clone)]
+pub struct FlipDispatchOutcome {
+    pub status: PresentStatus,
+    pub completed: Vec<CompletedPageFlip>,
 }
 
 #[derive(Debug)]
@@ -167,6 +185,7 @@ pub struct RendererState {
     cursor_frame: Option<CursorFrame>,
     pointer_x: i32,
     pointer_y: i32,
+    scene_dirty: bool,
 }
 
 impl RendererState {
@@ -183,7 +202,22 @@ impl RendererState {
             cursor_frame: None,
             pointer_x: 0,
             pointer_y: 0,
+            scene_dirty: false,
         })
+    }
+
+    pub fn scene_dirty(&self) -> bool {
+        self.scene_dirty
+    }
+
+    pub fn mark_scene_dirty(&mut self) {
+        self.scene_dirty = true;
+    }
+
+    fn mark_dirty_if_active(&mut self) {
+        if !self.drm_devices.opened().is_empty() {
+            self.scene_dirty = true;
+        }
     }
 
     /// Snapshot of discovered DRM devices and connectors, with render-device selection marked.
@@ -215,7 +249,7 @@ impl RendererState {
     }
 
     /// Drain DRM page-flip events, retire buffers, and schedule queued flips.
-    pub fn dispatch_page_flips(&mut self) -> anyhow::Result<PresentStatus> {
+    pub fn dispatch_page_flips(&mut self) -> anyhow::Result<FlipDispatchOutcome> {
         let fds: Vec<RawFd> = self
             .drm_devices
             .opened()
@@ -226,42 +260,37 @@ impl RendererState {
             dispatch_drm_events(fd)?;
         }
         let completed = self.flip_events.drain();
-        for flip in completed {
+        for flip in &completed {
             self.retire_page_flip(flip.crtc_id)?;
         }
-        Ok(self.present_status())
+        Ok(FlipDispatchOutcome {
+            status: self.present_status(),
+            completed,
+        })
     }
 
-    /// Replace or insert a surface frame and present the scene.
-    pub fn set_surface_frame(&mut self, frame: SurfaceFrame) -> anyhow::Result<PresentStatus> {
+    /// Replace or insert a surface frame without presenting.
+    pub fn set_surface_frame(&mut self, frame: SurfaceFrame) -> anyhow::Result<()> {
         frame.validate()?;
         let key = (frame.owner_id, frame.surface_id);
         if !self.surface_frames.contains_key(&key) {
             self.surface_order.push(key);
         }
         self.surface_frames.insert(key, frame);
-        if self.drm_devices.opened().is_empty() {
-            return Ok(self.present_status());
-        }
-        self.present_enabled_outputs(SOLID_CLEAR_COLOR)
+        self.mark_dirty_if_active();
+        Ok(())
     }
 
-    pub fn remove_surface_frame(
-        &mut self,
-        owner_id: u32,
-        surface_id: u32,
-    ) -> anyhow::Result<PresentStatus> {
+    pub fn remove_surface_frame(&mut self, owner_id: u32, surface_id: u32) -> anyhow::Result<()> {
         let key = (owner_id, surface_id);
         if self.surface_frames.remove(&key).is_some() {
             self.surface_order.retain(|k| *k != key);
-            if !self.drm_devices.opened().is_empty() {
-                return self.present_enabled_outputs(SOLID_CLEAR_COLOR);
-            }
+            self.mark_dirty_if_active();
         }
-        Ok(self.present_status())
+        Ok(())
     }
 
-    pub fn remove_client_frames(&mut self, owner_id: u32) -> anyhow::Result<PresentStatus> {
+    pub fn remove_client_frames(&mut self, owner_id: u32) -> anyhow::Result<()> {
         let before = self.surface_frames.len();
         self.surface_frames.retain(|(owner, _), _| *owner != owner_id);
         self.surface_order.retain(|(owner, _)| *owner != owner_id);
@@ -272,12 +301,10 @@ impl RendererState {
         if cursor_removed {
             self.cursor_frame = None;
         }
-        if (self.surface_frames.len() != before || cursor_removed)
-            && !self.drm_devices.opened().is_empty()
-        {
-            return self.present_enabled_outputs(SOLID_CLEAR_COLOR);
+        if self.surface_frames.len() != before || cursor_removed {
+            self.mark_dirty_if_active();
         }
-        Ok(self.present_status())
+        Ok(())
     }
 
     pub fn cursor_surface_key(&self) -> Option<(u32, u32)> {
@@ -286,51 +313,47 @@ impl RendererState {
             .map(|cursor| (cursor.owner_id, cursor.surface_id))
     }
 
-    pub fn set_cursor_frame(&mut self, frame: CursorFrame) -> anyhow::Result<PresentStatus> {
+    pub fn set_cursor_frame(&mut self, frame: CursorFrame) -> anyhow::Result<()> {
         frame.validate()?;
         self.cursor_frame = Some(frame);
-        if self.drm_devices.opened().is_empty() {
-            return Ok(self.present_status());
-        }
-        self.present_enabled_outputs(SOLID_CLEAR_COLOR)
+        self.mark_dirty_if_active();
+        Ok(())
     }
 
-    pub fn clear_cursor_frame(&mut self) -> anyhow::Result<PresentStatus> {
+    pub fn clear_cursor_frame(&mut self) -> anyhow::Result<()> {
         if self.cursor_frame.is_none() {
-            return Ok(self.present_status());
+            return Ok(());
         }
         self.cursor_frame = None;
-        if self.drm_devices.opened().is_empty() {
-            return Ok(self.present_status());
-        }
-        self.present_enabled_outputs(SOLID_CLEAR_COLOR)
+        self.mark_dirty_if_active();
+        Ok(())
     }
 
-    pub fn update_pointer_position(&mut self, x: i32, y: i32) -> anyhow::Result<PresentStatus> {
+    pub fn update_pointer_position(&mut self, x: i32, y: i32) -> anyhow::Result<()> {
         if self.pointer_x == x && self.pointer_y == y {
-            return Ok(self.present_status());
+            return Ok(());
         }
         self.pointer_x = x;
         self.pointer_y = y;
-        if self.drm_devices.opened().is_empty() {
-            return Ok(self.present_status());
-        }
-        self.present_enabled_outputs(SOLID_CLEAR_COLOR)
+        self.mark_dirty_if_active();
+        Ok(())
     }
 
-    pub fn update_cursor_hotspot(&mut self, hotspot_x: i32, hotspot_y: i32) -> anyhow::Result<PresentStatus> {
+    pub fn update_cursor_hotspot(&mut self, hotspot_x: i32, hotspot_y: i32) -> anyhow::Result<()> {
         let Some(cursor) = self.cursor_frame.as_mut() else {
-            return Ok(self.present_status());
+            return Ok(());
         };
         if cursor.hotspot_x == hotspot_x && cursor.hotspot_y == hotspot_y {
-            return Ok(self.present_status());
+            return Ok(());
         }
         cursor.hotspot_x = hotspot_x;
         cursor.hotspot_y = hotspot_y;
-        if self.drm_devices.opened().is_empty() {
-            return Ok(self.present_status());
-        }
-        self.present_enabled_outputs(SOLID_CLEAR_COLOR)
+        self.mark_dirty_if_active();
+        Ok(())
+    }
+
+    pub fn flip_idle(&self) -> bool {
+        self.present_status().idle
     }
 
     /// Geometry of the first enabled present target, if DRM outputs are resolvable.
@@ -364,18 +387,16 @@ impl RendererState {
         self.drm_devices.reconcile(seat)
     }
 
-    /// Select the Vulkan render device (`None` = auto). Re-presents if the seat is active.
-    pub fn set_render_device(&mut self, path: Option<PathBuf>) -> anyhow::Result<PresentStatus> {
+    /// Select the Vulkan render device (`None` = auto).
+    pub fn set_render_device(&mut self, path: Option<PathBuf>) -> anyhow::Result<()> {
         info!("Render device config: {path:?}");
         self.render_device = path;
-        if !self.drm_devices.opened().is_empty() {
-            return self.present_enabled_outputs(SOLID_CLEAR_COLOR);
-        }
-        Ok(self.present_status())
+        self.mark_dirty_if_active();
+        Ok(())
     }
 
-    /// Merge per-connector output config. Re-presents if the seat is active.
-    pub fn set_output_configs(&mut self, configs: Vec<OutputConfig>) -> anyhow::Result<PresentStatus> {
+    /// Merge per-connector output config.
+    pub fn set_output_configs(&mut self, configs: Vec<OutputConfig>) -> anyhow::Result<()> {
         for config in configs {
             info!(
                 "Output config: {} enabled={} mode={:?}",
@@ -383,10 +404,29 @@ impl RendererState {
             );
             self.output_configs.insert(config.name.clone(), config);
         }
-        if !self.drm_devices.opened().is_empty() {
-            return self.present_enabled_outputs(SOLID_CLEAR_COLOR);
+        self.mark_dirty_if_active();
+        Ok(())
+    }
+
+    /// Run a present pass when `force` is set or the scene is dirty.
+    pub fn present(&mut self, color: [f32; 4], force: bool) -> anyhow::Result<PresentOutcome> {
+        if !force && !self.scene_dirty {
+            return Ok(PresentOutcome {
+                presented: false,
+                status: self.present_status(),
+                timings: None,
+            });
         }
-        Ok(self.present_status())
+        self.scene_dirty = false;
+        let started = Instant::now();
+        let status = self.present_enabled_outputs(color)?;
+        Ok(PresentOutcome {
+            presented: true,
+            status,
+            timings: Some(FrameTimings {
+                render_duration: started.elapsed(),
+            }),
+        })
     }
 
     /// Present a solid clear on every enabled connected output (any card).
@@ -402,7 +442,7 @@ impl RendererState {
             return Ok(self.present_status());
         };
 
-        info!("Using render device {}", render_path.display());
+        debug!("Using render device {}", render_path.display());
         self.ensure_vulkan(&render_path)?;
 
         let targets = self.collect_present_targets();
@@ -418,7 +458,7 @@ impl RendererState {
             match self.present_one_output(&target, color) {
                 Ok(()) => {
                     if let Some(scanout) = self.scanouts.get(&target.connector_name) {
-                        info!(
+                        debug!(
                             "Presented {} on {} (CRTC {}, {}x{}@{}Hz)",
                             scanout.output.connector_name,
                             scanout.drm_path.display(),
@@ -441,7 +481,7 @@ impl RendererState {
         }
 
         self.scanouts.retain(|name, _| keep.contains(name));
-        info!("Presented {presented} output(s)");
+        debug!("Presented {presented} output(s)");
         Ok(self.present_status())
     }
 
@@ -632,7 +672,6 @@ impl RendererState {
             )
             .context("Failed to upload Wayland SHM scene")?;
 
-            vulkan.device().wait_idle()?;
             (dma_image, fourcc)
         };
 
