@@ -22,6 +22,7 @@ pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland};
 pub use seat::{ActiveCursor, KeyboardModifiers};
 pub use output::OutputInfo;
 pub use surface::Rectangle;
+pub use dmabuf::ExportedDmabuf;
 
 pub struct DisplayMessage;
 
@@ -41,6 +42,8 @@ pub struct CommittedFrame {
     pub offset_y: i32,
     pub x: i32,
     pub y: i32,
+    /// Populated for linux-dmabuf commits; renderer imports this FD on the GPU.
+    pub dmabuf: Option<ExportedDmabuf>,
     /// Output-space regions that changed this commit.
     pub damage: Vec<Rectangle>,
     /// When true, the entire surface area must be recomposited.

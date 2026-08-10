@@ -67,6 +67,19 @@ pub struct DmabufSnapshot {
     pub format: u32,
 }
 
+/// DMA-BUF plane metadata with a compositor-owned FD duplicate (no CPU copy).
+#[derive(Debug)]
+pub struct ExportedDmabuf {
+    pub fd: OwnedFd,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub offset: u32,
+    pub modifier: u64,
+    pub drm_fourcc: u32,
+    pub wl_format: u32,
+}
+
 #[derive(Debug)]
 struct Plane {
     fd: OwnedFd,
@@ -362,6 +375,51 @@ impl DmabufManager {
             format,
         })
     }
+
+    /// Duplicates the buffer FD for GPU import without a CPU copy.
+    pub fn export_buffer(
+        &self,
+        client_id: ClientId,
+        buffer_id: ObjectId,
+    ) -> Result<ExportedDmabuf> {
+        let buffer = self
+            .buffers
+            .get(&(client_id, buffer_id))
+            .ok_or_else(|| DmabufError::new(DmabufErrorKind::InvalidObject, "Unknown dmabuf"))?;
+        let plane = &buffer.planes[0];
+        let fd = dup_fd(plane.fd.as_raw_fd())?;
+        let wl_format = match buffer.format {
+            DRM_FORMAT_ARGB8888 => WL_SHM_FORMAT_ARGB8888,
+            DRM_FORMAT_XRGB8888 => WL_SHM_FORMAT_XRGB8888,
+            _ => {
+                return Err(DmabufError::new(
+                    DmabufErrorKind::InvalidFormat,
+                    "Unsupported dmabuf format",
+                ));
+            }
+        };
+        Ok(ExportedDmabuf {
+            fd,
+            width: buffer.width,
+            height: buffer.height,
+            stride: plane.stride,
+            offset: plane.offset,
+            modifier: plane.modifier,
+            drm_fourcc: buffer.format,
+            wl_format,
+        })
+    }
+}
+
+fn dup_fd(fd: RawFd) -> Result<OwnedFd> {
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(DmabufError::new(
+            DmabufErrorKind::InvalidFd,
+            "Failed to duplicate dmabuf fd",
+        ));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(dup) })
 }
 
 fn fd_size(fd: RawFd) -> Result<u64> {
@@ -431,6 +489,44 @@ mod tests {
         assert_eq!(snap.height, 1);
         assert_eq!(snap.stride, 8);
         assert_eq!(snap.format, WL_SHM_FORMAT_XRGB8888);
+        assert_eq!(snap.pixels, pixels);
+    }
+
+    #[test]
+    fn export_buffer_duplicates_fd_without_cpu_copy() {
+        let mut manager = DmabufManager::default();
+        let client_id = client(1);
+        manager.create_params(client_id, object(2)).unwrap();
+        let pixels = [0x11u8, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff];
+        manager
+            .add_plane(
+                client_id,
+                object(2),
+                memfd(&pixels),
+                0,
+                0,
+                8,
+                0,
+                DRM_FORMAT_MOD_LINEAR as u32,
+            )
+            .unwrap();
+        manager
+            .create_immed(
+                client_id,
+                object(2),
+                object(3),
+                2,
+                1,
+                DRM_FORMAT_XRGB8888,
+                0,
+            )
+            .unwrap();
+        let exported = manager.export_buffer(client_id, object(3)).unwrap();
+        assert_eq!(exported.width, 2);
+        assert_eq!(exported.height, 1);
+        assert_eq!(exported.stride, 8);
+        assert_eq!(exported.drm_fourcc, DRM_FORMAT_XRGB8888);
+        let snap = manager.snapshot_buffer(client_id, object(3)).unwrap();
         assert_eq!(snap.pixels, pixels);
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -89,10 +89,21 @@ pub struct FlipDispatchOutcome {
     pub completed: Vec<CompletedPageFlip>,
 }
 
+/// Client DMA-BUF attachment for zero-copy GPU import.
+#[derive(Debug)]
+pub struct DmabufAttachment {
+    pub buffer_id: u32,
+    pub fd: OwnedFd,
+    pub drm_fourcc: u32,
+    pub offset: u32,
+    pub modifier: u64,
+}
+
 #[derive(Debug)]
 pub struct SurfaceFrame {
     pub owner_id: u32,
     pub surface_id: u32,
+    pub buffer_id: u32,
     pub pixels: Vec<u8>,
     pub width: usize,
     pub height: usize,
@@ -101,6 +112,7 @@ pub struct SurfaceFrame {
     pub x: i32,
     pub y: i32,
     pub buffer_scale: i32,
+    pub dmabuf: Option<DmabufAttachment>,
     /// Output-space regions updated by this commit.
     pub damage: Vec<DamageRect>,
     /// When true, the entire output backing must be recomposited.
@@ -121,14 +133,16 @@ impl SurfaceFrame {
             self.stride >= row_bytes,
             "Surface frame stride is smaller than one row"
         );
-        let required = self
-            .stride
-            .checked_mul(self.height)
-            .context("Surface frame size overflows")?;
-        anyhow::ensure!(
-            self.pixels.len() >= required,
-            "Surface frame pixel data is truncated"
-        );
+        if self.dmabuf.is_none() {
+            let required = self
+                .stride
+                .checked_mul(self.height)
+                .context("Surface frame size overflows")?;
+            anyhow::ensure!(
+                self.pixels.len() >= required,
+                "Surface frame pixel data is truncated"
+            );
+        }
         anyhow::ensure!(
             matches!(self.format, WL_SHM_FORMAT_ARGB8888 | WL_SHM_FORMAT_XRGB8888),
             "Unsupported Wayland SHM format {:#x}",
@@ -138,10 +152,11 @@ impl SurfaceFrame {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CursorFrame {
     pub owner_id: u32,
     pub surface_id: u32,
+    pub buffer_id: u32,
     pub pixels: Vec<u8>,
     pub width: usize,
     pub height: usize,
@@ -150,6 +165,7 @@ pub struct CursorFrame {
     pub hotspot_x: i32,
     pub hotspot_y: i32,
     pub buffer_scale: i32,
+    pub dmabuf: Option<DmabufAttachment>,
 }
 
 impl CursorFrame {
@@ -166,14 +182,16 @@ impl CursorFrame {
             self.stride >= row_bytes,
             "Cursor frame stride is smaller than one row"
         );
-        let required = self
-            .stride
-            .checked_mul(self.height)
-            .context("Cursor frame size overflows")?;
-        anyhow::ensure!(
-            self.pixels.len() >= required,
-            "Cursor frame pixel data is truncated"
-        );
+        if self.dmabuf.is_none() {
+            let required = self
+                .stride
+                .checked_mul(self.height)
+                .context("Cursor frame size overflows")?;
+            anyhow::ensure!(
+                self.pixels.len() >= required,
+                "Cursor frame pixel data is truncated"
+            );
+        }
         anyhow::ensure!(
             matches!(self.format, WL_SHM_FORMAT_ARGB8888 | WL_SHM_FORMAT_XRGB8888),
             "Unsupported cursor SHM format {:#x}",
@@ -434,16 +452,25 @@ impl RendererState {
         }
         let old_hotspot = (cursor.hotspot_x, cursor.hotspot_y);
         let pointer = (self.pointer_x, self.pointer_y);
-        let mut old_cursor = cursor.clone();
-        old_cursor.hotspot_x = old_hotspot.0;
-        old_cursor.hotspot_y = old_hotspot.1;
-        let damage = cursor_damage_rects(&old_cursor, pointer, pointer);
-        let mut new_cursor = old_cursor.clone();
-        new_cursor.hotspot_x = hotspot_x;
-        new_cursor.hotspot_y = hotspot_y;
-        let new_damage = cursor_damage_rects(&new_cursor, pointer, pointer);
-        self.pending_damage.extend(damage);
-        self.pending_damage.extend(new_damage);
+        let damage_for = |hotspot_x: i32, hotspot_y: i32| {
+            let scratch = CursorFrame {
+                owner_id: cursor.owner_id,
+                surface_id: cursor.surface_id,
+                buffer_id: cursor.buffer_id,
+                pixels: Vec::new(),
+                width: cursor.width,
+                height: cursor.height,
+                stride: cursor.stride,
+                format: cursor.format,
+                hotspot_x,
+                hotspot_y,
+                buffer_scale: cursor.buffer_scale,
+                dmabuf: None,
+            };
+            cursor_damage_rects(&scratch, pointer, pointer)
+        };
+        self.pending_damage.extend(damage_for(old_hotspot.0, old_hotspot.1));
+        self.pending_damage.extend(damage_for(hotspot_x, hotspot_y));
         self.pending_pointer_damage = true;
         if let Some(cursor) = self.cursor_frame.as_mut() {
             cursor.hotspot_x = hotspot_x;
@@ -803,6 +830,11 @@ impl RendererState {
             )?;
 
             let render_pass = vulkan.scanout_render_pass()?;
+            let scanout_old_layout = if buffer.fresh {
+                vk::ImageLayout::UNDEFINED
+            } else {
+                vk::ImageLayout::GENERAL
+            };
             composite_to_scanout(
                 vulkan,
                 &compositor,
@@ -810,6 +842,7 @@ impl RendererState {
                 render_pass,
                 &buffer.dma_image,
                 &buffer.framebuffer,
+                scanout_old_layout,
                 width,
                 height,
                 color,
@@ -1063,6 +1096,7 @@ mod tests {
         SurfaceFrame {
             owner_id: 1,
             surface_id: 2,
+            buffer_id: 3,
             pixels: vec![0; 16],
             width: 2,
             height: 2,
@@ -1071,6 +1105,7 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            dmabuf: None,
             damage: Vec::new(),
             full_surface: true,
         }
@@ -1098,6 +1133,7 @@ mod tests {
         let frame = SurfaceFrame {
             owner_id: 1,
             surface_id: 2,
+            buffer_id: 3,
             pixels: vec![1, 2, 3, 0, 4, 5, 6, 0],
             width: 2,
             height: 1,
@@ -1106,6 +1142,7 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            dmabuf: None,
             damage: Vec::new(),
             full_surface: true,
         };
@@ -1144,6 +1181,7 @@ mod tests {
         let cursor = CursorFrame {
             owner_id: 1,
             surface_id: 3,
+            buffer_id: 4,
             pixels: vec![10, 20, 30, 255],
             width: 1,
             height: 1,
@@ -1152,6 +1190,7 @@ mod tests {
             hotspot_x: 0,
             hotspot_y: 0,
             buffer_scale: 1,
+            dmabuf: None,
         };
         let mut upload = composite_surface_full(&[], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
         composite_cursor_into(&mut upload, 2, 1, &cursor, 1, 0).unwrap();

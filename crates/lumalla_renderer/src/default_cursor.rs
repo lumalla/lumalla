@@ -45,6 +45,7 @@ pub fn default_cursor_frame() -> &'static CursorFrame {
     CURSOR.get_or_init(|| CursorFrame {
         owner_id: 0,
         surface_id: 0,
+        buffer_id: 0,
         pixels: build_default_cursor_pixels(),
         width: SIZE,
         height: SIZE,
@@ -53,5 +54,6 @@ pub fn default_cursor_frame() -> &'static CursorFrame {
         hotspot_x: 0,
         hotspot_y: 0,
         buffer_scale: 1,
+        dmabuf: None,
     })
 }

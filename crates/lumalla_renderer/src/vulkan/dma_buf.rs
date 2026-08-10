@@ -364,6 +364,15 @@ impl Drop for DmaBufImage {
     }
 }
 
+/// Maps a DRM fourcc to a Vulkan format for linear DMA-BUF import.
+pub fn drm_fourcc_to_vulkan(fourcc: u32) -> Option<vk::Format> {
+    match fourcc {
+        DRM_FORMAT_ARGB8888 | DRM_FORMAT_XRGB8888 => Some(vk::Format::B8G8R8A8_UNORM),
+        DRM_FORMAT_ABGR8888 | DRM_FORMAT_XBGR8888 => Some(vk::Format::R8G8B8A8_UNORM),
+        _ => None,
+    }
+}
+
 /// Maps a Vulkan format to a DRM fourcc.
 pub fn vulkan_to_drm_fourcc(format: vk::Format) -> Option<u32> {
     match format {

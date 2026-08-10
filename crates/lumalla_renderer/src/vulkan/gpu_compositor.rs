@@ -2,20 +2,21 @@
 
 use std::collections::HashMap;
 use std::mem;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::ptr;
 
 use anyhow::Context;
 use ash::vk;
 
 use crate::default_cursor::default_cursor_frame;
-use crate::{CursorFrame, SurfaceFrame};
+use crate::{CursorFrame, DmabufAttachment, SurfaceFrame};
 
 const WL_SHM_FORMAT_XRGB8888: u32 = 1;
 
 use super::{
     CommandBufferRecorder, CommandPool, DescriptorPool, DescriptorSetLayout, Device,
     DmaBufImage, Fence, Framebuffer, GraphicsPipeline, GraphicsPipelineBuilder, Image,
-    PhysicalDevice, RenderPass, Sampler, ShaderModule, VulkanContext,
+    PhysicalDevice, RenderPass, Sampler, ShaderModule, VulkanContext, drm_fourcc_to_vulkan,
 };
 
 const MAX_SURFACE_TEXTURES: u32 = 256;
@@ -27,6 +28,7 @@ struct LayerPushConstants {
     dest: [f32; 4],
     output_size: [f32; 2],
     force_opaque: f32,
+    _padding: f32,
 }
 
 pub struct GpuCompositor {
@@ -52,8 +54,8 @@ impl GpuCompositor {
             "/composite.frag.spv"
         )));
 
-        let vert_shader = ShaderModule::from_spirv(device, vert_spv)?;
-        let frag_shader = ShaderModule::from_spirv(device, frag_spv)?;
+        let vert_shader = ShaderModule::from_spirv(device, &vert_spv)?;
+        let frag_shader = ShaderModule::from_spirv(device, &frag_spv)?;
         let descriptor_layout = DescriptorSetLayout::new_texture_sampler(device)?;
         let descriptor_pool =
             DescriptorPool::new_combined_image_sampler(device, MAX_SURFACE_TEXTURES)?;
@@ -103,6 +105,7 @@ impl GpuCompositor {
             dest,
             output_size: [output_width as f32, output_height as f32],
             force_opaque: if force_opaque { 1.0 } else { 0.0 },
+            _padding: 0.0,
         };
         unsafe {
             device.handle().cmd_push_constants(
@@ -120,10 +123,25 @@ impl GpuCompositor {
 }
 
 struct SurfaceTexture {
-    image: Image,
+    backing: TextureBacking,
     descriptor_set: vk::DescriptorSet,
     wl_format: u32,
     uploaded: bool,
+    buffer_id: u32,
+}
+
+enum TextureBacking {
+    Shm(Image),
+    Dmabuf(DmaBufImage),
+}
+
+impl TextureBacking {
+    fn view(&self) -> vk::ImageView {
+        match self {
+            Self::Shm(image) => image.view(),
+            Self::Dmabuf(image) => image.view(),
+        }
+    }
 }
 
 pub struct SurfaceTextureCache {
@@ -162,23 +180,31 @@ impl SurfaceTextureCache {
     ) -> anyhow::Result<()> {
         match cursor {
             Some(frame) => {
-                self.sync_pixels(
-                    vulkan,
-                    compositor,
-                    (frame.owner_id, frame.surface_id),
-                    &frame.pixels,
-                    frame.width as u32,
-                    frame.height as u32,
-                    frame.stride as u32,
-                    frame.format,
-                )
+                let key = (frame.owner_id, frame.surface_id);
+                if let Some(dmabuf) = frame.dmabuf.as_ref() {
+                    let surface = cursor_surface_view(frame);
+                    self.sync_dmabuf(vulkan, compositor, key, &surface, dmabuf)
+                } else {
+                    self.sync_shm_pixels(
+                        vulkan,
+                        compositor,
+                        key,
+                        frame.buffer_id,
+                        &frame.pixels,
+                        frame.width as u32,
+                        frame.height as u32,
+                        frame.stride as u32,
+                        frame.format,
+                    )
+                }
             }
             None => {
                 let default = default_cursor_frame();
-                self.sync_pixels(
+                self.sync_shm_pixels(
                     vulkan,
                     compositor,
                     CURSOR_TEXTURE_KEY,
+                    default.buffer_id,
                     &default.pixels,
                     default.width as u32,
                     default.height as u32,
@@ -189,21 +215,107 @@ impl SurfaceTextureCache {
         }
     }
 
-    fn sync_pixels(
+    fn sync_frame(
+        &mut self,
+        vulkan: &mut VulkanContext,
+        compositor: &GpuCompositor,
+        frame: &SurfaceFrame,
+    ) -> anyhow::Result<()> {
+        let key = (frame.owner_id, frame.surface_id);
+        if let Some(dmabuf) = frame.dmabuf.as_ref() {
+            self.sync_dmabuf(vulkan, compositor, key, frame, dmabuf)
+        } else {
+            self.sync_shm_pixels(
+                vulkan,
+                compositor,
+                key,
+                frame.buffer_id,
+                &frame.pixels,
+                frame.width as u32,
+                frame.height as u32,
+                frame.stride as u32,
+                frame.format,
+            )
+        }
+    }
+
+    fn sync_dmabuf(
         &mut self,
         vulkan: &mut VulkanContext,
         compositor: &GpuCompositor,
         key: (u32, u32),
+        frame: &SurfaceFrame,
+        dmabuf: &DmabufAttachment,
+    ) -> anyhow::Result<()> {
+        let width = frame.width as u32;
+        let height = frame.height as u32;
+        if self.textures.get(&key).is_some_and(|tex| {
+            matches!(tex.backing, TextureBacking::Dmabuf(_))
+                && tex.buffer_id == dmabuf.buffer_id
+                && tex.wl_format == frame.format
+        }) {
+            return Ok(());
+        }
+
+        let format = drm_fourcc_to_vulkan(dmabuf.drm_fourcc)
+            .with_context(|| format!("Unsupported DRM fourcc {:#x}", dmabuf.drm_fourcc))?;
+        let import_fd = dup_fd(dmabuf.fd.as_raw_fd())?;
+        let imported = DmaBufImage::import_from_dma_buf(
+            vulkan.device(),
+            vulkan.physical_device(),
+            import_fd,
+            width,
+            height,
+            format,
+            dmabuf.modifier,
+            dmabuf.offset as u64,
+            frame.stride as u32,
+        )?;
+        transition_image_to_shader_read(
+            vulkan.device(),
+            vulkan.graphics_command_pool(),
+            imported.image(),
+        )?;
+
+        let descriptor_set = compositor
+            .descriptor_pool
+            .allocate_sampler_set(vulkan.device(), &compositor.descriptor_layout)?;
+        write_texture_descriptor(
+            vulkan.device(),
+            descriptor_set,
+            imported.view(),
+            compositor.sampler.handle(),
+        );
+
+        self.textures.insert(
+            key,
+            SurfaceTexture {
+                backing: TextureBacking::Dmabuf(imported),
+                descriptor_set,
+                wl_format: frame.format,
+                uploaded: true,
+                buffer_id: dmabuf.buffer_id,
+            },
+        );
+        Ok(())
+    }
+
+    fn sync_shm_pixels(
+        &mut self,
+        vulkan: &mut VulkanContext,
+        compositor: &GpuCompositor,
+        key: (u32, u32),
+        buffer_id: u32,
         pixels: &[u8],
         width: u32,
         height: u32,
         stride: u32,
         wl_format: u32,
     ) -> anyhow::Result<()> {
-        let needs_create = self
-            .textures
-            .get(&key)
-            .is_none_or(|tex| tex.image.extent().width != width || tex.image.extent().height != height);
+        let needs_create = self.textures.get(&key).is_none_or(|tex| {
+            !matches!(tex.backing, TextureBacking::Shm(_))
+                || tex.extent().is_none_or(|extent| extent.width != width || extent.height != height)
+        });
 
         if needs_create {
             let image = vulkan.create_sampled_image(width, height)?;
@@ -213,10 +325,11 @@ impl SurfaceTextureCache {
             self.textures.insert(
                 key,
                 SurfaceTexture {
-                    image,
+                    backing: TextureBacking::Shm(image),
                     descriptor_set,
                     wl_format,
                     uploaded: false,
+                    buffer_id,
                 },
             );
         }
@@ -226,12 +339,17 @@ impl SurfaceTextureCache {
             .get_mut(&key)
             .context("Surface texture missing after create")?;
         texture.wl_format = wl_format;
+        texture.buffer_id = buffer_id;
 
+        let image = match &texture.backing {
+            TextureBacking::Shm(image) => image,
+            TextureBacking::Dmabuf(_) => anyhow::bail!("SHM upload targeted imported DMA-BUF"),
+        };
         upload_bgra_texture(
             vulkan.device(),
             vulkan.physical_device(),
             vulkan.graphics_command_pool(),
-            &texture.image,
+            image,
             pixels,
             width,
             height,
@@ -243,7 +361,7 @@ impl SurfaceTextureCache {
         write_texture_descriptor(
             vulkan.device(),
             texture.descriptor_set,
-            texture.image.view(),
+            image.view(),
             compositor.sampler.handle(),
         );
 
@@ -258,19 +376,102 @@ impl SurfaceTextureCache {
         cursor: Option<&CursorFrame>,
     ) -> anyhow::Result<()> {
         for frame in layers {
-            self.sync_pixels(
-                vulkan,
-                compositor,
-                (frame.owner_id, frame.surface_id),
-                &frame.pixels,
-                frame.width as u32,
-                frame.height as u32,
-                frame.stride as u32,
-                frame.format,
-            )?;
+            self.sync_frame(vulkan, compositor, frame)?;
         }
         self.sync_cursor(vulkan, compositor, cursor)
     }
+}
+
+impl SurfaceTexture {
+    fn extent(&self) -> Option<vk::Extent2D> {
+        match &self.backing {
+            TextureBacking::Shm(image) => Some(image.extent()),
+            TextureBacking::Dmabuf(image) => Some(image.extent()),
+        }
+    }
+}
+
+fn cursor_surface_view(cursor: &CursorFrame) -> SurfaceFrame {
+    SurfaceFrame {
+        owner_id: cursor.owner_id,
+        surface_id: cursor.surface_id,
+        buffer_id: cursor.buffer_id,
+        pixels: Vec::new(),
+        width: cursor.width,
+        height: cursor.height,
+        stride: cursor.stride,
+        format: cursor.format,
+        x: 0,
+        y: 0,
+        buffer_scale: cursor.buffer_scale,
+        dmabuf: None,
+        damage: Vec::new(),
+        full_surface: true,
+    }
+}
+
+fn dup_fd(fd: std::os::fd::RawFd) -> anyhow::Result<std::os::fd::OwnedFd> {
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    anyhow::ensure!(dup >= 0, "Failed to duplicate DMA-BUF fd");
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) })
+}
+
+fn transition_image_to_shader_read(
+    device: &Device,
+    command_pool: &CommandPool,
+    image: vk::Image,
+) -> anyhow::Result<()> {
+    let command_buffer = command_pool.allocate_command_buffer(device)?;
+    let record_result = (|| -> anyhow::Result<()> {
+        let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
+        let barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(color_subresource_range());
+        unsafe {
+            device.handle().cmd_pipeline_barrier(
+                recorder.command_buffer(),
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+        recorder.end()?;
+        Ok(())
+    })();
+    if let Err(error) = record_result {
+        command_pool.free_command_buffers(device, &[command_buffer]);
+        return Err(error);
+    }
+    let fence = match Fence::new(device, false) {
+        Ok(fence) => fence,
+        Err(error) => {
+            command_pool.free_command_buffers(device, &[command_buffer]);
+            return Err(error);
+        }
+    };
+    if let Err(error) = device.submit_graphics(&[command_buffer], &[], &[], &[], fence.handle()) {
+        command_pool.free_command_buffers(device, &[command_buffer]);
+        return Err(error);
+    }
+    if let Err(error) = fence
+        .wait_default()
+        .context("Timed out transitioning imported DMA-BUF")
+    {
+        let _ = device.wait_idle();
+        command_pool.free_command_buffers(device, &[command_buffer]);
+        return Err(error);
+    }
+    command_pool.free_command_buffers(device, &[command_buffer]);
+    Ok(())
 }
 
 pub fn composite_to_scanout(
@@ -280,6 +481,7 @@ pub fn composite_to_scanout(
     render_pass: &RenderPass,
     scanout_image: &DmaBufImage,
     framebuffer: &Framebuffer,
+    scanout_old_layout: vk::ImageLayout,
     output_width: u32,
     output_height: u32,
     clear_color: [f32; 4],
@@ -293,7 +495,12 @@ pub fn composite_to_scanout(
     let command_buffer = command_pool.allocate_command_buffer(device)?;
 
     let record_result = (|| -> anyhow::Result<()> {
-        transition_scanout_for_render(device, command_buffer, scanout_image)?;
+        transition_scanout_for_render(
+            device,
+            command_buffer,
+            scanout_image,
+            scanout_old_layout,
+        )?;
 
         let mut recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
         let clear_value = vk::ClearValue {
@@ -425,11 +632,31 @@ fn transition_scanout_for_render(
     device: &Device,
     command_buffer: vk::CommandBuffer,
     image: &DmaBufImage,
+    old_layout: vk::ImageLayout,
 ) -> anyhow::Result<()> {
+    if old_layout == vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+        return Ok(());
+    }
+
+    let (src_access, src_stage) = match old_layout {
+        vk::ImageLayout::UNDEFINED => (
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+        ),
+        vk::ImageLayout::GENERAL => (
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+        ),
+        _ => (
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+        ),
+    };
+
     let barrier = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .src_access_mask(src_access)
         .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-        .old_layout(vk::ImageLayout::GENERAL)
+        .old_layout(old_layout)
         .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -438,7 +665,7 @@ fn transition_scanout_for_render(
     unsafe {
         device.handle().cmd_pipeline_barrier(
             command_buffer,
-            vk::PipelineStageFlags::ALL_COMMANDS,
+            src_stage,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::DependencyFlags::empty(),
             &[],
@@ -607,12 +834,15 @@ fn color_subresource_range() -> vk::ImageSubresourceRange {
     }
 }
 
-fn spv_from_bytes(bytes: &[u8]) -> &[u32] {
+fn spv_from_bytes(bytes: &[u8]) -> Vec<u32> {
     assert!(
         bytes.len().is_multiple_of(4),
         "SPIR-V bytecode length must be a multiple of 4"
     );
-    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len() / 4) }
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
 }
 
 struct StagingBuffer {

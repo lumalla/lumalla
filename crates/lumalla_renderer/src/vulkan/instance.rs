@@ -310,6 +310,8 @@ impl VulkanContext {
 
 impl Drop for VulkanContext {
     fn drop(&mut self) {
+        drop(self.scanout_render_pass.take());
+
         // Command pool must be destroyed before device
         if let (Some(command_pool), Some(device)) = (&mut self.graphics_command_pool, &self.device)
         {

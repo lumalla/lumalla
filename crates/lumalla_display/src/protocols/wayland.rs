@@ -215,18 +215,18 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
             .surface_manager
             .surface_role_is_cursor(ctx.client_id, commit.surface_id);
         if is_cursor || commit.mapped {
-            let (pixels, width, height, stride, format) =
+            let (pixels, width, height, stride, format, dmabuf) =
                 if state.dmabuf_manager.has_buffer(ctx.client_id, buffer_id) {
-                    match state.dmabuf_manager.snapshot_buffer(ctx.client_id, buffer_id) {
-                        Ok(snapshot) => (
-                            snapshot.pixels,
-                            snapshot.width,
-                            snapshot.height,
-                            snapshot.stride,
-                            snapshot.format,
-                        ),
+                    match state.dmabuf_manager.export_buffer(ctx.client_id, buffer_id) {
+                        Ok(exported) => {
+                            let width = exported.width as usize;
+                            let height = exported.height as usize;
+                            let stride = exported.stride as usize;
+                            let format = exported.wl_format;
+                            (Vec::new(), width, height, stride, format, Some(exported))
+                        }
                         Err(error) => {
-                            debug!("dmabuf snapshot failed: {error}");
+                            debug!("dmabuf export failed: {error}");
                             let message = error.to_string();
                             ctx.writer
                                 .wl_display_error(DISPLAY_OBJECT_ID)
@@ -244,6 +244,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                             snapshot.height,
                             snapshot.stride,
                             snapshot.format,
+                            None,
                         ),
                         Err(error) => {
                             report_shm_error(ctx, buffer_id, &error);
@@ -279,6 +280,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                         offset_y: commit.offset.1,
                         x: 0,
                         y: 0,
+                        dmabuf,
                         damage,
                         full_surface: true,
                     }));
@@ -300,6 +302,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                         offset_y: commit.offset.1,
                         x: output_x,
                         y: output_y,
+                        dmabuf,
                         damage,
                         full_surface,
                     }));
@@ -2229,7 +2232,17 @@ mod tests {
         };
         assert_eq!(frame.surface_id, object_id(6));
         assert_eq!(frame.buffer_id, object_id(10));
-        assert_eq!(frame.pixels, [0xaa, 0xbb, 0xcc, 0xff]);
+        assert!(frame.pixels.is_empty());
+        let exported = frame.dmabuf.as_ref().expect("dmabuf export");
+        assert_eq!(exported.width, 1);
+        assert_eq!(exported.height, 1);
+        assert_eq!(exported.stride, 4);
+        assert_eq!(exported.drm_fourcc, DRM_FORMAT_XRGB8888);
         assert_eq!(frame.format, WL_SHM_FORMAT_XRGB8888);
+        let snap = state
+            .dmabuf_manager
+            .snapshot_buffer(frame.client_id, frame.buffer_id)
+            .unwrap();
+        assert_eq!(snap.pixels, [0xaa, 0xbb, 0xcc, 0xff]);
     }
 }

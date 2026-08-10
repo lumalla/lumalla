@@ -20,8 +20,8 @@ use lumalla_display::{
 };
 use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
 use lumalla_renderer::{
-    CursorFrame, OutputDamageRect, PresentStatus, RenderScheduler, RendererState, SOLID_CLEAR_COLOR,
-    SurfaceFrame,
+    CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RenderScheduler, RendererState,
+    SOLID_CLEAR_COLOR, SurfaceFrame,
 };
 use lumalla_seat::SeatState;
 use lumalla_shared::{
@@ -582,9 +582,17 @@ impl AppData {
         for update in updates {
             match update {
                 SurfaceUpdate::Frame(frame) => {
-                    let frame = SurfaceFrame {
+                    let dmabuf = frame.dmabuf.map(|exported| DmabufAttachment {
+                        buffer_id: frame.buffer_id.get(),
+                        fd: exported.fd,
+                        drm_fourcc: exported.drm_fourcc,
+                        offset: exported.offset,
+                        modifier: exported.modifier,
+                    });
+                    let surface = SurfaceFrame {
                         owner_id: frame.client_id.get(),
                         surface_id: frame.surface_id.get(),
+                        buffer_id: frame.buffer_id.get(),
                         pixels: frame.pixels,
                         width: frame.width,
                         height: frame.height,
@@ -593,6 +601,7 @@ impl AppData {
                         x: frame.x,
                         y: frame.y,
                         buffer_scale: frame.buffer_scale,
+                        dmabuf,
                         damage: frame
                             .damage
                             .into_iter()
@@ -605,7 +614,7 @@ impl AppData {
                             .collect(),
                         full_surface: frame.full_surface,
                     };
-                    if let Err(err) = self.renderer_state.set_surface_frame(frame) {
+                    if let Err(err) = self.renderer_state.set_surface_frame(surface) {
                         error!("Unable to queue committed Wayland surface: {err:#}");
                     }
                 }
@@ -619,9 +628,17 @@ impl AppData {
                         })
                         .map(|cursor| (cursor.hotspot_x, cursor.hotspot_y))
                         .unwrap_or((0, 0));
+                    let dmabuf = frame.dmabuf.map(|exported| DmabufAttachment {
+                        buffer_id: frame.buffer_id.get(),
+                        fd: exported.fd,
+                        drm_fourcc: exported.drm_fourcc,
+                        offset: exported.offset,
+                        modifier: exported.modifier,
+                    });
                     let cursor = CursorFrame {
                         owner_id: frame.client_id.get(),
                         surface_id: frame.surface_id.get(),
+                        buffer_id: frame.buffer_id.get(),
                         pixels: frame.pixels,
                         width: frame.width,
                         height: frame.height,
@@ -630,6 +647,7 @@ impl AppData {
                         hotspot_x: hotspot.0,
                         hotspot_y: hotspot.1,
                         buffer_scale: frame.buffer_scale,
+                        dmabuf,
                     };
                     if let Err(err) = self.renderer_state.set_cursor_frame(cursor) {
                         error!("Unable to queue committed cursor surface: {err:#}");

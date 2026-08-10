@@ -584,6 +584,7 @@ mod tests {
         SurfaceFrame {
             owner_id: 1,
             surface_id: 2,
+            buffer_id: 3,
             pixels: vec![0; 16],
             width: 2,
             height: 2,
@@ -592,6 +593,7 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            dmabuf: None,
             damage: Vec::new(),
             full_surface: true,
         }
@@ -650,6 +652,7 @@ mod tests {
         let cursor = CursorFrame {
             owner_id: 1,
             surface_id: 3,
+            buffer_id: 4,
             pixels: vec![10; 4],
             width: 1,
             height: 1,
@@ -658,6 +661,7 @@ mod tests {
             hotspot_x: 0,
             hotspot_y: 0,
             buffer_scale: 1,
+            dmabuf: None,
         };
         let rects = cursor_damage_rects(&cursor, (0, 0), (3, 0));
         assert_eq!(rects.len(), 1);
@@ -669,6 +673,7 @@ mod tests {
         let cursor = CursorFrame {
             owner_id: 1,
             surface_id: 3,
+            buffer_id: 4,
             pixels: vec![10; 4],
             width: 1,
             height: 1,
@@ -677,6 +682,7 @@ mod tests {
             hotspot_x: 0,
             hotspot_y: 0,
             buffer_scale: 1,
+            dmabuf: None,
         };
         let first = cursor_damage_rects(&cursor, (0, 0), (10, 0));
         let second = cursor_damage_rects(&cursor, (10, 0), (20, 0));
