@@ -47,24 +47,55 @@
           RUSTFLAGS = "-L ${pkgs.libgbm}/lib -L ${pkgs.libdrm}/lib";
         };
 
+        cargoRuntimeInputs = with pkgs; [
+          cargo
+          rustc
+          pkg-config
+          clang
+          libclang
+        ];
+
         runLocal = pkgs.writeShellApplication {
           name = "lumalla-run-local";
-          runtimeInputs = with pkgs; [
-            cargo
-            rustc
-            pkg-config
-            clang
-            libclang
-          ];
+          runtimeInputs = cargoRuntimeInputs;
           text = builtins.readFile ./run-local.sh;
+        };
+
+        cpuProfiling = pkgs.writeShellApplication {
+          name = "lumalla-cpu-profiling";
+          runtimeInputs = cargoRuntimeInputs ++ (with pkgs; [
+            perf
+            hotspot
+          ]);
+          text = builtins.readFile ./cpu-profiling.sh;
+        };
+
+        memProfiling = pkgs.writeShellApplication {
+          name = "lumalla-mem-profiling";
+          runtimeInputs = cargoRuntimeInputs ++ (with pkgs; [
+            heaptrack
+          ]);
+          text = builtins.readFile ./mem-profiling.sh;
         };
       in {
         packages.default = naersk'.buildPackage commonBuildArgs;
         packages.run-local = runLocal;
+        packages.cpu-profiling = cpuProfiling;
+        packages.mem-profiling = memProfiling;
 
         apps.run-local = {
           type = "app";
           program = "${runLocal}/bin/lumalla-run-local";
+        };
+
+        apps.cpu-profiling = {
+          type = "app";
+          program = "${cpuProfiling}/bin/lumalla-cpu-profiling";
+        };
+
+        apps.mem-profiling = {
+          type = "app";
+          program = "${memProfiling}/bin/lumalla-mem-profiling";
         };
 
         checks.default = naersk'.buildPackage (commonBuildArgs
@@ -92,7 +123,12 @@
             clang
             libclang
             libdrm.dev
+            perf
+            hotspot
+            heaptrack
             runLocal
+            cpuProfiling
+            memProfiling
           ];
           buildInputs = with pkgs; [
             seatd

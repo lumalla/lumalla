@@ -49,3 +49,9 @@ log = { workspace = true }
 anyhow = { workspace = true }
 mio = { workspace = true }
 signal-hook = { workspace = true }
+
+# Optimized build with debug info for CPU/memory profilers (perf, heaptrack, …).
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
