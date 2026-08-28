@@ -272,6 +272,20 @@ impl SurfaceTextureCache {
         self.textures.get(&key)
     }
 
+    fn replace_texture(
+        &mut self,
+        device: &Device,
+        pool: &DescriptorPool,
+        key: (u32, u32),
+        texture: SurfaceTexture,
+    ) -> anyhow::Result<()> {
+        if let Some(old) = self.textures.remove(&key) {
+            pool.free_set(device, old.descriptor_set)?;
+        }
+        self.textures.insert(key, texture);
+        Ok(())
+    }
+
     fn sync_cursor(
         &mut self,
         vulkan: &mut VulkanContext,
@@ -369,7 +383,9 @@ impl SurfaceTextureCache {
             let descriptor_set = compositor
                 .descriptor_pool
                 .allocate_sampler_set(vulkan.device(), &compositor.descriptor_layout)?;
-            self.textures.insert(
+            self.replace_texture(
+                vulkan.device(),
+                &compositor.descriptor_pool,
                 key,
                 SurfaceTexture {
                     backing: TextureBacking::Shm(image),
@@ -383,7 +399,7 @@ impl SurfaceTextureCache {
                     dmabuf_width: 0,
                     dmabuf_height: 0,
                 },
-            );
+            )?;
         }
 
         let texture = self
@@ -530,7 +546,9 @@ impl SurfaceTextureCache {
             compositor.sampler.handle(),
         );
 
-        self.textures.insert(
+        self.replace_texture(
+            vulkan.device(),
+            &compositor.descriptor_pool,
             key,
             SurfaceTexture {
                 backing: TextureBacking::Dmabuf(imported),
@@ -544,7 +562,7 @@ impl SurfaceTextureCache {
                 dmabuf_width: width,
                 dmabuf_height: height,
             },
-        );
+        )?;
         Ok(())
     }
 
@@ -571,7 +589,9 @@ impl SurfaceTextureCache {
             let descriptor_set = compositor
                 .descriptor_pool
                 .allocate_sampler_set(vulkan.device(), &compositor.descriptor_layout)?;
-            self.textures.insert(
+            self.replace_texture(
+                vulkan.device(),
+                &compositor.descriptor_pool,
                 key,
                 SurfaceTexture {
                     backing: TextureBacking::Shm(image),
@@ -585,7 +605,7 @@ impl SurfaceTextureCache {
                     dmabuf_width: 0,
                     dmabuf_height: 0,
                 },
-            );
+            )?;
         }
 
         let texture = self
@@ -939,14 +959,13 @@ pub fn composite_to_scanout(
     let command_buffer = command_pool.allocate_command_buffer(device)?;
 
     let record_result = (|| -> anyhow::Result<()> {
+        let mut recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
         transition_scanout_for_render(
             device,
-            command_buffer,
+            recorder.command_buffer(),
             scanout_image,
             scanout_old_layout,
         )?;
-
-        let mut recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
         recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
 
         match composite_mode {

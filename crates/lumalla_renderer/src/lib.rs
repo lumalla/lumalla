@@ -941,51 +941,59 @@ impl RendererState {
                 .compositor
                 .take()
                 .context("GPU compositor missing after init")?;
-            self.gpu.surface_textures.sync_scene(
-                vulkan,
-                &compositor,
-                &mut batch,
-                &layers,
-                cursor,
-                &composite_mode,
-                &dirty_surfaces,
-                &pending_surface_buffer_damage,
-                &_pending_damage,
-                pointer_damage || cursor_buffer_dirty,
-            )?;
+            let gpu_result = (|| -> anyhow::Result<()> {
+                self.gpu.surface_textures.sync_scene(
+                    vulkan,
+                    &compositor,
+                    &mut batch,
+                    &layers,
+                    cursor,
+                    &composite_mode,
+                    &dirty_surfaces,
+                    &pending_surface_buffer_damage,
+                    &_pending_damage,
+                    pointer_damage || cursor_buffer_dirty,
+                )?;
 
-            vulkan.ensure_scanout_render_pass()?;
-            let render_pass = match &composite_mode {
-                CompositeMode::Full => vulkan.scanout_render_pass()?,
-                CompositeMode::Partial(_) => {
-                    vulkan.ensure_scanout_render_pass_load()?;
-                    vulkan.scanout_render_pass_load()?
-                }
-            };
-            let scanout_old_layout = if buffer.fresh {
-                vk::ImageLayout::UNDEFINED
-            } else {
-                vk::ImageLayout::GENERAL
-            };
-            composite_to_scanout(
-                vulkan,
-                &mut batch,
-                &compositor,
-                &self.gpu.surface_textures,
-                render_pass,
-                &buffer.dma_image,
-                &buffer.framebuffer,
-                scanout_old_layout,
-                width,
-                height,
-                color,
-                composite_mode,
-                &layers,
-                cursor,
-                pointer_x,
-                pointer_y,
-            )
-            .context("Failed to GPU-composite scene to scanout buffer")?;
+                vulkan.ensure_scanout_render_pass()?;
+                let render_pass = match &composite_mode {
+                    CompositeMode::Full => vulkan.scanout_render_pass()?,
+                    CompositeMode::Partial(_) => {
+                        vulkan.ensure_scanout_render_pass_load()?;
+                        vulkan.scanout_render_pass_load()?
+                    }
+                };
+                let scanout_old_layout = if buffer.fresh {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    vk::ImageLayout::GENERAL
+                };
+                composite_to_scanout(
+                    vulkan,
+                    &mut batch,
+                    &compositor,
+                    &self.gpu.surface_textures,
+                    render_pass,
+                    &buffer.dma_image,
+                    &buffer.framebuffer,
+                    scanout_old_layout,
+                    width,
+                    height,
+                    color,
+                    composite_mode,
+                    &layers,
+                    cursor,
+                    pointer_x,
+                    pointer_y,
+                )
+                .context("Failed to GPU-composite scene to scanout buffer")?;
+                Ok(())
+            })();
+            if let Err(error) = gpu_result {
+                self.gpu.surface_textures.clear();
+                self.gpu.compositor = Some(compositor);
+                return Err(error);
+            }
             self.gpu.compositor = Some(compositor);
 
             buffer.gpu_pending = Some(batch.submit(vulkan.device())?);

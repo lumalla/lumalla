@@ -90,5 +90,6 @@ end)
 
 lum.on_startup(function()
 	enable_all_outputs(lum.get_drm_devices())
-	lum.spawn({ command = "qalculate-qt" })
+	-- lum.spawn({ command = "qalculate-qt" })
+	lum.spawn({ command = "wezterm", args = { "start", "--always-new-process" } })
 end)

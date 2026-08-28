@@ -149,8 +149,11 @@ fn report_data_device_error(ctx: &mut Ctx, object_id: ObjectId, error: DataDevic
 }
 
 fn div_ceil_i32(value: i32, divisor: i32) -> i32 {
-    let divisor = divisor.max(1);
-    (value + divisor - 1) / divisor
+    let divisor = i64::from(divisor.max(1));
+    let value = i64::from(value.max(0));
+    ((value + divisor - 1) / divisor)
+        .try_into()
+        .unwrap_or(i32::MAX)
 }
 
 /// Maps commit damage hints to output-space and buffer-space rectangles.
@@ -195,10 +198,10 @@ fn commit_damage(
                 height: rect.height,
             });
             buffer_damage.push(Rectangle {
-                x: rect.x * scale,
-                y: rect.y * scale,
-                width: rect.width * scale,
-                height: rect.height * scale,
+                x: rect.x.saturating_mul(scale),
+                y: rect.y.saturating_mul(scale),
+                width: rect.width.saturating_mul(scale),
+                height: rect.height.saturating_mul(scale),
             });
         }
     }

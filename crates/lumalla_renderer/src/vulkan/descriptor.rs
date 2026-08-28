@@ -119,6 +119,12 @@ impl DescriptorPool {
         Ok(sets[0])
     }
 
+    pub fn free_set(&self, device: &Device, set: vk::DescriptorSet) -> anyhow::Result<()> {
+        unsafe { device.handle().free_descriptor_sets(self.handle, &[set]) }
+            .context("Failed to free descriptor set")?;
+        Ok(())
+    }
+
     pub fn handle(&self) -> vk::DescriptorPool {
         self.handle
     }
