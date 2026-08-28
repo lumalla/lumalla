@@ -9,7 +9,8 @@ include = ["src/**/*", "LICENSE-*", "build.rs"]
 
 [dependencies]
 anyhow = { workspace = true }
-mio = { workspace = true }
+io-uring = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
 
 [build-dependencies]

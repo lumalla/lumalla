@@ -2,7 +2,6 @@
 
 use std::{
     ffi::{CStr, CString, OsStr, c_char, c_int, c_void},
-    io,
     marker::PhantomData,
     os::{
         fd::{IntoRawFd, RawFd},
@@ -17,7 +16,6 @@ use anyhow::Context;
 use log::{debug, info, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::Udev;
-use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
 
 #[allow(
     non_camel_case_types,
@@ -335,27 +333,9 @@ impl Drop for LibInput {
     }
 }
 
-impl Source for LibInput {
-    fn register(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        SourceFd(&self.fd).register(registry, token, interests)
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        SourceFd(&self.fd).reregister(registry, token, interests)
-    }
-
-    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-        SourceFd(&self.fd).deregister(registry)
+impl LibInput {
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.fd
     }
 }
 

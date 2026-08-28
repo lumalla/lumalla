@@ -9,7 +9,6 @@ use ash::vk;
 use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::{DrmDeviceState, OutputConfig};
-use mio::{Interest, Registry, Token, event::Source};
 
 pub mod drm;
 pub mod vulkan;
@@ -1192,27 +1191,9 @@ struct PresentTarget {
     output: ConnectedOutput,
 }
 
-impl Source for RendererState {
-    fn register(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        self.drm_devices.register(registry, token, interests)
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        self.drm_devices.reregister(registry, token, interests)
-    }
-
-    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-        self.drm_devices.deregister(registry)
+impl RendererState {
+    pub fn udev_monitor_fd(&self) -> RawFd {
+        self.drm_devices.monitor_fd()
     }
 }
 

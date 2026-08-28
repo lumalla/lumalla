@@ -18,7 +18,9 @@ mod surface;
 mod output;
 mod xdg;
 
-pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland};
+pub use lumalla_wayland_protocol::{
+    buffer::ReadResult, ClientConnection, ClientId, Wayland,
+};
 pub use seat::{ActiveCursor, KeyboardModifiers};
 pub use output::OutputInfo;
 pub use surface::Rectangle;

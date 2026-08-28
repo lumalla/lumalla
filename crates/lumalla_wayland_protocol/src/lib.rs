@@ -1,11 +1,13 @@
 use anyhow::Context;
 use log::{debug, error};
-use mio::{event::Source, unix::SourceFd};
 use std::{
     fs, io,
     num::NonZeroU32,
     ops::Deref,
-    os::{fd::AsRawFd, unix::net::UnixListener},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        unix::net::UnixListener,
+    },
     path::Path,
 };
 
@@ -72,16 +74,38 @@ impl Wayland {
         })
     }
 
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+
+    /// Allocate the next client id (used when accepting via io_uring).
+    pub fn allocate_client_id(&mut self) -> Option<ClientId> {
+        let client_id = self.next_client_id;
+        let next = NonZeroU32::new(self.next_client_id.get() + 1)?;
+        self.next_client_id = ClientId::new(next);
+        Some(client_id)
+    }
+
+    /// Create a client from an accepted connection fd.
+    pub fn client_from_accepted_fd(&mut self, fd: RawFd) -> Option<ClientConnection> {
+        let client_id = self.allocate_client_id()?;
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        match ClientConnection::from_accepted_fd(owned, client_id) {
+            Ok(client) => {
+                debug!("New client connected with ID: {:?}", client_id);
+                Some(client)
+            }
+            Err(e) => {
+                error!("Failed to create client connection: {}", e);
+                None
+            }
+        }
+    }
+
     pub fn next_client(&mut self) -> Option<ClientConnection> {
         match self.listener.accept() {
             Ok((stream, _addr)) => {
-                let client_id = self.next_client_id;
-                let Some(next_client_id) = NonZeroU32::new(self.next_client_id.get() + 1) else {
-                    error!("Failed to increment client ID");
-                    return None;
-                };
-                self.next_client_id = ClientId::new(next_client_id);
-
+                let client_id = self.allocate_client_id()?;
                 match ClientConnection::new(stream, client_id) {
                     Ok(client) => {
                         debug!("New client connected with ID: {:?}", client_id);
@@ -93,10 +117,7 @@ impl Wayland {
                     }
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // No more clients to accept
-                None
-            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => None,
             Err(e) => {
                 error!("Failed to accept client: {}", e);
                 None
@@ -105,37 +126,12 @@ impl Wayland {
     }
 
     pub fn socket_path(&self) -> &str {
-        &self.socket_path
-    }
-}
-
-impl Source for Wayland {
-    fn register(
-        &mut self,
-        registry: &mio::Registry,
-        token: mio::Token,
-        interests: mio::Interest,
-    ) -> io::Result<()> {
-        SourceFd(&self.listener.as_raw_fd()).register(registry, token, interests)
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &mio::Registry,
-        token: mio::Token,
-        interests: mio::Interest,
-    ) -> io::Result<()> {
-        SourceFd(&self.listener.as_raw_fd()).reregister(registry, token, interests)
-    }
-
-    fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()> {
-        SourceFd(&self.listener.as_raw_fd()).deregister(registry)
+        self.socket_path.as_str()
     }
 }
 
 impl Drop for Wayland {
     fn drop(&mut self) {
-        // Clean up socket file when dropping
         if Path::new(&self.socket_path).exists() {
             if let Err(e) = fs::remove_file(&self.socket_path) {
                 error!("Failed to remove socket file: {}", e);

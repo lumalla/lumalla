@@ -12,7 +12,6 @@ use anyhow::Context;
 use log::{info, warn};
 use lumalla_seat::{SeatDevice, SeatState};
 use lumalla_shared::{DrmConnector, DrmDeviceState, Udev, UdevMonitor};
-use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
 
 use super::connector::probe_connectors;
 use super::modeset::enable_atomic_client_caps;
@@ -352,29 +351,9 @@ impl DrmDevices {
         }
         Ok(())
     }
-}
 
-impl Source for DrmDevices {
-    fn register(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        SourceFd(&self.monitor.fd()).register(registry, token, interests)
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        SourceFd(&self.monitor.fd()).reregister(registry, token, interests)
-    }
-
-    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-        SourceFd(&self.monitor.fd()).deregister(registry)
+    pub fn monitor_fd(&self) -> std::os::fd::RawFd {
+        self.monitor.fd()
     }
 }
 

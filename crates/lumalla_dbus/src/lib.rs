@@ -8,7 +8,6 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
-    time::Duration,
 };
 
 use anyhow::Context;
@@ -18,8 +17,10 @@ use lumalla_ipc::{
     BUS_NAME, OBJECT_PATH, WindowManager, signals,
     types::{DrmDeviceInfo, OutputInfo},
 };
-use lumalla_shared::{Comms, DbusMessage, DrmDeviceState, MESSAGE_CHANNEL_TOKEN, MainMessage, Output};
-use mio::{Events, Poll};
+use lumalla_shared::{
+    Completion, Comms, DbusMessage, DrmDeviceState, EventLoop, MESSAGE_CHANNEL_TOKEN, MainMessage,
+    OpKind, Output, monotonic_deadline_after,
+};
 use zbus::{Error as ZbusError, blocking::connection};
 
 /// A registered D-Bus service that must be kept alive for the lifetime of the compositor.
@@ -87,7 +88,7 @@ impl DbusService {
 
 struct DbusState {
     channel: mpsc::Receiver<DbusMessage>,
-    event_loop: Poll,
+    event_loop: EventLoop,
     shutting_down: bool,
     connection: zbus::blocking::Connection,
     outputs: Arc<Mutex<Vec<OutputInfo>>>,
@@ -97,7 +98,7 @@ struct DbusState {
 }
 
 impl DbusState {
-    fn new(event_loop: Poll, channel: mpsc::Receiver<DbusMessage>, service: DbusService) -> Self {
+    fn new(event_loop: EventLoop, channel: mpsc::Receiver<DbusMessage>, service: DbusService) -> Self {
         Self {
             channel,
             event_loop,
@@ -111,23 +112,16 @@ impl DbusState {
     }
 
     fn run(&mut self) -> anyhow::Result<()> {
-        let mut events = Events::with_capacity(128);
+        let mut completions = Vec::with_capacity(16);
         loop {
-            if let Err(err) = self
-                .event_loop
-                .poll(&mut events, Some(Duration::from_millis(50)))
-            {
-                error!("Unable to poll D-Bus event loop: {err}");
+            let (sec, nsec) = monotonic_deadline_after(std::time::Duration::from_millis(50))?;
+            self.event_loop.set_absolute_timeout_timespec(sec, nsec)?;
+            if let Err(err) = self.event_loop.wait(&mut completions) {
+                error!("Unable to wait on D-Bus event loop: {err}");
             }
 
-            for event in events.iter() {
-                if event.token() == MESSAGE_CHANNEL_TOKEN {
-                    while let Ok(message) = self.channel.try_recv() {
-                        if let Err(err) = self.handle_message(message) {
-                            error!("Unable to handle D-Bus message: {err}");
-                        }
-                    }
-                }
+            for completion in completions.drain(..) {
+                self.handle_completion(completion);
             }
 
             if self.shutting_down {
@@ -135,7 +129,32 @@ impl DbusState {
             }
         }
 
+        self.event_loop.shutdown_drain()?;
         Ok(())
+    }
+
+    fn handle_completion(&mut self, completion: Completion) {
+        match completion.kind {
+            OpKind::Wake => {
+                while let Ok(message) = self.channel.try_recv() {
+                    if let Err(err) = self.handle_message(message) {
+                        error!("Unable to handle D-Bus message: {err}");
+                    }
+                }
+                if let Err(err) = self.event_loop.rearm_waker() {
+                    error!("Unable to re-arm D-Bus waker: {err}");
+                }
+            }
+            OpKind::Timeout | OpKind::Cancel => {}
+            other => {
+                debug_assert!(
+                    false,
+                    "unexpected D-Bus completion kind {other:?} id={}",
+                    completion.id
+                );
+            }
+        }
+        let _ = MESSAGE_CHANNEL_TOKEN;
     }
 
     fn handle_message(&mut self, message: DbusMessage) -> anyhow::Result<()> {
@@ -197,7 +216,7 @@ impl DbusState {
 /// Run the D-Bus message loop on a dedicated thread.
 pub fn run_thread(
     comms: Comms,
-    event_loop: Poll,
+    event_loop: EventLoop,
     channel: mpsc::Receiver<DbusMessage>,
     service: DbusService,
 ) -> anyhow::Result<JoinHandle<()>> {
@@ -248,7 +267,7 @@ mod tests {
         let err = second.err().unwrap();
         assert!(
             format!("{err:#}").contains("already owns"),
-            "unexpected error: {err:#}"
+            "error should mention name ownership: {err:#}"
         );
         drop(holder);
     }

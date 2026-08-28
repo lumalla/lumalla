@@ -10,6 +10,10 @@
   </p>
 </div>
 
+## Requirements
+
+- Linux with io_uring (kernel 5.19+ recommended for async cancel-by-fd; Accept / RecvMsg / SendMsg / Timeout ABS)
+
 ## License
 
 Except where noted, all code in this repository is dual-licensed under either:

@@ -1,45 +1,43 @@
 use log::warn;
-use mio::{Poll, Waker};
 use std::sync::{Arc, mpsc};
 
-use crate::{DbusMessage, MESSAGE_CHANNEL_TOKEN, MainMessage};
+use crate::ring::{EventLoop, SharedWaker};
 
-/// Create a new event loop with a message channel already set up
-pub fn message_loop_with_channel<M>() -> anyhow::Result<(Poll, mpsc::Receiver<M>, MessageSender<M>)>
-{
-    let event_loop = mio::Poll::new()?;
+/// Create a new event loop with a message channel already set up.
+pub fn message_loop_with_channel<M>()
+-> anyhow::Result<(EventLoop, mpsc::Receiver<M>, MessageSender<M>)> {
+    let event_loop = EventLoop::new(1024)?;
     let (sender, receiver) = mpsc::channel();
-    let waker = Waker::new(event_loop.registry(), MESSAGE_CHANNEL_TOKEN)?;
+    let waker = Arc::new(event_loop.waker());
     Ok((
         event_loop,
         receiver,
-        MessageSender::new(sender, Arc::new(waker)),
+        MessageSender::new(sender, waker),
     ))
 }
 
-/// A sender that works with mio channels
+/// A sender that wakes an [`EventLoop`] when a message is queued.
 #[derive(Debug)]
 pub struct MessageSender<T> {
     sender: mpsc::Sender<T>,
-    waker: std::sync::Arc<mio::Waker>,
+    waker: SharedWaker,
 }
 
 impl<T> Clone for MessageSender<T> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
-            waker: self.waker.clone(),
+            waker: Arc::clone(&self.waker),
         }
     }
 }
 
 impl<T> MessageSender<T> {
-    /// Create a new MioSender
-    pub fn new(sender: mpsc::Sender<T>, waker: std::sync::Arc<mio::Waker>) -> Self {
+    pub fn new(sender: mpsc::Sender<T>, waker: SharedWaker) -> Self {
         Self { sender, waker }
     }
 
-    /// Send a message and wake up the event loop
+    /// Send a message and wake up the event loop.
     pub fn send(&self, message: T) -> Result<(), mpsc::SendError<T>> {
         let result = self.sender.send(message);
         if result.is_ok() {
@@ -50,11 +48,10 @@ impl<T> MessageSender<T> {
 }
 
 /// Holds the channels for general communication and sending messages to the different threads.
-/// Also, provides some convenience methods for interacting with other threads.
 #[derive(Clone)]
 pub struct Comms {
-    to_main: MessageSender<MainMessage>,
-    to_dbus: MessageSender<DbusMessage>,
+    to_main: MessageSender<crate::MainMessage>,
+    to_dbus: MessageSender<crate::DbusMessage>,
 }
 
 impl std::fmt::Debug for Comms {
@@ -64,35 +61,33 @@ impl std::fmt::Debug for Comms {
 }
 
 impl Comms {
-    /// Creates a new instance of `Comms` with the given channels.
-    pub fn new(to_main: MessageSender<MainMessage>, to_dbus: MessageSender<DbusMessage>) -> Self {
+    pub fn new(
+        to_main: MessageSender<crate::MainMessage>,
+        to_dbus: MessageSender<crate::DbusMessage>,
+    ) -> Self {
         Comms { to_main, to_dbus }
     }
 
-    /// Sends a message to the main thread.
-    pub fn main(&self, message: MainMessage) {
+    pub fn main(&self, message: crate::MainMessage) {
         self.to_main
             .send(message)
             .expect("Lost connection to the main thread");
     }
 
-    /// Get a message sender for sending messages to the main thread.
-    pub fn main_sender(&self) -> MessageSender<MainMessage> {
+    pub fn main_sender(&self) -> MessageSender<crate::MainMessage> {
         self.to_main.clone()
     }
 
-    /// Sends a message to the D-Bus thread.
-    pub fn dbus(&self, message: DbusMessage) {
+    pub fn dbus(&self, message: crate::DbusMessage) {
         if let Err(e) = self.to_dbus.send(message) {
             warn!("Lost connection to D-Bus ({e}). Requesting shutdown");
             self.to_main
-                .send(MainMessage::Shutdown)
+                .send(crate::MainMessage::Shutdown)
                 .expect("Lost connection to the main thread");
         }
     }
 
-    /// Get a message sender for sending messages to the D-Bus thread.
-    pub fn dbus_sender(&self) -> MessageSender<DbusMessage> {
+    pub fn dbus_sender(&self) -> MessageSender<crate::DbusMessage> {
         self.to_dbus.clone()
     }
 }
@@ -100,6 +95,7 @@ impl Comms {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DbusMessage, MainMessage};
     use std::sync::mpsc;
 
     struct Receivers {

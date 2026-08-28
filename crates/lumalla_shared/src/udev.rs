@@ -252,7 +252,7 @@ impl UdevMonitor {
         Ok(())
     }
 
-    /// File descriptor suitable for `poll`/`epoll`/`mio`.
+    /// File descriptor suitable for polling / io_uring POLL_ADD.
     pub fn fd(&self) -> RawFd {
         unsafe { bindings::udev_monitor_get_fd(self.monitor.as_ptr()) }
     }

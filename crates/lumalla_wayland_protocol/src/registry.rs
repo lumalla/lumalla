@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     num::NonZeroU32,
-    os::fd::RawFd,
+    os::fd::OwnedFd,
 };
 
 use crate::{
@@ -277,7 +277,7 @@ pub trait RequestHandler {
         ctx: &mut Ctx,
         header: &MessageHeader,
         data: &[u8],
-        fds: &mut VecDeque<RawFd>,
+        fds: &mut VecDeque<OwnedFd>,
     ) -> anyhow::Result<()>;
 }
 
@@ -291,7 +291,7 @@ where
         ctx: &mut Ctx,
         header: &MessageHeader,
         data: &[u8],
-        fds: &mut VecDeque<RawFd>,
+        fds: &mut VecDeque<OwnedFd>,
     ) -> anyhow::Result<()> {
         match object.interface_index {
             InterfaceIndex::WlDisplay => {
@@ -385,16 +385,14 @@ where
             InterfaceIndex::ZwpLinuxBufferParamsV1 => {
                 ZwpLinuxBufferParamsV1::handle_request(self, ctx, header, data, fds, object.version)
             }
-            InterfaceIndex::ZwpLinuxDmabufFeedbackV1 => {
-                ZwpLinuxDmabufFeedbackV1::handle_request(
-                    self,
-                    ctx,
-                    header,
-                    data,
-                    fds,
-                    object.version,
-                )
-            }
+            InterfaceIndex::ZwpLinuxDmabufFeedbackV1 => ZwpLinuxDmabufFeedbackV1::handle_request(
+                self,
+                ctx,
+                header,
+                data,
+                fds,
+                object.version,
+            ),
         }
     }
 }

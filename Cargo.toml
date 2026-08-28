@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.dependencies]
-mio = { version = "1", features = ["os-poll", "os-ext"] }
+io-uring = "0.7"
 log = { version = "0.4.27", features = [
     "max_level_trace",
     "release_max_level_warn",
@@ -44,10 +44,11 @@ lumalla_input = { path = "./crates/lumalla_input", version = "^0.1.0" }
 lumalla_renderer = { path = "./crates/lumalla_renderer", version = "^0.1.0" }
 lumalla_seat = { path = "./crates/lumalla_seat", version = "^0.1.0" }
 lumalla_shared = { path = "./crates/lumalla_shared", version = "^0.1.0" }
+libc = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 anyhow = { workspace = true }
-mio = { workspace = true }
+io-uring = { workspace = true }
 signal-hook = { workspace = true }
 
 # Optimized build with debug info for CPU/memory profilers (perf, heaptrack, …).

@@ -10,7 +10,6 @@ include = ["src/**/*", "LICENSE-*", "build.rs", "wrapper.h"]
 [dependencies]
 lumalla_shared = { path = "../lumalla_shared" }
 anyhow = { workspace = true }
-mio = { workspace = true }
 log = { workspace = true }
 libc = { workspace = true }
 

@@ -606,6 +606,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
+dependencies = [
+ "bitflags 2.9.1",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -729,6 +740,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "env_logger",
+ "io-uring",
+ "libc",
  "log",
  "lumalla_dbus",
  "lumalla_display",
@@ -736,7 +749,6 @@ dependencies = [
  "lumalla_renderer",
  "lumalla_seat",
  "lumalla_shared",
- "mio",
  "signal-hook",
 ]
 
@@ -763,7 +775,6 @@ dependencies = [
  "log",
  "lumalla_ipc",
  "lumalla_shared",
- "mio",
  "serde",
  "zbus",
 ]
@@ -777,7 +788,6 @@ dependencies = [
  "log",
  "lumalla_shared",
  "lumalla_wayland_protocol",
- "mio",
 ]
 
 [[package]]
@@ -789,7 +799,6 @@ dependencies = [
  "log",
  "lumalla_seat",
  "lumalla_shared",
- "mio",
  "pkg-config",
 ]
 
@@ -815,7 +824,6 @@ dependencies = [
  "log",
  "lumalla_seat",
  "lumalla_shared",
- "mio",
  "naga",
  "pkg-config",
 ]
@@ -828,7 +836,6 @@ dependencies = [
  "libc",
  "log",
  "lumalla_shared",
- "mio",
  "pkg-config",
 ]
 
@@ -837,8 +844,9 @@ name = "lumalla_shared"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "io-uring",
+ "libc",
  "log",
- "mio",
  "pkg-config",
 ]
 
@@ -850,7 +858,6 @@ dependencies = [
  "libc",
  "log",
  "lumalla_wayland_protocol_macros",
- "mio",
 ]
 
 [[package]]

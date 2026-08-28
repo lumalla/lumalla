@@ -12,6 +12,5 @@ lumalla_ipc = { path = "../lumalla_ipc" }
 lumalla_shared = { path = "../lumalla_shared" }
 anyhow = { workspace = true }
 log = { workspace = true }
-mio = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 zbus = { version = "5.16", features = ["blocking-api"] }

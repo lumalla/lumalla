@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 
@@ -31,6 +30,10 @@ impl SeatState {
     }
 
     pub fn fd(&self) -> RawFd {
+        self.main_seat.fd()
+    }
+
+    pub fn as_raw_fd(&self) -> RawFd {
         self.main_seat.fd()
     }
 
@@ -92,29 +95,5 @@ impl SeatState {
     pub fn switch_session(&self, session: i32) -> anyhow::Result<()> {
         debug!("Switching seat session to {session}");
         self.main_seat.switch_session(session)
-    }
-}
-
-impl mio::event::Source for SeatState {
-    fn register(
-        &mut self,
-        registry: &mio::Registry,
-        token: mio::Token,
-        interests: mio::Interest,
-    ) -> io::Result<()> {
-        self.main_seat.register(registry, token, interests)
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &mio::Registry,
-        token: mio::Token,
-        interests: mio::Interest,
-    ) -> io::Result<()> {
-        self.main_seat.reregister(registry, token, interests)
-    }
-
-    fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()> {
-        self.main_seat.deregister(registry)
     }
 }

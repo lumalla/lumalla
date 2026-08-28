@@ -83,6 +83,8 @@ fn rust_type_from_wayland_type_for_method(
             }
         }
         "array" => quote! { &[u8] },
+        // Event builders take RawFd: callers typically pass as_raw_fd() and retain ownership
+        // (SCM_RIGHTS duplicates the descriptor into the message).
         "fd" => quote! { std::os::unix::io::RawFd },
         _ => quote! { () }, // Unknown type
     };
@@ -386,14 +388,19 @@ fn generate_interface_code_parts(
                                 &escape_rust_keyword(&arg.name),
                                 proc_macro2::Span::call_site(),
                             );
+                            // OwnedFd lives in the reader queue; request accessors still expose
+                            // RawFd (-1 if missing) so generated `&self` getters stay Copy-friendly.
                             quote! {
-                                #field_name: fds.pop_front().unwrap_or(-1)
+                                #field_name: fds
+                                    .pop_front()
+                                    .map(std::os::fd::IntoRawFd::into_raw_fd)
+                                    .unwrap_or(-1)
                             }
                         });
 
                     quote! {
                         #[inline]
-                        pub fn new(data: &'a [u8], fds: &mut std::collections::VecDeque<std::os::unix::io::RawFd>) -> Self {
+                        pub fn new(data: &'a [u8], fds: &mut std::collections::VecDeque<std::os::unix::io::OwnedFd>) -> Self {
                             Self {
                                 data,
                                 #(#fd_assignments,)*
@@ -403,7 +410,7 @@ fn generate_interface_code_parts(
                 } else {
                     quote! {
                         #[inline]
-                        pub fn new(data: &'a [u8], _fds: &mut std::collections::VecDeque<std::os::unix::io::RawFd>) -> Self {
+                        pub fn new(data: &'a [u8], _fds: &mut std::collections::VecDeque<std::os::unix::io::OwnedFd>) -> Self {
                             Self { data }
                         }
                     }
@@ -595,7 +602,7 @@ fn generate_interface_code_parts(
                     ctx: &mut Ctx,
                     header: &MessageHeader,
                     data: &[u8],
-                    fds: &mut std::collections::VecDeque<std::os::unix::io::RawFd>,
+                    fds: &mut std::collections::VecDeque<std::os::unix::io::OwnedFd>,
                     object_version: u32,
                 ) -> anyhow::Result<()> {
                     match header.opcode {
@@ -707,7 +714,7 @@ fn generate_interface_code_parts(
                             (quote! { write_u32 }, quote! { #arg_name.get() })
                         }
                     }
-                    "fd" => (quote! { write_fd }, quote! { #arg_name as i32 }),
+                    "fd" => (quote! { write_fd }, quote! { #arg_name }),
                     "array" => {
                         if arg.allow_null.unwrap_or(false) {
                             (quote! { write_array }, quote! { #arg_name.unwrap_or(&[]) })

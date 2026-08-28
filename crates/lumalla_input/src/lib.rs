@@ -3,12 +3,11 @@
 mod libinput;
 mod xkb;
 
-use std::{io, pin::Pin, time::Instant};
+use std::{os::fd::RawFd, pin::Pin, time::Instant};
 
 use log::debug;
 use lumalla_seat::SeatState;
 use lumalla_shared::{Comms, DbusMessage, KeymapMemfd, MainMessage, Mods};
-use mio::{Interest, Registry, Token, event::Source};
 
 use crate::libinput::{InputEvent, KEY_STATE_PRESSED, LibInput, is_modifier_key, update_modifier};
 use crate::xkb::Xkb;
@@ -123,9 +122,8 @@ impl InputState {
         self.libinput.assign_seat(seat_name)?;
         self.libinput.resume()?;
         // Resume queues DEVICE_ADDED while we are inside another poll handler.
-        // mio uses edge-triggered epoll, so that readability edge is missed and
-        // the fd stays readable forever — no further LIBINPUT_TOKEN wakes.
-        // Drain now so the fd can go idle and re-arm on real input.
+        // With oneshot POLL_ADD that edge is consumed; drain now so the fd can
+        // go idle and re-arm on real input.
         self.dispatch(|_| {})
     }
 
@@ -146,6 +144,10 @@ impl InputState {
 
     pub fn clear_keymaps(&mut self) {
         self.keymaps.clear();
+    }
+
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.libinput.as_raw_fd()
     }
 
     pub fn set_output_geometry(&mut self, width: u32, height: u32) {
@@ -298,29 +300,5 @@ fn fn_key_to_vt(key: u32) -> Option<i32> {
         Some((key - libinput::bindings::KEY_F1 + 1) as i32)
     } else {
         None
-    }
-}
-
-impl Source for InputState {
-    fn register(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        self.libinput.register(registry, token, interests)
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        self.libinput.reregister(registry, token, interests)
-    }
-
-    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-        self.libinput.deregister(registry)
     }
 }

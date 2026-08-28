@@ -1,6 +1,5 @@
 use std::{
     ffi::CStr,
-    io,
     os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
     ptr::NonNull,
     sync::atomic::{AtomicBool, Ordering},
@@ -8,7 +7,6 @@ use std::{
 
 use log::error;
 use lumalla_shared::{Comms, MainMessage};
-use mio::{Interest, Registry, Token, event::Source, unix::SourceFd};
 
 #[allow(
     non_camel_case_types,
@@ -276,26 +274,3 @@ impl Drop for LibSeat {
     }
 }
 
-impl Source for LibSeat {
-    fn register(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        SourceFd(&self.fd).register(registry, token, interests)
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        SourceFd(&self.fd).reregister(registry, token, interests)
-    }
-
-    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-        SourceFd(&self.fd).deregister(registry)
-    }
-}

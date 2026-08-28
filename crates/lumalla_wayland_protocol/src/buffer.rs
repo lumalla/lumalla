@@ -1,8 +1,13 @@
-use std::{collections::VecDeque, io, mem, os::fd::RawFd, ptr};
+use std::{
+    collections::VecDeque,
+    io, mem,
+    os::fd::{FromRawFd, OwnedFd, RawFd},
+    ptr, slice,
+};
 
 use libc::{
     CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_NXTHDR, CMSG_SPACE, EAGAIN, EWOULDBLOCK, MSG_CTRUNC,
-    MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET, close, cmsghdr, iovec, msghdr, recvmsg, sendmsg,
+    MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET, cmsghdr, iovec, msghdr, recvmsg, sendmsg,
 };
 use log::error;
 
@@ -19,6 +24,8 @@ const HEADER_SIZE: usize = 8;
 const MAX_MESSAGE_SIZE: usize = u16::MAX as usize;
 const BUFFER_SIZE: usize = MAX_MESSAGE_SIZE * 2;
 type Buffer = [u8; BUFFER_SIZE];
+const SEND_CHUNK_SIZE: usize = 4096;
+const MAX_SEND_BUFFERS: usize = 5;
 const MAX_FDS_IN_CMSG: usize = 253;
 const CMSG_BUFFER_SIZE: usize =
     unsafe { CMSG_SPACE((MAX_FDS_IN_CMSG * mem::size_of::<RawFd>()) as u32) as usize };
@@ -33,8 +40,11 @@ pub struct Reader {
     buffer: Box<Buffer>,
     bytes_in_buffer: usize,
     current_buffer_offset: usize,
-    fds: VecDeque<RawFd>,
+    fds: VecDeque<OwnedFd>,
     cmsg_buffer: Box<CmsgBuffer>,
+    /// Stable iov/msghdr for an in-flight RecvMsg SQE.
+    recv_iov: iovec,
+    recv_msghdr: msghdr,
 }
 
 #[derive(Debug, PartialEq)]
@@ -53,52 +63,68 @@ impl Reader {
             current_buffer_offset: 0,
             fds: VecDeque::with_capacity(MAX_FDS_IN_CMSG),
             cmsg_buffer: unsafe { Box::new_uninit().assume_init() },
+            recv_iov: iovec {
+                iov_base: ptr::null_mut(),
+                iov_len: 0,
+            },
+            recv_msghdr: unsafe { mem::zeroed() },
         }
     }
 
-    #[must_use]
-    pub fn read(&mut self) -> ReadResult {
+    fn compact_if_needed(&mut self) {
         if self.current_buffer_offset > 0 {
             self.buffer
                 .copy_within(self.current_buffer_offset..self.bytes_in_buffer, 0);
             self.bytes_in_buffer -= self.current_buffer_offset;
             self.current_buffer_offset = 0;
         }
+    }
+
+    /// Build a stable `msghdr` for `IORING_OP_RECVMSG`. Valid until the matching CQE is applied.
+    pub fn prepare_recv_msghdr(&mut self) -> Option<*mut msghdr> {
+        self.compact_if_needed();
         if self.bytes_in_buffer == self.buffer.len() {
             error!("Wayland receive buffer is full");
-            return ReadResult::EndOfStream;
+            return None;
         }
-
-        let usable_buffer = &mut self.buffer[self.bytes_in_buffer..];
-        let mut iov = iovec {
-            iov_base: usable_buffer.as_mut_ptr() as *mut _,
-            iov_len: usable_buffer.len(),
+        let usable = &mut self.buffer[self.bytes_in_buffer..];
+        self.recv_iov = iovec {
+            iov_base: usable.as_mut_ptr().cast(),
+            iov_len: usable.len(),
         };
-        let mut msghdr = msghdr {
+        self.recv_msghdr = msghdr {
             msg_name: ptr::null_mut(),
             msg_namelen: 0,
-            msg_iov: &mut iov as *mut _,
+            msg_iov: &mut self.recv_iov as *mut _,
             msg_iovlen: 1,
             msg_control: self.cmsg_buffer.as_mut_ptr().cast(),
             msg_controllen: mem::size_of_val(self.cmsg_buffer.as_ref()),
             msg_flags: 0,
         };
-        let received_bytes = unsafe { recvmsg(self.fd, &mut msghdr as *mut _, 0) };
+        Some(&mut self.recv_msghdr as *mut msghdr)
+    }
+
+    /// Apply a RecvMsg / recvmsg result code.
+    pub fn apply_recv_result(&mut self, received_bytes: i32) -> ReadResult {
         match received_bytes {
             0 => ReadResult::EndOfStream,
-            -1 => match unsafe { *libc::__errno_location() } {
-                #[allow(unreachable_patterns)] // On some platforms these may have different values
-                EWOULDBLOCK | EAGAIN => ReadResult::NoMoreData,
-                err => {
+            -1 => ReadResult::NoMoreData,
+            n if n < 0 => {
+                let err = -n;
+                if err == EWOULDBLOCK || err == EAGAIN {
+                    ReadResult::NoMoreData
+                } else {
                     error!("Error reading from socket: {}", err);
                     ReadResult::EndOfStream
                 }
-            },
-            _ => {
-                self.bytes_in_buffer += received_bytes as usize;
+            }
+            n => {
+                let received_bytes = n as usize;
+                self.bytes_in_buffer += received_bytes;
                 let first_new_fd = self.fds.len();
+                let msghdr = &self.recv_msghdr;
                 unsafe {
-                    let mut cmsg = CMSG_FIRSTHDR(&msghdr);
+                    let mut cmsg = CMSG_FIRSTHDR(msghdr);
                     while !cmsg.is_null() {
                         if (*cmsg).cmsg_level == SOL_SOCKET && (*cmsg).cmsg_type == SCM_RIGHTS {
                             if (*cmsg).cmsg_len < CMSG_LEN(0) as usize {
@@ -109,22 +135,18 @@ impl Reader {
                             let data_len = (*cmsg).cmsg_len - CMSG_LEN(0) as usize;
                             let fd_count = data_len / mem::size_of::<RawFd>();
 
-                            let fds = std::slice::from_raw_parts(data_ptr, fd_count);
+                            let fds = slice::from_raw_parts(data_ptr, fd_count);
                             for &fd in fds {
-                                self.fds.push_back(fd);
+                                self.fds.push_back(OwnedFd::from_raw_fd(fd));
                             }
                         }
-                        cmsg = CMSG_NXTHDR(&msghdr, cmsg);
+                        cmsg = CMSG_NXTHDR(msghdr, cmsg);
                     }
                 }
                 if msghdr.msg_flags & MSG_CTRUNC != 0 {
                     error!("Wayland ancillary data was truncated");
                     while self.fds.len() > first_new_fd {
-                        if let Some(fd) = self.fds.pop_back() {
-                            unsafe {
-                                close(fd);
-                            }
-                        }
+                        self.fds.pop_back();
                     }
                     return ReadResult::EndOfStream;
                 }
@@ -133,7 +155,23 @@ impl Reader {
         }
     }
 
-    pub fn next(&mut self) -> anyhow::Result<Option<(MessageHeader, &[u8], &mut VecDeque<RawFd>)>> {
+    /// Synchronous recv (tests / fallback).
+    #[must_use]
+    pub fn read(&mut self) -> ReadResult {
+        let Some(msg) = self.prepare_recv_msghdr() else {
+            return ReadResult::EndOfStream;
+        };
+        let received_bytes = unsafe { recvmsg(self.fd, msg, 0) };
+        if received_bytes < 0 {
+            let err = unsafe { *libc::__errno_location() };
+            return self.apply_recv_result(-err);
+        }
+        self.apply_recv_result(received_bytes as i32)
+    }
+
+    pub fn next(
+        &mut self,
+    ) -> anyhow::Result<Option<(MessageHeader, &[u8], &mut VecDeque<OwnedFd>)>> {
         let available_bytes = self.bytes_in_buffer - self.current_buffer_offset;
         if available_bytes < HEADER_SIZE {
             return Ok(None);
@@ -171,50 +209,138 @@ impl Reader {
     pub fn message_handled(&mut self, message_size: usize) {
         self.current_buffer_offset += message_size;
         if self.bytes_in_buffer == self.current_buffer_offset {
-            // If we've read all the data in the buffer, reset the offset
             self.current_buffer_offset = 0;
             self.bytes_in_buffer = 0;
         }
     }
 }
 
-impl Drop for Reader {
-    fn drop(&mut self) {
-        for fd in self.fds.drain(..) {
-            unsafe {
-                close(fd);
-            }
+#[derive(Debug)]
+struct SendChunk {
+    data: Box<[u8; SEND_CHUNK_SIZE]>,
+    len: usize,
+    send_offset: usize,
+    fds: Vec<RawFd>,
+}
+
+impl SendChunk {
+    fn new() -> Self {
+        Self {
+            data: Box::new([0; SEND_CHUNK_SIZE]),
+            len: 0,
+            send_offset: 0,
+            fds: Vec::new(),
         }
+    }
+
+    fn remaining(&self) -> usize {
+        SEND_CHUNK_SIZE - self.len
     }
 }
 
 #[derive(Debug)]
 pub struct Writer {
     fd: RawFd,
-    buffer: Box<Buffer>,
-    bytes_in_buffer: usize,
-    fds: Vec<RawFd>,
-    message_start_index: usize,
-    message_length_index: usize,
+    active: SendChunk,
+    queue: VecDeque<SendChunk>,
+    in_flight: Option<SendChunk>,
+    message_start_offset: usize,
     last_err: Option<anyhow::Error>,
+    send_buffer_limit_exceeded: bool,
+    send_cmsg: Box<CmsgBuffer>,
+    send_iov: iovec,
+    send_msghdr: msghdr,
 }
 
-// TODO: change the writer to unchecked copies
 impl Writer {
     pub fn new(fd: RawFd) -> Self {
         Self {
             fd,
-            buffer: unsafe { Box::new_uninit().assume_init() },
-            bytes_in_buffer: 0,
-            fds: Vec::new(),
-            message_start_index: 0,
-            message_length_index: 0,
+            active: SendChunk::new(),
+            queue: VecDeque::new(),
+            in_flight: None,
+            message_start_offset: 0,
             last_err: None,
+            send_buffer_limit_exceeded: false,
+            send_cmsg: unsafe { Box::new_uninit().assume_init() },
+            send_iov: iovec {
+                iov_base: ptr::null_mut(),
+                iov_len: 0,
+            },
+            send_msghdr: unsafe { mem::zeroed() },
         }
     }
 
     pub fn last_err(&mut self) -> Option<anyhow::Error> {
         self.last_err.take()
+    }
+
+    pub fn send_buffer_limit_exceeded(&self) -> bool {
+        self.send_buffer_limit_exceeded
+    }
+
+    pub fn send_in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    fn buffers_in_use(&self) -> usize {
+        1 + self.queue.len() + usize::from(self.in_flight.is_some())
+    }
+
+    fn set_send_buffer_limit_exceeded(&mut self) {
+        self.send_buffer_limit_exceeded = true;
+        self.last_err = Some(anyhow::anyhow!(
+            "Client exceeded {MAX_SEND_BUFFERS} send buffers (unresponsive reader)"
+        ));
+    }
+
+    fn rotate_active(&mut self) -> bool {
+        if self.buffers_in_use() >= MAX_SEND_BUFFERS {
+            self.set_send_buffer_limit_exceeded();
+            return false;
+        }
+        if self.active.len > 0 {
+            self.queue
+                .push_back(mem::replace(&mut self.active, SendChunk::new()));
+        }
+        true
+    }
+
+    fn pending_stream_bytes(&self) -> usize {
+        self.queue.iter().map(|chunk| chunk.len).sum::<usize>() + self.active.len
+    }
+
+    fn patch_stream_u16(&mut self, offset: usize, value: u16) {
+        let mut remaining = offset;
+        for chunk in &mut self.queue {
+            if remaining < chunk.len {
+                chunk.data[remaining..remaining + mem::size_of::<u16>()]
+                    .copy_from_slice(&value.to_ne_bytes());
+                return;
+            }
+            remaining -= chunk.len;
+        }
+        debug_assert!(remaining < self.active.len);
+        self.active.data[remaining..remaining + mem::size_of::<u16>()]
+            .copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn ensure_room(&mut self, need: usize) -> bool {
+        if self.last_err.is_some() {
+            return false;
+        }
+        if need > SEND_CHUNK_SIZE {
+            self.last_err = Some(anyhow::anyhow!(
+                "Wayland write of {need} bytes exceeds send chunk size {SEND_CHUNK_SIZE}"
+            ));
+            return false;
+        }
+        while need > self.active.remaining() {
+            if !self.rotate_active() {
+                return false;
+            }
+        }
+        true
     }
 
     #[inline]
@@ -226,54 +352,60 @@ impl Writer {
             self.last_err = Some(err);
             return;
         }
-        self.message_start_index = self.bytes_in_buffer;
+        self.message_start_offset = self.pending_stream_bytes();
         self.write_u32(object_id.get());
         self.write_u16(opcode);
-        self.message_length_index = self.bytes_in_buffer;
         self.write_u16(0);
     }
 
     #[inline]
     pub fn write_message_length(&mut self) {
-        let message_length = self.bytes_in_buffer - self.message_start_index;
+        let message_length = self.pending_stream_bytes() - self.message_start_offset;
         if message_length > MAX_MESSAGE_SIZE || !message_length.is_multiple_of(4) {
             self.last_err = Some(anyhow::anyhow!(
                 "Invalid outgoing Wayland message size {message_length}"
             ));
             return;
         }
-        let index = self.message_length_index;
-        self.buffer[index..index + mem::size_of::<u16>()]
-            .copy_from_slice(&(message_length as u16).to_ne_bytes());
+        self.patch_stream_u16(self.message_start_offset + 6, message_length as u16);
     }
 
     #[inline]
     pub fn write_u16(&mut self, value: u16) {
-        self.buffer[self.bytes_in_buffer..self.bytes_in_buffer + mem::size_of::<u16>()]
-            .copy_from_slice(&value.to_ne_bytes());
-        self.bytes_in_buffer += mem::size_of::<u16>();
+        let size = mem::size_of::<u16>();
+        if !self.ensure_room(size) {
+            return;
+        }
+        let start = self.active.len;
+        self.active.data[start..start + size].copy_from_slice(&value.to_ne_bytes());
+        self.active.len += size;
     }
 
     #[inline]
     pub fn write_i32(&mut self, value: i32) {
-        self.buffer[self.bytes_in_buffer..self.bytes_in_buffer + mem::size_of::<i32>()]
-            .copy_from_slice(&value.to_ne_bytes());
-        self.bytes_in_buffer += mem::size_of::<i32>();
+        let size = mem::size_of::<i32>();
+        if !self.ensure_room(size) {
+            return;
+        }
+        let start = self.active.len;
+        self.active.data[start..start + size].copy_from_slice(&value.to_ne_bytes());
+        self.active.len += size;
     }
 
     #[inline]
     pub fn write_u32(&mut self, value: u32) {
-        self.buffer[self.bytes_in_buffer..self.bytes_in_buffer + mem::size_of::<u32>()]
-            .copy_from_slice(&value.to_ne_bytes());
-        self.bytes_in_buffer += mem::size_of::<u32>();
+        let size = mem::size_of::<u32>();
+        if !self.ensure_room(size) {
+            return;
+        }
+        let start = self.active.len;
+        self.active.data[start..start + size].copy_from_slice(&value.to_ne_bytes());
+        self.active.len += size;
     }
 
     #[inline]
     pub fn write_fixed(&mut self, value: f32) {
-        let fixed = f32_to_fixed(value);
-        self.buffer[self.bytes_in_buffer..self.bytes_in_buffer + mem::size_of::<i32>()]
-            .copy_from_slice(&fixed.to_ne_bytes());
-        self.bytes_in_buffer += mem::size_of::<f32>();
+        self.write_i32(f32_to_fixed(value));
     }
 
     #[inline]
@@ -284,16 +416,20 @@ impl Writer {
             return;
         }
         let len = bytes.len() + 1;
-        let len_index_start = self.bytes_in_buffer;
-        let len_index_end = self.bytes_in_buffer + mem::size_of::<u32>();
-        self.buffer[len_index_start..len_index_end].copy_from_slice(&(len as u32).to_ne_bytes());
+        let padded_len = (len + 3) & !3;
+        if !self.ensure_room(padded_len) {
+            return;
+        }
+        let len_index_start = self.active.len;
+        let len_index_end = len_index_start + mem::size_of::<u32>();
+        self.active.data[len_index_start..len_index_end]
+            .copy_from_slice(&(len as u32).to_ne_bytes());
         let str_index_start = len_index_end;
         let str_index_end = str_index_start + bytes.len();
-        self.buffer[str_index_start..str_index_end].copy_from_slice(bytes);
-        self.buffer[str_index_end] = 0;
-        let padded_len = (len + 3) & !3;
-        self.buffer[str_index_end + 1..str_index_start + padded_len].fill(0);
-        self.bytes_in_buffer = str_index_start + padded_len;
+        self.active.data[str_index_start..str_index_end].copy_from_slice(bytes);
+        self.active.data[str_index_end] = 0;
+        self.active.data[str_index_end + 1..str_index_start + padded_len].fill(0);
+        self.active.len = str_index_start + padded_len;
     }
 
     #[inline]
@@ -311,80 +447,220 @@ impl Writer {
             self.last_err = Some(anyhow::anyhow!("Wayland array is too long"));
             return;
         }
-        let bytes = array;
-        let len = bytes.len();
-        let len_index_start = self.bytes_in_buffer;
-        let len_index_end = self.bytes_in_buffer + mem::size_of::<u32>();
-        self.buffer[len_index_start..len_index_end].copy_from_slice(&(len as u32).to_ne_bytes());
-        let val_index_start = len_index_end;
-        let val_index_end = val_index_start + len;
-        self.buffer[val_index_start..val_index_end].copy_from_slice(bytes);
+        let len = array.len();
+        if !self.ensure_room(mem::size_of::<u32>()) {
+            return;
+        }
+        let len_index_start = self.active.len;
+        let len_index_end = len_index_start + mem::size_of::<u32>();
+        self.active.data[len_index_start..len_index_end]
+            .copy_from_slice(&(len as u32).to_ne_bytes());
+        self.active.len = len_index_end;
+
+        let mut offset = 0;
+        while offset < len {
+            if self.active.remaining() == 0 && !self.rotate_active() {
+                return;
+            }
+            let to_write = len.saturating_sub(offset).min(self.active.remaining());
+            let start = self.active.len;
+            self.active.data[start..start + to_write]
+                .copy_from_slice(&array[offset..offset + to_write]);
+            self.active.len += to_write;
+            offset += to_write;
+        }
+
         let padded_len = (len + 3) & !3;
-        self.buffer[val_index_end..val_index_start + padded_len].fill(0);
-        self.bytes_in_buffer = val_index_start + padded_len;
+        let pad_remaining = padded_len - len;
+        let mut padded = 0;
+        while padded < pad_remaining {
+            if self.active.remaining() == 0 && !self.rotate_active() {
+                return;
+            }
+            let to_write = pad_remaining.saturating_sub(padded).min(self.active.remaining());
+            self.active.data[self.active.len..self.active.len + to_write].fill(0);
+            self.active.len += to_write;
+            padded += to_write;
+        }
     }
 
     #[inline]
     pub fn write_fd(&mut self, fd: RawFd) {
-        if self.fds.len() == MAX_FDS_IN_CMSG {
+        if self.active.fds.len() == MAX_FDS_IN_CMSG {
             self.last_err = Some(anyhow::anyhow!(
                 "Too many file descriptors in Wayland message"
             ));
             return;
         }
-        self.fds.push(fd);
+        self.active.fds.push(fd);
+    }
+
+    fn seal_active_to_queue(&mut self) -> bool {
+        if self.active.len == 0 {
+            return true;
+        }
+        if self.buffers_in_use() >= MAX_SEND_BUFFERS {
+            self.set_send_buffer_limit_exceeded();
+            return false;
+        }
+        self.queue
+            .push_back(mem::replace(&mut self.active, SendChunk::new()));
+        true
+    }
+
+    fn promote_next_send_chunk(&mut self) -> Option<()> {
+        if self.in_flight.is_some() {
+            return Some(());
+        }
+        if let Some(chunk) = self.queue.pop_front() {
+            debug_assert!(chunk.len > 0, "queued send chunk must not be empty");
+            self.in_flight = Some(chunk);
+            return Some(());
+        }
+        if self.active.len == 0 {
+            return None;
+        }
+        if !self.seal_active_to_queue() {
+            return None;
+        }
+        self.in_flight = self.queue.pop_front();
+        self.in_flight.as_ref()?;
+        Some(())
+    }
+
+    fn build_send_msghdr(&mut self) {
+        let chunk = self.in_flight.as_mut().expect("in_flight chunk missing");
+        let remaining = chunk.len - chunk.send_offset;
+        self.send_iov = iovec {
+            iov_base: chunk.data[chunk.send_offset..].as_mut_ptr().cast(),
+            iov_len: remaining,
+        };
+        let (control_ptr, control_len) = if chunk.fds.is_empty() {
+            (ptr::null_mut(), 0)
+        } else {
+            let payload_len = chunk.fds.len() * mem::size_of::<RawFd>();
+            let cmsg = self.send_cmsg.as_mut_ptr().cast::<cmsghdr>();
+            unsafe {
+                (*cmsg).cmsg_level = SOL_SOCKET;
+                (*cmsg).cmsg_type = SCM_RIGHTS;
+                (*cmsg).cmsg_len = CMSG_LEN(payload_len as u32) as usize;
+                ptr::copy_nonoverlapping(
+                    chunk.fds.as_ptr().cast::<u8>(),
+                    CMSG_DATA(cmsg),
+                    payload_len,
+                );
+            }
+            (self.send_cmsg.as_mut_ptr().cast(), unsafe {
+                CMSG_SPACE(payload_len as u32) as usize
+            })
+        };
+        self.send_msghdr = msghdr {
+            msg_name: ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut self.send_iov as *mut _,
+            msg_iovlen: 1,
+            msg_control: control_ptr,
+            msg_controllen: control_len,
+            msg_flags: 0,
+        };
+    }
+
+    /// Return a stable msghdr for SendMsg, if there is output to send.
+    pub fn prepare_send_msghdr(&mut self) -> Option<*const msghdr> {
+        if self.in_flight.is_some() {
+            return Some(&self.send_msghdr as *const msghdr);
+        }
+        self.promote_next_send_chunk()?;
+        self.build_send_msghdr();
+        Some(&self.send_msghdr as *const msghdr)
+    }
+
+    /// Apply a SendMsg result. Returns whether the same chunk still needs sending.
+    pub fn apply_send_result(&mut self, result: i32) -> anyhow::Result<bool> {
+        let Some(chunk) = self.in_flight.as_mut() else {
+            return Ok(false);
+        };
+        if result < 0 {
+            let err = -result;
+            if err == EWOULDBLOCK || err == EAGAIN {
+                return Ok(true);
+            }
+            self.in_flight = None;
+            return Err(io::Error::from_raw_os_error(err).into());
+        }
+        if result == 0 {
+            self.in_flight = None;
+            anyhow::bail!("Wayland socket write returned zero");
+        }
+        let written = result as usize;
+        chunk.fds.clear();
+        chunk.send_offset += written;
+        if chunk.send_offset >= chunk.len {
+            self.in_flight = None;
+            Ok(false)
+        } else {
+            self.build_send_msghdr();
+            Ok(true)
+        }
     }
 
     #[inline]
     pub fn flush_if_needed(&mut self) -> anyhow::Result<()> {
-        if self.bytes_in_buffer >= MAX_MESSAGE_SIZE || self.fds.len() >= 100 {
-            self.flush()
-        } else {
-            Ok(())
+        if self.active.fds.len() >= 100 {
+            if self.active.len > 0 && !self.rotate_active() {
+                return Err(
+                    self.last_err
+                        .take()
+                        .unwrap_or_else(|| anyhow::anyhow!("send buffer limit exceeded")),
+                );
+            }
         }
+        if self.active.remaining() < HEADER_SIZE && !self.rotate_active() {
+            return Err(
+                self.last_err
+                    .take()
+                    .unwrap_or_else(|| anyhow::anyhow!("send buffer limit exceeded")),
+            );
+        }
+        Ok(())
     }
 
-    #[inline]
-    pub fn flush(&mut self) -> anyhow::Result<()> {
-        if self.bytes_in_buffer == 0 {
-            return Ok(());
-        }
-
-        while self.bytes_in_buffer > 0 {
-            let mut iov = iovec {
-                iov_base: self.buffer.as_mut_ptr().cast(),
-                iov_len: self.bytes_in_buffer,
+    fn send_chunk_sync(&mut self, chunk: &mut SendChunk) -> anyhow::Result<()> {
+        while chunk.send_offset < chunk.len {
+            let remaining = chunk.len - chunk.send_offset;
+            self.send_iov = iovec {
+                iov_base: chunk.data[chunk.send_offset..].as_mut_ptr().cast(),
+                iov_len: remaining,
             };
-            let mut control = [0usize; CMSG_BUFFER_WORDS];
-            let (control_ptr, control_len) = if self.fds.is_empty() {
+            let (control_ptr, control_len) = if chunk.fds.is_empty() {
                 (ptr::null_mut(), 0)
             } else {
-                let payload_len = self.fds.len() * mem::size_of::<RawFd>();
-                let cmsg = control.as_mut_ptr().cast::<cmsghdr>();
+                let payload_len = chunk.fds.len() * mem::size_of::<RawFd>();
+                let cmsg = self.send_cmsg.as_mut_ptr().cast::<cmsghdr>();
                 unsafe {
                     (*cmsg).cmsg_level = SOL_SOCKET;
                     (*cmsg).cmsg_type = SCM_RIGHTS;
                     (*cmsg).cmsg_len = CMSG_LEN(payload_len as u32) as usize;
                     ptr::copy_nonoverlapping(
-                        self.fds.as_ptr().cast::<u8>(),
+                        chunk.fds.as_ptr().cast::<u8>(),
                         CMSG_DATA(cmsg),
                         payload_len,
                     );
                 }
-                (control.as_mut_ptr().cast(), unsafe {
+                (self.send_cmsg.as_mut_ptr().cast(), unsafe {
                     CMSG_SPACE(payload_len as u32) as usize
                 })
             };
-            let msg = msghdr {
+            self.send_msghdr = msghdr {
                 msg_name: ptr::null_mut(),
                 msg_namelen: 0,
-                msg_iov: &mut iov,
+                msg_iov: &mut self.send_iov as *mut _,
                 msg_iovlen: 1,
                 msg_control: control_ptr,
                 msg_controllen: control_len,
                 msg_flags: 0,
             };
-            let result = unsafe { sendmsg(self.fd, &msg, MSG_NOSIGNAL) };
+            let result = unsafe { sendmsg(self.fd, &self.send_msghdr, MSG_NOSIGNAL) };
             if result < 0 {
                 let err = io::Error::last_os_error();
                 if err
@@ -393,22 +669,43 @@ impl Writer {
                 {
                     return Ok(());
                 }
+                chunk.fds.clear();
                 return Err(err.into());
             }
             if result == 0 {
                 anyhow::bail!("Wayland socket write returned zero");
             }
+            chunk.fds.clear();
+            chunk.send_offset += result as usize;
+        }
+        Ok(())
+    }
 
-            let written = result as usize;
-            self.fds.clear();
-            self.buffer.copy_within(written..self.bytes_in_buffer, 0);
-            self.bytes_in_buffer -= written;
+    /// Synchronous flush (tests). If a uring send is in flight, returns an error.
+    #[inline]
+    pub fn flush(&mut self) -> anyhow::Result<()> {
+        if self.in_flight.is_some() {
+            anyhow::bail!("Cannot sync-flush while SendMsg is in flight");
+        }
+        if !self.seal_active_to_queue() {
+            return Err(
+                self.last_err
+                    .take()
+                    .unwrap_or_else(|| anyhow::anyhow!("send buffer limit exceeded")),
+            );
+        }
+        while let Some(mut chunk) = self.queue.pop_front() {
+            self.send_chunk_sync(&mut chunk)?;
+            if chunk.send_offset < chunk.len {
+                self.queue.push_front(chunk);
+                break;
+            }
         }
         Ok(())
     }
 
     pub fn has_pending_output(&self) -> bool {
-        self.bytes_in_buffer != 0
+        self.in_flight.is_some() || !self.queue.is_empty() || self.active.len > 0
     }
 }
 
@@ -553,5 +850,78 @@ mod tests {
             let back = fixed_to_f32(fixed);
             assert!((value - back).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn writer_rotates_chunks_and_sends_sequentially() {
+        let socket = UnixStream::pair().unwrap();
+        let mut writer = Writer::new(socket.1.as_raw_fd());
+
+        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 0);
+        let words_in_first_chunk = (SEND_CHUNK_SIZE - HEADER_SIZE) / mem::size_of::<u32>();
+        for _ in 0..words_in_first_chunk {
+            writer.write_u32(0xABAB_ABAB);
+        }
+        for _ in 0..20 {
+            writer.write_u32(0xCDCD_CDFD);
+        }
+        writer.write_message_length();
+        assert!(writer.has_pending_output());
+
+        let total = HEADER_SIZE + words_in_first_chunk * mem::size_of::<u32>() + 20 * mem::size_of::<u32>();
+        let msg = writer.prepare_send_msghdr().unwrap();
+        let first = unsafe { sendmsg(socket.1.as_raw_fd(), &*msg, MSG_NOSIGNAL) };
+        assert_eq!(first as usize, SEND_CHUNK_SIZE);
+        assert!(!writer.apply_send_result(first as i32).unwrap());
+
+        let msg = writer.prepare_send_msghdr().unwrap();
+        let second = unsafe { sendmsg(socket.1.as_raw_fd(), &*msg, MSG_NOSIGNAL) };
+        assert_eq!(second as usize, total - SEND_CHUNK_SIZE);
+        assert!(!writer.apply_send_result(second as i32).unwrap());
+        assert!(!writer.has_pending_output());
+    }
+
+    #[test]
+    fn writer_disconnects_at_send_buffer_limit() {
+        let socket = UnixStream::pair().unwrap();
+        let mut writer = Writer::new(socket.1.as_raw_fd());
+
+        let fill_chunk = |writer: &mut Writer| {
+            writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 0);
+            let words = (SEND_CHUNK_SIZE - HEADER_SIZE) / mem::size_of::<u32>();
+            for _ in 0..words {
+                writer.write_u32(0);
+            }
+            writer.write_message_length();
+        };
+
+        for _ in 0..MAX_SEND_BUFFERS {
+            fill_chunk(&mut writer);
+        }
+        assert!(!writer.send_buffer_limit_exceeded());
+
+        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 0);
+        assert!(writer.send_buffer_limit_exceeded());
+    }
+
+    #[test]
+    fn writer_resumes_partial_chunk_send() {
+        let socket = UnixStream::pair().unwrap();
+        let mut writer = Writer::new(socket.1.as_raw_fd());
+
+        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 0);
+        writer.write_array(&vec![1u8; 32]);
+        writer.write_message_length();
+        let _ = writer.prepare_send_msghdr().unwrap();
+
+        let total = HEADER_SIZE + mem::size_of::<u32>() + 32;
+        let partial = (HEADER_SIZE + 16) as i32;
+        assert!(writer.apply_send_result(partial).unwrap());
+        assert!(writer.send_in_flight());
+
+        let msg = writer.prepare_send_msghdr().unwrap();
+        let rest = unsafe { sendmsg(socket.1.as_raw_fd(), &*msg, MSG_NOSIGNAL) };
+        assert_eq!(rest as usize, total - partial as usize);
+        assert!(!writer.apply_send_result(rest as i32).unwrap());
     }
 }
