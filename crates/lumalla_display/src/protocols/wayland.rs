@@ -153,28 +153,30 @@ fn div_ceil_i32(value: i32, divisor: i32) -> i32 {
     (value + divisor - 1) / divisor
 }
 
-/// Maps commit damage hints to output-space rectangles.
-fn commit_output_damage(
+/// Maps commit damage hints to output-space and buffer-space rectangles.
+fn commit_damage(
     commit: &SurfaceCommit,
     output_x: i32,
     output_y: i32,
     buffer_width: usize,
     buffer_height: usize,
-) -> (Vec<Rectangle>, bool) {
+) -> (Vec<Rectangle>, Vec<Rectangle>, bool) {
     let full_surface = commit.newly_mapped
         || (commit.damage.is_empty() && commit.buffer_damage.is_empty());
     if full_surface {
-        return (Vec::new(), true);
+        return (Vec::new(), Vec::new(), true);
     }
 
     let scale = commit.buffer_scale.max(1);
-    let mut damage = Vec::new();
+    let mut output_damage = Vec::new();
+    let mut buffer_damage = Vec::new();
     if !commit.buffer_damage.is_empty() {
         for rect in &commit.buffer_damage {
             if rect.width <= 0 || rect.height <= 0 {
                 continue;
             }
-            damage.push(Rectangle {
+            buffer_damage.push(*rect);
+            output_damage.push(Rectangle {
                 x: output_x + rect.x / scale,
                 y: output_y + rect.y / scale,
                 width: div_ceil_i32(rect.width, scale),
@@ -186,27 +188,39 @@ fn commit_output_damage(
             if rect.width <= 0 || rect.height <= 0 {
                 continue;
             }
-            damage.push(Rectangle {
+            output_damage.push(Rectangle {
                 x: output_x + rect.x,
                 y: output_y + rect.y,
                 width: rect.width,
                 height: rect.height,
             });
+            buffer_damage.push(Rectangle {
+                x: rect.x * scale,
+                y: rect.y * scale,
+                width: rect.width * scale,
+                height: rect.height * scale,
+            });
         }
     }
 
-    if damage.is_empty() {
+    if output_damage.is_empty() {
         let width = div_ceil_i32(buffer_width as i32, scale);
         let height = div_ceil_i32(buffer_height as i32, scale);
-        damage.push(Rectangle {
+        output_damage.push(Rectangle {
             x: output_x,
             y: output_y,
             width,
             height,
         });
+        buffer_damage.push(Rectangle {
+            x: 0,
+            y: 0,
+            width: buffer_width as i32,
+            height: buffer_height as i32,
+        });
     }
 
-    (damage, false)
+    (output_damage, buffer_damage, false)
 }
 
 fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: SurfaceCommit) {
@@ -260,8 +274,8 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
             );
             let output_x = commit.layout.0 + commit.offset.0;
             let output_y = commit.layout.1 + commit.offset.1;
-            let (damage, full_surface) =
-                commit_output_damage(&commit, output_x, output_y, width, height);
+            let (damage, buffer_damage, full_surface) =
+                commit_damage(&commit, output_x, output_y, width, height);
             if is_cursor {
                 state
                     .surface_updates
@@ -282,6 +296,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                         y: 0,
                         dmabuf,
                         damage,
+                        buffer_damage: Vec::new(),
                         full_surface: true,
                     }));
             } else {
@@ -304,6 +319,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                         y: output_y,
                         dmabuf,
                         damage,
+                        buffer_damage,
                         full_surface,
                     }));
             }

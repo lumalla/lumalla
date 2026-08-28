@@ -880,6 +880,16 @@ impl AppData {
                                 height: rect.height,
                             })
                             .collect(),
+                        buffer_damage: frame
+                            .buffer_damage
+                            .into_iter()
+                            .map(|rect| OutputDamageRect {
+                                x: rect.x,
+                                y: rect.y,
+                                width: rect.width,
+                                height: rect.height,
+                            })
+                            .collect(),
                         full_surface: frame.full_surface,
                     };
                     if let Err(err) = self.renderer_state.set_surface_frame(surface) {

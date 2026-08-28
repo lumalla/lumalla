@@ -554,6 +554,60 @@ pub fn clip_damage_list(
         .collect()
 }
 
+/// Clips buffer-space damage to a surface buffer extent.
+pub fn clip_buffer_damage_list(
+    damage: &[DamageRect],
+    buffer_width: u32,
+    buffer_height: u32,
+) -> Vec<DamageRect> {
+    damage
+        .iter()
+        .filter_map(|rect| clip_buffer_damage(*rect, buffer_width, buffer_height))
+        .collect()
+}
+
+pub fn buffer_damage_to_upload_rect(
+    damage: DamageRect,
+    buffer_width: u32,
+    buffer_height: u32,
+) -> Option<UploadRect> {
+    let clipped = clip_buffer_damage(damage, buffer_width, buffer_height)?;
+    Some(UploadRect {
+        x: clipped.x.max(0) as u32,
+        y: clipped.y.max(0) as u32,
+        width: clipped.width.max(0) as u32,
+        height: clipped.height.max(0) as u32,
+    })
+    .filter(|rect| rect.width > 0 && rect.height > 0)
+}
+
+fn clip_buffer_damage(rect: DamageRect, buffer_width: u32, buffer_height: u32) -> Option<DamageRect> {
+    if rect.width <= 0 || rect.height <= 0 {
+        return None;
+    }
+    let x0 = rect.x.max(0);
+    let y0 = rect.y.max(0);
+    let x1 = rect
+        .x
+        .saturating_add(rect.width)
+        .min(buffer_width as i32);
+    let y1 = rect
+        .y
+        .saturating_add(rect.height)
+        .min(buffer_height as i32);
+    let width = x1 - x0;
+    let height = y1 - y0;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some(DamageRect {
+        x: x0,
+        y: y0,
+        width,
+        height,
+    })
+}
+
 fn clip_damage(rect: DamageRect, output_width: u32, output_height: u32) -> Option<DamageRect> {
     if rect.width <= 0 || rect.height <= 0 {
         return None;
@@ -595,7 +649,7 @@ fn cursor_bounds(cursor: &CursorFrame, pointer_x: i32, pointer_y: i32) -> Option
     })
 }
 
-fn rect_union(a: DamageRect, b: DamageRect) -> Option<DamageRect> {
+pub fn rect_union(a: DamageRect, b: DamageRect) -> Option<DamageRect> {
     let x0 = a.x.min(b.x);
     let y0 = a.y.min(b.y);
     let x1 = a.x.saturating_add(a.width).max(b.x.saturating_add(b.width));
@@ -611,6 +665,14 @@ fn rect_union(a: DamageRect, b: DamageRect) -> Option<DamageRect> {
         width,
         height,
     })
+}
+
+/// Unions an iterator of damage rects into a single bounding rect.
+pub fn union_damage_rects(rects: impl IntoIterator<Item = DamageRect>) -> Option<DamageRect> {
+    rects
+        .into_iter()
+        .filter(|rect| rect.width > 0 && rect.height > 0)
+        .reduce(|a, b| rect_union(a, b).unwrap_or(a))
 }
 
 fn div_ceil_i32(value: i32, divisor: i32) -> i32 {
@@ -638,6 +700,7 @@ mod tests {
             buffer_scale: 1,
             dmabuf: None,
             damage: Vec::new(),
+            buffer_damage: Vec::new(),
             full_surface: true,
         }
     }
@@ -746,6 +809,44 @@ mod tests {
                 && rect.y + rect.height >= mid.y + mid.height
         };
         assert!(covers_mid(second[0]));
+    }
+
+    #[test]
+    fn union_damage_rects_coalesces_disjoint_regions() {
+        let union = union_damage_rects([
+            DamageRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            DamageRect {
+                x: 8,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+        ])
+        .unwrap();
+        assert_eq!(union.x, 0);
+        assert_eq!(union.width, 12);
+    }
+
+    #[test]
+    fn buffer_damage_to_upload_rect_clips_to_buffer() {
+        let upload = buffer_damage_to_upload_rect(
+            DamageRect {
+                x: -2,
+                y: 0,
+                width: 6,
+                height: 4,
+            },
+            4,
+            4,
+        )
+        .unwrap();
+        assert_eq!(upload.x, 0);
+        assert_eq!(upload.width, 4);
     }
 
     #[test]

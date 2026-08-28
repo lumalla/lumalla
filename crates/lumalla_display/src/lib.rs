@@ -48,6 +48,8 @@ pub struct CommittedFrame {
     pub dmabuf: Option<ExportedDmabuf>,
     /// Output-space regions that changed this commit.
     pub damage: Vec<Rectangle>,
+    /// Buffer-space regions that changed this commit (for GPU texture uploads).
+    pub buffer_damage: Vec<Rectangle>,
     /// When true, the entire surface area must be recomposited.
     pub full_surface: bool,
 }

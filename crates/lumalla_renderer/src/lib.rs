@@ -20,8 +20,9 @@ mod scene_backing;
 
 use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
 pub use crate::scene_backing::{
-    CompositeMode, DamageRect as OutputDamageRect, UploadRect, clip_damage_list,
-    cursor_damage_rects, cursor_damage_rects_default, prepare_gpu_composite,
+    CompositeMode, DamageRect as OutputDamageRect, UploadRect, buffer_damage_to_upload_rect,
+    clip_buffer_damage_list, clip_damage_list, cursor_damage_rects, cursor_damage_rects_default,
+    prepare_gpu_composite, rect_union, union_damage_rects,
 };
 use crate::scene_backing::DamageRect;
 use crate::drm::{
@@ -118,6 +119,8 @@ pub struct SurfaceFrame {
     pub dmabuf: Option<DmabufAttachment>,
     /// Output-space regions updated by this commit.
     pub damage: Vec<DamageRect>,
+    /// Buffer-space regions updated by this commit.
+    pub buffer_damage: Vec<DamageRect>,
     /// When true, the entire output backing must be recomposited.
     pub full_surface: bool,
 }
@@ -239,6 +242,7 @@ pub struct RendererState {
     scene_dirty: bool,
     gpu: GpuRenderResources,
     pending_damage: Vec<DamageRect>,
+    pending_surface_buffer_damage: HashMap<(u32, u32), DamageRect>,
     pending_full_redraw: bool,
     pending_pointer_damage: bool,
     dirty_surface_keys: HashSet<(u32, u32)>,
@@ -263,6 +267,7 @@ impl RendererState {
             scene_dirty: false,
             gpu: GpuRenderResources::new(),
             pending_damage: Vec::new(),
+            pending_surface_buffer_damage: HashMap::new(),
             pending_full_redraw: false,
             pending_pointer_damage: false,
             dirty_surface_keys: HashSet::new(),
@@ -273,6 +278,7 @@ impl RendererState {
     fn invalidate_surface_textures(&mut self) {
         self.gpu.clear();
         self.pending_damage.clear();
+        self.pending_surface_buffer_damage.clear();
         self.pending_full_redraw = true;
         self.pending_pointer_damage = false;
         self.dirty_surface_keys.clear();
@@ -376,8 +382,21 @@ impl RendererState {
         if frame.full_surface {
             self.pending_full_redraw = true;
             self.pending_damage.clear();
+            self.pending_surface_buffer_damage.remove(&key);
         } else {
             self.pending_damage.extend(frame.damage.iter().copied());
+            if let Some(commit_rect) = union_damage_rects(frame.buffer_damage.iter().copied()) {
+                match self.pending_surface_buffer_damage.get_mut(&key) {
+                    Some(existing) => {
+                        if let Some(merged) = rect_union(*existing, commit_rect) {
+                            *existing = merged;
+                        }
+                    }
+                    None => {
+                        self.pending_surface_buffer_damage.insert(key, commit_rect);
+                    }
+                }
+            }
         }
         self.dirty_surface_keys.insert(key);
         self.surface_frames.insert(key, frame);
@@ -391,6 +410,7 @@ impl RendererState {
             self.surface_order.retain(|k| *k != key);
             self.gpu.surface_textures.remove(key);
             self.dirty_surface_keys.remove(&key);
+            self.pending_surface_buffer_damage.remove(&key);
             self.pending_full_redraw = true;
             self.pending_damage.clear();
             self.mark_dirty_if_active();
@@ -403,6 +423,8 @@ impl RendererState {
         self.surface_frames.retain(|(owner, _), _| *owner != owner_id);
         self.surface_order.retain(|(owner, _)| *owner != owner_id);
         self.gpu.surface_textures.remove_client(owner_id);
+        self.pending_surface_buffer_damage
+            .retain(|(owner, _), _| *owner != owner_id);
         let cursor_removed = self
             .cursor_frame
             .as_ref()
@@ -848,6 +870,8 @@ impl RendererState {
         };
 
         let _pending_damage = std::mem::take(&mut self.pending_damage);
+        let pending_surface_buffer_damage =
+            std::mem::take(&mut self.pending_surface_buffer_damage);
         let force_full = self.pending_full_redraw;
         let pointer_damage = self.pending_pointer_damage;
         let cursor_buffer_dirty = self.cursor_buffer_dirty;
@@ -925,6 +949,8 @@ impl RendererState {
                 cursor,
                 &composite_mode,
                 &dirty_surfaces,
+                &pending_surface_buffer_damage,
+                &_pending_damage,
                 pointer_damage || cursor_buffer_dirty,
             )?;
 
@@ -1217,8 +1243,42 @@ mod tests {
             buffer_scale: 1,
             dmabuf: None,
             damage: Vec::new(),
+            buffer_damage: Vec::new(),
             full_surface: true,
         }
+    }
+
+    #[test]
+    fn accumulates_disjoint_buffer_damage_across_commits() {
+        let mut state = RendererState::new().unwrap();
+        let key = (1, 2);
+        let mut first = frame();
+        first.full_surface = false;
+        first.buffer_damage = vec![DamageRect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        }];
+        state.set_surface_frame(first).unwrap();
+
+        let mut second = frame();
+        second.buffer_id = 4;
+        second.full_surface = false;
+        second.buffer_damage = vec![DamageRect {
+            x: 8,
+            y: 0,
+            width: 4,
+            height: 4,
+        }];
+        state.set_surface_frame(second).unwrap();
+
+        let accumulated = state
+            .pending_surface_buffer_damage
+            .get(&key)
+            .expect("buffer damage should accumulate per surface");
+        assert_eq!(accumulated.x, 0);
+        assert_eq!(accumulated.width, 12);
     }
 
     #[test]
@@ -1254,6 +1314,7 @@ mod tests {
             buffer_scale: 1,
             dmabuf: None,
             damage: Vec::new(),
+            buffer_damage: Vec::new(),
             full_surface: true,
         };
 

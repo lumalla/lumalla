@@ -10,7 +10,7 @@ use anyhow::Context;
 use ash::vk;
 
 use crate::default_cursor::default_cursor_frame;
-use crate::scene_backing::{CompositeMode, DamageRect, UploadRect};
+use crate::scene_backing::{CompositeMode, DamageRect, UploadRect, buffer_damage_to_upload_rect};
 use crate::{CursorFrame, DmabufAttachment, SurfaceFrame};
 
 const WL_SHM_FORMAT_XRGB8888: u32 = 1;
@@ -324,12 +324,23 @@ impl SurfaceTextureCache {
         compositor: &GpuCompositor,
         batch: &mut GpuWorkBatch,
         frame: &SurfaceFrame,
+        force_full_texture: bool,
+        surface_buffer_damage: Option<DamageRect>,
+        pending_output_damage: &[DamageRect],
     ) -> anyhow::Result<()> {
         let key = (frame.owner_id, frame.surface_id);
         if let Some(dmabuf) = frame.dmabuf.as_ref() {
             self.sync_dmabuf(vulkan, compositor, batch, key, frame, dmabuf)
         } else {
-            self.sync_shm_frame(vulkan, compositor, batch, frame)
+            self.sync_shm_frame(
+                vulkan,
+                compositor,
+                batch,
+                frame,
+                force_full_texture,
+                surface_buffer_damage,
+                pending_output_damage,
+            )
         }
     }
 
@@ -339,6 +350,9 @@ impl SurfaceTextureCache {
         compositor: &GpuCompositor,
         batch: &mut GpuWorkBatch,
         frame: &SurfaceFrame,
+        force_full_texture: bool,
+        surface_buffer_damage: Option<DamageRect>,
+        pending_output_damage: &[DamageRect],
     ) -> anyhow::Result<()> {
         let key = (frame.owner_id, frame.surface_id);
         let width = frame.width as u32;
@@ -348,6 +362,7 @@ impl SurfaceTextureCache {
             !matches!(tex.backing, TextureBacking::Shm(_))
                 || tex.extent().is_none_or(|extent| extent.width != width || extent.height != height)
         });
+        let buffer_id_changed = self.textures.get(&key).is_some_and(|tex| tex.buffer_id != frame.buffer_id);
 
         if needs_create {
             let image = vulkan.create_sampled_image(width, height)?;
@@ -383,7 +398,23 @@ impl SurfaceTextureCache {
             TextureBacking::Dmabuf(_) => anyhow::bail!("SHM upload targeted imported DMA-BUF"),
         };
 
-        if needs_create || frame.full_surface || frame.damage.is_empty() {
+        let upload_regions = if !force_full_texture
+            && !needs_create
+            && !buffer_id_changed
+            && !frame.full_surface
+        {
+            collect_shm_upload_regions(
+                frame,
+                surface_buffer_damage,
+                pending_output_damage,
+                width,
+                height,
+            )
+        } else {
+            None
+        };
+
+        if upload_regions.is_none() {
             upload_bgra_texture(
                 vulkan.device(),
                 vulkan.physical_device(),
@@ -398,11 +429,7 @@ impl SurfaceTextureCache {
                 None,
             )?;
         } else {
-            for region in frame
-                .damage
-                .iter()
-                .filter_map(|rect| output_damage_to_buffer_rect(frame, *rect))
-            {
+            for region in upload_regions.unwrap_or_default() {
                 upload_bgra_texture(
                     vulkan.device(),
                     vulkan.physical_device(),
@@ -606,13 +633,24 @@ impl SurfaceTextureCache {
         cursor: Option<&CursorFrame>,
         composite_mode: &CompositeMode,
         dirty_surfaces: &HashSet<(u32, u32)>,
+        surface_buffer_damage: &HashMap<(u32, u32), DamageRect>,
+        pending_output_damage: &[DamageRect],
         sync_cursor: bool,
     ) -> anyhow::Result<()> {
         let sync_all = matches!(composite_mode, CompositeMode::Full);
         for frame in layers {
             let key = (frame.owner_id, frame.surface_id);
             if sync_all || dirty_surfaces.contains(&key) {
-                self.sync_frame(vulkan, compositor, batch, frame)?;
+                let buffer_damage = surface_buffer_damage.get(&key).copied();
+                self.sync_frame(
+                    vulkan,
+                    compositor,
+                    batch,
+                    frame,
+                    sync_all,
+                    buffer_damage,
+                    pending_output_damage,
+                )?;
             }
         }
         if sync_all || sync_cursor {
@@ -646,7 +684,33 @@ fn cursor_surface_view(cursor: &CursorFrame) -> SurfaceFrame {
         buffer_scale: cursor.buffer_scale,
         dmabuf: None,
         damage: Vec::new(),
+        buffer_damage: Vec::new(),
         full_surface: true,
+    }
+}
+
+fn collect_shm_upload_regions(
+    frame: &SurfaceFrame,
+    surface_buffer_damage: Option<DamageRect>,
+    pending_output_damage: &[DamageRect],
+    buffer_width: u32,
+    buffer_height: u32,
+) -> Option<Vec<UploadRect>> {
+    let mut regions = Vec::new();
+    if let Some(rect) = surface_buffer_damage {
+        if let Some(upload) = buffer_damage_to_upload_rect(rect, buffer_width, buffer_height) {
+            regions.push(upload);
+        }
+    }
+    for rect in pending_output_damage {
+        if let Some(upload) = output_damage_to_buffer_rect(frame, *rect) {
+            regions.push(upload);
+        }
+    }
+    if regions.is_empty() {
+        None
+    } else {
+        Some(regions)
     }
 }
 
