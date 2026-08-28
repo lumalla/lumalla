@@ -3,6 +3,37 @@ use crate::Output;
 use crate::OutputConfig;
 use std::path::PathBuf;
 
+/// Synthetic input requested by profiling or automation configs.
+#[derive(Debug, Clone)]
+pub enum InjectedInput {
+    /// Press and release a named key (xkb keysym name).
+    Key {
+        /// Keysym name such as `"Return"` or `"a"`.
+        name: String,
+    },
+    /// Type a UTF-8 string as key presses.
+    TypeText {
+        /// Text to type.
+        text: String,
+    },
+    /// Move the pointer to absolute compositor coordinates.
+    PointerMove {
+        /// X coordinate in compositor space.
+        x: f64,
+        /// Y coordinate in compositor space.
+        y: f64,
+    },
+    /// Click a pointer button at absolute compositor coordinates.
+    PointerClick {
+        /// X coordinate in compositor space.
+        x: f64,
+        /// Y coordinate in compositor space.
+        y: f64,
+        /// Linux input button code (defaults to left button).
+        button: u32,
+    },
+}
+
 /// Represents the messages that can be sent to the main thread
 pub enum MainMessage {
     /// Requests the application to shut down
@@ -35,4 +66,6 @@ pub enum MainMessage {
         /// Output name previously passed to [`Self::AddOutput`].
         name: String,
     },
+    /// Inject synthetic keyboard or pointer input.
+    InjectInput(InjectedInput),
 }

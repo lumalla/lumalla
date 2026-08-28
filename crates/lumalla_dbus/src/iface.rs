@@ -13,7 +13,7 @@ use lumalla_ipc::{
         DrmDeviceInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowRuleInfo, ZoneInfo,
     },
 };
-use lumalla_shared::{Comms, MainMessage, Mods, Output};
+use lumalla_shared::{Comms, InjectedInput, MainMessage, Mods, Output};
 use std::path::PathBuf;
 use zbus::blocking::Connection;
 
@@ -244,6 +244,34 @@ impl WindowManagerHandler for CompositorHandler {
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()> {
         self.state.keymaps.lock().unwrap().clear();
         self.state.comms.main(MainMessage::ClearKeymaps);
+        Ok(())
+    }
+
+    fn inject_key(&mut self, name: &str) -> zbus::fdo::Result<()> {
+        self.state.comms.main(MainMessage::InjectInput(InjectedInput::Key {
+            name: name.to_string(),
+        }));
+        Ok(())
+    }
+
+    fn type_text(&mut self, text: &str) -> zbus::fdo::Result<()> {
+        self.state.comms.main(MainMessage::InjectInput(InjectedInput::TypeText {
+            text: text.to_string(),
+        }));
+        Ok(())
+    }
+
+    fn inject_pointer_move(&mut self, x: f64, y: f64) -> zbus::fdo::Result<()> {
+        self.state
+            .comms
+            .main(MainMessage::InjectInput(InjectedInput::PointerMove { x, y }));
+        Ok(())
+    }
+
+    fn inject_pointer_click(&mut self, x: f64, y: f64, button: u32) -> zbus::fdo::Result<()> {
+        self.state.comms.main(MainMessage::InjectInput(
+            InjectedInput::PointerClick { x, y, button },
+        ));
         Ok(())
     }
 }

@@ -3,9 +3,27 @@ set -eu
 
 # Profile Lumalla memory with heaptrack, then open the recording in heaptrack_gui.
 # Must be invoked with the repository root as the working directory.
+#
+# Usage:
+#   ./mem-profiling.sh [scenario]
+#
+# Scenarios are Lua configs under profiling/scenarios/. The default is "idle".
+# Set LUMALLA_PROFILE_SCENARIO to override without a positional argument.
 
 if [ ! -f Cargo.toml ] || [ ! -f init.lua ]; then
   echo "error: run from the lumalla repository root (Cargo.toml and init.lua required)" >&2
+  exit 1
+fi
+
+scenario="${LUMALLA_PROFILE_SCENARIO:-idle}"
+if [ "$#" -gt 0 ]; then
+  scenario="$1"
+  shift
+fi
+
+config="./profiling/scenarios/${scenario}.lua"
+if [ ! -f "$config" ]; then
+  echo "error: unknown profiling scenario '${scenario}' (expected ${config})" >&2
   exit 1
 fi
 
@@ -17,15 +35,14 @@ cargo build -p lumalla --profile profiling
 outdir="${LUMALLA_PROFILE_DIR:-./profiling-out}"
 mkdir -p "$outdir"
 timestamp="$(date +%Y%m%d-%H%M%S)"
-heap_output="${outdir}/mem-${timestamp}"
+heap_output="${outdir}/mem-${scenario}-${timestamp}"
 
-echo "Recording memory profile to ${heap_output}"
-echo "Stop Lumalla (Ctrl+C) when you are done exercising the workload."
+echo "Recording memory profile for scenario '${scenario}' to ${heap_output}"
 
 status=0
 heaptrack -o "$heap_output" \
   ./target/profiling/lumalla \
-  --config ./init.lua \
+  --config "$config" \
   --config-command ./target/profiling/lumalla-config \
   "$@" || status=$?
 

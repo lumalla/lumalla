@@ -29,6 +29,7 @@ mod bindings {
     pub const XKB_STATE_MODS_LATCHED: c_int = 1 << 1;
     pub const XKB_STATE_MODS_LOCKED: c_int = 1 << 2;
     pub const XKB_STATE_LAYOUT_EFFECTIVE: c_int = 1 << 7;
+    pub const XKB_KEYSYM_NO_FLAGS: c_int = 0;
 
     /// Offset from Linux/evdev KEY_* codes to xkb keycodes.
     pub const EVDEV_OFFSET: u32 = 8;
@@ -92,7 +93,32 @@ mod bindings {
 
         pub fn xkb_keysym_get_name(keysym: xkb_keysym_t, buffer: *mut c_char, size: usize)
         -> c_int;
+        pub fn xkb_keysym_from_name(name: *const c_char, flags: c_int) -> xkb_keysym_t;
+        pub fn xkb_utf32_to_keysym(ucs4: u32) -> xkb_keysym_t;
+        pub fn xkb_keymap_min_keycode(keymap: *mut xkb_keymap) -> xkb_keycode_t;
+        pub fn xkb_keymap_max_keycode(keymap: *mut xkb_keymap) -> xkb_keycode_t;
+        pub fn xkb_keymap_num_levels_for_key(
+            keymap: *mut xkb_keymap,
+            key: xkb_keycode_t,
+            layout: xkb_layout_index_t,
+        ) -> u32;
+        pub fn xkb_keymap_key_get_syms_by_level(
+            keymap: *mut xkb_keymap,
+            key: xkb_keycode_t,
+            layout: xkb_layout_index_t,
+            level: u32,
+            syms_out: *mut *const xkb_keysym_t,
+        ) -> c_int;
     }
+}
+
+/// How to press a keysym on the current keymap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeysymPress {
+    /// Linux/evdev keycode.
+    pub evdev_keycode: u32,
+    /// Whether left shift should be held for this press.
+    pub shift: bool,
 }
 
 /// Modifier and layout state from xkb.
@@ -280,6 +306,67 @@ impl Xkb {
     pub fn key_get_one_sym(&self, evdev_keycode: u32) -> u32 {
         let key = evdev_keycode + bindings::EVDEV_OFFSET;
         unsafe { bindings::xkb_state_key_get_one_sym(self.state.as_ptr(), key) }
+    }
+
+    /// Resolve a keysym name (e.g. `"Return"`, `"a"`) to a keysym value.
+    pub fn keysym_from_name(name: &str) -> anyhow::Result<u32> {
+        let name_c = std::ffi::CString::new(name).context("Keysym name contains null byte")?;
+        let keysym = unsafe {
+            bindings::xkb_keysym_from_name(
+                name_c.as_ptr(),
+                bindings::XKB_KEYSYM_NO_FLAGS,
+            )
+        };
+        if keysym == 0 {
+            anyhow::bail!("Unknown keysym name: {name}");
+        }
+        Ok(keysym)
+    }
+
+    /// Resolve a Unicode scalar to a keysym.
+    pub fn keysym_from_char(ch: char) -> anyhow::Result<u32> {
+        let keysym = unsafe { bindings::xkb_utf32_to_keysym(ch as u32) };
+        if keysym == 0 {
+            anyhow::bail!("No keysym for character: {ch:?}");
+        }
+        Ok(keysym)
+    }
+
+    /// Find an evdev keycode (and shift state) that produces `keysym` on layout 0.
+    pub fn evdev_key_for_keysym(&self, keysym: u32) -> Option<KeysymPress> {
+        let min_key = unsafe { bindings::xkb_keymap_min_keycode(self.keymap.as_ptr()) };
+        let max_key = unsafe { bindings::xkb_keymap_max_keycode(self.keymap.as_ptr()) };
+        let layout = 0;
+
+        for key in min_key..=max_key {
+            let levels = unsafe {
+                bindings::xkb_keymap_num_levels_for_key(self.keymap.as_ptr(), key, layout)
+            };
+            for level in 0..levels {
+                let mut syms_ptr: *const bindings::xkb_keysym_t = std::ptr::null();
+                let count = unsafe {
+                    bindings::xkb_keymap_key_get_syms_by_level(
+                        self.keymap.as_ptr(),
+                        key,
+                        layout,
+                        level,
+                        &mut syms_ptr,
+                    )
+                };
+                if count <= 0 || syms_ptr.is_null() {
+                    continue;
+                }
+                let sym = unsafe { *syms_ptr };
+                if sym == keysym {
+                    let evdev_keycode = key.saturating_sub(bindings::EVDEV_OFFSET);
+                    return Some(KeysymPress {
+                        evdev_keycode,
+                        shift: level > 0,
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Human-readable name for a keysym (e.g. `"a"`, `"Return"`).

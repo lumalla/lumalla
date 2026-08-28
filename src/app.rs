@@ -18,16 +18,16 @@ use lumalla_display::{
     ClientConnection, ClientId, DisplayState, KeyboardModifiers, OutputInfo, ReadResult,
     SurfaceUpdate, Wayland, create_wayland_display,
 };
-use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
+use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent, BTN_LEFT};
 use lumalla_renderer::{
     CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RenderScheduler, RendererState,
     SOLID_CLEAR_COLOR, SurfaceFrame,
 };
 use lumalla_seat::SeatState;
 use lumalla_shared::{
-    Comms, Completion, DbusMessage, EventLoop, GlobalArgs, Interest, MESSAGE_CHANNEL_TOKEN,
-    MainMessage, MessageSender, OpKind, encode_user_data, message_loop_with_channel,
-    monotonic_deadline_after,
+    Comms, Completion, DbusMessage, EventLoop, GlobalArgs, InjectedInput, Interest,
+    MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender, OpKind, encode_user_data,
+    message_loop_with_channel, monotonic_deadline_after,
 };
 
 pub const LIBSEAT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 1;
@@ -218,105 +218,23 @@ impl AppData {
                 }
             }
             LIBINPUT_TOKEN => {
-                let AppData {
-                    input_state,
-                    display_state,
-                    connected_clients,
-                    renderer_state,
-                    ..
-                } = self;
-                let mut pointer_changed = false;
-                if let Err(err) = input_state.dispatch(|event| match event {
-                    SeatEvent::Keyboard(KeyboardEvent::Key {
-                        time_msec,
-                        key,
-                        pressed,
-                    }) => {
-                        display_state.handle_keyboard_key(
-                            connected_clients,
-                            time_msec,
-                            key,
-                            pressed,
-                        );
-                    }
-                    SeatEvent::Keyboard(KeyboardEvent::Modifiers(modifiers)) => {
-                        display_state.handle_keyboard_modifiers(
-                            connected_clients,
-                            KeyboardModifiers {
-                                depressed: modifiers.depressed,
-                                latched: modifiers.latched,
-                                locked: modifiers.locked,
-                                group: modifiers.group,
-                            },
-                        );
-                    }
-                    SeatEvent::Pointer(PointerEvent::Motion { time_msec, dx, dy }) => {
-                        pointer_changed = true;
-                        display_state.handle_pointer_motion(connected_clients, time_msec, dx, dy);
-                    }
-                    SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {
-                        pointer_changed = true;
-                        display_state.handle_pointer_absolute(connected_clients, time_msec, x, y);
-                    }
-                    SeatEvent::Pointer(PointerEvent::Button {
-                        time_msec,
-                        button,
-                        pressed,
-                    }) => {
-                        display_state.handle_pointer_button(
-                            connected_clients,
-                            time_msec,
-                            button,
-                            pressed,
-                        );
-                    }
-                    SeatEvent::Pointer(PointerEvent::Axis {
-                        time_msec,
-                        axis,
-                        value,
-                    }) => {
-                        display_state.handle_pointer_axis(
-                            connected_clients,
-                            time_msec,
-                            axis,
-                            value,
-                        );
-                    }
-                    SeatEvent::Touch(TouchEvent::Down {
-                        time_msec,
-                        id,
-                        x,
-                        y,
-                    }) => {
-                        display_state.handle_touch_down(connected_clients, time_msec, id, x, y);
-                    }
-                    SeatEvent::Touch(TouchEvent::Up { time_msec, id }) => {
-                        display_state.handle_touch_up(connected_clients, time_msec, id);
-                    }
-                    SeatEvent::Touch(TouchEvent::Motion {
-                        time_msec,
-                        id,
-                        x,
-                        y,
-                    }) => {
-                        display_state.handle_touch_motion(connected_clients, time_msec, id, x, y);
-                    }
-                    SeatEvent::Touch(TouchEvent::Frame) => {
-                        display_state.handle_touch_frame(connected_clients);
-                    }
-                    SeatEvent::Touch(TouchEvent::Cancel) => {
-                        display_state.handle_touch_cancel(connected_clients);
-                    }
-                }) {
+                let mut events = Vec::new();
+                if let Err(err) = self.input_state.dispatch(|event| events.push(event)) {
                     error!("Unable to dispatch libinput events: {err}");
-                } else if pointer_changed {
-                    if let Err(err) = renderer_state.update_pointer_position(
-                        display_state.pointer_position().0.round() as i32,
-                        display_state.pointer_position().1.round() as i32,
-                    ) {
-                        error!("Unable to update pointer position: {err:#}");
-                    } else if renderer_state.scene_dirty() {
-                        self.render_scheduler.mark_dirty(Instant::now());
+                } else {
+                    let mut pointer_changed = false;
+                    for event in events {
+                        pointer_changed |= self.handle_seat_event(event);
+                    }
+                    if pointer_changed {
+                        if let Err(err) = self.renderer_state.update_pointer_position(
+                            self.display_state.pointer_position().0.round() as i32,
+                            self.display_state.pointer_position().1.round() as i32,
+                        ) {
+                            error!("Unable to update pointer position: {err:#}");
+                        } else if self.renderer_state.scene_dirty() {
+                            self.render_scheduler.mark_dirty(Instant::now());
+                        }
                     }
                 }
             }
@@ -723,9 +641,149 @@ impl AppData {
                         self.init_shutdown();
                     }
                 }
+                MainMessage::InjectInput(input) => {
+                    if let Err(err) = self.inject_input(input) {
+                        error!("Unable to inject input: {err:#}");
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    fn inject_input(&mut self, input: InjectedInput) -> anyhow::Result<()> {
+        let mut events = Vec::new();
+        let result = match input {
+            InjectedInput::Key { name } => self
+                .input_state
+                .inject_key_name(&name, &mut |event| events.push(event)),
+            InjectedInput::TypeText { text } => self
+                .input_state
+                .inject_type_text(&text, &mut |event| events.push(event)),
+            InjectedInput::PointerMove { x, y } => {
+                self.input_state
+                    .inject_pointer_move(x, y, &mut |event| events.push(event));
+                Ok(())
+            }
+            InjectedInput::PointerClick { x, y, button } => {
+                self.input_state.inject_pointer_click(
+                    x,
+                    y,
+                    if button == 0 { BTN_LEFT } else { button },
+                    &mut |event| events.push(event),
+                );
+                Ok(())
+            }
+        };
+        let mut pointer_changed = false;
+        for event in events {
+            pointer_changed |= self.handle_seat_event(event);
+        }
+        if pointer_changed {
+            if let Err(err) = self.renderer_state.update_pointer_position(
+                self.display_state.pointer_position().0.round() as i32,
+                self.display_state.pointer_position().1.round() as i32,
+            ) {
+                error!("Unable to update pointer position after input injection: {err:#}");
+            } else if self.renderer_state.scene_dirty() {
+                self.render_scheduler.mark_dirty(Instant::now());
+            }
+        }
+        result
+    }
+
+    fn handle_seat_event(&mut self, event: SeatEvent) -> bool {
+        let mut pointer_changed = false;
+        match event {
+            SeatEvent::Keyboard(KeyboardEvent::Key {
+                time_msec,
+                key,
+                pressed,
+            }) => {
+                self.display_state.handle_keyboard_key(
+                    &mut self.connected_clients,
+                    time_msec,
+                    key,
+                    pressed,
+                );
+            }
+            SeatEvent::Keyboard(KeyboardEvent::Modifiers(modifiers)) => {
+                self.display_state.handle_keyboard_modifiers(
+                    &mut self.connected_clients,
+                    KeyboardModifiers {
+                        depressed: modifiers.depressed,
+                        latched: modifiers.latched,
+                        locked: modifiers.locked,
+                        group: modifiers.group,
+                    },
+                );
+            }
+            SeatEvent::Pointer(PointerEvent::Motion { time_msec, dx, dy }) => {
+                pointer_changed = true;
+                self.display_state
+                    .handle_pointer_motion(&mut self.connected_clients, time_msec, dx, dy);
+            }
+            SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {
+                pointer_changed = true;
+                self.display_state
+                    .handle_pointer_absolute(&mut self.connected_clients, time_msec, x, y);
+            }
+            SeatEvent::Pointer(PointerEvent::Button {
+                time_msec,
+                button,
+                pressed,
+            }) => {
+                self.display_state.handle_pointer_button(
+                    &mut self.connected_clients,
+                    time_msec,
+                    button,
+                    pressed,
+                );
+            }
+            SeatEvent::Pointer(PointerEvent::Axis {
+                time_msec,
+                axis,
+                value,
+            }) => {
+                self.display_state.handle_pointer_axis(
+                    &mut self.connected_clients,
+                    time_msec,
+                    axis,
+                    value,
+                );
+            }
+            SeatEvent::Touch(TouchEvent::Down {
+                time_msec,
+                id,
+                x,
+                y,
+            }) => {
+                self.display_state
+                    .handle_touch_down(&mut self.connected_clients, time_msec, id, x, y);
+            }
+            SeatEvent::Touch(TouchEvent::Up { time_msec, id }) => {
+                self.display_state
+                    .handle_touch_up(&mut self.connected_clients, time_msec, id);
+            }
+            SeatEvent::Touch(TouchEvent::Motion {
+                time_msec,
+                id,
+                x,
+                y,
+            }) => {
+                self.display_state
+                    .handle_touch_motion(&mut self.connected_clients, time_msec, id, x, y);
+            }
+            SeatEvent::Touch(TouchEvent::Frame) => {
+                self.display_state
+                    .handle_touch_frame(&mut self.connected_clients);
+            }
+            SeatEvent::Touch(TouchEvent::Cancel) => {
+                self.display_state
+                    .handle_touch_cancel(&mut self.connected_clients);
+            }
+        }
+        pointer_changed
     }
 
     fn emit_outputs_changed(&self) {

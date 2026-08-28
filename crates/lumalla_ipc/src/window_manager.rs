@@ -75,6 +75,18 @@ pub trait WindowManagerHandler: Send + Sync {
 
     /// Clear all key bindings.
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()>;
+
+    /// Press and release a named key.
+    fn inject_key(&mut self, name: &str) -> zbus::fdo::Result<()>;
+
+    /// Type a UTF-8 string as key presses.
+    fn type_text(&mut self, text: &str) -> zbus::fdo::Result<()>;
+
+    /// Move the pointer to absolute compositor coordinates.
+    fn inject_pointer_move(&mut self, x: f64, y: f64) -> zbus::fdo::Result<()>;
+
+    /// Click a pointer button at absolute compositor coordinates.
+    fn inject_pointer_click(&mut self, x: f64, y: f64, button: u32) -> zbus::fdo::Result<()>;
 }
 
 /// D-Bus object exported at [`crate::OBJECT_PATH`].
@@ -196,6 +208,22 @@ impl WindowManager {
 
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()> {
         self.handler.clear_keymaps()
+    }
+
+    fn inject_key(&mut self, name: &str) -> zbus::fdo::Result<()> {
+        self.handler.inject_key(name)
+    }
+
+    fn type_text(&mut self, text: &str) -> zbus::fdo::Result<()> {
+        self.handler.type_text(text)
+    }
+
+    fn inject_pointer_move(&mut self, x: f64, y: f64) -> zbus::fdo::Result<()> {
+        self.handler.inject_pointer_move(x, y)
+    }
+
+    fn inject_pointer_click(&mut self, x: f64, y: f64, button: u32) -> zbus::fdo::Result<()> {
+        self.handler.inject_pointer_click(x, y, button)
     }
 
     #[zbus(signal)]

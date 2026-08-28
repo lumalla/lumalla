@@ -3,6 +3,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::thread;
+use std::time::Duration;
 
 use std::sync::Arc;
 
@@ -116,6 +118,7 @@ pub(crate) fn init_dbus_module(
     init_dbus_output(lua, &module, client.clone())?;
     init_dbus_drm(lua, &module, client.clone())?;
     init_dbus_spawn(lua, &module, client.clone())?;
+    init_dbus_input(lua, &module, client.clone())?;
     init_dbus_zone(lua, &module, client.clone())?;
     init_dbus_window(lua, &module, client)?;
 
@@ -370,6 +373,58 @@ fn init_dbus_spawn(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> Lu
             Ok(())
         })?,
     )?;
+    Ok(())
+}
+
+fn init_dbus_input(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> LuaResult<()> {
+    module.set(
+        "sleep",
+        lua.create_function(|_, seconds: f64| {
+            if seconds > 0.0 {
+                thread::sleep(Duration::from_secs_f64(seconds));
+            }
+            Ok(())
+        })?,
+    )?;
+
+    let key_client = client.clone();
+    module.set(
+        "key",
+        lua.create_function(move |_, name: String| {
+            dbus_result(key_client.proxy.inject_key(&name))?;
+            Ok(())
+        })?,
+    )?;
+
+    let type_client = client.clone();
+    module.set(
+        "type",
+        lua.create_function(move |_, text: String| {
+            dbus_result(type_client.proxy.type_text(&text))?;
+            Ok(())
+        })?,
+    )?;
+
+    let move_client = client.clone();
+    module.set(
+        "pointer_move",
+        lua.create_function(move |_, (x, y): (f64, f64)| {
+            dbus_result(move_client.proxy.inject_pointer_move(x, y))?;
+            Ok(())
+        })?,
+    )?;
+
+    let click_client = client;
+    module.set(
+        "click",
+        lua.create_function(
+            move |_, (x, y, button): (f64, f64, Option<u32>)| {
+                dbus_result(click_client.proxy.inject_pointer_click(x, y, button.unwrap_or(0)))?;
+                Ok(())
+            },
+        )?,
+    )?;
+
     Ok(())
 }
 

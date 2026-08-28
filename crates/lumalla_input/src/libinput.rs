@@ -63,6 +63,8 @@ pub(crate) mod bindings {
     pub const KEY_LEFTMETA: u32 = 125;
     pub const KEY_RIGHTMETA: u32 = 126;
     pub const KEY_BACKSPACE: u32 = 14;
+    pub const KEY_SPACE: u32 = 57;
+    pub const KEY_ENTER: u32 = 28;
     pub const KEY_F1: u32 = 59;
     pub const KEY_F12: u32 = 70;
 
