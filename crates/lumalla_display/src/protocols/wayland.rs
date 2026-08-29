@@ -1985,7 +1985,7 @@ mod tests {
         );
         assert!(globals.contains(&(
             lumalla_wayland_protocol::protocols::xdg_shell::XDG_WM_BASE_NAME,
-            1
+            3
         )));
         assert!(globals.contains(&(
             lumalla_wayland_protocol::protocols::linux_dmabuf::ZWP_LINUX_DMABUF_V1_NAME,

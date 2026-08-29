@@ -126,6 +126,7 @@
             perf
             hotspot
             heaptrack
+            xwayland-satellite
             runLocal
             cpuProfiling
             memProfiling

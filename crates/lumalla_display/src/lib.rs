@@ -762,7 +762,10 @@ impl Default for Globals {
         globals.register_version(InterfaceIndex::WlSubcompositor, 1, [].into_iter());
         globals.register_version(InterfaceIndex::WlFixes, 1, [].into_iter());
         globals.register_version(InterfaceIndex::WlDataDeviceManager, 3, [].into_iter());
-        globals.register_version(InterfaceIndex::XdgWmBase, 1, [].into_iter());
+        // Advertise at least v2 so clients like xwayland-satellite (binds 2..=6) can
+        // connect; v3 covers popup reposition / reactive positioner. Do not claim v4+
+        // until configure_bounds / wm_capabilities are emitted.
+        globals.register_version(InterfaceIndex::XdgWmBase, 3, [].into_iter());
         // Stable linux-dmabuf keeps the zwp_ interface name; advertise v4 for
         // format/modifier events, create_immed, and feedback format_table.
         globals.register_version(InterfaceIndex::ZwpLinuxDmabufV1, 4, [].into_iter());
