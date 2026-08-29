@@ -43,6 +43,9 @@ pub struct SeatManager {
     output_height: u32,
     /// Active touch points: seat slot -> (client, surface).
     active_touches: HashMap<i32, (ClientId, ObjectId)>,
+    /// `wl_keyboard.leave` events for clients other than the one currently being
+    /// dispatched (protocol handlers only have that client's writer).
+    pending_keyboard_leaves: Vec<(ClientId, ObjectId, ObjectId)>,
     serial: Serial,
 }
 
@@ -93,6 +96,7 @@ impl Default for SeatManager {
             output_width: 0,
             output_height: 0,
             active_touches: HashMap::new(),
+            pending_keyboard_leaves: Vec::new(),
             serial: Serial::new(),
         }
     }
@@ -404,12 +408,51 @@ impl SeatManager {
         }
     }
 
+    /// Focus keyboard input on `surface` for `client_id`.
+    ///
+    /// Clears keyboard focus on every other surface/client first so there is at
+    /// most one keyboard focus per seat. Leaves for other clients are queued in
+    /// [`Self::pending_keyboard_leaves`] when only this client's writer is available;
+    /// call [`Self::flush_pending_keyboard_leaves`] once those writers are reachable.
     pub fn focus_keyboards_on_surface(
         &mut self,
         client_id: ClientId,
         surface: ObjectId,
         writer: &mut Writer,
     ) {
+        // Leave every keyboard that is not already on the target surface.
+        let to_leave: Vec<(ClientId, ObjectId, ObjectId)> = self
+            .keyboards
+            .iter()
+            .filter_map(|kb| {
+                let focus = kb.focus?;
+                if kb.client_id == client_id && focus == surface {
+                    return None;
+                }
+                Some((kb.client_id, kb.id, focus))
+            })
+            .collect();
+        for (leave_client, keyboard_id, old_surface) in to_leave {
+            if leave_client == client_id {
+                let serial = self.serial.next_serial();
+                writer
+                    .wl_keyboard_leave(keyboard_id)
+                    .serial(serial)
+                    .surface(old_surface);
+            } else {
+                self.pending_keyboard_leaves
+                    .push((leave_client, keyboard_id, old_surface));
+            }
+            if let Some(keyboard) = self
+                .keyboards
+                .iter_mut()
+                .find(|kb| kb.client_id == leave_client && kb.id == keyboard_id)
+            {
+                // Clear immediately so key events are not dual-delivered before flush.
+                keyboard.focus = None;
+            }
+        }
+
         let modifiers = self.modifiers;
         let keyboards: Vec<(ObjectId, Option<ObjectId>)> = self
             .keyboards
@@ -420,13 +463,6 @@ impl SeatManager {
         for (keyboard_id, previous_focus) in keyboards {
             if previous_focus == Some(surface) {
                 continue;
-            }
-            if let Some(old_surface) = previous_focus {
-                let serial = self.serial.next_serial();
-                writer
-                    .wl_keyboard_leave(keyboard_id)
-                    .serial(serial)
-                    .surface(old_surface);
             }
             let serial = self.serial.next_serial();
             writer
@@ -448,6 +484,25 @@ impl SeatManager {
             {
                 keyboard.focus = Some(surface);
             }
+        }
+    }
+
+    /// Deliver queued `wl_keyboard.leave` events to other clients.
+    pub fn flush_pending_keyboard_leaves(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) {
+        let pending = std::mem::take(&mut self.pending_keyboard_leaves);
+        for (client_id, keyboard_id, surface) in pending {
+            let Some(client) = clients.get_mut(&client_id) else {
+                continue;
+            };
+            let serial = self.serial.next_serial();
+            client
+                .writer_mut()
+                .wl_keyboard_leave(keyboard_id)
+                .serial(serial)
+                .surface(surface);
         }
     }
 
@@ -553,6 +608,7 @@ impl SeatManager {
                 if let Some(client) = clients.get_mut(&client_id) {
                     self.focus_keyboards_on_surface(client_id, surface, client.writer_mut());
                 }
+                self.flush_pending_keyboard_leaves(clients);
             }
         }
         let state = if pressed {
@@ -949,7 +1005,10 @@ impl Serial {
 mod tests {
     use std::{
         num::NonZeroU32,
-        os::{fd::AsRawFd, unix::net::UnixStream},
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::net::UnixStream,
+        },
     };
 
     use lumalla_wayland_protocol::{ClientId, ObjectId, buffer::Writer};
@@ -969,6 +1028,57 @@ mod tests {
         let (_receiver, sender) = UnixStream::pair().unwrap();
         let writer = Writer::new(sender.as_raw_fd());
         (sender, writer)
+    }
+
+    fn fake_keymap() -> KeymapMemfd {
+        let name = c"lumalla-test-keymap";
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create failed");
+        let keymap = b"xkb_keymap {};\0";
+        let written = unsafe {
+            libc::write(fd, keymap.as_ptr().cast(), keymap.len())
+        };
+        assert_eq!(written as usize, keymap.len());
+        KeymapMemfd::new(unsafe { OwnedFd::from_raw_fd(fd) }, keymap.len() as u32)
+    }
+
+    #[test]
+    fn focus_keyboards_clears_other_client_focus() {
+        let mut seat = SeatManager::default();
+        seat.set_keymap(fake_keymap());
+        let (_keep_a, mut writer_a) = writer();
+        let (_keep_b, mut writer_b) = writer();
+        let client_a = client(1);
+        let client_b = client(2);
+        let keyboard_a = object(10);
+        let keyboard_b = object(11);
+        let surface_a = object(20);
+        let surface_b = object(21);
+
+        seat.create_keyboard(client_a, keyboard_a, 5, &mut writer_a, Some(surface_a))
+            .unwrap();
+        seat.create_keyboard(client_b, keyboard_b, 5, &mut writer_b, None)
+            .unwrap();
+        assert_eq!(seat.keyboards[0].focus, Some(surface_a));
+        assert!(seat.keyboards[1].focus.is_none());
+
+        seat.focus_keyboards_on_surface(client_b, surface_b, &mut writer_b);
+        assert!(seat.keyboards[0].focus.is_none());
+        assert_eq!(seat.keyboards[1].focus, Some(surface_b));
+        assert_eq!(seat.pending_keyboard_leaves.len(), 1);
+        assert_eq!(
+            seat.pending_keyboard_leaves[0],
+            (client_a, keyboard_a, surface_a)
+        );
+
+        // Keys must only go to the newly focused client.
+        let focused: Vec<_> = seat
+            .keyboards
+            .iter()
+            .filter(|kb| kb.focus.is_some())
+            .map(|kb| kb.client_id)
+            .collect();
+        assert_eq!(focused, vec![client_b]);
     }
 
     #[test]

@@ -1352,7 +1352,14 @@ impl WlSeat for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::WlKeyboard, version) {
             return;
         }
-        let focus = self.surface_manager.first_surface(ctx.client_id);
+        let focus = match self.seat_manager.focused_keyboard_surface() {
+            // Inherit existing seat focus for this client (e.g. second wl_keyboard).
+            Some((focused_client, surface)) if focused_client == ctx.client_id => Some(surface),
+            // Another client already owns keyboard focus — do not steal it.
+            Some(_) => None,
+            // No seat focus yet: focus this client's first surface if any.
+            None => self.surface_manager.first_surface(ctx.client_id),
+        };
         if let Err(err) = self.seat_manager.create_keyboard(
             ctx.client_id,
             *params.id(),

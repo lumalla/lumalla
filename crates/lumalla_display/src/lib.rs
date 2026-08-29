@@ -155,6 +155,13 @@ impl DisplayState {
             .send_all_feedback(clients.values_mut());
     }
 
+    pub fn flush_pending_keyboard_leaves(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) {
+        self.seat_manager.flush_pending_keyboard_leaves(clients);
+    }
+
     pub fn handle_keyboard_key(
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,

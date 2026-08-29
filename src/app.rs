@@ -385,6 +385,8 @@ impl AppData {
                     );
                     self.begin_client_disconnect(event_loop, client_id);
                 } else {
+                    self.display_state
+                        .flush_pending_keyboard_leaves(&mut self.connected_clients);
                     self.submit_committed_frames();
                     let layout_syncs = self
                         .display_state
