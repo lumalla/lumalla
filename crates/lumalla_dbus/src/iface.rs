@@ -7,34 +7,20 @@ use std::{
 };
 
 use log::{error, info, warn};
+use lumalla_input::evdev_keycode_from_name;
 use lumalla_ipc::{
     INTERFACE_NAME, KeyBindingInfo, OBJECT_PATH, WindowManagerHandler,
     types::{
-        DrmDeviceInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowRuleInfo, ZoneInfo,
+        DrmDeviceInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowInfo, WindowRuleInfo,
+        ZoneInfo,
     },
 };
-use lumalla_shared::{Comms, InjectedInput, MainMessage, Mods, Output};
+use lumalla_shared::{
+    Comms, InjectedInput, MainMessage, Mods, Output, WindowGeometryUpdate, WindowState,
+    geometry_field_from_dbus,
+};
 use std::path::PathBuf;
 use zbus::blocking::Connection;
-
-fn key_name_to_keycode(key_name: &str) -> Option<u32> {
-    match key_name {
-        "backspace" => Some(14),
-        "f1" => Some(59),
-        "f2" => Some(60),
-        "f3" => Some(61),
-        "f4" => Some(62),
-        "f5" => Some(63),
-        "f6" => Some(64),
-        "f7" => Some(65),
-        "f8" => Some(66),
-        "f9" => Some(67),
-        "f10" => Some(68),
-        "f11" => Some(69),
-        "f12" => Some(70),
-        _ => None,
-    }
-}
 
 pub(crate) struct ServiceState {
     pub comms: Comms,
@@ -44,6 +30,7 @@ pub(crate) struct ServiceState {
     pub wayland_display: Arc<Mutex<Option<String>>>,
     pub extra_env: Arc<Mutex<HashMap<String, String>>>,
     pub keymaps: Arc<Mutex<Vec<KeyBindingInfo>>>,
+    pub windows: Arc<Mutex<Vec<WindowState>>>,
 }
 
 pub(crate) struct CompositorHandler {
@@ -158,23 +145,58 @@ impl WindowManagerHandler for CompositorHandler {
     }
 
     fn add_window_rule(&mut self, rule: WindowRuleInfo) -> zbus::fdo::Result<()> {
-        let _ = rule;
-        // self.state
-        //     .comms
-        //     .display(DisplayMessage::AddWindowRule(rule.into()));
+        self.state
+            .comms
+            .main(MainMessage::AddWindowRule(rule.into()));
         Ok(())
     }
 
-    fn close_current_window(&mut self) -> zbus::fdo::Result<()> {
-        // self.state.comms.display(DisplayMessage::CloseCurrentWindow);
+    fn clear_window_rules(&mut self) -> zbus::fdo::Result<()> {
+        self.state.comms.main(MainMessage::ClearWindowRules);
         Ok(())
     }
 
-    fn move_current_window_to_zone(&mut self, zone: &str) -> zbus::fdo::Result<()> {
-        let _ = zone;
-        // self.state
-        //     .comms
-        //     .display(DisplayMessage::MoveCurrentWindowToZone(zone.to_string()));
+    fn get_windows(&self) -> zbus::fdo::Result<Vec<WindowInfo>> {
+        Ok(self
+            .state
+            .windows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(WindowInfo::from)
+            .collect())
+    }
+
+    fn get_focused_window(&self) -> zbus::fdo::Result<u32> {
+        Ok(self
+            .state
+            .windows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|window| window.focused)
+            .map(|window| window.id)
+            .unwrap_or(0))
+    }
+
+    fn set_window(
+        &mut self,
+        id: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> zbus::fdo::Result<()> {
+        self.state.comms.main(MainMessage::SetWindow {
+            id: if id == 0 { None } else { Some(id) },
+            geometry: WindowGeometryUpdate {
+                x: geometry_field_from_dbus(x),
+                y: geometry_field_from_dbus(y),
+                width: geometry_field_from_dbus(width),
+                height: geometry_field_from_dbus(height),
+            },
+            user_initiated: true,
+        });
         Ok(())
     }
 
@@ -230,7 +252,11 @@ impl WindowManagerHandler for CompositorHandler {
 
     fn map_key(&mut self, binding: KeyBindingInfo) -> zbus::fdo::Result<()> {
         self.state.keymaps.lock().unwrap().push(binding.clone());
-        let Some(key) = key_name_to_keycode(&binding.key) else {
+        let Some(key) = evdev_keycode_from_name(&binding.key) else {
+            warn!(
+                "Ignoring keymap binding {:?}+{}: unknown key name",
+                binding.mods, binding.key
+            );
             return Ok(());
         };
         self.state.comms.main(MainMessage::AddKeymap {

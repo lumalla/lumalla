@@ -386,6 +386,13 @@ impl AppData {
                     self.begin_client_disconnect(event_loop, client_id);
                 } else {
                     self.submit_committed_frames();
+                    let layout_syncs = self
+                        .display_state
+                        .drain_pending_geometry(&mut self.connected_clients);
+                    self.apply_renderer_layout_syncs(&layout_syncs);
+                    if !layout_syncs.is_empty() {
+                        self.sync_windows_to_dbus();
+                    }
                     self.sync_pointer_cursor();
                 }
             }
@@ -450,6 +457,7 @@ impl AppData {
         } else if self.renderer_state.scene_dirty() {
             self.render_scheduler.mark_dirty(Instant::now());
         }
+        self.sync_windows_to_dbus();
         self.try_finalize_client(client_id);
     }
 
@@ -645,6 +653,31 @@ impl AppData {
                     if let Err(err) = self.inject_input(input) {
                         error!("Unable to inject input: {err:#}");
                     }
+                }
+                MainMessage::SetWindow {
+                    id,
+                    geometry,
+                    user_initiated,
+                } => {
+                    match self.display_state.set_window(
+                        id,
+                        geometry,
+                        user_initiated,
+                        &mut self.connected_clients,
+                    ) {
+                        Ok(layout_syncs) => {
+                            self.apply_renderer_layout_syncs(&layout_syncs);
+                            self.sync_windows_to_dbus();
+                            self.render_scheduler.request_immediate();
+                        }
+                        Err(err) => error!("Unable to set window geometry: {err}"),
+                    }
+                }
+                MainMessage::AddWindowRule(rule) => {
+                    self.display_state.add_window_rule(rule);
+                }
+                MainMessage::ClearWindowRules => {
+                    self.display_state.clear_window_rules();
                 }
             }
         }
@@ -845,8 +878,33 @@ impl AppData {
         }
     }
 
+    fn apply_renderer_layout_syncs(
+        &mut self,
+        layout_syncs: &[lumalla_display::RendererLayoutSync],
+    ) {
+        for sync in layout_syncs {
+            if let Err(err) = self.renderer_state.update_surface_frame_position(
+                sync.owner_id,
+                sync.surface_id,
+                sync.x,
+                sync.y,
+            ) {
+                error!("Unable to update surface frame position: {err:#}");
+            }
+        }
+        if !layout_syncs.is_empty() && self.renderer_state.scene_dirty() {
+            self.render_scheduler.mark_dirty(Instant::now());
+        }
+    }
+
+    fn sync_windows_to_dbus(&mut self) {
+        self.comms
+            .dbus(DbusMessage::SetWindows(self.display_state.window_states()));
+    }
+
     fn submit_committed_frames(&mut self) {
         let updates: Vec<_> = self.display_state.take_surface_updates().collect();
+        let had_updates = !updates.is_empty();
         for update in updates {
             match update {
                 SurfaceUpdate::Frame(frame) => {
@@ -943,6 +1001,9 @@ impl AppData {
                     }
                 }
             }
+        }
+        if had_updates {
+            self.sync_windows_to_dbus();
         }
         if self.renderer_state.scene_dirty()
             || self.display_state.pending_frame_callback_count() > 0

@@ -1,4 +1,4 @@
-use crate::{DrmDeviceState, Output};
+use crate::{DrmDeviceState, Output, WindowState};
 
 /// Messages handled by the compositor D-Bus thread.
 #[derive(Debug)]
@@ -19,4 +19,6 @@ pub enum DbusMessage {
     EmitBindingActivated(String),
     /// Set `WAYLAND_DISPLAY` used for processes spawned over D-Bus.
     SetWaylandDisplay(String),
+    /// Replace the window list returned by `GetWindows`.
+    SetWindows(Vec<WindowState>),
 }

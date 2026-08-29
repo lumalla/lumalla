@@ -30,6 +30,7 @@ pub struct DbusService {
     output_lookup: Arc<Mutex<HashMap<String, Output>>>,
     drm_devices: Arc<Mutex<Vec<DrmDeviceInfo>>>,
     wayland_display: Arc<Mutex<Option<String>>>,
+    windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
 }
 
 impl DbusService {
@@ -47,6 +48,7 @@ impl DbusService {
             wayland_display: Arc::clone(&wayland_display),
             extra_env: Arc::new(Mutex::new(HashMap::new())),
             keymaps: Arc::new(Mutex::new(Vec::new())),
+            windows: Arc::new(Mutex::new(Vec::new())),
         });
         let connection = connection::Builder::session()
             .context("Failed to connect to session bus")?
@@ -77,6 +79,7 @@ impl DbusService {
             output_lookup,
             drm_devices,
             wayland_display,
+            windows: state.windows.clone(),
         })
     }
 
@@ -95,6 +98,7 @@ struct DbusState {
     output_lookup: Arc<Mutex<HashMap<String, Output>>>,
     drm_devices: Arc<Mutex<Vec<DrmDeviceInfo>>>,
     wayland_display: Arc<Mutex<Option<String>>>,
+    windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
 }
 
 impl DbusState {
@@ -108,6 +112,7 @@ impl DbusState {
             output_lookup: service.output_lookup,
             drm_devices: service.drm_devices,
             wayland_display: service.wayland_display,
+            windows: service.windows,
         }
     }
 
@@ -189,6 +194,9 @@ impl DbusState {
             DbusMessage::SetWaylandDisplay(wayland_display) => {
                 info!("Setting WAYLAND_DISPLAY for D-Bus spawns to {wayland_display}");
                 *self.wayland_display.lock().unwrap() = Some(wayland_display);
+            }
+            DbusMessage::SetWindows(windows) => {
+                *self.windows.lock().unwrap() = windows;
             }
         }
 

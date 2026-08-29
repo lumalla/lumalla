@@ -323,6 +323,31 @@ impl SurfaceManager {
         Ok(())
     }
 
+    pub fn set_surface_layout(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        x: i32,
+        y: i32,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        surface.layout = (x, y);
+        Ok(())
+    }
+
+    pub fn surface_layout(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Option<(i32, i32)> {
+        self.surfaces
+            .get(&(client_id, surface_id))
+            .map(|surface| surface.layout)
+    }
+
     pub fn assign_cursor_role(
         &mut self,
         client_id: ClientId,
@@ -981,10 +1006,7 @@ impl SurfaceManager {
                 .surfaces
                 .get_mut(&(client_id, id))
                 .ok_or(SurfaceError::UnknownSurface)?;
-            if matches!(
-                surface.role,
-                Some(Role::Shell(_)) | Some(Role::Xdg(_))
-            ) {
+            if matches!(surface.role, Some(Role::Shell(_))) {
                 let pos = self.next_cascade;
                 self.next_cascade = self.next_cascade.wrapping_add(32);
                 surface.layout = (pos, pos);

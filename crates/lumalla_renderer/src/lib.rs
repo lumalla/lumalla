@@ -404,6 +404,28 @@ impl RendererState {
         Ok(())
     }
 
+    pub fn update_surface_frame_position(
+        &mut self,
+        owner_id: u32,
+        surface_id: u32,
+        x: i32,
+        y: i32,
+    ) -> anyhow::Result<()> {
+        let key = (owner_id, surface_id);
+        let Some(frame) = self.surface_frames.get_mut(&key) else {
+            return Ok(());
+        };
+        if frame.x == x && frame.y == y {
+            return Ok(());
+        }
+        frame.x = x;
+        frame.y = y;
+        self.pending_full_redraw = true;
+        self.pending_damage.clear();
+        self.mark_dirty_if_active();
+        Ok(())
+    }
+
     pub fn remove_surface_frame(&mut self, owner_id: u32, surface_id: u32) -> anyhow::Result<()> {
         let key = (owner_id, surface_id);
         if self.surface_frames.remove(&key).is_some() {

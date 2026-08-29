@@ -5,7 +5,7 @@ mod xkb;
 
 use std::{os::fd::RawFd, pin::Pin, time::Instant};
 
-use log::debug;
+use log::{debug, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::{Comms, DbusMessage, KeymapMemfd, MainMessage, Mods};
 
@@ -13,6 +13,43 @@ use crate::libinput::{InputEvent, KEY_STATE_PRESSED, LibInput, is_modifier_key, 
 use crate::xkb::Xkb;
 
 pub use xkb::XkbModifiers as KeyboardModifiers;
+
+/// Resolve a key name (e.g. `"m"`, `"Return"`, `"F1"`) to a Linux evdev keycode.
+pub fn evdev_keycode_from_name(name: &str) -> Option<u32> {
+    let xkb = Xkb::new().ok()?;
+    for candidate in candidate_key_names(name) {
+        let Ok(keysym) = Xkb::keysym_from_name(&candidate) else {
+            continue;
+        };
+        let Some(press) = xkb.evdev_key_for_keysym(keysym) else {
+            continue;
+        };
+        if press.shift {
+            warn!(
+                "Key `{name}` requires shift on the default keymap; map_key bindings do not model shift yet"
+            );
+        }
+        return Some(press.evdev_keycode);
+    }
+    None
+}
+
+fn candidate_key_names(name: &str) -> Vec<String> {
+    let mut candidates = vec![name.to_string()];
+    if name.len() == 1 {
+        candidates.push(name.to_uppercase());
+    }
+    if let Some(digits) = name.strip_prefix('f').or_else(|| name.strip_prefix('F'))
+        && !digits.is_empty()
+        && digits.chars().all(|ch| ch.is_ascii_digit())
+    {
+        candidates.push(format!("F{digits}"));
+    }
+    if name.eq_ignore_ascii_case("backspace") {
+        candidates.push("BackSpace".to_string());
+    }
+    candidates
+}
 
 struct KeyBinding {
     key: u32,
@@ -406,5 +443,17 @@ fn fn_key_to_vt(key: u32) -> Option<i32> {
         Some((key - libinput::bindings::KEY_F1 + 1) as i32)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_common_key_names_to_evdev_keycodes() {
+        assert_eq!(evdev_keycode_from_name("m"), Some(50));
+        assert_eq!(evdev_keycode_from_name("f1"), Some(59));
+        assert_eq!(evdev_keycode_from_name("backspace"), Some(14));
     }
 }

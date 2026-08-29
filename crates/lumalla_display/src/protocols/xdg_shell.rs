@@ -363,24 +363,37 @@ impl XdgSurface for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::XdgToplevel, version) {
             return;
         }
+        let Ok(wl_surface) = self.xdg_manager.wl_surface_for_xdg(ctx.client_id, object_id) else {
+            report_xdg_error(ctx, object_id, XdgError::UnknownXdgSurface);
+            return;
+        };
+        let (width, height) = self.register_toplevel(
+            ctx.client_id,
+            *params.id(),
+            object_id,
+            wl_surface,
+        );
         match self.xdg_manager.create_toplevel(
             ctx.client_id,
             *params.id(),
             object_id,
-            DEFAULT_TOPLEVEL_WIDTH,
-            DEFAULT_TOPLEVEL_HEIGHT,
+            width,
+            height,
         ) {
             Ok(serial) => {
                 ctx.writer
                     .xdg_toplevel_configure(*params.id())
-                    .width(DEFAULT_TOPLEVEL_WIDTH)
-                    .height(DEFAULT_TOPLEVEL_HEIGHT)
+                    .width(width)
+                    .height(height)
                     .states(&[]);
                 ctx.writer
                     .xdg_surface_configure(object_id)
                     .serial(serial);
             }
-            Err(error) => report_xdg_error(ctx, object_id, error),
+            Err(error) => {
+                self.unregister_toplevel(ctx.client_id, *params.id());
+                report_xdg_error(ctx, object_id, error);
+            }
         }
     }
 
@@ -482,7 +495,10 @@ impl XdgSurface for DisplayState {
 impl XdgToplevel for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &XdgToplevelDestroy<'_>) {
         match self.xdg_manager.destroy_toplevel(ctx.client_id, object_id) {
-            Ok(_) => ctx.registry.free_object(object_id, ctx.writer),
+            Ok(_) => {
+                self.unregister_toplevel(ctx.client_id, object_id);
+                ctx.registry.free_object(object_id, ctx.writer);
+            }
             Err(error) => report_xdg_error(ctx, object_id, error),
         }
     }
@@ -507,13 +523,16 @@ impl XdgToplevel for DisplayState {
         object_id: ObjectId,
         params: &XdgToplevelSetTitle<'_>,
     ) {
+        let title = params.title().to_owned();
         if let Err(error) = self.xdg_manager.set_toplevel_title(
             ctx.client_id,
             object_id,
-            params.title().to_owned(),
+            title.clone(),
         ) {
             report_xdg_error(ctx, object_id, error);
+            return;
         }
+        self.on_toplevel_title_set(ctx.client_id, object_id, title);
     }
 
     fn set_app_id(
@@ -522,13 +541,16 @@ impl XdgToplevel for DisplayState {
         object_id: ObjectId,
         params: &XdgToplevelSetAppId<'_>,
     ) {
+        let app_id = params.app_id().to_owned();
         if let Err(error) = self.xdg_manager.set_toplevel_app_id(
             ctx.client_id,
             object_id,
-            params.app_id().to_owned(),
+            app_id.clone(),
         ) {
             report_xdg_error(ctx, object_id, error);
+            return;
         }
+        self.queue_rule_geometry_for_toplevel(ctx.client_id, object_id, app_id);
     }
 
     fn show_window_menu(

@@ -383,6 +383,22 @@ impl XdgManager {
         Ok((toplevel.configure_width, toplevel.configure_height))
     }
 
+    pub fn set_toplevel_configure_size(
+        &mut self,
+        client_id: ClientId,
+        toplevel_id: ObjectId,
+        width: i32,
+        height: i32,
+    ) -> Result<(), XdgError> {
+        let toplevel = self
+            .toplevels
+            .get_mut(&(client_id, toplevel_id))
+            .ok_or(XdgError::UnknownToplevel)?;
+        toplevel.configure_width = width;
+        toplevel.configure_height = height;
+        Ok(())
+    }
+
     pub fn xdg_surface_for_toplevel(
         &self,
         client_id: ClientId,

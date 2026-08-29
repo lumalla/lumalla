@@ -59,7 +59,7 @@ pub struct Wayland {
 impl Wayland {
     pub fn new(socket_path: String) -> anyhow::Result<Self> {
         if Path::new(&socket_path).exists() {
-            fs::remove_file(&socket_path).context("Failed to remove existing socket")?;
+            anyhow::bail!("Wayland socket already exists: {socket_path}");
         }
         let listener = UnixListener::bind(&socket_path).context("Failed to bind to socket")?;
         listener

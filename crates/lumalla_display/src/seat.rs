@@ -279,6 +279,12 @@ impl SeatManager {
             .and_then(|p| p.focus)
     }
 
+    pub fn focused_keyboard_surface(&self) -> Option<(ClientId, ObjectId)> {
+        self.keyboards
+            .iter()
+            .find_map(|keyboard| keyboard.focus.map(|surface| (keyboard.client_id, surface)))
+    }
+
     pub fn set_cursor(
         &mut self,
         client_id: ClientId,

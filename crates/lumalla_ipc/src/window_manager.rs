@@ -3,8 +3,8 @@
 use zbus::{interface, object_server::SignalEmitter};
 
 use crate::types::{
-    DrmDeviceInfo, KeyBindingInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowRuleInfo,
-    ZoneInfo,
+    DrmDeviceInfo, KeyBindingInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowInfo,
+    WindowRuleInfo, ZoneInfo,
 };
 
 /// Server-side handler for [`WindowManager`] D-Bus methods.
@@ -41,11 +41,25 @@ pub trait WindowManagerHandler: Send + Sync {
     /// Add a window placement rule.
     fn add_window_rule(&mut self, rule: WindowRuleInfo) -> zbus::fdo::Result<()>;
 
-    /// Close the focused window.
-    fn close_current_window(&mut self) -> zbus::fdo::Result<()>;
+    /// Remove all window placement rules.
+    fn clear_window_rules(&mut self) -> zbus::fdo::Result<()>;
 
-    /// Move the focused window to a zone.
-    fn move_current_window_to_zone(&mut self, zone: &str) -> zbus::fdo::Result<()>;
+    /// Return managed windows.
+    fn get_windows(&self) -> zbus::fdo::Result<Vec<WindowInfo>>;
+
+    /// Return the focused window id, if any.
+    fn get_focused_window(&self) -> zbus::fdo::Result<u32>;
+
+    /// Update window geometry. Pass `id = 0` to target the focused window.
+    /// Use `WINDOW_GEOMETRY_UNSET` for fields that should not be changed.
+    fn set_window(
+        &mut self,
+        id: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> zbus::fdo::Result<()>;
 
     /// Spawn a child process.
     fn spawn(&mut self, command: &str, args: Vec<String>) -> zbus::fdo::Result<()>;
@@ -165,12 +179,27 @@ impl WindowManager {
         self.handler.add_window_rule(rule)
     }
 
-    fn close_current_window(&mut self) -> zbus::fdo::Result<()> {
-        self.handler.close_current_window()
+    fn clear_window_rules(&mut self) -> zbus::fdo::Result<()> {
+        self.handler.clear_window_rules()
     }
 
-    fn move_current_window_to_zone(&mut self, zone: &str) -> zbus::fdo::Result<()> {
-        self.handler.move_current_window_to_zone(zone)
+    fn get_windows(&self) -> zbus::fdo::Result<Vec<WindowInfo>> {
+        self.handler.get_windows()
+    }
+
+    fn get_focused_window(&self) -> zbus::fdo::Result<u32> {
+        self.handler.get_focused_window()
+    }
+
+    fn set_window(
+        &mut self,
+        id: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> zbus::fdo::Result<()> {
+        self.handler.set_window(id, x, y, width, height)
     }
 
     fn spawn(&mut self, command: &str, args: Vec<String>) -> zbus::fdo::Result<()> {

@@ -344,6 +344,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                     commit.surface_id,
                     ctx.writer,
                 );
+                state.on_surface_focused(ctx.client_id, commit.surface_id);
                 for output in state
                     .output_manager
                     .bound_outputs_for_client(ctx.client_id)

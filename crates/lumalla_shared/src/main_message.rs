@@ -1,6 +1,8 @@
 use crate::Mods;
 use crate::Output;
 use crate::OutputConfig;
+use crate::WindowGeometryUpdate;
+use crate::WindowRule;
 use std::path::PathBuf;
 
 /// Synthetic input requested by profiling or automation configs.
@@ -68,4 +70,17 @@ pub enum MainMessage {
     },
     /// Inject synthetic keyboard or pointer input.
     InjectInput(InjectedInput),
+    /// Update window geometry. `id == None` targets the focused window.
+    SetWindow {
+        /// Window id, or `None` for the focused window.
+        id: Option<u32>,
+        /// Fields to update.
+        geometry: WindowGeometryUpdate,
+        /// When true, updated fields are marked as user-placed and won't be overwritten by rules.
+        user_initiated: bool,
+    },
+    /// Register a default placement rule for matching app ids.
+    AddWindowRule(WindowRule),
+    /// Remove all window placement rules.
+    ClearWindowRules,
 }

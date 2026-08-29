@@ -10,7 +10,9 @@ mod mods;
 mod output;
 pub mod ring;
 pub mod udev;
+mod window_geometry;
 mod window_rule;
+mod window_state;
 mod zone;
 
 pub use action::{Action, CallbackRef};
@@ -28,5 +30,9 @@ pub use ring::{
     monotonic_deadline_after, monotonic_now,
 };
 pub use udev::{Udev, UdevDevice, UdevEnumerate, UdevMonitor};
+pub use window_geometry::{
+    WindowGeometryUpdate, WINDOW_GEOMETRY_UNSET, geometry_field_from_dbus, geometry_field_to_dbus,
+};
 pub use window_rule::WindowRule;
+pub use window_state::WindowState;
 pub use zone::Zone;

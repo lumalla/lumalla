@@ -8,6 +8,7 @@ repository = "https://github.com/lumalla/lumalla"
 include = ["src/**/*", "LICENSE-*"]
 
 [dependencies]
+lumalla_input = { path = "../lumalla_input" }
 lumalla_ipc = { path = "../lumalla_ipc" }
 lumalla_shared = { path = "../lumalla_shared" }
 anyhow = { workspace = true }

@@ -9,7 +9,8 @@ pub mod types;
 pub use window_manager::{WindowManager, WindowManagerHandler, WindowManagerProxy, signals};
 pub use types::{
     DrmConnectorInfo, DrmDeviceInfo, DrmModeInfo, KeyBindingInfo, LayoutOutputInfo,
-    LayoutSpacesInfo, ModsInfo, OutputConfigInfo, OutputInfo, WindowRuleInfo, ZoneInfo,
+    LayoutSpacesInfo, ModsInfo, OutputConfigInfo, OutputInfo, WindowInfo, WindowRuleInfo,
+    ZoneInfo,
 };
 
 /// Well-known session bus name for the compositor.

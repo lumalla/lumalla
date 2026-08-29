@@ -1,12 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 
 use anyhow::Context;
-use lumalla_shared::Comms;
+use lumalla_shared::{Comms, WindowGeometryUpdate, WindowRule, WindowState};
 use lumalla_wayland_protocol::registry::InterfaceIndex;
+use lumalla_wayland_protocol::{ObjectId, buffer::Writer};
 
 use crate::{
     data_device::DataDeviceManager, dmabuf::DmabufManager, output::OutputManager,
-    seat::SeatManager, shm::ShmManager, surface::SurfaceManager, xdg::XdgManager,
+    seat::SeatManager, shm::ShmManager, surface::SurfaceManager, window_manager::WindowManager,
+    xdg::XdgManager,
 };
 
 mod data_device;
@@ -16,6 +18,7 @@ mod seat;
 mod shm;
 mod surface;
 mod output;
+mod window_manager;
 mod xdg;
 
 pub use lumalla_wayland_protocol::{
@@ -25,6 +28,7 @@ pub use seat::{ActiveCursor, KeyboardModifiers};
 pub use output::OutputInfo;
 pub use surface::Rectangle;
 pub use dmabuf::ExportedDmabuf;
+pub use window_manager::{WindowError, WindowGeometryChange};
 
 pub struct DisplayMessage;
 
@@ -64,6 +68,15 @@ pub enum SurfaceUpdate {
     },
 }
 
+/// Renderer position update after a window move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RendererLayoutSync {
+    pub owner_id: u32,
+    pub surface_id: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
 pub struct DisplayState {
     _comms: Comms,
     globals: Globals,
@@ -74,7 +87,9 @@ pub struct DisplayState {
     output_manager: OutputManager,
     data_device_manager: DataDeviceManager,
     xdg_manager: XdgManager,
+    window_manager: WindowManager,
     surface_updates: VecDeque<SurfaceUpdate>,
+    pending_geometry_changes: Vec<WindowGeometryChange>,
     pending_frame_callbacks: VecDeque<(ClientId, lumalla_wayland_protocol::ObjectId)>,
 }
 
@@ -90,7 +105,9 @@ impl DisplayState {
             output_manager: OutputManager::default(),
             data_device_manager: DataDeviceManager::default(),
             xdg_manager: XdgManager::default(),
+            window_manager: WindowManager::default(),
             surface_updates: VecDeque::new(),
+            pending_geometry_changes: Vec::new(),
             pending_frame_callbacks: VecDeque::new(),
         })
     }
@@ -193,6 +210,11 @@ impl DisplayState {
             button,
             pressed,
         );
+        if pressed
+            && let Some((client_id, surface)) = self.seat_manager.focused_keyboard_surface()
+        {
+            self.on_surface_focused(client_id, surface);
+        }
     }
 
     pub fn handle_pointer_axis(
@@ -310,6 +332,7 @@ impl DisplayState {
         self.output_manager.remove_client(client_id);
         self.data_device_manager.remove_client(client_id);
         self.xdg_manager.delete_client(client_id);
+        self.window_manager.delete_client(client_id);
         self.pending_frame_callbacks
             .retain(|(owner, _)| *owner != client_id);
         self.surface_updates.retain(|update| match update {
@@ -387,6 +410,175 @@ impl DisplayState {
         self.seat_manager
             .add_main_seat(seat_name, &mut self.globals, client_connections)?;
         Ok(())
+    }
+
+    pub fn set_window(
+        &mut self,
+        id: Option<u32>,
+        geometry: WindowGeometryUpdate,
+        user_initiated: bool,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) -> Result<Vec<RendererLayoutSync>, WindowError> {
+        let changes = self.window_manager.set_window(
+            id,
+            geometry,
+            user_initiated,
+            &self.surface_manager,
+            &mut self.xdg_manager,
+        )?;
+        Ok(self.apply_geometry_changes(changes, clients))
+    }
+
+    pub fn add_window_rule(&mut self, rule: WindowRule) {
+        self.window_manager.add_rule(rule);
+    }
+
+    pub fn clear_window_rules(&mut self) {
+        self.window_manager.clear_rules();
+    }
+
+    pub fn window_states(&self) -> Vec<WindowState> {
+        self.window_manager
+            .window_states(&self.surface_manager, &self.xdg_manager)
+    }
+
+    pub fn focused_window_id(&self) -> Option<u32> {
+        self.window_manager.focused_window_id()
+    }
+
+    pub(crate) fn register_toplevel(
+        &mut self,
+        client_id: ClientId,
+        toplevel: ObjectId,
+        xdg_surface: ObjectId,
+        wl_surface: ObjectId,
+    ) -> (i32, i32) {
+        self.window_manager.register_toplevel(
+            client_id,
+            toplevel,
+            xdg_surface,
+            wl_surface,
+            &mut self.surface_manager,
+        )
+    }
+
+    pub(crate) fn unregister_toplevel(&mut self, client_id: ClientId, toplevel: ObjectId) {
+        self.window_manager.unregister_toplevel(client_id, toplevel);
+    }
+
+    pub fn drain_pending_geometry(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) -> Vec<RendererLayoutSync> {
+        if self.pending_geometry_changes.is_empty() {
+            return Vec::new();
+        }
+        let changes = std::mem::take(&mut self.pending_geometry_changes);
+        self.apply_geometry_changes(changes, clients)
+    }
+
+    pub(crate) fn queue_rule_geometry_for_toplevel(
+        &mut self,
+        client_id: ClientId,
+        toplevel: ObjectId,
+        app_id: String,
+    ) {
+        let surface_manager = &self.surface_manager;
+        let changes = self.window_manager.on_app_id_set(
+            client_id,
+            toplevel,
+            app_id,
+            surface_manager,
+            &mut self.xdg_manager,
+        );
+        self.pending_geometry_changes.extend(changes);
+    }
+
+    pub(crate) fn on_toplevel_title_set(
+        &mut self,
+        client_id: ClientId,
+        toplevel: ObjectId,
+        title: String,
+    ) {
+        self.window_manager
+            .set_toplevel_title(client_id, toplevel, title);
+    }
+
+    pub(crate) fn on_surface_focused(&mut self, client_id: ClientId, wl_surface: ObjectId) {
+        self.window_manager
+            .set_focus_from_surface(client_id, wl_surface);
+    }
+
+    pub(crate) fn flush_pending_window_configures(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) {
+        let pending = self.window_manager.take_pending_configures();
+        for configure in pending {
+            let Some(client) = clients.get_mut(&configure.client_id) else {
+                continue;
+            };
+            self.emit_toplevel_configure(
+                configure.client_id,
+                client.writer_mut(),
+                configure.xdg_surface,
+                configure.toplevel,
+            );
+        }
+    }
+
+    pub(crate) fn emit_toplevel_configure(
+        &mut self,
+        client_id: ClientId,
+        writer: &mut Writer,
+        xdg_surface_id: ObjectId,
+        toplevel_id: ObjectId,
+    ) {
+        let Ok(serial) = self
+            .xdg_manager
+            .send_configure_serial(client_id, xdg_surface_id)
+        else {
+            return;
+        };
+        let (width, height) = self
+            .xdg_manager
+            .toplevel_configure_size(client_id, toplevel_id)
+            .unwrap_or((
+                window_manager::DEFAULT_WINDOW_WIDTH,
+                window_manager::DEFAULT_WINDOW_HEIGHT,
+            ));
+        writer
+            .xdg_toplevel_configure(toplevel_id)
+            .width(width)
+            .height(height)
+            .states(&[]);
+        writer.xdg_surface_configure(xdg_surface_id).serial(serial);
+    }
+
+    fn apply_geometry_changes(
+        &mut self,
+        changes: Vec<WindowGeometryChange>,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) -> Vec<RendererLayoutSync> {
+        let mut renderer_syncs = Vec::new();
+        for change in changes {
+            if let Some((x, y)) = change.position {
+                let _ = self.surface_manager.set_surface_layout(
+                    change.client_id,
+                    change.wl_surface,
+                    x,
+                    y,
+                );
+                renderer_syncs.push(RendererLayoutSync {
+                    owner_id: change.client_id.get(),
+                    surface_id: change.wl_surface.get(),
+                    x,
+                    y,
+                });
+            }
+        }
+        self.flush_pending_window_configures(clients);
+        renderer_syncs
     }
 }
 

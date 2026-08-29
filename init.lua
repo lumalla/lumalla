@@ -90,6 +90,21 @@ end)
 
 lum.on_startup(function()
 	enable_all_outputs(lum.get_drm_devices())
-	-- lum.spawn({ command = "qalculate-qt" })
+	lum.spawn({ command = "qalculate-qt" })
 	lum.spawn({ command = "wezterm", args = { "start", "--always-new-process" } })
 end)
+
+lum.add_window_rule({
+	app_id = "io.github.Qalculate.qalculate-qt",
+	x = 1400,
+	y = 100,
+	width = 400,
+	height = 600,
+})
+lum.map_key({
+	key = "m",
+	mods = "logo",
+	callback = function()
+		lum.set_window({ width = 1200, height = 800 })
+	end,
+})

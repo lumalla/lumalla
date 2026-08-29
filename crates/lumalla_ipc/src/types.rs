@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use lumalla_shared::{DrmConnector, DrmDeviceState, DrmMode, Mods, Output, WindowRule, Zone};
+use lumalla_shared::{DrmConnector, DrmDeviceState, DrmMode, Mods, Output, WindowRule, Zone, WindowState};
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
 
@@ -278,25 +278,81 @@ impl From<ZoneInfo> for Zone {
 pub struct WindowRuleInfo {
     /// Application id to match.
     pub app_id: String,
-    /// Target zone name.
-    pub zone: String,
+    /// Default x position (`WINDOW_GEOMETRY_UNSET` = unset).
+    pub x: i32,
+    /// Default y position (`WINDOW_GEOMETRY_UNSET` = unset).
+    pub y: i32,
+    /// Default width (`WINDOW_GEOMETRY_UNSET` = unset).
+    pub width: i32,
+    /// Default height (`WINDOW_GEOMETRY_UNSET` = unset).
+    pub height: i32,
 }
 
 impl From<WindowRule> for WindowRuleInfo {
     fn from(rule: WindowRule) -> Self {
+        use lumalla_shared::geometry_field_to_dbus;
         Self {
             app_id: rule.app_id,
-            zone: rule.zone,
+            x: geometry_field_to_dbus(rule.x),
+            y: geometry_field_to_dbus(rule.y),
+            width: geometry_field_to_dbus(rule.width),
+            height: geometry_field_to_dbus(rule.height),
         }
     }
 }
 
 impl From<WindowRuleInfo> for WindowRule {
     fn from(rule: WindowRuleInfo) -> Self {
+        use lumalla_shared::geometry_field_from_dbus;
         Self {
             app_id: rule.app_id,
-            zone: rule.zone,
+            x: geometry_field_from_dbus(rule.x),
+            y: geometry_field_from_dbus(rule.y),
+            width: geometry_field_from_dbus(rule.width),
+            height: geometry_field_from_dbus(rule.height),
         }
+    }
+}
+
+/// Window state exposed over D-Bus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct WindowInfo {
+    /// Compositor-assigned window id.
+    pub id: u32,
+    /// Application id reported by the client.
+    pub app_id: String,
+    /// Window title reported by the client.
+    pub title: String,
+    /// X position in compositor space.
+    pub x: i32,
+    /// Y position in compositor space.
+    pub y: i32,
+    /// Width in pixels.
+    pub width: i32,
+    /// Height in pixels.
+    pub height: i32,
+    /// Whether this window currently has keyboard focus.
+    pub focused: bool,
+}
+
+impl From<&WindowState> for WindowInfo {
+    fn from(window: &WindowState) -> Self {
+        Self {
+            id: window.id,
+            app_id: window.app_id.clone(),
+            title: window.title.clone(),
+            x: window.x,
+            y: window.y,
+            width: window.width,
+            height: window.height,
+            focused: window.focused,
+        }
+    }
+}
+
+impl From<WindowState> for WindowInfo {
+    fn from(window: WindowState) -> Self {
+        Self::from(&window)
     }
 }
 
