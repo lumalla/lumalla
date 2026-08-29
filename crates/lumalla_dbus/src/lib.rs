@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::Context;
-use iface::{CompositorHandler, ServiceState, emit_signal};
+use iface::{CompositorHandler, ServiceState, complete_screenshot, emit_signal};
 use log::{error, info};
 use lumalla_ipc::{
     BUS_NAME, OBJECT_PATH, WindowManager, signals,
@@ -31,6 +31,7 @@ pub struct DbusService {
     drm_devices: Arc<Mutex<Vec<DrmDeviceInfo>>>,
     wayland_display: Arc<Mutex<Option<String>>>,
     windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
+    pending_screenshots: Arc<Mutex<HashMap<usize, Arc<iface::PendingScreenshot>>>>,
 }
 
 impl DbusService {
@@ -40,6 +41,7 @@ impl DbusService {
         let output_lookup = Arc::new(Mutex::new(HashMap::new()));
         let drm_devices = Arc::new(Mutex::new(Vec::new()));
         let wayland_display = Arc::new(Mutex::new(None));
+        let pending_screenshots = Arc::new(Mutex::new(HashMap::new()));
         let state = Arc::new(ServiceState {
             comms: comms.clone(),
             outputs: Arc::clone(&outputs),
@@ -49,6 +51,7 @@ impl DbusService {
             extra_env: Arc::new(Mutex::new(HashMap::new())),
             keymaps: Arc::new(Mutex::new(Vec::new())),
             windows: Arc::new(Mutex::new(Vec::new())),
+            pending_screenshots: Arc::clone(&pending_screenshots),
         });
         let connection = connection::Builder::session()
             .context("Failed to connect to session bus")?
@@ -80,6 +83,7 @@ impl DbusService {
             drm_devices,
             wayland_display,
             windows: state.windows.clone(),
+            pending_screenshots,
         })
     }
 
@@ -99,6 +103,7 @@ struct DbusState {
     drm_devices: Arc<Mutex<Vec<DrmDeviceInfo>>>,
     wayland_display: Arc<Mutex<Option<String>>>,
     windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
+    pending_screenshots: Arc<Mutex<HashMap<usize, Arc<iface::PendingScreenshot>>>>,
 }
 
 impl DbusState {
@@ -113,6 +118,7 @@ impl DbusState {
             drm_devices: service.drm_devices,
             wayland_display: service.wayland_display,
             windows: service.windows,
+            pending_screenshots: service.pending_screenshots,
         }
     }
 
@@ -197,6 +203,12 @@ impl DbusState {
             }
             DbusMessage::SetWindows(windows) => {
                 *self.windows.lock().unwrap() = windows;
+            }
+            DbusMessage::ScreenshotCaptured {
+                request_id,
+                result,
+            } => {
+                complete_screenshot(&self.pending_screenshots, request_id, result);
             }
         }
 

@@ -8,7 +8,7 @@ use anyhow::Context;
 use ash::vk;
 use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
-use lumalla_shared::{DrmDeviceState, OutputConfig};
+use lumalla_shared::{CapturedImage, DrmDeviceState, Output, OutputConfig};
 
 pub mod drm;
 pub mod vulkan;
@@ -33,7 +33,7 @@ use crate::drm::{
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
     DmaBufImage, GpuCompositor, GpuWorkBatch, SurfaceTextureCache, VulkanContext,
-    composite_to_scanout, copy_scanout_frame, vulkan_to_drm_fourcc,
+    composite_to_scanout, copy_scanout_frame, download_bgra_region, vulkan_to_drm_fourcc,
 };
 
 struct GpuRenderResources {
@@ -549,6 +549,101 @@ impl RendererState {
             target.output.mode.height() as i32,
             refresh_mhz.max(60_000),
         ))
+    }
+
+    /// Capture a rectangular region of the displayed scanouts as RGBA8 pixels.
+    ///
+    /// `x`/`y`/`width`/`height` are in global compositor (logical) space. `outputs`
+    /// supplies layout for mapping that space onto DRM scanout buffers.
+    pub fn capture_region(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        outputs: &[Output],
+    ) -> anyhow::Result<CapturedImage> {
+        anyhow::ensure!(width > 0 && height > 0, "capture region must be positive");
+        let dest_w = width as u32;
+        let dest_h = height as u32;
+        let mut rgba = vec![0u8; (dest_w as usize) * (dest_h as usize) * 4];
+        let mut covered = false;
+
+        let regions: Vec<CaptureRegion> = outputs
+            .iter()
+            .filter_map(|output| CaptureRegion::intersect(output, x, y, width, height))
+            .collect();
+
+        for region in regions {
+            if !self.scanouts.contains_key(&region.name) {
+                continue;
+            }
+
+            if let Some(pending) = self
+                .scanouts
+                .get_mut(&region.name)
+                .and_then(|scanout| scanout.current.gpu_pending.take())
+            {
+                let vulkan = self
+                    .vulkan
+                    .as_mut()
+                    .context("Vulkan is not initialized for screenshot capture")?;
+                pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
+            }
+
+            let fb_x = ((region.ix0 - region.ox) * region.scale) as u32;
+            let fb_y = ((region.iy0 - region.oy) * region.scale) as u32;
+            let fb_w = ((region.ix1 - region.ix0) * region.scale) as u32;
+            let fb_h = ((region.iy1 - region.iy0) * region.scale) as u32;
+            let logical_w = (region.ix1 - region.ix0) as u32;
+            let logical_h = (region.iy1 - region.iy0) as u32;
+            let dest_x = (region.ix0 - x) as u32;
+            let dest_y = (region.iy0 - y) as u32;
+
+            let vulkan = self
+                .vulkan
+                .as_ref()
+                .context("Vulkan is not initialized for screenshot capture")?;
+            let scanout = self
+                .scanouts
+                .get(&region.name)
+                .context("scanout disappeared during capture")?;
+            let format = scanout.current.dma_image.format();
+            let bgra = download_bgra_region(
+                vulkan,
+                &scanout.current.dma_image,
+                fb_x,
+                fb_y,
+                fb_w,
+                fb_h,
+            )?;
+
+            blit_bgra_to_rgba(
+                &bgra,
+                fb_w,
+                fb_h,
+                format,
+                &mut rgba,
+                dest_w,
+                dest_h,
+                dest_x,
+                dest_y,
+                logical_w,
+                logical_h,
+            )?;
+            covered = true;
+        }
+
+        anyhow::ensure!(
+            covered,
+            "screenshot region does not intersect any DRM scanout"
+        );
+
+        Ok(CapturedImage {
+            width: dest_w,
+            height: dest_h,
+            rgba,
+        })
     }
 
     /// DRM format/modifier pairs clients may use with linux-dmabuf.
@@ -1239,6 +1334,107 @@ impl RendererState {
 
         Ok(())
     }
+}
+
+struct CaptureRegion {
+    name: String,
+    ox: i32,
+    oy: i32,
+    scale: i32,
+    ix0: i32,
+    iy0: i32,
+    ix1: i32,
+    iy1: i32,
+}
+
+impl CaptureRegion {
+    fn intersect(output: &Output, x: i32, y: i32, width: i32, height: i32) -> Option<Self> {
+        let ox = output.location.0;
+        let oy = output.location.1;
+        let ow = output.size.0;
+        let oh = output.size.1;
+        if ow <= 0 || oh <= 0 {
+            return None;
+        }
+        let ix0 = x.max(ox);
+        let iy0 = y.max(oy);
+        let ix1 = (x + width).min(ox + ow);
+        let iy1 = (y + height).min(oy + oh);
+        if ix0 >= ix1 || iy0 >= iy1 {
+            return None;
+        }
+        Some(Self {
+            name: output.name.clone(),
+            ox,
+            oy,
+            scale: output.scale.max(1),
+            ix0,
+            iy0,
+            ix1,
+            iy1,
+        })
+    }
+}
+
+/// Nearest-neighbor blit from a BGRA/RGBA GPU download into an RGBA destination.
+fn blit_bgra_to_rgba(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    format: vk::Format,
+    dest: &mut [u8],
+    dest_w: u32,
+    dest_h: u32,
+    dest_x: u32,
+    dest_y: u32,
+    dest_region_w: u32,
+    dest_region_h: u32,
+) -> anyhow::Result<()> {
+    let src_stride = (src_w as usize)
+        .checked_mul(4)
+        .context("source stride overflow")?;
+    anyhow::ensure!(
+        src.len() >= src_stride.saturating_mul(src_h as usize),
+        "source buffer too small for {}x{}",
+        src_w,
+        src_h
+    );
+    anyhow::ensure!(
+        dest_x.saturating_add(dest_region_w) <= dest_w
+            && dest_y.saturating_add(dest_region_h) <= dest_h,
+        "destination region out of bounds"
+    );
+
+    let swap_rb = matches!(
+        format,
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB
+    );
+
+    for dy in 0..dest_region_h {
+        let sy = if dest_region_h == src_h {
+            dy
+        } else {
+            dy * src_h / dest_region_h
+        };
+        for dx in 0..dest_region_w {
+            let sx = if dest_region_w == src_w {
+                dx
+            } else {
+                dx * src_w / dest_region_w
+            };
+            let si = (sy as usize) * src_stride + (sx as usize) * 4;
+            let di = (((dest_y + dy) as usize) * (dest_w as usize) + ((dest_x + dx) as usize)) * 4;
+            if swap_rb {
+                dest[di] = src[si + 2];
+                dest[di + 1] = src[si + 1];
+                dest[di + 2] = src[si];
+                dest[di + 3] = src[si + 3];
+            } else {
+                dest[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+    }
+    Ok(())
 }
 
 struct PresentTarget {

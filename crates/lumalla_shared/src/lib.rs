@@ -1,5 +1,6 @@
 mod action;
 mod args;
+mod captured_image;
 mod comms;
 mod dbus_message;
 mod drm;
@@ -17,6 +18,7 @@ mod zone;
 
 pub use action::{Action, CallbackRef};
 pub use args::GlobalArgs;
+pub use captured_image::CapturedImage;
 pub use comms::{Comms, MessageSender, message_loop_with_channel};
 pub use dbus_message::DbusMessage;
 pub use drm::{DrmConnector, DrmDeviceState, DrmMode, OutputConfig};

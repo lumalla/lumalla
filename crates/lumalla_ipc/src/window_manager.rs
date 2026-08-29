@@ -101,6 +101,18 @@ pub trait WindowManagerHandler: Send + Sync {
 
     /// Click a pointer button at absolute compositor coordinates.
     fn inject_pointer_click(&mut self, x: f64, y: f64, button: u32) -> zbus::fdo::Result<()>;
+
+    /// Capture a compositor region to a PNG file at `path`.
+    ///
+    /// Blocks until the file is written or an error occurs.
+    fn capture_screenshot(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        path: &str,
+    ) -> zbus::fdo::Result<()>;
 }
 
 /// D-Bus object exported at [`crate::OBJECT_PATH`].
@@ -253,6 +265,17 @@ impl WindowManager {
 
     fn inject_pointer_click(&mut self, x: f64, y: f64, button: u32) -> zbus::fdo::Result<()> {
         self.handler.inject_pointer_click(x, y, button)
+    }
+
+    fn capture_screenshot(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        path: &str,
+    ) -> zbus::fdo::Result<()> {
+        self.handler.capture_screenshot(x, y, width, height, path)
     }
 
     #[zbus(signal)]

@@ -70,6 +70,19 @@ pub enum MainMessage {
     },
     /// Inject synthetic keyboard or pointer input.
     InjectInput(InjectedInput),
+    /// Capture a rectangular region of the compositor for a screenshot request.
+    CaptureScreenshot {
+        /// Correlates the reply on the D-Bus thread (path string heap pointer).
+        request_id: usize,
+        /// Left edge in compositor space.
+        x: i32,
+        /// Top edge in compositor space.
+        y: i32,
+        /// Region width in compositor space.
+        width: i32,
+        /// Region height in compositor space.
+        height: i32,
+    },
     /// Update window geometry. `id == None` targets the focused window.
     SetWindow {
         /// Window id, or `None` for the focused window.

@@ -654,6 +654,27 @@ impl AppData {
                         error!("Unable to inject input: {err:#}");
                     }
                 }
+                MainMessage::CaptureScreenshot {
+                    request_id,
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
+                    let outputs: Vec<_> = self
+                        .display_state
+                        .outputs()
+                        .map(lumalla_shared::Output::from)
+                        .collect();
+                    let result = self
+                        .renderer_state
+                        .capture_region(x, y, width, height, &outputs)
+                        .map_err(|err| format!("{err:#}"));
+                    self.comms.dbus(DbusMessage::ScreenshotCaptured {
+                        request_id,
+                        result,
+                    });
+                }
                 MainMessage::SetWindow {
                     id,
                     geometry,

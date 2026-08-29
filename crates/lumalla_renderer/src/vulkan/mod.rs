@@ -7,6 +7,7 @@ mod command;
 mod descriptor;
 mod device;
 mod dma_buf;
+mod download;
 mod framebuffer;
 mod gpu_compositor;
 mod image;
@@ -29,6 +30,7 @@ pub use dma_buf::{
     DRM_FORMAT_XBGR8888, DRM_FORMAT_XRGB8888, DmaBufImage, drm_fourcc_to_vulkan,
     query_samplable_dmabuf_formats, vulkan_to_drm_fourcc,
 };
+pub use download::download_bgra_region;
 pub use framebuffer::Framebuffer;
 pub use gpu_compositor::{
     GpuCompositor, GpuWorkBatch, PendingGpuSubmit, SurfaceTextureCache, composite_to_scanout,

@@ -2,8 +2,10 @@
 
 use std::{
     collections::HashMap,
+    fs::File,
+    io::BufWriter,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 use log::{error, info, warn};
@@ -16,11 +18,19 @@ use lumalla_ipc::{
     },
 };
 use lumalla_shared::{
-    Comms, InjectedInput, MainMessage, Mods, Output, WindowGeometryUpdate, WindowState,
-    geometry_field_from_dbus,
+    CapturedImage, Comms, InjectedInput, MainMessage, Mods, Output, WindowGeometryUpdate,
+    WindowState, geometry_field_from_dbus,
 };
 use std::path::PathBuf;
 use zbus::blocking::Connection;
+
+/// In-flight screenshot waiting for main-thread capture + PNG write completion.
+pub(crate) struct PendingScreenshot {
+    pub path: String,
+    /// `None` until the IPC thread finishes encode/write (or records an error).
+    pub result: Mutex<Option<Result<(), String>>>,
+    pub done: Condvar,
+}
 
 pub(crate) struct ServiceState {
     pub comms: Comms,
@@ -31,6 +41,7 @@ pub(crate) struct ServiceState {
     pub extra_env: Arc<Mutex<HashMap<String, String>>>,
     pub keymaps: Arc<Mutex<Vec<KeyBindingInfo>>>,
     pub windows: Arc<Mutex<Vec<WindowState>>>,
+    pub pending_screenshots: Arc<Mutex<HashMap<usize, Arc<PendingScreenshot>>>>,
 }
 
 pub(crate) struct CompositorHandler {
@@ -300,6 +311,106 @@ impl WindowManagerHandler for CompositorHandler {
         ));
         Ok(())
     }
+
+    fn capture_screenshot(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        path: &str,
+    ) -> zbus::fdo::Result<()> {
+        if width <= 0 || height <= 0 {
+            return Err(zbus::fdo::Error::Failed(
+                "screenshot width and height must be positive".into(),
+            ));
+        }
+        if path.is_empty() {
+            return Err(zbus::fdo::Error::Failed(
+                "screenshot path must not be empty".into(),
+            ));
+        }
+
+        let path = path.to_string();
+        let request_id = path.as_ptr() as usize;
+        let pending = Arc::new(PendingScreenshot {
+            path,
+            result: Mutex::new(None),
+            done: Condvar::new(),
+        });
+        self.state
+            .pending_screenshots
+            .lock()
+            .unwrap()
+            .insert(request_id, Arc::clone(&pending));
+
+        self.state
+            .comms
+            .main(MainMessage::CaptureScreenshot {
+                request_id,
+                x,
+                y,
+                width,
+                height,
+            });
+
+        let mut guard = pending.result.lock().unwrap();
+        while guard.is_none() {
+            guard = pending.done.wait(guard).unwrap();
+        }
+        match guard.take().unwrap() {
+            Ok(()) => Ok(()),
+            Err(err) => Err(zbus::fdo::Error::Failed(err)),
+        }
+    }
+}
+
+pub(crate) fn complete_screenshot(
+    pending_screenshots: &Mutex<HashMap<usize, Arc<PendingScreenshot>>>,
+    request_id: usize,
+    result: Result<CapturedImage, String>,
+) {
+    let Some(pending) = pending_screenshots.lock().unwrap().remove(&request_id) else {
+        error!("Screenshot reply for unknown request_id={request_id:#x}");
+        return;
+    };
+
+    let write_result = match result {
+        Ok(image) => write_png(&pending.path, &image),
+        Err(err) => Err(err),
+    };
+
+    {
+        let mut guard = pending.result.lock().unwrap();
+        *guard = Some(write_result);
+    }
+    pending.done.notify_one();
+}
+
+fn write_png(path: &str, image: &CapturedImage) -> Result<(), String> {
+    let expected = (image.width as usize)
+        .checked_mul(image.height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "screenshot dimensions overflow".to_string())?;
+    if image.rgba.len() != expected {
+        return Err(format!(
+            "screenshot buffer size mismatch: got {} bytes, expected {expected}",
+            image.rgba.len()
+        ));
+    }
+
+    let file = File::create(path).map_err(|err| format!("failed to create {path}: {err}"))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, image.width, image.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut png_writer = encoder
+        .write_header()
+        .map_err(|err| format!("failed to write PNG header to {path}: {err}"))?;
+    png_writer
+        .write_image_data(&image.rgba)
+        .map_err(|err| format!("failed to write PNG data to {path}: {err}"))?;
+    Ok(())
 }
 
 fn spawn_process(

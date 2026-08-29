@@ -1,4 +1,4 @@
-use crate::{DrmDeviceState, Output, WindowState};
+use crate::{CapturedImage, DrmDeviceState, Output, WindowState};
 
 /// Messages handled by the compositor D-Bus thread.
 #[derive(Debug)]
@@ -21,4 +21,11 @@ pub enum DbusMessage {
     SetWaylandDisplay(String),
     /// Replace the window list returned by `GetWindows`.
     SetWindows(Vec<WindowState>),
+    /// Region capture finished; encode/write PNG on the D-Bus thread.
+    ScreenshotCaptured {
+        /// Matches the pending request id from [`crate::MainMessage::CaptureScreenshot`].
+        request_id: usize,
+        /// Captured pixels, or an error message.
+        result: Result<CapturedImage, String>,
+    },
 }

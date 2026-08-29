@@ -413,12 +413,27 @@ fn init_dbus_input(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> Lu
         })?,
     )?;
 
-    let click_client = client;
+    let click_client = client.clone();
     module.set(
         "click",
         lua.create_function(
             move |_, (x, y, button): (f64, f64, Option<u32>)| {
                 dbus_result(click_client.proxy.inject_pointer_click(x, y, button.unwrap_or(0)))?;
+                Ok(())
+            },
+        )?,
+    )?;
+
+    let screenshot_client = client;
+    module.set(
+        "screenshot",
+        lua.create_function(
+            move |_, (x, y, width, height, path): (i32, i32, i32, i32, String)| {
+                dbus_result(
+                    screenshot_client
+                        .proxy
+                        .capture_screenshot(x, y, width, height, &path),
+                )?;
                 Ok(())
             },
         )?,
