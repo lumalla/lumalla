@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use lumalla_ipc::{
     DrmDeviceInfo, KeyBindingInfo, LayoutOutputInfo, LayoutSpacesInfo, ModsInfo, OutputConfigInfo,
-    OutputInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo,
+    OutputInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo,
 };
 use lumalla_shared::{CallbackRef, GlobalArgs, Mods, Output, geometry_field_to_dbus};
 use mlua::{
@@ -167,6 +167,21 @@ fn init_dbus_keymap(
     client: DbusConfigClient,
     callback_state: CallbackState,
 ) -> LuaResult<()> {
+    let xkb_client = client.clone();
+    module.set(
+        "set_xkb",
+        lua.create_function(move |_, config: ConfigXkb| {
+            dbus_result(xkb_client.proxy.set_xkb(XkbInfo {
+                rules: config.rules.unwrap_or_default(),
+                model: config.model.unwrap_or_default(),
+                layout: config.layout.unwrap_or_default(),
+                variant: config.variant.unwrap_or_default(),
+                options: config.options.unwrap_or_default(),
+            }))?;
+            Ok(())
+        })?,
+    )?;
+
     module.set(
         "map_key",
         lua.create_function(move |_, keymap: ConfigKeymap| {
@@ -652,6 +667,33 @@ struct ConfigKeymap {
     key: String,
     mods: Mods,
     callback: LuaFunction,
+}
+
+struct ConfigXkb {
+    rules: Option<String>,
+    model: Option<String>,
+    layout: Option<String>,
+    variant: Option<String>,
+    options: Option<String>,
+}
+
+impl FromLua for ConfigXkb {
+    fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaXkb",
+                to: String::from("ConfigXkb"),
+                message: Some(String::from("Expected a Lua table for XKB config")),
+            })?;
+        Ok(Self {
+            rules: table.get("rules").unwrap_or(None),
+            model: table.get("model").unwrap_or(None),
+            layout: table.get("layout").unwrap_or(None),
+            variant: table.get("variant").unwrap_or(None),
+            options: table.get("options").unwrap_or(None),
+        })
+    }
 }
 
 impl FromLua for ConfigKeymap {

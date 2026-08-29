@@ -105,6 +105,10 @@ lum.add_window_rule({
 	width = 400,
 	height = 600,
 })
+-- Call set_xkb before map_key so binding key names resolve against the active layout.
+lum.set_xkb({
+	layout = "de",
+})
 lum.map_key({
 	key = "m",
 	mods = "logo",

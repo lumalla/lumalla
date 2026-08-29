@@ -14,6 +14,7 @@ pub mod udev;
 mod window_geometry;
 mod window_rule;
 mod window_state;
+mod xkb_config;
 mod zone;
 
 pub use action::{Action, CallbackRef};
@@ -37,4 +38,5 @@ pub use window_geometry::{
 };
 pub use window_rule::WindowRule;
 pub use window_state::WindowState;
+pub use xkb_config::XkbConfig;
 pub use zone::Zone;

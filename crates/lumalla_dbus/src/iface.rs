@@ -9,17 +9,17 @@ use std::{
 };
 
 use log::{error, info, warn};
-use lumalla_input::evdev_keycode_from_name;
+use lumalla_input::evdev_keycode_from_name_with_xkb;
 use lumalla_ipc::{
     INTERFACE_NAME, KeyBindingInfo, OBJECT_PATH, WindowManagerHandler,
     types::{
         DrmDeviceInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowInfo, WindowRuleInfo,
-        ZoneInfo,
+        XkbInfo, ZoneInfo,
     },
 };
 use lumalla_shared::{
     CapturedImage, Comms, InjectedInput, MainMessage, Mods, Output, WindowGeometryUpdate,
-    WindowState, geometry_field_from_dbus,
+    WindowState, XkbConfig, geometry_field_from_dbus,
 };
 use std::path::PathBuf;
 use zbus::blocking::Connection;
@@ -40,6 +40,7 @@ pub(crate) struct ServiceState {
     pub wayland_display: Arc<Mutex<Option<String>>>,
     pub extra_env: Arc<Mutex<HashMap<String, String>>>,
     pub keymaps: Arc<Mutex<Vec<KeyBindingInfo>>>,
+    pub xkb_config: Arc<Mutex<XkbConfig>>,
     pub windows: Arc<Mutex<Vec<WindowState>>>,
     pub pending_screenshots: Arc<Mutex<HashMap<usize, Arc<PendingScreenshot>>>>,
 }
@@ -263,7 +264,8 @@ impl WindowManagerHandler for CompositorHandler {
 
     fn map_key(&mut self, binding: KeyBindingInfo) -> zbus::fdo::Result<()> {
         self.state.keymaps.lock().unwrap().push(binding.clone());
-        let Some(key) = evdev_keycode_from_name(&binding.key) else {
+        let config = self.state.xkb_config.lock().unwrap().clone();
+        let Some(key) = evdev_keycode_from_name_with_xkb(&binding.key, &config) else {
             warn!(
                 "Ignoring keymap binding {:?}+{}: unknown key name",
                 binding.mods, binding.key
@@ -281,6 +283,14 @@ impl WindowManagerHandler for CompositorHandler {
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()> {
         self.state.keymaps.lock().unwrap().clear();
         self.state.comms.main(MainMessage::ClearKeymaps);
+        Ok(())
+    }
+
+    fn set_xkb(&mut self, xkb: XkbInfo) -> zbus::fdo::Result<()> {
+        let config = XkbConfig::from(xkb);
+        info!("Set XKB config over D-Bus: {config:?}");
+        *self.state.xkb_config.lock().unwrap() = config.clone();
+        self.state.comms.main(MainMessage::SetXkb(config));
         Ok(())
     }
 

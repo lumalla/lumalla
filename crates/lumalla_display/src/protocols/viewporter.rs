@@ -2,11 +2,7 @@ use log::debug;
 use lumalla_wayland_protocol::{
     Ctx, NewObjectId, ObjectId,
     buffer::fixed_to_f32,
-    protocols::{
-        ViewporterProtocol,
-        viewporter::*,
-        wayland::WL_DISPLAY_ERROR_INVALID_OBJECT,
-    },
+    protocols::{ViewporterProtocol, viewporter::*, wayland::WL_DISPLAY_ERROR_INVALID_OBJECT},
     registry::{DISPLAY_OBJECT_ID, InterfaceIndex},
 };
 
@@ -120,12 +116,7 @@ impl WpViewporter for DisplayState {
                 .message("get_viewport surface is not a wl_surface");
             return;
         }
-        if !register_object(
-            ctx,
-            params.id(),
-            InterfaceIndex::WpViewport,
-            version,
-        ) {
+        if !register_object(ctx, params.id(), InterfaceIndex::WpViewport, version) {
             return;
         }
         if let Err(error) =
@@ -146,12 +137,7 @@ impl WpViewport for DisplayState {
         ctx.registry.free_object(object_id, ctx.writer);
     }
 
-    fn set_source(
-        &mut self,
-        ctx: &mut Ctx,
-        object_id: ObjectId,
-        params: &WpViewportSetSource<'_>,
-    ) {
+    fn set_source(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WpViewportSetSource<'_>) {
         if let Err(error) = self.surface_manager.set_viewport_source(
             ctx.client_id,
             object_id,

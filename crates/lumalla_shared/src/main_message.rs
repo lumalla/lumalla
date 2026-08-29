@@ -3,6 +3,7 @@ use crate::Output;
 use crate::OutputConfig;
 use crate::WindowGeometryUpdate;
 use crate::WindowRule;
+use crate::XkbConfig;
 use std::path::PathBuf;
 
 /// Synthetic input requested by profiling or automation configs.
@@ -57,6 +58,8 @@ pub enum MainMessage {
     },
     /// Clears all compositor key bindings.
     ClearKeymaps,
+    /// Replace the XKB keymap from RMLVO names.
+    SetXkb(XkbConfig),
     /// Select the Vulkan render device by DRM primary path (`None` = auto).
     SetRenderDevice(Option<PathBuf>),
     /// Merge per-connector output configuration (enabled / mode).

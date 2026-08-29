@@ -7,7 +7,7 @@ use std::{os::fd::RawFd, pin::Pin, time::Instant};
 
 use log::{debug, warn};
 use lumalla_seat::SeatState;
-use lumalla_shared::{Comms, DbusMessage, KeymapMemfd, MainMessage, Mods};
+use lumalla_shared::{Comms, DbusMessage, KeymapMemfd, MainMessage, Mods, XkbConfig};
 
 use crate::libinput::{InputEvent, KEY_STATE_PRESSED, LibInput, is_modifier_key, update_modifier};
 use crate::xkb::Xkb;
@@ -15,8 +15,16 @@ use crate::xkb::Xkb;
 pub use xkb::XkbModifiers as KeyboardModifiers;
 
 /// Resolve a key name (e.g. `"m"`, `"Return"`, `"F1"`) to a Linux evdev keycode.
+///
+/// Uses the system default XKB names (typically US). Prefer
+/// [`evdev_keycode_from_name_with_xkb`] when a layout has been configured.
 pub fn evdev_keycode_from_name(name: &str) -> Option<u32> {
-    let xkb = Xkb::new().ok()?;
+    evdev_keycode_from_name_with_xkb(name, &XkbConfig::default())
+}
+
+/// Resolve a key name against a specific XKB RMLVO configuration (layout group 0).
+pub fn evdev_keycode_from_name_with_xkb(name: &str, config: &XkbConfig) -> Option<u32> {
+    let xkb = Xkb::new(config).ok()?;
     for candidate in candidate_key_names(name) {
         let Ok(keysym) = Xkb::keysym_from_name(&candidate) else {
             continue;
@@ -26,7 +34,7 @@ pub fn evdev_keycode_from_name(name: &str) -> Option<u32> {
         };
         if press.shift {
             warn!(
-                "Key `{name}` requires shift on the default keymap; map_key bindings do not model shift yet"
+                "Key `{name}` requires shift on the configured keymap; map_key bindings do not model shift yet"
             );
         }
         return Some(press.evdev_keycode);
@@ -55,7 +63,9 @@ fn candidate_key_names(name: &str) -> Vec<String> {
 ///
 /// Accepts `C-c`, `Ctrl+c`, and `Control+c` (any ASCII case on the prefix).
 fn split_ctrl_chord(name: &str) -> (bool, &str) {
-    for prefix in ["C-", "c-", "Ctrl+", "ctrl+", "CTRL+", "Control+", "control+", "CONTROL+"] {
+    for prefix in [
+        "C-", "c-", "Ctrl+", "ctrl+", "CTRL+", "Control+", "control+", "CONTROL+",
+    ] {
         if let Some(rest) = name.strip_prefix(prefix) {
             if !rest.is_empty() {
                 return (true, rest);
@@ -146,6 +156,7 @@ pub struct InputState {
     comms: Comms,
     libinput: LibInput,
     xkb: Xkb,
+    xkb_config: XkbConfig,
     mods: Mods,
     keymaps: Vec<KeyBinding>,
     start: Instant,
@@ -153,14 +164,23 @@ pub struct InputState {
 
 impl InputState {
     pub fn new(comms: Comms, seat_state: Pin<&SeatState>) -> anyhow::Result<Self> {
+        let xkb_config = XkbConfig::default();
         Ok(Self {
             comms,
             libinput: LibInput::new(seat_state)?,
-            xkb: Xkb::new()?,
+            xkb: Xkb::new(&xkb_config)?,
+            xkb_config,
             mods: Mods::default(),
             keymaps: Vec::new(),
             start: Instant::now(),
         })
+    }
+
+    /// Replace the XKB keymap from RMLVO names. On failure the previous keymap is kept.
+    pub fn set_xkb(&mut self, config: XkbConfig) -> anyhow::Result<()> {
+        self.xkb.set_names(&config)?;
+        self.xkb_config = config;
+        Ok(())
     }
 
     /// Sealed memfd with null-terminated xkb TEXT_V1 keymap for `wl_keyboard.keymap`.
@@ -474,6 +494,21 @@ mod tests {
         assert_eq!(evdev_keycode_from_name("m"), Some(50));
         assert_eq!(evdev_keycode_from_name("f1"), Some(59));
         assert_eq!(evdev_keycode_from_name("backspace"), Some(14));
+    }
+
+    #[test]
+    fn resolves_key_names_against_configured_layout() {
+        let de = XkbConfig {
+            layout: Some("de".into()),
+            ..Default::default()
+        };
+        let us = XkbConfig {
+            layout: Some("us".into()),
+            ..Default::default()
+        };
+        // On German QWERTZ, keysym `z` is produced by the physical Y key (evdev 21).
+        assert_eq!(evdev_keycode_from_name_with_xkb("z", &de), Some(21));
+        assert_eq!(evdev_keycode_from_name_with_xkb("z", &us), Some(44));
     }
 
     #[test]

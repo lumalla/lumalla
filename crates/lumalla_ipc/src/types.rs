@@ -384,5 +384,47 @@ pub struct KeyBindingInfo {
     pub mods: ModsInfo,
 }
 
+/// XKB RMLVO configuration. Empty strings select libxkbcommon defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct XkbInfo {
+    /// XKB rules file name.
+    pub rules: String,
+    /// Keyboard model (e.g. `pc105`).
+    pub model: String,
+    /// Layout(s), e.g. `us` or `us,de`.
+    pub layout: String,
+    /// Variant(s) matching `layout`.
+    pub variant: String,
+    /// Options, e.g. `grp:alt_shift_toggle`.
+    pub options: String,
+}
+
+impl From<&lumalla_shared::XkbConfig> for XkbInfo {
+    fn from(config: &lumalla_shared::XkbConfig) -> Self {
+        Self {
+            rules: config.rules.clone().unwrap_or_default(),
+            model: config.model.clone().unwrap_or_default(),
+            layout: config.layout.clone().unwrap_or_default(),
+            variant: config.variant.clone().unwrap_or_default(),
+            options: config.options.clone().unwrap_or_default(),
+        }
+    }
+}
+
+impl From<XkbInfo> for lumalla_shared::XkbConfig {
+    fn from(info: XkbInfo) -> Self {
+        fn nonempty(s: String) -> Option<String> {
+            if s.is_empty() { None } else { Some(s) }
+        }
+        Self {
+            rules: nonempty(info.rules),
+            model: nonempty(info.model),
+            layout: nonempty(info.layout),
+            variant: nonempty(info.variant),
+            options: nonempty(info.options),
+        }
+    }
+}
+
 /// Layout spaces keyed by name.
 pub type LayoutSpacesInfo = HashMap<String, Vec<LayoutOutputInfo>>;

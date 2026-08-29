@@ -107,6 +107,28 @@ impl SeatManager {
         self.keymap = Some(keymap);
     }
 
+    /// Replace the keymap and send `wl_keyboard.keymap` + modifiers to every keyboard.
+    pub fn update_keymap(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        keymap: KeymapMemfd,
+    ) -> anyhow::Result<()> {
+        self.keymap = Some(keymap);
+        let keyboards: Vec<(ClientId, ObjectId)> = self
+            .keyboards
+            .iter()
+            .map(|kb| (kb.client_id, kb.id))
+            .collect();
+        for (client_id, keyboard_id) in keyboards {
+            let Some(client) = clients.get_mut(&client_id) else {
+                continue;
+            };
+            self.send_keymap(client.writer_mut(), keyboard_id)?;
+            self.send_modifiers(client.writer_mut(), keyboard_id);
+        }
+        Ok(())
+    }
+
     pub fn set_modifiers(&mut self, modifiers: KeyboardModifiers) {
         self.modifiers = modifiers;
     }
@@ -830,8 +852,7 @@ impl SeatManager {
         time_msec: u32,
         send_motion: bool,
     ) {
-        let target =
-            surface_manager.global_pointer_target(None, self.pointer_x, self.pointer_y);
+        let target = surface_manager.global_pointer_target(None, self.pointer_x, self.pointer_y);
 
         // Leave pointers whose focus no longer matches the target.
         let leave_list: Vec<(ClientId, ObjectId, ObjectId, u32)> = self
@@ -1051,6 +1072,24 @@ mod tests {
     }
 
     #[test]
+    fn update_keymap_keeps_existing_keyboards() {
+        let mut seat = SeatManager::default();
+        seat.set_keymap(fake_keymap());
+        let (_keep, mut writer) = writer();
+        let client_id = client(1);
+        let keyboard_id = object(10);
+        seat.create_keyboard(client_id, keyboard_id, 5, &mut writer, None)
+            .unwrap();
+        assert_eq!(seat.keyboards.len(), 1);
+
+        let mut clients = HashMap::new();
+        // No live client connection — update should still replace the stored keymap.
+        seat.update_keymap(&mut clients, fake_keymap()).unwrap();
+        assert_eq!(seat.keyboards.len(), 1);
+        assert!(seat.keymap.is_some());
+    }
+
+    #[test]
     fn focus_keyboards_clears_other_client_focus() {
         let mut seat = SeatManager::default();
         seat.set_keymap(fake_keymap());
@@ -1195,9 +1234,7 @@ mod tests {
         for (cid, sid) in [(client_a, surface_a), (client_b, surface_b)] {
             surfaces.create_surface(cid, sid);
             surfaces.create_surface(cid, cursor);
-            surfaces
-                .create_shell_surface(cid, object(30), sid)
-                .unwrap();
+            surfaces.create_shell_surface(cid, object(30), sid).unwrap();
             surfaces
                 .set_shell_mode(cid, object(30), ShellMode::Toplevel)
                 .unwrap();
@@ -1207,8 +1244,22 @@ mod tests {
             let _ = surfaces.commit(cid, sid).unwrap();
         }
 
-        seat.create_pointer(client_a, pointer_a, 5, &mut writer, Some(surface_a), &surfaces);
-        seat.create_pointer(client_b, pointer_b, 5, &mut writer, Some(surface_b), &surfaces);
+        seat.create_pointer(
+            client_a,
+            pointer_a,
+            5,
+            &mut writer,
+            Some(surface_a),
+            &surfaces,
+        );
+        seat.create_pointer(
+            client_b,
+            pointer_b,
+            5,
+            &mut writer,
+            Some(surface_b),
+            &surfaces,
+        );
         let serial_a = seat.pointers[0].enter_serial.unwrap();
         let serial_b = seat.pointers[1].enter_serial.unwrap();
 

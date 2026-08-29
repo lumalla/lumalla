@@ -4,7 +4,7 @@ use zbus::{interface, object_server::SignalEmitter};
 
 use crate::types::{
     DrmDeviceInfo, KeyBindingInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowInfo,
-    WindowRuleInfo, ZoneInfo,
+    WindowRuleInfo, XkbInfo, ZoneInfo,
 };
 
 /// Server-side handler for [`WindowManager`] D-Bus methods.
@@ -89,6 +89,9 @@ pub trait WindowManagerHandler: Send + Sync {
 
     /// Clear all key bindings.
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()>;
+
+    /// Set the XKB keyboard layout (RMLVO). Empty strings use defaults.
+    fn set_xkb(&mut self, xkb: XkbInfo) -> zbus::fdo::Result<()>;
 
     /// Press and release a named key.
     fn inject_key(&mut self, name: &str) -> zbus::fdo::Result<()>;
@@ -249,6 +252,10 @@ impl WindowManager {
 
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()> {
         self.handler.clear_keymaps()
+    }
+
+    fn set_xkb(&mut self, xkb: XkbInfo) -> zbus::fdo::Result<()> {
+        self.handler.set_xkb(xkb)
     }
 
     fn inject_key(&mut self, name: &str) -> zbus::fdo::Result<()> {

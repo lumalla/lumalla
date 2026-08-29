@@ -9,9 +9,7 @@ use crate::{
     CommittedFrame, DisplayState, GlobalId, SurfaceUpdate,
     data_device::DataDeviceError,
     shm::{ShmError, ShmErrorKind},
-    surface::{
-        Rectangle, ShellMode, SurfaceCommit, SurfaceError, effective_surface_size,
-    },
+    surface::{Rectangle, ShellMode, SurfaceCommit, SurfaceError, effective_surface_size},
 };
 
 impl WaylandProtocol for DisplayState {}
@@ -79,9 +77,9 @@ fn report_surface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError)
             WL_SURFACE_ERROR_INVALID_OFFSET,
             "Attach offset must be zero since version 5",
         ),
-        SurfaceError::ViewportExists
-        | SurfaceError::NoSurface
-        | SurfaceError::ViewportBadValue => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Viewport error"),
+        SurfaceError::ViewportExists | SurfaceError::NoSurface | SurfaceError::ViewportBadValue => {
+            (WL_DISPLAY_ERROR_INVALID_OBJECT, "Viewport error")
+        }
     };
     ctx.writer
         .wl_display_error(DISPLAY_OBJECT_ID)
@@ -256,16 +254,18 @@ fn commit_damage(
                     rect.height.saturating_mul(src_h) / surface_height
                 };
                 buffer_damage.push(Rectangle {
-                    x: src_x + if surface_width <= 0 {
-                        0
-                    } else {
-                        rect.x.saturating_mul(src_w) / surface_width
-                    },
-                    y: src_y + if surface_height <= 0 {
-                        0
-                    } else {
-                        rect.y.saturating_mul(src_h) / surface_height
-                    },
+                    x: src_x
+                        + if surface_width <= 0 {
+                            0
+                        } else {
+                            rect.x.saturating_mul(src_w) / surface_width
+                        },
+                    y: src_y
+                        + if surface_height <= 0 {
+                            0
+                        } else {
+                            rect.y.saturating_mul(src_h) / surface_height
+                        },
                     width: bw.max(1),
                     height: bh.max(1),
                 });
@@ -403,11 +403,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                     viewport_src: commit.viewport.source,
                     dmabuf,
                     damage,
-                    buffer_damage: if is_cursor {
-                        Vec::new()
-                    } else {
-                        buffer_damage
-                    },
+                    buffer_damage: if is_cursor { Vec::new() } else { buffer_damage },
                     full_surface: is_cursor || full_surface,
                 };
                 if is_cursor {
@@ -415,9 +411,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                         .surface_updates
                         .push_back(SurfaceUpdate::Cursor(frame));
                 } else {
-                    state
-                        .surface_updates
-                        .push_back(SurfaceUpdate::Frame(frame));
+                    state.surface_updates.push_back(SurfaceUpdate::Frame(frame));
                 }
                 if commit.newly_mapped {
                     if let Some(shell_id) = commit.shell_id {
@@ -573,9 +567,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                         .surface_updates
                         .push_back(SurfaceUpdate::Cursor(frame));
                 } else {
-                    state
-                        .surface_updates
-                        .push_back(SurfaceUpdate::Frame(frame));
+                    state.surface_updates.push_back(SurfaceUpdate::Frame(frame));
                 }
             }
         }

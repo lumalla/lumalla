@@ -1,14 +1,14 @@
 //! Safe wrapper around libxkbcommon.
 
 use std::{
-    ffi::{CStr, c_char, c_int, c_void},
+    ffi::{CStr, CString, c_char, c_int, c_void},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     ptr::{self, NonNull},
 };
 
 use anyhow::Context;
 use log::debug;
-use lumalla_shared::KeymapMemfd;
+use lumalla_shared::{KeymapMemfd, XkbConfig};
 
 #[allow(
     non_camel_case_types,
@@ -137,21 +137,75 @@ pub struct Xkb {
     state: NonNull<bindings::xkb_state>,
 }
 
+fn option_cstring(value: &Option<String>) -> anyhow::Result<Option<CString>> {
+    match value {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => Ok(Some(
+            CString::new(s.as_str()).context("XKB name contains null byte")?,
+        )),
+    }
+}
+
+fn cstring_ptr(value: &Option<CString>) -> *const c_char {
+    value.as_ref().map(|s| s.as_ptr()).unwrap_or(ptr::null())
+}
+
 impl Xkb {
-    /// Create a context with the system default keymap and a fresh state.
-    pub fn new() -> anyhow::Result<Self> {
+    /// Create a context with a keymap compiled from `config` (defaults if empty).
+    pub fn new(config: &XkbConfig) -> anyhow::Result<Self> {
         let context = unsafe { bindings::xkb_context_new(bindings::XKB_CONTEXT_NO_FLAGS) };
         let Some(context) = NonNull::new(context) else {
             anyhow::bail!("Failed to create xkb context");
         };
 
-        // NULL fields select libxkbcommon defaults (typically evdev/pc105/us).
+        let (keymap, state) = match Self::compile_keymap(context, config) {
+            Ok(pair) => pair,
+            Err(err) => {
+                unsafe { bindings::xkb_context_unref(context.as_ptr()) };
+                return Err(err);
+            }
+        };
+
+        debug!("Created xkb context with keymap from {config:?}");
+        Ok(Self {
+            context,
+            keymap,
+            state,
+        })
+    }
+
+    /// Replace the keymap from new RMLVO names.
+    ///
+    /// On compile failure the previous keymap and state are left unchanged.
+    pub fn set_names(&mut self, config: &XkbConfig) -> anyhow::Result<()> {
+        let (keymap, state) = Self::compile_keymap(self.context, config)?;
+        unsafe {
+            bindings::xkb_state_unref(self.state.as_ptr());
+            bindings::xkb_keymap_unref(self.keymap.as_ptr());
+        }
+        self.keymap = keymap;
+        self.state = state;
+        debug!("Replaced xkb keymap from {config:?}");
+        Ok(())
+    }
+
+    fn compile_keymap(
+        context: NonNull<bindings::xkb_context>,
+        config: &XkbConfig,
+    ) -> anyhow::Result<(NonNull<bindings::xkb_keymap>, NonNull<bindings::xkb_state>)> {
+        let rules = option_cstring(&config.rules)?;
+        let model = option_cstring(&config.model)?;
+        let layout = option_cstring(&config.layout)?;
+        let variant = option_cstring(&config.variant)?;
+        let options = option_cstring(&config.options)?;
+
         let names = bindings::xkb_rule_names {
-            rules: ptr::null(),
-            model: ptr::null(),
-            layout: ptr::null(),
-            variant: ptr::null(),
-            options: ptr::null(),
+            rules: cstring_ptr(&rules),
+            model: cstring_ptr(&model),
+            layout: cstring_ptr(&layout),
+            variant: cstring_ptr(&variant),
+            options: cstring_ptr(&options),
         };
         let keymap = unsafe {
             bindings::xkb_keymap_new_from_names(
@@ -161,25 +215,16 @@ impl Xkb {
             )
         };
         let Some(keymap) = NonNull::new(keymap) else {
-            unsafe { bindings::xkb_context_unref(context.as_ptr()) };
-            anyhow::bail!("Failed to compile default xkb keymap");
+            anyhow::bail!("Failed to compile xkb keymap for {config:?}");
         };
 
         let state = unsafe { bindings::xkb_state_new(keymap.as_ptr()) };
         let Some(state) = NonNull::new(state) else {
-            unsafe {
-                bindings::xkb_keymap_unref(keymap.as_ptr());
-                bindings::xkb_context_unref(context.as_ptr());
-            }
+            unsafe { bindings::xkb_keymap_unref(keymap.as_ptr()) };
             anyhow::bail!("Failed to create xkb state");
         };
 
-        debug!("Created xkb context with default keymap");
-        Ok(Self {
-            context,
-            keymap,
-            state,
-        })
+        Ok((keymap, state))
     }
 
     /// Reset keyboard state (e.g. after losing the seat).
@@ -388,5 +433,72 @@ impl Drop for Xkb {
             bindings::xkb_keymap_unref(self.keymap.as_ptr());
             bindings::xkb_context_unref(self.context.as_ptr());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// KEY_Y (21): `y` on US, `z` on German QWERTZ.
+    const KEY_Y: u32 = 21;
+
+    #[test]
+    fn us_and_de_layouts_differ_on_y_key() {
+        let us = Xkb::new(&XkbConfig {
+            layout: Some("us".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let de = Xkb::new(&XkbConfig {
+            layout: Some("de".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let us_sym = Xkb::keysym_get_name(us.key_get_one_sym(KEY_Y)).unwrap();
+        let de_sym = Xkb::keysym_get_name(de.key_get_one_sym(KEY_Y)).unwrap();
+        assert_eq!(us_sym, "y");
+        assert_eq!(de_sym, "z");
+    }
+
+    #[test]
+    fn set_names_keeps_previous_keymap_on_failure() {
+        let mut xkb = Xkb::new(&XkbConfig {
+            layout: Some("us".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let before = Xkb::keysym_get_name(xkb.key_get_one_sym(KEY_Y)).unwrap();
+        assert_eq!(before, "y");
+
+        let err = xkb
+            .set_names(&XkbConfig {
+                layout: Some("this-layout-does-not-exist-xyzzy".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to compile"));
+
+        let after = Xkb::keysym_get_name(xkb.key_get_one_sym(KEY_Y)).unwrap();
+        assert_eq!(after, "y");
+    }
+
+    #[test]
+    fn set_names_replaces_keymap() {
+        let mut xkb = Xkb::new(&XkbConfig {
+            layout: Some("us".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        xkb.set_names(&XkbConfig {
+            layout: Some("de".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            Xkb::keysym_get_name(xkb.key_get_one_sym(KEY_Y)).unwrap(),
+            "z"
+        );
     }
 }

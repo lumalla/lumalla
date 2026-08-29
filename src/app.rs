@@ -611,6 +611,33 @@ impl AppData {
                 MainMessage::ClearKeymaps => {
                     self.input_state.clear_keymaps();
                 }
+                MainMessage::SetXkb(config) => {
+                    if let Err(err) = self.input_state.set_xkb(config) {
+                        error!("Unable to set XKB keymap: {err:#}");
+                    } else {
+                        match self.input_state.keymap_memfd() {
+                            Ok(keymap) => {
+                                let mods = self.input_state.modifiers();
+                                self.display_state
+                                    .set_keyboard_modifiers(KeyboardModifiers {
+                                        depressed: mods.depressed,
+                                        latched: mods.latched,
+                                        locked: mods.locked,
+                                        group: mods.group,
+                                    });
+                                if let Err(err) = self
+                                    .display_state
+                                    .update_keyboard_keymap(&mut self.connected_clients, keymap)
+                                {
+                                    error!("Unable to advertise updated XKB keymap: {err:#}");
+                                }
+                            }
+                            Err(err) => {
+                                error!("Unable to serialize updated XKB keymap: {err:#}");
+                            }
+                        }
+                    }
+                }
                 MainMessage::SetRenderDevice(path) => {
                     if let Err(err) = self.renderer_state.set_render_device(path) {
                         error!("Unable to set render device: {err:#}");

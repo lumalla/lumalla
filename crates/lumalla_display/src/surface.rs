@@ -654,11 +654,8 @@ impl SurfaceManager {
             .surfaces
             .get_mut(&(client_id, surface_id))
             .ok_or(SurfaceError::NoSurface)?;
-        surface.pending.viewport_destination = Some(if unset {
-            None
-        } else {
-            Some((width, height))
-        });
+        surface.pending.viewport_destination =
+            Some(if unset { None } else { Some((width, height)) });
         Ok(())
     }
 
@@ -692,11 +689,7 @@ impl SurfaceManager {
         Ok(())
     }
 
-    pub fn committed_viewport(
-        &self,
-        client_id: ClientId,
-        surface_id: ObjectId,
-    ) -> ViewportState {
+    pub fn committed_viewport(&self, client_id: ClientId, surface_id: ObjectId) -> ViewportState {
         self.surfaces
             .get(&(client_id, surface_id))
             .map(|s| s.current.viewport)
@@ -2372,9 +2365,7 @@ mod tests {
             .unwrap();
         manager.commit(client(1), object(2)).unwrap();
         // Content size with scale 2 is 50x50; source 80x80 is out of buffer.
-        manager
-            .set_buffer_scale(client(1), object(2), 2)
-            .unwrap();
+        manager.set_buffer_scale(client(1), object(2), 2).unwrap();
         manager.commit(client(1), object(2)).unwrap();
         assert_eq!(
             manager.validate_viewport_commit(client(1), object(2), Some(100), Some(100)),

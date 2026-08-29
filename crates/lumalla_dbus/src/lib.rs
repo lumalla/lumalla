@@ -50,6 +50,7 @@ impl DbusService {
             wayland_display: Arc::clone(&wayland_display),
             extra_env: Arc::new(Mutex::new(HashMap::new())),
             keymaps: Arc::new(Mutex::new(Vec::new())),
+            xkb_config: Arc::new(Mutex::new(lumalla_shared::XkbConfig::default())),
             windows: Arc::new(Mutex::new(Vec::new())),
             pending_screenshots: Arc::clone(&pending_screenshots),
         });
