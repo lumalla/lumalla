@@ -96,7 +96,10 @@ fn main() -> anyhow::Result<()> {
             break;
         }
     }
-    ensure!(saw_geometry && saw_mode && saw_done, "Missing wl_output events");
+    ensure!(
+        saw_geometry && saw_mode && saw_done,
+        "Missing wl_output events"
+    );
 
     send(
         &mut stream,

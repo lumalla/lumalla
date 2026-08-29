@@ -2,9 +2,7 @@ use log::debug;
 use lumalla_wayland_protocol::{
     Ctx, NewObjectId, ObjectId,
     protocols::{
-        PresentationTimeProtocol,
-        presentation_time::*,
-        wayland::WL_DISPLAY_ERROR_INVALID_OBJECT,
+        PresentationTimeProtocol, presentation_time::*, wayland::WL_DISPLAY_ERROR_INVALID_OBJECT,
     },
     registry::{DISPLAY_OBJECT_ID, InterfaceIndex},
 };
@@ -35,12 +33,7 @@ fn register_object(
 }
 
 impl WpPresentation for DisplayState {
-    fn destroy(
-        &mut self,
-        ctx: &mut Ctx,
-        object_id: ObjectId,
-        _params: &WpPresentationDestroy<'_>,
-    ) {
+    fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WpPresentationDestroy<'_>) {
         ctx.registry.free_object(object_id, ctx.writer);
     }
 

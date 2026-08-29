@@ -18,7 +18,7 @@ use lumalla_ipc::{
     types::{DrmDeviceInfo, OutputInfo},
 };
 use lumalla_shared::{
-    Completion, Comms, DbusMessage, DrmDeviceState, EventLoop, MESSAGE_CHANNEL_TOKEN, MainMessage,
+    Comms, Completion, DbusMessage, DrmDeviceState, EventLoop, MESSAGE_CHANNEL_TOKEN, MainMessage,
     OpKind, Output, monotonic_deadline_after,
 };
 use zbus::{Error as ZbusError, blocking::connection};
@@ -107,7 +107,11 @@ struct DbusState {
 }
 
 impl DbusState {
-    fn new(event_loop: EventLoop, channel: mpsc::Receiver<DbusMessage>, service: DbusService) -> Self {
+    fn new(
+        event_loop: EventLoop,
+        channel: mpsc::Receiver<DbusMessage>,
+        service: DbusService,
+    ) -> Self {
         Self {
             channel,
             event_loop,
@@ -204,10 +208,7 @@ impl DbusState {
             DbusMessage::SetWindows(windows) => {
                 *self.windows.lock().unwrap() = windows;
             }
-            DbusMessage::ScreenshotCaptured {
-                request_id,
-                result,
-            } => {
+            DbusMessage::ScreenshotCaptured { request_id, result } => {
                 complete_screenshot(&self.pending_screenshots, request_id, result);
             }
         }

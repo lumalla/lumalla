@@ -13,7 +13,7 @@ use lumalla_ipc::{
     DrmDeviceInfo, KeyBindingInfo, LayoutOutputInfo, LayoutSpacesInfo, ModsInfo, OutputConfigInfo,
     OutputInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo,
 };
-use lumalla_shared::{geometry_field_to_dbus, CallbackRef, GlobalArgs, Mods, Output};
+use lumalla_shared::{CallbackRef, GlobalArgs, Mods, Output, geometry_field_to_dbus};
 use mlua::{
     Error as LuaError, FromLua, Function as LuaFunction, IntoLua, Lua, Result as LuaResult,
     Table as LuaTable, Value as LuaValue,
@@ -41,8 +41,7 @@ impl DbusConfigClient {
         let connection = Box::leak(Box::new(
             Connection::session().context("Failed to connect to session bus")?,
         ));
-        let proxy = WindowManagerProxy::new(connection)
-            .context("Failed to create D-Bus proxy")?;
+        let proxy = WindowManagerProxy::new(connection).context("Failed to create D-Bus proxy")?;
         Ok(Self {
             proxy: Arc::new(proxy),
             _connection: connection,
@@ -337,11 +336,13 @@ struct ConfigOutputSetting {
 
 impl FromLua for ConfigOutputSetting {
     fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
-        let table = value.as_table().ok_or_else(|| LuaError::FromLuaConversionError {
-            from: "LuaOutputConfig",
-            to: String::from("ConfigOutputSetting"),
-            message: Some(String::from("Expected a Lua table for output config")),
-        })?;
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaOutputConfig",
+                to: String::from("ConfigOutputSetting"),
+                message: Some(String::from("Expected a Lua table for output config")),
+            })?;
         Ok(Self {
             name: table.get("name")?,
             enabled: table.get("enabled").unwrap_or(true),
@@ -364,11 +365,11 @@ fn init_dbus_spawn(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> Lu
     module.set(
         "focus_or_spawn",
         lua.create_function(move |_, (app_id, command): (String, ConfigSpawn)| {
-            dbus_result(
-                focus_client
-                    .proxy
-                    .focus_or_spawn(&app_id, &command.command, command.args),
-            )?;
+            dbus_result(focus_client.proxy.focus_or_spawn(
+                &app_id,
+                &command.command,
+                command.args,
+            ))?;
             Ok(())
         })?,
     )?;
@@ -416,12 +417,14 @@ fn init_dbus_input(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> Lu
     let click_client = client.clone();
     module.set(
         "click",
-        lua.create_function(
-            move |_, (x, y, button): (f64, f64, Option<u32>)| {
-                dbus_result(click_client.proxy.inject_pointer_click(x, y, button.unwrap_or(0)))?;
-                Ok(())
-            },
-        )?,
+        lua.create_function(move |_, (x, y, button): (f64, f64, Option<u32>)| {
+            dbus_result(
+                click_client
+                    .proxy
+                    .inject_pointer_click(x, y, button.unwrap_or(0)),
+            )?;
+            Ok(())
+        })?,
     )?;
 
     let screenshot_client = client;
@@ -518,8 +521,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "backspace",
-            create_quit_callback(lua, client.clone())
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_quit_callback(lua, client.clone()).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -528,8 +530,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f1",
-            create_vt_callback(lua, client.clone(), 1)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 1).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -538,8 +539,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f2",
-            create_vt_callback(lua, client.clone(), 2)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 2).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -548,8 +548,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f3",
-            create_vt_callback(lua, client.clone(), 3)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 3).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -558,8 +557,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f4",
-            create_vt_callback(lua, client.clone(), 4)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 4).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -568,8 +566,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f5",
-            create_vt_callback(lua, client.clone(), 5)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 5).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -578,8 +575,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f6",
-            create_vt_callback(lua, client.clone(), 6)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 6).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -588,8 +584,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f7",
-            create_vt_callback(lua, client.clone(), 7)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 7).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -598,8 +593,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f8",
-            create_vt_callback(lua, client.clone(), 8)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 8).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -608,8 +602,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f9",
-            create_vt_callback(lua, client.clone(), 9)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 9).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -618,8 +611,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f10",
-            create_vt_callback(lua, client.clone(), 10)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 10).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -628,8 +620,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f11",
-            create_vt_callback(lua, client.clone(), 11)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 11).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
         (
             Mods {
@@ -638,8 +629,7 @@ pub(crate) fn set_default_keymaps(
                 ..Default::default()
             },
             "f12",
-            create_vt_callback(lua, client.clone(), 12)
-                .map_err(|err| anyhow::anyhow!("{err}"))?,
+            create_vt_callback(lua, client.clone(), 12).map_err(|err| anyhow::anyhow!("{err}"))?,
         ),
     ];
 
@@ -692,11 +682,13 @@ struct ConfigLayout {
 
 impl FromLua for ConfigLayout {
     fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
-        let table = value.as_table().ok_or_else(|| LuaError::FromLuaConversionError {
-            from: "LuaConfigLayout",
-            to: String::from("ConfigLayout"),
-            message: Some(String::from("Expected a Lua table for the ConfigLayout")),
-        })?;
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaConfigLayout",
+                to: String::from("ConfigLayout"),
+                message: Some(String::from("Expected a Lua table for the ConfigLayout")),
+            })?;
         let mut spaces = HashMap::new();
         for pair in table.pairs() {
             let (space_name, config_outputs) = pair?;
@@ -740,11 +732,13 @@ impl From<&Output> for ConfigOutput {
 
 impl FromLua for ConfigOutput {
     fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
-        let table = value.as_table().ok_or_else(|| LuaError::FromLuaConversionError {
-            from: "LuaOutput",
-            to: String::from("ConfigOutput"),
-            message: Some(String::from("Expected a Lua table for the ConfigOutput")),
-        })?;
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaOutput",
+                to: String::from("ConfigOutput"),
+                message: Some(String::from("Expected a Lua table for the ConfigOutput")),
+            })?;
         Ok(Self {
             name: table.get("name")?,
             description: table
@@ -798,11 +792,13 @@ struct ConfigSpawn {
 
 impl FromLua for ConfigSpawn {
     fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
-        let table = value.as_table().ok_or_else(|| LuaError::FromLuaConversionError {
-            from: "LuaSpawn",
-            to: String::from("ConfigSpawn"),
-            message: Some(String::from("Expected a Lua table for the ConfigSpawn")),
-        })?;
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaSpawn",
+                to: String::from("ConfigSpawn"),
+                message: Some(String::from("Expected a Lua table for the ConfigSpawn")),
+            })?;
         Ok(Self {
             command: table.get("command")?,
             args: table.get("args").unwrap_or_default(),
@@ -820,11 +816,13 @@ struct ConfigWindowUpdate {
 
 impl FromLua for ConfigWindowUpdate {
     fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
-        let table = value.as_table().ok_or_else(|| LuaError::FromLuaConversionError {
-            from: "LuaWindowUpdate",
-            to: String::from("ConfigWindowUpdate"),
-            message: Some(String::from("Expected a Lua table for the window update")),
-        })?;
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaWindowUpdate",
+                to: String::from("ConfigWindowUpdate"),
+                message: Some(String::from("Expected a Lua table for the window update")),
+            })?;
         Ok(Self {
             id: table.get("id").unwrap_or(None),
             x: table.get("x").unwrap_or(None),
@@ -886,11 +884,15 @@ struct ConfigWindowRule {
 
 impl FromLua for ConfigWindowRule {
     fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
-        let table = value.as_table().ok_or_else(|| LuaError::FromLuaConversionError {
-            from: "LuaWindowRule",
-            to: String::from("ConfigWindowRule"),
-            message: Some(String::from("Expected a Lua table for the ConfigWindowRule")),
-        })?;
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaWindowRule",
+                to: String::from("ConfigWindowRule"),
+                message: Some(String::from(
+                    "Expected a Lua table for the ConfigWindowRule",
+                )),
+            })?;
         Ok(Self {
             app_id: table.get("app_id")?,
             x: table.get("x").unwrap_or(None),

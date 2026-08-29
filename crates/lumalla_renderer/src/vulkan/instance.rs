@@ -283,11 +283,7 @@ impl VulkanContext {
     }
 
     /// Creates a sampled BGRA texture for surface uploads.
-    pub fn create_sampled_image(
-        &mut self,
-        width: u32,
-        height: u32,
-    ) -> anyhow::Result<Image> {
+    pub fn create_sampled_image(&mut self, width: u32, height: u32) -> anyhow::Result<Image> {
         let device = self
             .device
             .as_ref()

@@ -345,11 +345,7 @@ impl SurfaceManager {
         Ok(())
     }
 
-    pub fn surface_layout(
-        &self,
-        client_id: ClientId,
-        surface_id: ObjectId,
-    ) -> Option<(i32, i32)> {
+    pub fn surface_layout(&self, client_id: ClientId, surface_id: ObjectId) -> Option<(i32, i32)> {
         self.surfaces
             .get(&(client_id, surface_id))
             .map(|surface| surface.layout)
@@ -1180,12 +1176,7 @@ impl SurfaceManager {
         self.is_effectively_synchronized(client_id, sub.parent)
     }
 
-    fn would_create_cycle(
-        &self,
-        client_id: ClientId,
-        surface: ObjectId,
-        parent: ObjectId,
-    ) -> bool {
+    fn would_create_cycle(&self, client_id: ClientId, surface: ObjectId, parent: ObjectId) -> bool {
         let mut current = parent;
         loop {
             if current == surface {
@@ -1204,12 +1195,7 @@ impl SurfaceManager {
         }
     }
 
-    fn remove_child_from_parent(
-        &mut self,
-        client_id: ClientId,
-        parent: ObjectId,
-        child: ObjectId,
-    ) {
+    fn remove_child_from_parent(&mut self, client_id: ClientId, parent: ObjectId, child: ObjectId) {
         if let Some(parent_surface) = self.surfaces.get_mut(&(client_id, parent)) {
             parent_surface.current_children.retain(|id| *id != child);
             if let Some(pending) = parent_surface.pending_children.as_mut() {
@@ -1232,16 +1218,16 @@ impl SurfaceManager {
         let parent = sub.parent;
         let surface = sub.surface;
         if sibling != parent {
-            let sibling_is_valid = self
-                .surfaces
-                .get(&(client_id, parent))
-                .is_some_and(|parent_surface| {
-                    let stack = parent_surface
-                        .pending_children
-                        .as_ref()
-                        .unwrap_or(&parent_surface.current_children);
-                    stack.contains(&sibling)
-                });
+            let sibling_is_valid =
+                self.surfaces
+                    .get(&(client_id, parent))
+                    .is_some_and(|parent_surface| {
+                        let stack = parent_surface
+                            .pending_children
+                            .as_ref()
+                            .unwrap_or(&parent_surface.current_children);
+                        stack.contains(&sibling)
+                    });
             if !sibling_is_valid {
                 return Err(SurfaceError::BadSurface);
             }
@@ -1479,10 +1465,7 @@ impl Region {
 }
 
 fn rect_contains(rect: &Rectangle, x: i32, y: i32) -> bool {
-    x >= rect.x
-        && y >= rect.y
-        && x < rect.x + rect.width
-        && y < rect.y + rect.height
+    x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1518,9 +1501,7 @@ mod tests {
         manager
             .attach(client(1), object(2), Some(object(4)), 5, 6, 1)
             .unwrap();
-        manager
-            .set_buffer_scale(client(1), object(2), 2)
-            .unwrap();
+        manager.set_buffer_scale(client(1), object(2), 2).unwrap();
         manager
             .set_buffer_transform(client(1), object(2), 1)
             .unwrap();
@@ -1694,7 +1675,12 @@ mod tests {
             .unwrap()
             .layout;
         let (local_x, local_y) = manager
-            .surface_local_coords(client(1), object(2), layout.0 as f64 + 20.0, layout.1 as f64 + 30.0)
+            .surface_local_coords(
+                client(1),
+                object(2),
+                layout.0 as f64 + 20.0,
+                layout.1 as f64 + 30.0,
+            )
             .unwrap();
         assert!((local_x - 20.0).abs() < f32::EPSILON);
         assert!((local_y - 30.0).abs() < f32::EPSILON);
@@ -1708,7 +1694,9 @@ mod tests {
             .create_shell_surface(client(1), object(3), object(2))
             .unwrap();
         assert_eq!(
-            manager.assign_cursor_role(client(1), object(2)).unwrap_err(),
+            manager
+                .assign_cursor_role(client(1), object(2))
+                .unwrap_err(),
             SurfaceError::RoleAlreadyAssigned
         );
         manager.create_surface(client(1), object(4));
@@ -1726,15 +1714,21 @@ mod tests {
         manager
             .set_pending_shell_ping(client(1), object(3), 42)
             .unwrap();
-        assert!(!manager
-            .acknowledge_shell_ping(client(1), object(3), 7)
-            .unwrap());
-        assert!(manager
-            .acknowledge_shell_ping(client(1), object(3), 42)
-            .unwrap());
-        assert!(!manager
-            .acknowledge_shell_ping(client(1), object(3), 42)
-            .unwrap());
+        assert!(
+            !manager
+                .acknowledge_shell_ping(client(1), object(3), 7)
+                .unwrap()
+        );
+        assert!(
+            manager
+                .acknowledge_shell_ping(client(1), object(3), 42)
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .acknowledge_shell_ping(client(1), object(3), 42)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1887,9 +1881,7 @@ mod tests {
         manager
             .create_subsurface(client(1), object(5), object(3), object(2))
             .unwrap();
-        manager
-            .set_position(client(1), object(5), 12, 34)
-            .unwrap();
+        manager.set_position(client(1), object(5), 12, 34).unwrap();
 
         manager
             .attach(client(1), object(3), Some(object(6)), 0, 0, 1)

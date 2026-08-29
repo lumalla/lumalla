@@ -312,10 +312,7 @@ impl Xkb {
     pub fn keysym_from_name(name: &str) -> anyhow::Result<u32> {
         let name_c = std::ffi::CString::new(name).context("Keysym name contains null byte")?;
         let keysym = unsafe {
-            bindings::xkb_keysym_from_name(
-                name_c.as_ptr(),
-                bindings::XKB_KEYSYM_NO_FLAGS,
-            )
+            bindings::xkb_keysym_from_name(name_c.as_ptr(), bindings::XKB_KEYSYM_NO_FLAGS)
         };
         if keysym == 0 {
             anyhow::bail!("Unknown keysym name: {name}");

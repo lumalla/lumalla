@@ -285,30 +285,41 @@ impl WindowManagerHandler for CompositorHandler {
     }
 
     fn inject_key(&mut self, name: &str) -> zbus::fdo::Result<()> {
-        self.state.comms.main(MainMessage::InjectInput(InjectedInput::Key {
-            name: name.to_string(),
-        }));
+        self.state
+            .comms
+            .main(MainMessage::InjectInput(InjectedInput::Key {
+                name: name.to_string(),
+            }));
         Ok(())
     }
 
     fn type_text(&mut self, text: &str) -> zbus::fdo::Result<()> {
-        self.state.comms.main(MainMessage::InjectInput(InjectedInput::TypeText {
-            text: text.to_string(),
-        }));
+        self.state
+            .comms
+            .main(MainMessage::InjectInput(InjectedInput::TypeText {
+                text: text.to_string(),
+            }));
         Ok(())
     }
 
     fn inject_pointer_move(&mut self, x: f64, y: f64) -> zbus::fdo::Result<()> {
         self.state
             .comms
-            .main(MainMessage::InjectInput(InjectedInput::PointerMove { x, y }));
+            .main(MainMessage::InjectInput(InjectedInput::PointerMove {
+                x,
+                y,
+            }));
         Ok(())
     }
 
     fn inject_pointer_click(&mut self, x: f64, y: f64, button: u32) -> zbus::fdo::Result<()> {
-        self.state.comms.main(MainMessage::InjectInput(
-            InjectedInput::PointerClick { x, y, button },
-        ));
+        self.state
+            .comms
+            .main(MainMessage::InjectInput(InjectedInput::PointerClick {
+                x,
+                y,
+                button,
+            }));
         Ok(())
     }
 
@@ -344,15 +355,13 @@ impl WindowManagerHandler for CompositorHandler {
             .unwrap()
             .insert(request_id, Arc::clone(&pending));
 
-        self.state
-            .comms
-            .main(MainMessage::CaptureScreenshot {
-                request_id,
-                x,
-                y,
-                width,
-                height,
-            });
+        self.state.comms.main(MainMessage::CaptureScreenshot {
+            request_id,
+            x,
+            y,
+            width,
+            height,
+        });
 
         let mut guard = pending.result.lock().unwrap();
         while guard.is_none() {
@@ -426,7 +435,9 @@ fn spawn_process(
         info!("Spawning `{command}` with WAYLAND_DISPLAY={wayland_display}");
         cmd.env("WAYLAND_DISPLAY", wayland_display);
     } else {
-        warn!("Spawning `{command}` without WAYLAND_DISPLAY; client may connect to the wrong compositor");
+        warn!(
+            "Spawning `{command}` without WAYLAND_DISPLAY; client may connect to the wrong compositor"
+        );
     }
     if let Err(e) = cmd.spawn() {
         error!("Failed to start program {command}: {e}");

@@ -15,14 +15,12 @@ use std::{
 
 use anyhow::{Context, ensure};
 use lumalla_wayland_protocol::protocols::{
-    presentation_time::{
-        WP_PRESENTATION_FEEDBACK_OPCODE, WP_PRESENTATION_NAME,
-    },
+    presentation_time::{WP_PRESENTATION_FEEDBACK_OPCODE, WP_PRESENTATION_NAME},
     wayland::{
-        WL_COMPOSITOR_CREATE_SURFACE_OPCODE, WL_DISPLAY_GET_REGISTRY_OPCODE, WL_DISPLAY_SYNC_OPCODE,
-        WL_REGISTRY_BIND_OPCODE, WL_SHM_CREATE_POOL_OPCODE, WL_SHM_FORMAT_XRGB8888,
-        WL_SHM_POOL_CREATE_BUFFER_OPCODE, WL_SURFACE_ATTACH_OPCODE, WL_SURFACE_COMMIT_OPCODE,
-        WL_SURFACE_DAMAGE_OPCODE,
+        WL_COMPOSITOR_CREATE_SURFACE_OPCODE, WL_DISPLAY_GET_REGISTRY_OPCODE,
+        WL_DISPLAY_SYNC_OPCODE, WL_REGISTRY_BIND_OPCODE, WL_SHM_CREATE_POOL_OPCODE,
+        WL_SHM_FORMAT_XRGB8888, WL_SHM_POOL_CREATE_BUFFER_OPCODE, WL_SURFACE_ATTACH_OPCODE,
+        WL_SURFACE_COMMIT_OPCODE, WL_SURFACE_DAMAGE_OPCODE,
     },
     xdg_shell::{
         XDG_SURFACE_ACK_CONFIGURE_OPCODE, XDG_SURFACE_GET_TOPLEVEL_OPCODE,
@@ -197,7 +195,11 @@ fn commit_with_feedback(
     push_u32(&mut feedback_payload, feedback_id);
     send(
         stream,
-        request(presentation, WP_PRESENTATION_FEEDBACK_OPCODE, feedback_payload),
+        request(
+            presentation,
+            WP_PRESENTATION_FEEDBACK_OPCODE,
+            feedback_payload,
+        ),
     )?;
     send(stream, request(7, WL_SURFACE_COMMIT_OPCODE, Vec::new()))?;
     Ok(())
@@ -313,8 +315,12 @@ fn checkerboard() -> Vec<u8> {
 }
 
 fn memory_file(bytes: &[u8]) -> anyhow::Result<File> {
-    let fd =
-        unsafe { libc::memfd_create(c"lumalla-presentation-time-smoke".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe {
+        libc::memfd_create(
+            c"lumalla-presentation-time-smoke".as_ptr(),
+            libc::MFD_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("memfd_create failed");
     }

@@ -477,7 +477,9 @@ impl Writer {
             if self.active.remaining() == 0 && !self.rotate_active() {
                 return;
             }
-            let to_write = pad_remaining.saturating_sub(padded).min(self.active.remaining());
+            let to_write = pad_remaining
+                .saturating_sub(padded)
+                .min(self.active.remaining());
             self.active.data[self.active.len..self.active.len + to_write].fill(0);
             self.active.len += to_write;
             padded += to_write;
@@ -608,19 +610,17 @@ impl Writer {
     pub fn flush_if_needed(&mut self) -> anyhow::Result<()> {
         if self.active.fds.len() >= 100 {
             if self.active.len > 0 && !self.rotate_active() {
-                return Err(
-                    self.last_err
-                        .take()
-                        .unwrap_or_else(|| anyhow::anyhow!("send buffer limit exceeded")),
-                );
+                return Err(self
+                    .last_err
+                    .take()
+                    .unwrap_or_else(|| anyhow::anyhow!("send buffer limit exceeded")));
             }
         }
         if self.active.remaining() < HEADER_SIZE && !self.rotate_active() {
-            return Err(
-                self.last_err
-                    .take()
-                    .unwrap_or_else(|| anyhow::anyhow!("send buffer limit exceeded")),
-            );
+            return Err(self
+                .last_err
+                .take()
+                .unwrap_or_else(|| anyhow::anyhow!("send buffer limit exceeded")));
         }
         Ok(())
     }
@@ -688,11 +688,10 @@ impl Writer {
             anyhow::bail!("Cannot sync-flush while SendMsg is in flight");
         }
         if !self.seal_active_to_queue() {
-            return Err(
-                self.last_err
-                    .take()
-                    .unwrap_or_else(|| anyhow::anyhow!("send buffer limit exceeded")),
-            );
+            return Err(self
+                .last_err
+                .take()
+                .unwrap_or_else(|| anyhow::anyhow!("send buffer limit exceeded")));
         }
         while let Some(mut chunk) = self.queue.pop_front() {
             self.send_chunk_sync(&mut chunk)?;
@@ -868,7 +867,8 @@ mod tests {
         writer.write_message_length();
         assert!(writer.has_pending_output());
 
-        let total = HEADER_SIZE + words_in_first_chunk * mem::size_of::<u32>() + 20 * mem::size_of::<u32>();
+        let total =
+            HEADER_SIZE + words_in_first_chunk * mem::size_of::<u32>() + 20 * mem::size_of::<u32>();
         let msg = writer.prepare_send_msghdr().unwrap();
         let first = unsafe { sendmsg(socket.1.as_raw_fd(), &*msg, MSG_NOSIGNAL) };
         assert_eq!(first as usize, SEND_CHUNK_SIZE);

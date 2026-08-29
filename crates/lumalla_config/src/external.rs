@@ -131,8 +131,7 @@ impl ExternalConfig {
 
     fn handle_ready(&mut self) -> anyhow::Result<()> {
         if let Some(on_startup) = *self.on_startup.borrow() {
-            self.callback_state
-                .run_callback::<(), ()>(on_startup, ())?;
+            self.callback_state.run_callback::<(), ()>(on_startup, ())?;
         }
         Ok(())
     }
@@ -161,20 +160,15 @@ impl ExternalConfig {
             warn!("Ignoring binding activation with invalid id: {binding_id}");
             return Ok(());
         };
-        self.callback_state.run_callback::<(), ()>(
-            CallbackRef { callback_id },
-            (),
-        )?;
+        self.callback_state
+            .run_callback::<(), ()>(CallbackRef { callback_id }, ())?;
         Ok(())
     }
 
     fn on_connector_change(&mut self) -> anyhow::Result<()> {
         if let Some(on_connector_change) = *self.on_connector_change.borrow() {
-            let outputs: Vec<ConfigOutput> = self
-                .outputs
-                .values()
-                .map(ConfigOutput::from)
-                .collect();
+            let outputs: Vec<ConfigOutput> =
+                self.outputs.values().map(ConfigOutput::from).collect();
             self.callback_state
                 .run_callback::<Vec<ConfigOutput>, ()>(on_connector_change, outputs)?;
         }

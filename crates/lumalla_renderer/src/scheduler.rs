@@ -142,12 +142,7 @@ impl RenderScheduler {
     }
 
     /// After a flip, reschedule if more work is still pending.
-    pub fn after_flip(
-        &mut self,
-        now: Instant,
-        scene_dirty: bool,
-        pending_frame_callbacks: bool,
-    ) {
+    pub fn after_flip(&mut self, now: Instant, scene_dirty: bool, pending_frame_callbacks: bool) {
         self.on_flip_completed(now);
         if scene_dirty || pending_frame_callbacks {
             self.schedule_next_present(now);

@@ -16,8 +16,8 @@ mod memory;
 mod physical_device;
 mod pipeline;
 mod render_pass;
-pub mod shaders;
 mod sampler;
+pub mod shaders;
 mod sync;
 mod upload;
 

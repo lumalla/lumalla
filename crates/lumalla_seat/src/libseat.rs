@@ -164,11 +164,7 @@ impl LibSeat {
         if fd < 0 {
             anyhow::bail!("Failed to get seat file descriptor");
         }
-        Ok(Self {
-            seat,
-            fd,
-            userdata,
-        })
+        Ok(Self { seat, fd, userdata })
     }
 
     /// Get the file descriptor for the seat
@@ -273,4 +269,3 @@ impl Drop for LibSeat {
         self.seat = NonNull::dangling();
     }
 }
-

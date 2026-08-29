@@ -211,7 +211,9 @@ fn main() -> anyhow::Result<()> {
                     let surface = read_u32(&event.payload, 4)?;
                     let sx = fixed_to_f32(read_i32(&event.payload, 8)?);
                     let sy = fixed_to_f32(read_i32(&event.payload, 12)?);
-                    println!("wl_pointer.enter serial={serial} surface={surface} ({sx:.1},{sy:.1})");
+                    println!(
+                        "wl_pointer.enter serial={serial} surface={surface} ({sx:.1},{sy:.1})"
+                    );
                     if !cursor_set {
                         let mut payload = Vec::new();
                         push_u32(&mut payload, serial);

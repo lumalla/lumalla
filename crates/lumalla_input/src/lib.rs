@@ -226,12 +226,7 @@ impl InputState {
     }
 
     /// Move the pointer to absolute compositor coordinates.
-    pub fn inject_pointer_move(
-        &mut self,
-        x: f64,
-        y: f64,
-        on_event: &mut impl FnMut(SeatEvent),
-    ) {
+    pub fn inject_pointer_move(&mut self, x: f64, y: f64, on_event: &mut impl FnMut(SeatEvent)) {
         let time_msec = self.now_msec();
         on_event(SeatEvent::Pointer(PointerEvent::Absolute {
             time_msec,

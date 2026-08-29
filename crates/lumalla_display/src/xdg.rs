@@ -118,11 +118,7 @@ impl XdgManager {
         self.wm_bases.insert((client_id, id), ());
     }
 
-    pub fn destroy_wm_base(
-        &mut self,
-        client_id: ClientId,
-        id: ObjectId,
-    ) -> Result<(), XdgError> {
+    pub fn destroy_wm_base(&mut self, client_id: ClientId, id: ObjectId) -> Result<(), XdgError> {
         self.wm_bases
             .remove(&(client_id, id))
             .ok_or(XdgError::UnknownWmBase)?;
@@ -419,7 +415,10 @@ impl XdgManager {
             .toplevels
             .remove(&(client_id, toplevel_id))
             .ok_or(XdgError::UnknownToplevel)?;
-        if let Some(surface) = self.xdg_surfaces.get_mut(&(client_id, toplevel.xdg_surface)) {
+        if let Some(surface) = self
+            .xdg_surfaces
+            .get_mut(&(client_id, toplevel.xdg_surface))
+        {
             if surface.role == Some(XdgRole::Toplevel(toplevel_id)) {
                 surface.role = None;
             }
@@ -632,18 +631,15 @@ impl XdgManager {
     }
 
     #[allow(dead_code)]
-    pub fn is_xdg_toplevel_mapped_role(
-        &self,
-        client_id: ClientId,
-        wl_surface: ObjectId,
-    ) -> bool {
+    pub fn is_xdg_toplevel_mapped_role(&self, client_id: ClientId, wl_surface: ObjectId) -> bool {
         self.can_map_wl_surface(client_id, wl_surface)
     }
 
     pub fn delete_client(&mut self, client_id: ClientId) {
         self.wm_bases.retain(|(owner, _), _| *owner != client_id);
         self.positioners.retain(|(owner, _), _| *owner != client_id);
-        self.xdg_surfaces.retain(|(owner, _), _| *owner != client_id);
+        self.xdg_surfaces
+            .retain(|(owner, _), _| *owner != client_id);
         self.toplevels.retain(|(owner, _), _| *owner != client_id);
         self.popups.retain(|(owner, _), _| *owner != client_id);
         self.surface_to_xdg

@@ -124,8 +124,7 @@ impl PhysicalDevice {
             warn!("Could not determine DRM device path for selected GPU");
         }
 
-        let memory_properties =
-            unsafe { instance.get_physical_device_memory_properties(handle) };
+        let memory_properties = unsafe { instance.get_physical_device_memory_properties(handle) };
 
         Ok(Self {
             handle,

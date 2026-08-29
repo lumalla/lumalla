@@ -1,19 +1,11 @@
 use log::debug;
 use lumalla_wayland_protocol::{
     Ctx, NewObjectId, ObjectId,
-    protocols::{
-        XdgShellProtocol,
-        wayland::WL_DISPLAY_ERROR_INVALID_OBJECT,
-        xdg_shell::*,
-    },
+    protocols::{XdgShellProtocol, wayland::WL_DISPLAY_ERROR_INVALID_OBJECT, xdg_shell::*},
     registry::{DISPLAY_OBJECT_ID, InterfaceIndex},
 };
 
-use crate::{
-    DisplayState,
-    surface::SurfaceError,
-    xdg::XdgError,
-};
+use crate::{DisplayState, surface::SurfaceError, xdg::XdgError};
 
 impl XdgShellProtocol for DisplayState {}
 
@@ -52,10 +44,7 @@ fn report_xdg_error(ctx: &mut Ctx, object_id: ObjectId, error: XdgError) {
             XDG_SURFACE_ERROR_NOT_CONSTRUCTED,
             "xdg_surface has no role object",
         ),
-        XdgError::InvalidSerial => (
-            XDG_SURFACE_ERROR_INVALID_SERIAL,
-            "Invalid configure serial",
-        ),
+        XdgError::InvalidSerial => (XDG_SURFACE_ERROR_INVALID_SERIAL, "Invalid configure serial"),
         XdgError::UnconfiguredBuffer => (
             XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER,
             "Buffer attached before configure ack",
@@ -163,19 +152,17 @@ impl XdgWmBase for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::XdgSurface, version) {
             return;
         }
-        if let Err(error) = self.surface_manager.assign_xdg_role(
-            ctx.client_id,
-            params.surface(),
-            *params.id(),
-        ) {
+        if let Err(error) =
+            self.surface_manager
+                .assign_xdg_role(ctx.client_id, params.surface(), *params.id())
+        {
             report_surface_role_error(ctx, object_id, error);
             return;
         }
-        if let Err(error) = self.xdg_manager.create_xdg_surface(
-            ctx.client_id,
-            *params.id(),
-            params.surface(),
-        ) {
+        if let Err(error) =
+            self.xdg_manager
+                .create_xdg_surface(ctx.client_id, *params.id(), params.surface())
+        {
             let _ = self
                 .surface_manager
                 .clear_xdg_role(ctx.client_id, params.surface());
@@ -200,12 +187,7 @@ impl XdgPositioner for DisplayState {
         ctx.registry.free_object(object_id, ctx.writer);
     }
 
-    fn set_size(
-        &mut self,
-        ctx: &mut Ctx,
-        object_id: ObjectId,
-        params: &XdgPositionerSetSize<'_>,
-    ) {
+    fn set_size(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &XdgPositionerSetSize<'_>) {
         if let Err(error) = self.xdg_manager.positioner_set_size(
             ctx.client_id,
             object_id,
@@ -283,12 +265,10 @@ impl XdgPositioner for DisplayState {
         object_id: ObjectId,
         params: &XdgPositionerSetOffset<'_>,
     ) {
-        if let Err(error) = self.xdg_manager.positioner_set_offset(
-            ctx.client_id,
-            object_id,
-            params.x(),
-            params.y(),
-        ) {
+        if let Err(error) =
+            self.xdg_manager
+                .positioner_set_offset(ctx.client_id, object_id, params.x(), params.y())
+        {
             report_xdg_error(ctx, object_id, error);
         }
     }
@@ -341,9 +321,14 @@ impl XdgPositioner for DisplayState {
 
 impl XdgSurface for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &XdgSurfaceDestroy<'_>) {
-        match self.xdg_manager.destroy_xdg_surface(ctx.client_id, object_id) {
+        match self
+            .xdg_manager
+            .destroy_xdg_surface(ctx.client_id, object_id)
+        {
             Ok(wl_surface) => {
-                let _ = self.surface_manager.clear_xdg_role(ctx.client_id, wl_surface);
+                let _ = self
+                    .surface_manager
+                    .clear_xdg_role(ctx.client_id, wl_surface);
                 ctx.registry.free_object(object_id, ctx.writer);
             }
             Err(error) => report_xdg_error(ctx, object_id, error),
@@ -363,16 +348,15 @@ impl XdgSurface for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::XdgToplevel, version) {
             return;
         }
-        let Ok(wl_surface) = self.xdg_manager.wl_surface_for_xdg(ctx.client_id, object_id) else {
+        let Ok(wl_surface) = self
+            .xdg_manager
+            .wl_surface_for_xdg(ctx.client_id, object_id)
+        else {
             report_xdg_error(ctx, object_id, XdgError::UnknownXdgSurface);
             return;
         };
-        let (width, height) = self.register_toplevel(
-            ctx.client_id,
-            *params.id(),
-            object_id,
-            wl_surface,
-        );
+        let (width, height) =
+            self.register_toplevel(ctx.client_id, *params.id(), object_id, wl_surface);
         match self.xdg_manager.create_toplevel(
             ctx.client_id,
             *params.id(),
@@ -386,9 +370,7 @@ impl XdgSurface for DisplayState {
                     .width(width)
                     .height(height)
                     .states(&[]);
-                ctx.writer
-                    .xdg_surface_configure(object_id)
-                    .serial(serial);
+                ctx.writer.xdg_surface_configure(object_id).serial(serial);
             }
             Err(error) => {
                 self.unregister_toplevel(ctx.client_id, *params.id());
@@ -397,19 +379,16 @@ impl XdgSurface for DisplayState {
         }
     }
 
-    fn get_popup(
-        &mut self,
-        ctx: &mut Ctx,
-        object_id: ObjectId,
-        params: &XdgSurfaceGetPopup<'_>,
-    ) {
+    fn get_popup(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &XdgSurfaceGetPopup<'_>) {
         if ctx.registry.interface_index(params.positioner()) != Some(InterfaceIndex::XdgPositioner)
         {
             report_xdg_error(ctx, object_id, XdgError::UnknownPositioner);
             return;
         }
         let parent = match params.parent() {
-            Some(parent) if ctx.registry.interface_index(parent) == Some(InterfaceIndex::XdgSurface) => {
+            Some(parent)
+                if ctx.registry.interface_index(parent) == Some(InterfaceIndex::XdgSurface) =>
+            {
                 parent
             }
             Some(parent) => {
@@ -442,9 +421,7 @@ impl XdgSurface for DisplayState {
                     .y(0)
                     .width(DEFAULT_TOPLEVEL_WIDTH)
                     .height(DEFAULT_TOPLEVEL_HEIGHT);
-                ctx.writer
-                    .xdg_surface_configure(object_id)
-                    .serial(serial);
+                ctx.writer.xdg_surface_configure(object_id).serial(serial);
             }
             Err(error) => report_xdg_error(ctx, object_id, error),
         }
@@ -517,36 +494,24 @@ impl XdgToplevel for DisplayState {
         }
     }
 
-    fn set_title(
-        &mut self,
-        ctx: &mut Ctx,
-        object_id: ObjectId,
-        params: &XdgToplevelSetTitle<'_>,
-    ) {
+    fn set_title(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &XdgToplevelSetTitle<'_>) {
         let title = params.title().to_owned();
-        if let Err(error) = self.xdg_manager.set_toplevel_title(
-            ctx.client_id,
-            object_id,
-            title.clone(),
-        ) {
+        if let Err(error) =
+            self.xdg_manager
+                .set_toplevel_title(ctx.client_id, object_id, title.clone())
+        {
             report_xdg_error(ctx, object_id, error);
             return;
         }
         self.on_toplevel_title_set(ctx.client_id, object_id, title);
     }
 
-    fn set_app_id(
-        &mut self,
-        ctx: &mut Ctx,
-        object_id: ObjectId,
-        params: &XdgToplevelSetAppId<'_>,
-    ) {
+    fn set_app_id(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &XdgToplevelSetAppId<'_>) {
         let app_id = params.app_id().to_owned();
-        if let Err(error) = self.xdg_manager.set_toplevel_app_id(
-            ctx.client_id,
-            object_id,
-            app_id.clone(),
-        ) {
+        if let Err(error) =
+            self.xdg_manager
+                .set_toplevel_app_id(ctx.client_id, object_id, app_id.clone())
+        {
             report_xdg_error(ctx, object_id, error);
             return;
         }
@@ -682,8 +647,14 @@ impl XdgPopup for DisplayState {
 }
 
 /// Hook called from wl_surface.commit path for xdg bookkeeping.
-pub(crate) fn on_xdg_surface_commit(state: &mut DisplayState, client_id: lumalla_wayland_protocol::ClientId, surface_id: ObjectId) {
-    state.xdg_manager.on_wl_surface_commit(client_id, surface_id);
+pub(crate) fn on_xdg_surface_commit(
+    state: &mut DisplayState,
+    client_id: lumalla_wayland_protocol::ClientId,
+    surface_id: ObjectId,
+) {
+    state
+        .xdg_manager
+        .on_wl_surface_commit(client_id, surface_id);
 }
 
 /// Report an xdg error from the wl_surface.commit path.

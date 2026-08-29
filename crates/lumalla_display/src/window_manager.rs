@@ -131,7 +131,8 @@ impl WindowManager {
             .collect();
         for id in ids {
             if let Some(window) = self.windows.remove(&id) {
-                self.by_toplevel.remove(&(window.client_id, window.toplevel));
+                self.by_toplevel
+                    .remove(&(window.client_id, window.toplevel));
             }
             if self.focused_id == Some(id) {
                 self.focused_id = None;
@@ -212,17 +213,9 @@ impl WindowManager {
                 }
                 id
             }
-            _ => self
-                .focused_id
-                .ok_or(WindowError::NoFocusedWindow)?,
+            _ => self.focused_id.ok_or(WindowError::NoFocusedWindow)?,
         };
-        Ok(self.apply_update(
-            target,
-            update,
-            user_initiated,
-            surface_manager,
-            xdg_manager,
-        ))
+        Ok(self.apply_update(target, update, user_initiated, surface_manager, xdg_manager))
     }
 
     pub fn take_pending_configures(&mut self) -> Vec<PendingConfigure> {

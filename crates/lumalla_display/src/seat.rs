@@ -678,9 +678,7 @@ impl SeatManager {
         x: f64,
         y: f64,
     ) {
-        let Some((client_id, surface)) =
-            surface_manager.global_pointer_target(None, x, y)
-        else {
+        let Some((client_id, surface)) = surface_manager.global_pointer_target(None, x, y) else {
             return;
         };
         self.active_touches.insert(touch_id, (client_id, surface));
@@ -870,7 +868,12 @@ impl SeatManager {
         };
 
         let (sx, sy) = surface_manager
-            .surface_local_coords(target_client, target_surface, self.pointer_x, self.pointer_y)
+            .surface_local_coords(
+                target_client,
+                target_surface,
+                self.pointer_x,
+                self.pointer_y,
+            )
             .unwrap_or((self.pointer_x as f32, self.pointer_y as f32));
 
         let enter_list: Vec<(ObjectId, u32, bool)> = self
@@ -1035,9 +1038,7 @@ mod tests {
         let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0, "memfd_create failed");
         let keymap = b"xkb_keymap {};\0";
-        let written = unsafe {
-            libc::write(fd, keymap.as_ptr().cast(), keymap.len())
-        };
+        let written = unsafe { libc::write(fd, keymap.as_ptr().cast(), keymap.len()) };
         assert_eq!(written as usize, keymap.len());
         KeymapMemfd::new(unsafe { OwnedFd::from_raw_fd(fd) }, keymap.len() as u32)
     }
@@ -1085,7 +1086,14 @@ mod tests {
     fn create_pointer_tracks_object() {
         let mut seat = SeatManager::default();
         let (_keep, mut writer) = writer();
-        seat.create_pointer(client(1), object(10), 5, &mut writer, None, &SurfaceManager::default());
+        seat.create_pointer(
+            client(1),
+            object(10),
+            5,
+            &mut writer,
+            None,
+            &SurfaceManager::default(),
+        );
         assert_eq!(seat.pointers.len(), 1);
         assert_eq!(seat.pointers[0].id, object(10));
         seat.destroy_pointer(client(1), object(10), &mut SurfaceManager::default());
@@ -1110,7 +1118,9 @@ mod tests {
         surfaces
             .set_shell_mode(client_id, object(30), ShellMode::Toplevel)
             .unwrap();
-        surfaces.attach(client_id, surface, Some(object(40)), 0, 0, 1).unwrap();
+        surfaces
+            .attach(client_id, surface, Some(object(40)), 0, 0, 1)
+            .unwrap();
         let _ = surfaces.commit(client_id, surface).unwrap();
 
         seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces);
@@ -1197,7 +1207,9 @@ mod tests {
         surfaces
             .set_shell_mode(client_id, object(30), ShellMode::Toplevel)
             .unwrap();
-        surfaces.attach(client_id, surface, Some(object(40)), 0, 0, 1).unwrap();
+        surfaces
+            .attach(client_id, surface, Some(object(40)), 0, 0, 1)
+            .unwrap();
         let _ = surfaces.commit(client_id, surface).unwrap();
         surfaces
             .set_committed_buffer_size(client_id, surface, 200, 200)

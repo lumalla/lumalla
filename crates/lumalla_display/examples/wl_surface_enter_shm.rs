@@ -16,10 +16,10 @@ use std::{
 use anyhow::{Context, ensure};
 use lumalla_wayland_protocol::protocols::{
     wayland::{
-        WL_COMPOSITOR_CREATE_SURFACE_OPCODE, WL_DISPLAY_GET_REGISTRY_OPCODE, WL_DISPLAY_SYNC_OPCODE,
-        WL_REGISTRY_BIND_OPCODE, WL_SHM_CREATE_POOL_OPCODE, WL_SHM_FORMAT_XRGB8888,
-        WL_SHM_POOL_CREATE_BUFFER_OPCODE, WL_SURFACE_ATTACH_OPCODE, WL_SURFACE_COMMIT_OPCODE,
-        WL_SURFACE_DAMAGE_OPCODE,
+        WL_COMPOSITOR_CREATE_SURFACE_OPCODE, WL_DISPLAY_GET_REGISTRY_OPCODE,
+        WL_DISPLAY_SYNC_OPCODE, WL_REGISTRY_BIND_OPCODE, WL_SHM_CREATE_POOL_OPCODE,
+        WL_SHM_FORMAT_XRGB8888, WL_SHM_POOL_CREATE_BUFFER_OPCODE, WL_SURFACE_ATTACH_OPCODE,
+        WL_SURFACE_COMMIT_OPCODE, WL_SURFACE_DAMAGE_OPCODE,
     },
     xdg_shell::{
         XDG_SURFACE_ACK_CONFIGURE_OPCODE, XDG_SURFACE_GET_TOPLEVEL_OPCODE,
@@ -80,7 +80,10 @@ fn main() -> anyhow::Result<()> {
             break;
         }
     }
-    ensure!(mode_width.is_some() && mode_height.is_some(), "Missing wl_output.mode");
+    ensure!(
+        mode_width.is_some() && mode_height.is_some(),
+        "Missing wl_output.mode"
+    );
 
     send(
         &mut stream,
@@ -301,7 +304,10 @@ fn read_event(stream: &mut UnixStream) -> anyhow::Result<Event> {
     let object_id = u32::from_ne_bytes(header[0..4].try_into().unwrap());
     let opcode = u16::from_ne_bytes(header[4..6].try_into().unwrap());
     let size = u16::from_ne_bytes(header[6..8].try_into().unwrap()) as usize;
-    ensure!(size >= 8 && size.is_multiple_of(4), "Invalid event size {size}");
+    ensure!(
+        size >= 8 && size.is_multiple_of(4),
+        "Invalid event size {size}"
+    );
     let mut payload = vec![0; size - 8];
     stream.read_exact(&mut payload)?;
     Ok(Event {

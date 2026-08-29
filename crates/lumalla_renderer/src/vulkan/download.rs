@@ -5,9 +5,7 @@ use std::ptr;
 use anyhow::Context;
 use ash::vk;
 
-use super::{
-    CommandBufferRecorder, Device, DmaBufImage, Fence, PhysicalDevice, VulkanContext,
-};
+use super::{CommandBufferRecorder, Device, DmaBufImage, Fence, PhysicalDevice, VulkanContext};
 
 /// Downloads a rectangular region from a scanout image as tightly packed BGRA8 bytes.
 pub fn download_bgra_region(
@@ -211,7 +209,10 @@ impl DownloadStagingBuffer {
     }
 
     fn read_bytes(&self, len: usize) -> anyhow::Result<Vec<u8>> {
-        anyhow::ensure!(len as vk::DeviceSize <= self.size, "download read exceeds staging size");
+        anyhow::ensure!(
+            len as vk::DeviceSize <= self.size,
+            "download read exceeds staging size"
+        );
         if !self.coherent {
             let range = vk::MappedMemoryRange::default()
                 .memory(self.memory)

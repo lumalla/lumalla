@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use lumalla_shared::{DrmConnector, DrmDeviceState, DrmMode, Mods, Output, WindowRule, Zone, WindowState};
+use lumalla_shared::{
+    DrmConnector, DrmDeviceState, DrmMode, Mods, Output, WindowRule, WindowState, Zone,
+};
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
 
@@ -81,7 +83,11 @@ impl From<&DrmDeviceState> for DrmDeviceInfo {
     fn from(device: &DrmDeviceState) -> Self {
         Self {
             path: device.path.to_string_lossy().into_owned(),
-            connectors: device.connectors.iter().map(DrmConnectorInfo::from).collect(),
+            connectors: device
+                .connectors
+                .iter()
+                .map(DrmConnectorInfo::from)
+                .collect(),
             selected_render_device: device.selected_render_device,
         }
     }

@@ -28,12 +28,12 @@ pub use message_runner::{MESSAGE_CHANNEL_TOKEN, MessageRunner};
 pub use mods::Mods;
 pub use output::Output;
 pub use ring::{
-    Completion, EventLoop, Interest, OpKind, SharedWaker, Waker, decode_user_data, encode_user_data,
-    monotonic_deadline_after, monotonic_now,
+    Completion, EventLoop, Interest, OpKind, SharedWaker, Waker, decode_user_data,
+    encode_user_data, monotonic_deadline_after, monotonic_now,
 };
 pub use udev::{Udev, UdevDevice, UdevEnumerate, UdevMonitor};
 pub use window_geometry::{
-    WindowGeometryUpdate, WINDOW_GEOMETRY_UNSET, geometry_field_from_dbus, geometry_field_to_dbus,
+    WINDOW_GEOMETRY_UNSET, WindowGeometryUpdate, geometry_field_from_dbus, geometry_field_to_dbus,
 };
 pub use window_rule::WindowRule;
 pub use window_state::WindowState;

@@ -2,12 +2,12 @@ use std::collections::{HashMap, VecDeque};
 
 use anyhow::Context;
 use lumalla_shared::{Comms, WindowGeometryUpdate, WindowRule, WindowState};
-use lumalla_wayland_protocol::registry::InterfaceIndex;
-use lumalla_wayland_protocol::{ObjectId, buffer::Writer, registry::Registry};
 use lumalla_wayland_protocol::protocols::presentation_time::{
     WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK, WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION,
     WP_PRESENTATION_FEEDBACK_KIND_VSYNC,
 };
+use lumalla_wayland_protocol::registry::InterfaceIndex;
+use lumalla_wayland_protocol::{ObjectId, buffer::Writer, registry::Registry};
 
 use crate::{
     data_device::DataDeviceManager, dmabuf::DmabufManager, output::OutputManager,
@@ -17,21 +17,19 @@ use crate::{
 
 mod data_device;
 mod dmabuf;
+mod output;
 mod protocols;
 mod seat;
 mod shm;
 mod surface;
-mod output;
 mod window_manager;
 mod xdg;
 
-pub use lumalla_wayland_protocol::{
-    buffer::ReadResult, ClientConnection, ClientId, Wayland,
-};
-pub use seat::{ActiveCursor, KeyboardModifiers};
-pub use output::OutputInfo;
-pub use surface::Rectangle;
 pub use dmabuf::ExportedDmabuf;
+pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland, buffer::ReadResult};
+pub use output::OutputInfo;
+pub use seat::{ActiveCursor, KeyboardModifiers};
+pub use surface::Rectangle;
 pub use window_manager::{WindowError, WindowGeometryChange};
 
 /// Presentation timing for a completed DRM page-flip.
@@ -151,8 +149,7 @@ impl DisplayState {
     ) {
         self.dmabuf_manager
             .set_supported_formats(formats, device_path);
-        self.dmabuf_manager
-            .send_all_feedback(clients.values_mut());
+        self.dmabuf_manager.send_all_feedback(clients.values_mut());
     }
 
     pub fn flush_pending_keyboard_leaves(
@@ -188,13 +185,8 @@ impl DisplayState {
         dx: f64,
         dy: f64,
     ) {
-        self.seat_manager.handle_pointer_motion(
-            clients,
-            &self.surface_manager,
-            time_msec,
-            dx,
-            dy,
-        );
+        self.seat_manager
+            .handle_pointer_motion(clients, &self.surface_manager, time_msec, dx, dy);
     }
 
     pub fn handle_pointer_absolute(
@@ -204,13 +196,8 @@ impl DisplayState {
         x: f64,
         y: f64,
     ) {
-        self.seat_manager.handle_pointer_absolute(
-            clients,
-            &self.surface_manager,
-            time_msec,
-            x,
-            y,
-        );
+        self.seat_manager
+            .handle_pointer_absolute(clients, &self.surface_manager, time_msec, x, y);
     }
 
     pub fn set_output_geometry(&mut self, width: u32, height: u32) {
@@ -239,8 +226,7 @@ impl DisplayState {
             button,
             pressed,
         );
-        if pressed
-            && let Some((client_id, surface)) = self.seat_manager.focused_keyboard_surface()
+        if pressed && let Some((client_id, surface)) = self.seat_manager.focused_keyboard_surface()
         {
             self.on_surface_focused(client_id, surface);
         }
@@ -330,13 +316,7 @@ impl DisplayState {
         };
         let (registry, writer) = client.registry_and_writer_mut();
         self.data_device_manager.drag_motion(
-            client_id,
-            time_msec,
-            x as f32,
-            y as f32,
-            target,
-            registry,
-            writer,
+            client_id, time_msec, x as f32, y as f32, target, registry, writer,
         );
     }
 
@@ -708,7 +688,11 @@ impl DisplayState {
     }
 }
 
-fn send_presentation_discarded(writer: &mut Writer, registry: &mut Registry, feedback_id: ObjectId) {
+fn send_presentation_discarded(
+    writer: &mut Writer,
+    registry: &mut Registry,
+    feedback_id: ObjectId,
+) {
     writer.wp_presentation_feedback_discarded(feedback_id);
     registry.free_object(feedback_id, writer);
 }

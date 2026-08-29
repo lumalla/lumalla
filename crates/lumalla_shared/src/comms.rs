@@ -9,11 +9,7 @@ pub fn message_loop_with_channel<M>()
     let event_loop = EventLoop::new(1024)?;
     let (sender, receiver) = mpsc::channel();
     let waker = Arc::new(event_loop.waker());
-    Ok((
-        event_loop,
-        receiver,
-        MessageSender::new(sender, waker),
-    ))
+    Ok((event_loop, receiver, MessageSender::new(sender, waker)))
 }
 
 /// A sender that wakes an [`EventLoop`] when a message is queued.

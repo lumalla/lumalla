@@ -16,9 +16,9 @@ use crate::{CursorFrame, DmabufAttachment, SurfaceFrame};
 const WL_SHM_FORMAT_XRGB8888: u32 = 1;
 
 use super::{
-    CommandBufferRecorder, CommandPool, DescriptorPool, DescriptorSetLayout, Device,
-    DmaBufImage, Fence, Framebuffer, GraphicsPipeline, GraphicsPipelineBuilder, Image,
-    PhysicalDevice, RenderPass, Sampler, ShaderModule, VulkanContext, drm_fourcc_to_vulkan,
+    CommandBufferRecorder, CommandPool, DescriptorPool, DescriptorSetLayout, Device, DmaBufImage,
+    Fence, Framebuffer, GraphicsPipeline, GraphicsPipelineBuilder, Image, PhysicalDevice,
+    RenderPass, Sampler, ShaderModule, VulkanContext, drm_fourcc_to_vulkan,
 };
 
 const MAX_SURFACE_TEXTURES: u32 = 256;
@@ -50,10 +50,7 @@ impl GpuWorkBatch {
     }
 
     /// Submits all recorded work with a single fence (does not wait).
-    pub fn submit(
-        self,
-        device: &Device,
-    ) -> anyhow::Result<PendingGpuSubmit> {
+    pub fn submit(self, device: &Device) -> anyhow::Result<PendingGpuSubmit> {
         if self.command_buffers.is_empty() {
             return Ok(PendingGpuSubmit::empty());
         }
@@ -131,10 +128,7 @@ pub struct GpuCompositor {
 }
 
 impl GpuCompositor {
-    pub fn new(
-        device: &Device,
-        render_pass: &RenderPass,
-    ) -> anyhow::Result<Self> {
+    pub fn new(device: &Device, render_pass: &RenderPass) -> anyhow::Result<Self> {
         let vert_spv = spv_from_bytes(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/composite.vert.spv"
@@ -186,12 +180,7 @@ impl GpuCompositor {
         clip: Option<&vk::Rect2D>,
     ) {
         recorder.bind_pipeline(&self.pipeline);
-        recorder.bind_descriptor_sets(
-            self.pipeline.layout(),
-            0,
-            &[texture.descriptor_set],
-            &[],
-        );
+        recorder.bind_descriptor_sets(self.pipeline.layout(), 0, &[texture.descriptor_set], &[]);
         let push = LayerPushConstants {
             dest,
             output_size: [output_width as f32, output_height as f32],
@@ -264,8 +253,7 @@ impl SurfaceTextureCache {
     }
 
     pub fn remove_client(&mut self, owner_id: u32) {
-        self.textures
-            .retain(|(owner, _), _| *owner != owner_id);
+        self.textures.retain(|(owner, _), _| *owner != owner_id);
     }
 
     fn texture(&self, key: (u32, u32)) -> Option<&SurfaceTexture> {
@@ -374,9 +362,14 @@ impl SurfaceTextureCache {
         let stride = frame.stride as u32;
         let needs_create = self.textures.get(&key).is_none_or(|tex| {
             !matches!(tex.backing, TextureBacking::Shm(_))
-                || tex.extent().is_none_or(|extent| extent.width != width || extent.height != height)
+                || tex
+                    .extent()
+                    .is_none_or(|extent| extent.width != width || extent.height != height)
         });
-        let buffer_id_changed = self.textures.get(&key).is_some_and(|tex| tex.buffer_id != frame.buffer_id);
+        let buffer_id_changed = self
+            .textures
+            .get(&key)
+            .is_some_and(|tex| tex.buffer_id != frame.buffer_id);
 
         if needs_create {
             let image = vulkan.create_sampled_image(width, height)?;
@@ -414,21 +407,18 @@ impl SurfaceTextureCache {
             TextureBacking::Dmabuf(_) => anyhow::bail!("SHM upload targeted imported DMA-BUF"),
         };
 
-        let upload_regions = if !force_full_texture
-            && !needs_create
-            && !buffer_id_changed
-            && !frame.full_surface
-        {
-            collect_shm_upload_regions(
-                frame,
-                surface_buffer_damage,
-                pending_output_damage,
-                width,
-                height,
-            )
-        } else {
-            None
-        };
+        let upload_regions =
+            if !force_full_texture && !needs_create && !buffer_id_changed && !frame.full_surface {
+                collect_shm_upload_regions(
+                    frame,
+                    surface_buffer_damage,
+                    pending_output_damage,
+                    width,
+                    height,
+                )
+            } else {
+                None
+            };
 
         if upload_regions.is_none() {
             upload_bgra_texture(
@@ -498,7 +488,10 @@ impl SurfaceTextureCache {
 
         if can_reuse {
             let image = {
-                let tex = self.textures.get(&key).context("Missing reused DMA-BUF texture")?;
+                let tex = self
+                    .textures
+                    .get(&key)
+                    .context("Missing reused DMA-BUF texture")?;
                 match &tex.backing {
                     TextureBacking::Dmabuf(image) => image.image(),
                     TextureBacking::Shm(_) => anyhow::bail!("Expected DMA-BUF backing"),
@@ -581,7 +574,9 @@ impl SurfaceTextureCache {
     ) -> anyhow::Result<()> {
         let needs_create = self.textures.get(&key).is_none_or(|tex| {
             !matches!(tex.backing, TextureBacking::Shm(_))
-                || tex.extent().is_none_or(|extent| extent.width != width || extent.height != height)
+                || tex
+                    .extent()
+                    .is_none_or(|extent| extent.width != width || extent.height != height)
         });
 
         if needs_create {
@@ -1229,56 +1224,55 @@ fn upload_bgra_texture(
         .context("Texture size overflows")?;
     anyhow::ensure!(pixels.len() >= full_size, "Texture pixel data is truncated");
 
-    let (staging_bytes, copy_stride, copy_height, image_offset, image_extent) =
-        match region {
-            Some(region) => {
-                let region_row_bytes = usize::try_from(region.width)
-                    .context("Region width overflows")?
-                    .checked_mul(4)
-                    .context("Region row bytes overflow")?;
-                let region_size = region_row_bytes
-                    .checked_mul(region.height as usize)
-                    .context("Region size overflows")?;
-                let mut staging_bytes = vec![0u8; region_size];
-                for row in 0..region.height {
-                    let src_row = (region.y + row) as usize;
-                    let src_start = src_row
-                        .checked_mul(row_bytes)
-                        .and_then(|offset| offset.checked_add(region.x as usize * 4))
-                        .context("Region source offset overflows")?;
-                    let dst_start = row as usize * region_row_bytes;
-                    let dst_end = dst_start + region_row_bytes;
-                    staging_bytes[dst_start..dst_end]
-                        .copy_from_slice(&pixels[src_start..src_start + region_row_bytes]);
-                }
-                (
-                    staging_bytes,
-                    region.width,
-                    region.height,
-                    vk::Offset3D {
-                        x: region.x as i32,
-                        y: region.y as i32,
-                        z: 0,
-                    },
-                    vk::Extent3D {
-                        width: region.width,
-                        height: region.height,
-                        depth: 1,
-                    },
-                )
+    let (staging_bytes, copy_stride, copy_height, image_offset, image_extent) = match region {
+        Some(region) => {
+            let region_row_bytes = usize::try_from(region.width)
+                .context("Region width overflows")?
+                .checked_mul(4)
+                .context("Region row bytes overflow")?;
+            let region_size = region_row_bytes
+                .checked_mul(region.height as usize)
+                .context("Region size overflows")?;
+            let mut staging_bytes = vec![0u8; region_size];
+            for row in 0..region.height {
+                let src_row = (region.y + row) as usize;
+                let src_start = src_row
+                    .checked_mul(row_bytes)
+                    .and_then(|offset| offset.checked_add(region.x as usize * 4))
+                    .context("Region source offset overflows")?;
+                let dst_start = row as usize * region_row_bytes;
+                let dst_end = dst_start + region_row_bytes;
+                staging_bytes[dst_start..dst_end]
+                    .copy_from_slice(&pixels[src_start..src_start + region_row_bytes]);
             }
-            None => (
-                pixels[..full_size].to_vec(),
-                width,
-                height,
-                vk::Offset3D { x: 0, y: 0, z: 0 },
+            (
+                staging_bytes,
+                region.width,
+                region.height,
+                vk::Offset3D {
+                    x: region.x as i32,
+                    y: region.y as i32,
+                    z: 0,
+                },
                 vk::Extent3D {
-                    width,
-                    height,
+                    width: region.width,
+                    height: region.height,
                     depth: 1,
                 },
-            ),
-        };
+            )
+        }
+        None => (
+            pixels[..full_size].to_vec(),
+            width,
+            height,
+            vk::Offset3D { x: 0, y: 0, z: 0 },
+            vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+        ),
+    };
 
     let staging = StagingBuffer::new(device, physical_device, &staging_bytes)?;
     let command_buffer = command_pool.allocate_command_buffer(device)?;
@@ -1464,7 +1458,9 @@ fn intersect_damage(a: DamageRect, b: DamageRect) -> Option<DamageRect> {
     let x0 = a.x.max(b.x);
     let y0 = a.y.max(b.y);
     let x1 = a.x.saturating_add(a.width).min(b.x.saturating_add(b.width));
-    let y1 = a.y.saturating_add(a.height).min(b.y.saturating_add(b.height));
+    let y1 =
+        a.y.saturating_add(a.height)
+            .min(b.y.saturating_add(b.height));
     let width = x1 - x0;
     let height = y1 - y0;
     if width <= 0 || height <= 0 {

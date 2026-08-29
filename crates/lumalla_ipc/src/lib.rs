@@ -2,16 +2,15 @@
 
 #![warn(missing_docs)]
 
+pub mod types;
 #[allow(missing_docs)] // zbus-generated proxy trait methods
 mod window_manager;
-pub mod types;
 
-pub use window_manager::{WindowManager, WindowManagerHandler, WindowManagerProxy, signals};
 pub use types::{
     DrmConnectorInfo, DrmDeviceInfo, DrmModeInfo, KeyBindingInfo, LayoutOutputInfo,
-    LayoutSpacesInfo, ModsInfo, OutputConfigInfo, OutputInfo, WindowInfo, WindowRuleInfo,
-    ZoneInfo,
+    LayoutSpacesInfo, ModsInfo, OutputConfigInfo, OutputInfo, WindowInfo, WindowRuleInfo, ZoneInfo,
 };
+pub use window_manager::{WindowManager, WindowManagerHandler, WindowManagerProxy, signals};
 
 /// Well-known session bus name for the compositor.
 pub const BUS_NAME: &str = "org.lumalla.wm";

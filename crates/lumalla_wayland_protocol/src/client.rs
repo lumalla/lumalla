@@ -250,8 +250,8 @@ mod tests {
     #[test]
     fn broadcast_global_remove_writes_registry_event() {
         let (mut receiver, sender) = UnixStream::pair().unwrap();
-        let mut client = ClientConnection::new(sender, ClientId::new(NonZeroU32::new(1).unwrap()))
-            .unwrap();
+        let mut client =
+            ClientConnection::new(sender, ClientId::new(NonZeroU32::new(1).unwrap())).unwrap();
         client
             .registry
             .register_client_object_with_version(

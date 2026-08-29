@@ -31,9 +31,6 @@ pub fn geometry_field_to_dbus(value: Option<i32>) -> i32 {
 impl WindowGeometryUpdate {
     /// Returns true when no geometry field is set.
     pub fn is_empty(&self) -> bool {
-        self.x.is_none()
-            && self.y.is_none()
-            && self.width.is_none()
-            && self.height.is_none()
+        self.x.is_none() && self.y.is_none() && self.width.is_none() && self.height.is_none()
     }
 }

@@ -227,9 +227,8 @@ impl LibInput {
 
         let udev = Udev::new()?;
 
-        let libinput = unsafe {
-            bindings::libinput_udev_create_context(&INTERFACE, seat_ptr, udev.as_ptr())
-        };
+        let libinput =
+            unsafe { bindings::libinput_udev_create_context(&INTERFACE, seat_ptr, udev.as_ptr()) };
         let Some(libinput) = NonNull::new(libinput) else {
             anyhow::bail!("Failed to create libinput context");
         };
@@ -463,9 +462,8 @@ impl LibInput {
                     } else {
                         let button =
                             unsafe { bindings::libinput_event_pointer_get_button(pointer) };
-                        let state = unsafe {
-                            bindings::libinput_event_pointer_get_button_state(pointer)
-                        };
+                        let state =
+                            unsafe { bindings::libinput_event_pointer_get_button_state(pointer) };
                         Some(InputEvent::PointerButton {
                             button,
                             pressed: state == BUTTON_STATE_PRESSED,

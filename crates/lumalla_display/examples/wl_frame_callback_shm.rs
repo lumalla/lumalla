@@ -16,10 +16,10 @@ use std::{
 use anyhow::{Context, ensure};
 use lumalla_wayland_protocol::protocols::{
     wayland::{
-        WL_COMPOSITOR_CREATE_SURFACE_OPCODE, WL_DISPLAY_GET_REGISTRY_OPCODE, WL_DISPLAY_SYNC_OPCODE,
-        WL_REGISTRY_BIND_OPCODE, WL_SHM_CREATE_POOL_OPCODE, WL_SHM_FORMAT_XRGB8888,
-        WL_SHM_POOL_CREATE_BUFFER_OPCODE, WL_SURFACE_ATTACH_OPCODE, WL_SURFACE_COMMIT_OPCODE,
-        WL_SURFACE_DAMAGE_OPCODE, WL_SURFACE_FRAME_OPCODE,
+        WL_COMPOSITOR_CREATE_SURFACE_OPCODE, WL_DISPLAY_GET_REGISTRY_OPCODE,
+        WL_DISPLAY_SYNC_OPCODE, WL_REGISTRY_BIND_OPCODE, WL_SHM_CREATE_POOL_OPCODE,
+        WL_SHM_FORMAT_XRGB8888, WL_SHM_POOL_CREATE_BUFFER_OPCODE, WL_SURFACE_ATTACH_OPCODE,
+        WL_SURFACE_COMMIT_OPCODE, WL_SURFACE_DAMAGE_OPCODE, WL_SURFACE_FRAME_OPCODE,
     },
     xdg_shell::{
         XDG_SURFACE_ACK_CONFIGURE_OPCODE, XDG_SURFACE_GET_TOPLEVEL_OPCODE,
@@ -139,7 +139,10 @@ fn main() -> anyhow::Result<()> {
     // Pace a second commit only after the first frame callback.
     commit_frame(&mut stream, 9, 13)?;
     let second_done = wait_frame_done(&mut stream, 13, xdg_wm_base)?;
-    ensure!(second_done > 0, "second frame callback_data must be non-zero");
+    ensure!(
+        second_done > 0,
+        "second frame callback_data must be non-zero"
+    );
     println!("Second wl_callback.done callback_data={second_done}");
     println!(
         "Frame callback pacing confirmed on {}.",

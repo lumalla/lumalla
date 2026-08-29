@@ -59,18 +59,24 @@ fn report_surface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError)
             (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown shell surface")
         }
         SurfaceError::UnknownRegion => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown region"),
-        SurfaceError::UnknownSubsurface => {
-            (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown subsurface")
-        }
-        SurfaceError::BadParent => (WL_SUBCOMPOSITOR_ERROR_BAD_PARENT, "Invalid subsurface parent"),
-        SurfaceError::BadSurface => (WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE, "Invalid subsurface surface"),
+        SurfaceError::UnknownSubsurface => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown subsurface"),
+        SurfaceError::BadParent => (
+            WL_SUBCOMPOSITOR_ERROR_BAD_PARENT,
+            "Invalid subsurface parent",
+        ),
+        SurfaceError::BadSurface => (
+            WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+            "Invalid subsurface surface",
+        ),
         SurfaceError::InvalidScale => (WL_SURFACE_ERROR_INVALID_SCALE, "Buffer scale must be > 0"),
-        SurfaceError::InvalidTransform => {
-            (WL_SURFACE_ERROR_INVALID_TRANSFORM, "Invalid buffer transform")
-        }
-        SurfaceError::InvalidOffset => {
-            (WL_SURFACE_ERROR_INVALID_OFFSET, "Attach offset must be zero since version 5")
-        }
+        SurfaceError::InvalidTransform => (
+            WL_SURFACE_ERROR_INVALID_TRANSFORM,
+            "Invalid buffer transform",
+        ),
+        SurfaceError::InvalidOffset => (
+            WL_SURFACE_ERROR_INVALID_OFFSET,
+            "Attach offset must be zero since version 5",
+        ),
     };
     ctx.writer
         .wl_display_error(DISPLAY_OBJECT_ID)
@@ -81,10 +87,14 @@ fn report_surface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError)
 
 fn report_subcompositor_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError) {
     let (code, message) = match error {
-        SurfaceError::BadParent => (WL_SUBCOMPOSITOR_ERROR_BAD_PARENT, "Invalid subsurface parent"),
-        SurfaceError::BadSurface | SurfaceError::RoleAlreadyAssigned => {
-            (WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE, "Invalid subsurface surface")
-        }
+        SurfaceError::BadParent => (
+            WL_SUBCOMPOSITOR_ERROR_BAD_PARENT,
+            "Invalid subsurface parent",
+        ),
+        SurfaceError::BadSurface | SurfaceError::RoleAlreadyAssigned => (
+            WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+            "Invalid subsurface surface",
+        ),
         other => {
             report_surface_error(ctx, object_id, other);
             return;
@@ -118,27 +128,25 @@ fn report_data_device_error(ctx: &mut Ctx, object_id: ObjectId, error: DataDevic
         DataDeviceError::RoleConflict => (WL_DATA_DEVICE_ERROR_ROLE, "Surface already has a role"),
         DataDeviceError::InvalidActionMask => {
             // Prefer source/offer-specific codes when possible; default to offer.
-            (WL_DATA_OFFER_ERROR_INVALID_ACTION_MASK, "Invalid action mask")
+            (
+                WL_DATA_OFFER_ERROR_INVALID_ACTION_MASK,
+                "Invalid action mask",
+            )
         }
-        DataDeviceError::InvalidAction => {
-            (WL_DATA_OFFER_ERROR_INVALID_ACTION, "Invalid action")
-        }
-        DataDeviceError::InvalidFinish => {
-            (WL_DATA_OFFER_ERROR_INVALID_FINISH, "Invalid finish")
-        }
+        DataDeviceError::InvalidAction => (WL_DATA_OFFER_ERROR_INVALID_ACTION, "Invalid action"),
+        DataDeviceError::InvalidFinish => (WL_DATA_OFFER_ERROR_INVALID_FINISH, "Invalid finish"),
         DataDeviceError::InvalidOffer => {
             (WL_DATA_OFFER_ERROR_INVALID_OFFER, "Invalid offer request")
         }
-        DataDeviceError::InvalidSource => {
-            (WL_DATA_SOURCE_ERROR_INVALID_SOURCE, "Invalid source request")
-        }
+        DataDeviceError::InvalidSource => (
+            WL_DATA_SOURCE_ERROR_INVALID_SOURCE,
+            "Invalid source request",
+        ),
         DataDeviceError::UnknownSource
         | DataDeviceError::UnknownDevice
         | DataDeviceError::UnknownOffer
         | DataDeviceError::UnknownSeat
-        | DataDeviceError::UnknownSurface => {
-            (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown object")
-        }
+        | DataDeviceError::UnknownSurface => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown object"),
     };
     debug!("Data device protocol error: {error}");
     ctx.writer
@@ -164,8 +172,8 @@ fn commit_damage(
     buffer_width: usize,
     buffer_height: usize,
 ) -> (Vec<Rectangle>, Vec<Rectangle>, bool) {
-    let full_surface = commit.newly_mapped
-        || (commit.damage.is_empty() && commit.buffer_damage.is_empty());
+    let full_surface =
+        commit.newly_mapped || (commit.damage.is_empty() && commit.buffer_damage.is_empty());
     if full_surface {
         return (Vec::new(), Vec::new(), true);
     }
@@ -334,9 +342,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                         .set_pending_shell_ping(ctx.client_id, shell_id, serial)
                         .is_ok()
                     {
-                        ctx.writer
-                            .wl_shell_surface_ping(shell_id)
-                            .serial(serial);
+                        ctx.writer.wl_shell_surface_ping(shell_id).serial(serial);
                     }
                 }
                 state.seat_manager.focus_keyboards_on_surface(
@@ -345,10 +351,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                     ctx.writer,
                 );
                 state.on_surface_focused(ctx.client_id, commit.surface_id);
-                for output in state
-                    .output_manager
-                    .bound_outputs_for_client(ctx.client_id)
-                {
+                for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
                     ctx.writer
                         .wl_surface_enter(commit.surface_id)
                         .output(output);
@@ -356,25 +359,18 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
             }
         }
         ctx.writer.wl_buffer_release(buffer_id);
-        } else if commit.attached_buffer == Some(None) {
-        state.seat_manager.leave_keyboards_on_surface(
-            ctx.client_id,
-            commit.surface_id,
-            ctx.writer,
-        );
-        state.seat_manager.leave_pointers_on_surface(
-            ctx.client_id,
-            commit.surface_id,
-            ctx.writer,
-        );
+    } else if commit.attached_buffer == Some(None) {
+        state
+            .seat_manager
+            .leave_keyboards_on_surface(ctx.client_id, commit.surface_id, ctx.writer);
+        state
+            .seat_manager
+            .leave_pointers_on_surface(ctx.client_id, commit.surface_id, ctx.writer);
         state.surface_updates.push_back(SurfaceUpdate::Unmapped {
             client_id: ctx.client_id,
             surface_id: commit.surface_id,
         });
-        for output in state
-            .output_manager
-            .bound_outputs_for_client(ctx.client_id)
-        {
+        for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
             ctx.writer
                 .wl_surface_leave(commit.surface_id)
                 .output(output);
@@ -654,7 +650,10 @@ impl WlDataOffer for DisplayState {
     }
 
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlDataOfferDestroy<'_>) {
-        if let Err(error) = self.data_device_manager.destroy_offer(ctx.client_id, object_id) {
+        if let Err(error) = self
+            .data_device_manager
+            .destroy_offer(ctx.client_id, object_id)
+        {
             report_data_device_error(ctx, object_id, error);
             return;
         }
@@ -662,9 +661,9 @@ impl WlDataOffer for DisplayState {
     }
 
     fn finish(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlDataOfferFinish<'_>) {
-        if let Err(error) =
-            self.data_device_manager
-                .finish(ctx.client_id, object_id, ctx.writer)
+        if let Err(error) = self
+            .data_device_manager
+            .finish(ctx.client_id, object_id, ctx.writer)
         {
             report_data_device_error(ctx, object_id, error);
         }
@@ -1095,16 +1094,10 @@ impl WlSurface for DisplayState {
             .destroy_surface(ctx.client_id, object_id)
         {
             Ok(destroyed) => {
-                self.seat_manager.leave_keyboards_on_surface(
-                    ctx.client_id,
-                    object_id,
-                    ctx.writer,
-                );
-                self.seat_manager.leave_pointers_on_surface(
-                    ctx.client_id,
-                    object_id,
-                    ctx.writer,
-                );
+                self.seat_manager
+                    .leave_keyboards_on_surface(ctx.client_id, object_id, ctx.writer);
+                self.seat_manager
+                    .leave_pointers_on_surface(ctx.client_id, object_id, ctx.writer);
                 for callback in destroyed.callbacks {
                     ctx.registry.free_object(callback, ctx.writer);
                 }
@@ -1131,10 +1124,7 @@ impl WlSurface for DisplayState {
                     ctx.registry.free_object(subsurface_id, ctx.writer);
                 }
                 if destroyed.was_mapped {
-                    for output in self
-                        .output_manager
-                        .bound_outputs_for_client(ctx.client_id)
-                    {
+                    for output in self.output_manager.bound_outputs_for_client(ctx.client_id) {
                         ctx.writer.wl_surface_leave(object_id).output(output);
                     }
                     self.surface_updates.push_back(SurfaceUpdate::Unmapped {
@@ -1256,9 +1246,9 @@ impl WlSurface for DisplayState {
 
         let attaching_buffer = matches!(result.primary.attached_buffer, Some(Some(_)));
         if attaching_buffer
-            && let Err(error) =
-                self.xdg_manager
-                    .check_buffer_commit(ctx.client_id, object_id, true)
+            && let Err(error) = self
+                .xdg_manager
+                .check_buffer_commit(ctx.client_id, object_id, true)
         {
             crate::protocols::xdg_shell::report_commit_error(ctx, object_id, error);
             return;
@@ -1277,11 +1267,10 @@ impl WlSurface for DisplayState {
         object_id: ObjectId,
         params: &WlSurfaceSetBufferTransform<'_>,
     ) {
-        if let Err(error) = self.surface_manager.set_buffer_transform(
-            ctx.client_id,
-            object_id,
-            params.transform(),
-        ) {
+        if let Err(error) =
+            self.surface_manager
+                .set_buffer_transform(ctx.client_id, object_id, params.transform())
+        {
             report_surface_error(ctx, object_id, error);
         }
     }
@@ -1321,12 +1310,10 @@ impl WlSurface for DisplayState {
     }
 
     fn offset(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlSurfaceOffset) {
-        if let Err(error) = self.surface_manager.offset(
-            ctx.client_id,
-            object_id,
-            params.x(),
-            params.y(),
-        ) {
+        if let Err(error) =
+            self.surface_manager
+                .offset(ctx.client_id, object_id, params.x(), params.y())
+        {
             report_surface_error(ctx, object_id, error);
         }
     }
@@ -1342,9 +1329,7 @@ impl WlSeat for DisplayState {
             return;
         }
         let (px, py) = self.seat_manager.pointer_position();
-        let focus = self
-            .surface_manager
-            .pointer_target(ctx.client_id, px, py);
+        let focus = self.surface_manager.pointer_target(ctx.client_id, px, py);
         self.seat_manager.create_pointer(
             ctx.client_id,
             *params.id(),
@@ -1400,12 +1385,7 @@ impl WlSeat for DisplayState {
 }
 
 impl WlPointer for DisplayState {
-    fn set_cursor(
-        &mut self,
-        ctx: &mut Ctx,
-        object_id: ObjectId,
-        params: &WlPointerSetCursor<'_>,
-    ) {
+    fn set_cursor(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlPointerSetCursor<'_>) {
         if let Some(surface) = params.surface() {
             if ctx.registry.interface_index(surface) != Some(InterfaceIndex::WlSurface) {
                 report_surface_error(ctx, surface, SurfaceError::UnknownSurface);
@@ -1426,11 +1406,8 @@ impl WlPointer for DisplayState {
     }
 
     fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlPointerRelease<'_>) {
-        self.seat_manager.destroy_pointer(
-            ctx.client_id,
-            object_id,
-            &mut self.surface_manager,
-        );
+        self.seat_manager
+            .destroy_pointer(ctx.client_id, object_id, &mut self.surface_manager);
         ctx.registry.free_object(object_id, ctx.writer);
     }
 }
@@ -1572,12 +1549,10 @@ impl WlSubsurface for DisplayState {
         object_id: ObjectId,
         params: &WlSubsurfaceSetPosition<'_>,
     ) {
-        if let Err(error) = self.surface_manager.set_position(
-            ctx.client_id,
-            object_id,
-            params.x(),
-            params.y(),
-        ) {
+        if let Err(error) =
+            self.surface_manager
+                .set_position(ctx.client_id, object_id, params.x(), params.y())
+        {
             report_surface_error(ctx, object_id, error);
         }
     }
@@ -1618,12 +1593,7 @@ impl WlSubsurface for DisplayState {
         }
     }
 
-    fn set_sync(
-        &mut self,
-        ctx: &mut Ctx,
-        object_id: ObjectId,
-        _params: &WlSubsurfaceSetSync<'_>,
-    ) {
+    fn set_sync(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSubsurfaceSetSync<'_>) {
         if let Err(error) = self.surface_manager.set_sync(ctx.client_id, object_id) {
             report_surface_error(ctx, object_id, error);
         }
@@ -1889,9 +1859,7 @@ mod tests {
                 )
                 .is_err()
         );
-        state
-            .remove_output("VIRTUAL-1", [].into_iter())
-            .unwrap();
+        state.remove_output("VIRTUAL-1", [].into_iter()).unwrap();
         let names: Vec<_> = state.outputs().map(|output| output.name.as_str()).collect();
         assert_eq!(names, ["HDMI-A-1"]);
         assert!(state.remove_output("VIRTUAL-1", [].into_iter()).is_err());
@@ -2165,8 +2133,7 @@ mod tests {
                 .seq_hi(0)
                 .seq_lo(99)
                 .flags(flags);
-            ctx.registry
-                .free_object(pending.feedback_id, ctx.writer);
+            ctx.registry.free_object(pending.feedback_id, ctx.writer);
         }
         assert!(ctx.registry.object_metadata(feedback_b).is_none());
         assert_eq!(state.pending_presentation_feedback_count(), 0);
@@ -2273,11 +2240,7 @@ mod tests {
             WL_SHM_POOL_CREATE_BUFFER_OPCODE,
             &[8, 0, 1, 1, 4, WL_SHM_FORMAT_XRGB8888],
         ));
-        wire.extend(wire_message(
-            5,
-            XDG_WM_BASE_GET_XDG_SURFACE_OPCODE,
-            &[9, 6],
-        ));
+        wire.extend(wire_message(5, XDG_WM_BASE_GET_XDG_SURFACE_OPCODE, &[9, 6]));
         wire.extend(wire_message(9, XDG_SURFACE_GET_TOPLEVEL_OPCODE, &[10]));
 
         let fd = memory_file(&[1, 2, 3, 0xff]);
@@ -2296,9 +2259,7 @@ mod tests {
         wire.extend(wire_message(6, WL_SURFACE_ATTACH_OPCODE, &[8, 0, 0]));
         wire.extend(wire_message(6, WL_SURFACE_DAMAGE_OPCODE, &[0, 0, 1, 1]));
         wire.extend(wire_message(6, WL_SURFACE_COMMIT_OPCODE, &[]));
-        client_stream
-            .write_all(&wire)
-            .unwrap();
+        client_stream.write_all(&wire).unwrap();
         client.handle_messages(&mut state).unwrap();
 
         let updates: Vec<_> = state.take_surface_updates().collect();
@@ -2311,6 +2272,7 @@ mod tests {
 
     #[test]
     fn wire_client_can_commit_an_xdg_dmabuf_toplevel() {
+        use crate::dmabuf::DRM_FORMAT_XRGB8888;
         use lumalla_wayland_protocol::protocols::{
             linux_dmabuf::{
                 ZWP_LINUX_BUFFER_PARAMS_V1_ADD_OPCODE,
@@ -2322,7 +2284,6 @@ mod tests {
                 XDG_WM_BASE_GET_XDG_SURFACE_OPCODE, XDG_WM_BASE_NAME,
             },
         };
-        use crate::dmabuf::DRM_FORMAT_XRGB8888;
 
         static NEXT_SOCKET: AtomicU64 = AtomicU64::new(200);
         let socket_path = std::env::temp_dir().join(format!(
@@ -2370,18 +2331,18 @@ mod tests {
             wire.append(&mut data);
         }
         wire.extend(wire_message(3, WL_COMPOSITOR_CREATE_SURFACE_OPCODE, &[6]));
-        wire.extend(wire_message(
-            4,
-            XDG_WM_BASE_GET_XDG_SURFACE_OPCODE,
-            &[7, 6],
-        ));
+        wire.extend(wire_message(4, XDG_WM_BASE_GET_XDG_SURFACE_OPCODE, &[7, 6]));
         wire.extend(wire_message(7, XDG_SURFACE_GET_TOPLEVEL_OPCODE, &[8]));
         client_stream.write_all(&wire).unwrap();
         client.handle_messages(&mut state).unwrap();
 
         let mut wire = Vec::new();
         wire.extend(wire_message(7, XDG_SURFACE_ACK_CONFIGURE_OPCODE, &[1]));
-        wire.extend(wire_message(5, ZWP_LINUX_DMABUF_V1_CREATE_PARAMS_OPCODE, &[9]));
+        wire.extend(wire_message(
+            5,
+            ZWP_LINUX_DMABUF_V1_CREATE_PARAMS_OPCODE,
+            &[9],
+        ));
         // add: plane_idx, offset, stride, modifier_hi, modifier_lo (+ fd)
         wire.extend(wire_message(
             9,

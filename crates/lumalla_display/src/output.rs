@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use lumalla_wayland_protocol::{
     ClientConnection, ClientId, ObjectId,
     buffer::Writer,
@@ -370,13 +370,16 @@ mod tests {
         assert!(bytes.len() >= 8);
         // geometry opcode 0, mode opcode 1, scale opcode 3, name 4, description 5, done 2
         assert!(bytes.windows(8).any(|w| {
-            u32::from_ne_bytes(w[0..4].try_into().unwrap()) == 10 && u16::from_ne_bytes(w[4..6].try_into().unwrap()) == 0
+            u32::from_ne_bytes(w[0..4].try_into().unwrap()) == 10
+                && u16::from_ne_bytes(w[4..6].try_into().unwrap()) == 0
         }));
         assert!(bytes.windows(8).any(|w| {
-            u32::from_ne_bytes(w[0..4].try_into().unwrap()) == 10 && u16::from_ne_bytes(w[4..6].try_into().unwrap()) == 1
+            u32::from_ne_bytes(w[0..4].try_into().unwrap()) == 10
+                && u16::from_ne_bytes(w[4..6].try_into().unwrap()) == 1
         }));
         assert!(bytes.windows(8).any(|w| {
-            u32::from_ne_bytes(w[0..4].try_into().unwrap()) == 10 && u16::from_ne_bytes(w[4..6].try_into().unwrap()) == 2
+            u32::from_ne_bytes(w[0..4].try_into().unwrap()) == 10
+                && u16::from_ne_bytes(w[4..6].try_into().unwrap()) == 2
         }));
     }
 

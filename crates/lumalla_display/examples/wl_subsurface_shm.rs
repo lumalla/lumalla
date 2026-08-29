@@ -212,7 +212,10 @@ fn attach_damage_commit(
         request(surface, WL_SURFACE_DAMAGE_OPCODE, damage_payload),
     )?;
     if let Some(frame) = frame {
-        send(stream, request(surface, WL_SURFACE_FRAME_OPCODE, u32_arg(frame)))?;
+        send(
+            stream,
+            request(surface, WL_SURFACE_FRAME_OPCODE, u32_arg(frame)),
+        )?;
     }
     send(
         stream,

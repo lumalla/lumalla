@@ -369,10 +369,7 @@ fn read_event_with_fd(stream: &mut UnixStream) -> anyhow::Result<(Event, Option<
             return Err(err).context("recvmsg failed");
         }
         if n == 0 {
-            anyhow::bail!(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "peer closed"
-            ));
+            anyhow::bail!(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
         }
         ensure!(n as usize == 8, "expected Wayland header, got {n} bytes");
         break;

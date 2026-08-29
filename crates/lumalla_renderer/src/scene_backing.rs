@@ -191,9 +191,10 @@ pub fn prepare_gpu_composite(
 
     // Coalesce into one bounding rect so multi-move pointer damage cannot leave
     // stale pixels between separately scissored clear regions.
-    let Some(bounds) = clipped.into_iter().reduce(|a, b| {
-        rect_union(a, b).unwrap_or(a)
-    }) else {
+    let Some(bounds) = clipped
+        .into_iter()
+        .reduce(|a, b| rect_union(a, b).unwrap_or(a))
+    else {
         return CompositeMode::Full;
     };
     let upload = UploadRect {
@@ -253,9 +254,7 @@ fn composite_region(
 ) -> anyhow::Result<()> {
     let width = output_width as usize;
     let height = output_height as usize;
-    let row_bytes = width
-        .checked_mul(4)
-        .context("Output row size overflows")?;
+    let row_bytes = width.checked_mul(4).context("Output row size overflows")?;
     let clear_b = (clear[2].clamp(0.0, 1.0) * 255.0) as u8;
     let clear_g = (clear[1].clamp(0.0, 1.0) * 255.0) as u8;
     let clear_r = (clear[0].clamp(0.0, 1.0) * 255.0) as u8;
@@ -283,9 +282,7 @@ fn composite_region(
     }
 
     for frame in frames {
-        composite_frame_in_rect(
-            pixels, width, height, x0, y0, x1, y1, frame,
-        )?;
+        composite_frame_in_rect(pixels, width, height, x0, y0, x1, y1, frame)?;
     }
 
     let cursor_rect = DamageRect {
@@ -360,8 +357,7 @@ fn composite_frame_in_rect(
             let source_x = ((dx as u128 * frame.width as u128) / dest_w as u128) as usize;
             let source = source_y * frame.stride + source_x * 4;
             let destination = oy * row_bytes + ox * 4;
-            pixels[destination..destination + 4]
-                .copy_from_slice(&frame.pixels[source..source + 4]);
+            pixels[destination..destination + 4].copy_from_slice(&frame.pixels[source..source + 4]);
             if frame.format == WL_SHM_FORMAT_XRGB8888 {
                 pixels[destination + 3] = u8::MAX;
             }
@@ -444,8 +440,7 @@ fn composite_cursor_in_rect(
             for channel in 0..3 {
                 let dst = pixels[destination + channel] as u16;
                 let src_channel = src[channel] as u16;
-                pixels[destination + channel] =
-                    ((src_channel * alpha + dst * inv) / 255) as u8;
+                pixels[destination + channel] = ((src_channel * alpha + dst * inv) / 255) as u8;
             }
             pixels[destination + 3] = u8::MAX;
         }
@@ -581,20 +576,18 @@ pub fn buffer_damage_to_upload_rect(
     .filter(|rect| rect.width > 0 && rect.height > 0)
 }
 
-fn clip_buffer_damage(rect: DamageRect, buffer_width: u32, buffer_height: u32) -> Option<DamageRect> {
+fn clip_buffer_damage(
+    rect: DamageRect,
+    buffer_width: u32,
+    buffer_height: u32,
+) -> Option<DamageRect> {
     if rect.width <= 0 || rect.height <= 0 {
         return None;
     }
     let x0 = rect.x.max(0);
     let y0 = rect.y.max(0);
-    let x1 = rect
-        .x
-        .saturating_add(rect.width)
-        .min(buffer_width as i32);
-    let y1 = rect
-        .y
-        .saturating_add(rect.height)
-        .min(buffer_height as i32);
+    let x1 = rect.x.saturating_add(rect.width).min(buffer_width as i32);
+    let y1 = rect.y.saturating_add(rect.height).min(buffer_height as i32);
     let width = x1 - x0;
     let height = y1 - y0;
     if width <= 0 || height <= 0 {
@@ -615,10 +608,7 @@ fn clip_damage(rect: DamageRect, output_width: u32, output_height: u32) -> Optio
     let x0 = rect.x.max(0);
     let y0 = rect.y.max(0);
     let x1 = rect.x.saturating_add(rect.width).min(output_width as i32);
-    let y1 = rect
-        .y
-        .saturating_add(rect.height)
-        .min(output_height as i32);
+    let y1 = rect.y.saturating_add(rect.height).min(output_height as i32);
     let width = x1 - x0;
     let height = y1 - y0;
     if width <= 0 || height <= 0 {
@@ -653,7 +643,9 @@ pub fn rect_union(a: DamageRect, b: DamageRect) -> Option<DamageRect> {
     let x0 = a.x.min(b.x);
     let y0 = a.y.min(b.y);
     let x1 = a.x.saturating_add(a.width).max(b.x.saturating_add(b.width));
-    let y1 = a.y.saturating_add(a.height).max(b.y.saturating_add(b.height));
+    let y1 =
+        a.y.saturating_add(a.height)
+            .max(b.y.saturating_add(b.height));
     let width = x1 - x0;
     let height = y1 - y0;
     if width <= 0 || height <= 0 {

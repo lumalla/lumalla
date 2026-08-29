@@ -3,9 +3,7 @@
 use anyhow::Context;
 use ash::vk;
 
-use super::{
-    CommandBufferRecorder, CommandPool, Device, Fence, Framebuffer, RenderPass,
-};
+use super::{CommandBufferRecorder, CommandPool, Device, Fence, Framebuffer, RenderPass};
 
 /// Clear `framebuffer` to `color` (RGBA float) using a render pass with CLEAR load op.
 ///

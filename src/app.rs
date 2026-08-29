@@ -18,7 +18,7 @@ use lumalla_display::{
     ClientConnection, ClientId, DisplayState, KeyboardModifiers, OutputInfo, PresentationFlipInfo,
     ReadResult, SurfaceUpdate, Wayland, create_wayland_display,
 };
-use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent, BTN_LEFT};
+use lumalla_input::{BTN_LEFT, InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
 use lumalla_renderer::{
     CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RenderScheduler, RendererState,
     SOLID_CLEAR_COLOR, SurfaceFrame,
@@ -672,10 +672,8 @@ impl AppData {
                         .renderer_state
                         .capture_region(x, y, width, height, &outputs)
                         .map_err(|err| format!("{err:#}"));
-                    self.comms.dbus(DbusMessage::ScreenshotCaptured {
-                        request_id,
-                        result,
-                    });
+                    self.comms
+                        .dbus(DbusMessage::ScreenshotCaptured { request_id, result });
                 }
                 MainMessage::SetWindow {
                     id,
@@ -776,13 +774,21 @@ impl AppData {
             }
             SeatEvent::Pointer(PointerEvent::Motion { time_msec, dx, dy }) => {
                 pointer_changed = true;
-                self.display_state
-                    .handle_pointer_motion(&mut self.connected_clients, time_msec, dx, dy);
+                self.display_state.handle_pointer_motion(
+                    &mut self.connected_clients,
+                    time_msec,
+                    dx,
+                    dy,
+                );
             }
             SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {
                 pointer_changed = true;
-                self.display_state
-                    .handle_pointer_absolute(&mut self.connected_clients, time_msec, x, y);
+                self.display_state.handle_pointer_absolute(
+                    &mut self.connected_clients,
+                    time_msec,
+                    x,
+                    y,
+                );
             }
             SeatEvent::Pointer(PointerEvent::Button {
                 time_msec,
@@ -814,8 +820,13 @@ impl AppData {
                 x,
                 y,
             }) => {
-                self.display_state
-                    .handle_touch_down(&mut self.connected_clients, time_msec, id, x, y);
+                self.display_state.handle_touch_down(
+                    &mut self.connected_clients,
+                    time_msec,
+                    id,
+                    x,
+                    y,
+                );
             }
             SeatEvent::Touch(TouchEvent::Up { time_msec, id }) => {
                 self.display_state
@@ -827,8 +838,13 @@ impl AppData {
                 x,
                 y,
             }) => {
-                self.display_state
-                    .handle_touch_motion(&mut self.connected_clients, time_msec, id, x, y);
+                self.display_state.handle_touch_motion(
+                    &mut self.connected_clients,
+                    time_msec,
+                    id,
+                    x,
+                    y,
+                );
             }
             SeatEvent::Touch(TouchEvent::Frame) => {
                 self.display_state

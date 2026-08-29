@@ -294,8 +294,5 @@ impl WindowManager {
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn binding_activated(
-        emitter: &SignalEmitter<'_>,
-        binding_id: &str,
-    ) -> zbus::Result<()>;
+    async fn binding_activated(emitter: &SignalEmitter<'_>, binding_id: &str) -> zbus::Result<()>;
 }

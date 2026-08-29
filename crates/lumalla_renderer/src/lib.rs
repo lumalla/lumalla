@@ -14,21 +14,21 @@ pub mod drm;
 pub mod vulkan;
 
 mod default_cursor;
-pub mod scheduler;
 mod scanout_pool;
 mod scene_backing;
+pub mod scheduler;
 
-use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
-pub use crate::scene_backing::{
-    CompositeMode, DamageRect as OutputDamageRect, UploadRect, buffer_damage_to_upload_rect,
-    clip_buffer_damage_list, clip_damage_list, cursor_damage_rects, cursor_damage_rects_default,
-    prepare_gpu_composite, rect_union, union_damage_rects,
-};
-use crate::scene_backing::DamageRect;
 use crate::drm::{
     CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, FlipEventQueue, ModeBlob,
     atomic_modeset, atomic_page_flip, atomic_set_plane_fb, dispatch_drm_events,
     resolve_connected_output,
+};
+use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
+use crate::scene_backing::DamageRect;
+pub use crate::scene_backing::{
+    CompositeMode, DamageRect as OutputDamageRect, UploadRect, buffer_damage_to_upload_rect,
+    clip_buffer_damage_list, clip_damage_list, cursor_damage_rects, cursor_damage_rects_default,
+    prepare_gpu_composite, rect_union, union_damage_rects,
 };
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
@@ -297,9 +297,11 @@ impl RendererState {
 
     fn note_cursor_redraw(&mut self) {
         let rect = match self.cursor_frame.as_ref() {
-            Some(cursor) => {
-                cursor_damage_rects(cursor, (self.pointer_x, self.pointer_y), (self.pointer_x, self.pointer_y))
-            }
+            Some(cursor) => cursor_damage_rects(
+                cursor,
+                (self.pointer_x, self.pointer_y),
+                (self.pointer_x, self.pointer_y),
+            ),
             None => cursor_damage_rects_default(
                 (self.pointer_x, self.pointer_y),
                 (self.pointer_x, self.pointer_y),
@@ -442,7 +444,8 @@ impl RendererState {
 
     pub fn remove_client_frames(&mut self, owner_id: u32) -> anyhow::Result<()> {
         let before = self.surface_frames.len();
-        self.surface_frames.retain(|(owner, _), _| *owner != owner_id);
+        self.surface_frames
+            .retain(|(owner, _), _| *owner != owner_id);
         self.surface_order.retain(|(owner, _)| *owner != owner_id);
         self.gpu.surface_textures.remove_client(owner_id);
         self.pending_surface_buffer_damage
@@ -524,7 +527,8 @@ impl RendererState {
             };
             cursor_damage_rects(&scratch, pointer, pointer)
         };
-        self.pending_damage.extend(damage_for(old_hotspot.0, old_hotspot.1));
+        self.pending_damage
+            .extend(damage_for(old_hotspot.0, old_hotspot.1));
         self.pending_damage.extend(damage_for(hotspot_x, hotspot_y));
         self.pending_pointer_damage = true;
         if let Some(cursor) = self.cursor_frame.as_mut() {
@@ -609,26 +613,11 @@ impl RendererState {
                 .get(&region.name)
                 .context("scanout disappeared during capture")?;
             let format = scanout.current.dma_image.format();
-            let bgra = download_bgra_region(
-                vulkan,
-                &scanout.current.dma_image,
-                fb_x,
-                fb_y,
-                fb_w,
-                fb_h,
-            )?;
+            let bgra =
+                download_bgra_region(vulkan, &scanout.current.dma_image, fb_x, fb_y, fb_w, fb_h)?;
 
             blit_bgra_to_rgba(
-                &bgra,
-                fb_w,
-                fb_h,
-                format,
-                &mut rgba,
-                dest_w,
-                dest_h,
-                dest_x,
-                dest_y,
-                logical_w,
+                &bgra, fb_w, fb_h, format, &mut rgba, dest_w, dest_h, dest_x, dest_y, logical_w,
                 logical_h,
             )?;
             covered = true;
@@ -883,7 +872,9 @@ impl RendererState {
     }
 
     fn has_pending_flips(&self) -> bool {
-        self.scanouts.values().any(|scanout| scanout.pending.is_some())
+        self.scanouts
+            .values()
+            .any(|scanout| scanout.pending.is_some())
     }
 
     fn present_one_output(
@@ -893,13 +884,16 @@ impl RendererState {
     ) -> anyhow::Result<()> {
         let mut buffer = self.render_scanout_buffer(target, color)?;
 
-        let reuse_mode = self.scanouts.get(&target.connector_name).is_some_and(|prev| {
-            prev.drm_path == target.drm_path
-                && prev.output.connector_id == target.output.connector_id
-                && prev.output.crtc_id == target.output.crtc_id
-                && prev.output.plane_id == target.output.plane_id
-                && prev.output.mode == target.output.mode
-        });
+        let reuse_mode = self
+            .scanouts
+            .get(&target.connector_name)
+            .is_some_and(|prev| {
+                prev.drm_path == target.drm_path
+                    && prev.output.connector_id == target.output.connector_id
+                    && prev.output.crtc_id == target.output.crtc_id
+                    && prev.output.plane_id == target.output.plane_id
+                    && prev.output.mode == target.output.mode
+            });
 
         if reuse_mode {
             return self.schedule_or_queue_flip(&target.connector_name, buffer);
@@ -987,8 +981,7 @@ impl RendererState {
         };
 
         let _pending_damage = std::mem::take(&mut self.pending_damage);
-        let pending_surface_buffer_damage =
-            std::mem::take(&mut self.pending_surface_buffer_damage);
+        let pending_surface_buffer_damage = std::mem::take(&mut self.pending_surface_buffer_damage);
         let force_full = self.pending_full_redraw;
         let pointer_damage = self.pending_pointer_damage;
         let cursor_buffer_dirty = self.cursor_buffer_dirty;
@@ -997,13 +990,8 @@ impl RendererState {
         self.pending_pointer_damage = false;
         self.cursor_buffer_dirty = false;
 
-        let mut composite_mode = prepare_gpu_composite(
-            width,
-            height,
-            &_pending_damage,
-            force_full,
-            buffer.fresh,
-        );
+        let mut composite_mode =
+            prepare_gpu_composite(width, height, &_pending_damage, force_full, buffer.fresh);
 
         let layers: Vec<&SurfaceFrame> = self
             .surface_order
@@ -1153,11 +1141,10 @@ impl RendererState {
 
         let fb_id = buffer.drm_fb_id();
         let flip_result = {
-            let device = self
-                .drm_devices
-                .opened()
-                .get(&drm_path)
-                .with_context(|| format!("DRM device {} is no longer open", drm_path.display()))?;
+            let device =
+                self.drm_devices.opened().get(&drm_path).with_context(|| {
+                    format!("DRM device {} is no longer open", drm_path.display())
+                })?;
             atomic_page_flip(device.fd(), &output, fb_id, self.flip_events.as_ref())
         };
 
@@ -1171,9 +1158,7 @@ impl RendererState {
                 Ok(())
             }
             Err(err) => {
-                warn!(
-                    "Async page-flip failed on {connector_name}: {err:#}; using blocking update"
-                );
+                warn!("Async page-flip failed on {connector_name}: {err:#}; using blocking update");
                 {
                     let device = self.drm_devices.opened().get(&drm_path).with_context(|| {
                         format!("DRM device {} is no longer open", drm_path.display())
@@ -1544,13 +1529,9 @@ mod tests {
             full_surface: true,
         };
 
-        let mut upload =
-            composite_surface_full(&[&frame], 3, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
+        let mut upload = composite_surface_full(&[&frame], 3, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
         assert_eq!(upload.len(), 3 * 1 * 4);
-        assert_eq!(
-            upload,
-            vec![1, 2, 3, 255, 4, 5, 6, 255, 0, 0, 0, 255]
-        );
+        assert_eq!(upload, vec![1, 2, 3, 255, 4, 5, 6, 255, 0, 0, 0, 255]);
     }
 
     #[test]
@@ -1568,8 +1549,7 @@ mod tests {
             full_surface: true,
             ..frame()
         };
-        let upload =
-            composite_surface_full(&[&frame], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
+        let upload = composite_surface_full(&[&frame], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
         assert_eq!(upload, vec![0, 0, 0, 255, 9, 8, 7, 6]);
     }
 

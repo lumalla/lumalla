@@ -1,11 +1,7 @@
 use log::debug;
 use lumalla_wayland_protocol::{
     Ctx, NewObjectId, ObjectId,
-    protocols::{
-        LinuxDmabufV1Protocol,
-        linux_dmabuf::*,
-        wayland::WL_DISPLAY_ERROR_INVALID_OBJECT,
-    },
+    protocols::{LinuxDmabufV1Protocol, linux_dmabuf::*, wayland::WL_DISPLAY_ERROR_INVALID_OBJECT},
     registry::{DISPLAY_OBJECT_ID, InterfaceIndex},
 };
 
@@ -59,11 +55,13 @@ fn report_params_error(ctx: &mut Ctx, object_id: ObjectId, error: &DmabufError) 
         .message(&message);
 }
 
-pub(crate) fn send_dmabuf_formats(writer: &mut lumalla_wayland_protocol::buffer::Writer, id: ObjectId, formats: &[(u32, u64)]) {
+pub(crate) fn send_dmabuf_formats(
+    writer: &mut lumalla_wayland_protocol::buffer::Writer,
+    id: ObjectId,
+    formats: &[(u32, u64)],
+) {
     for &(format, modifier) in formats {
-        writer
-            .zwp_linux_dmabuf_v1_format(id)
-            .format(format);
+        writer.zwp_linux_dmabuf_v1_format(id).format(format);
         let modifier_hi = (modifier >> 32) as u32;
         let modifier_lo = modifier as u32;
         writer
@@ -130,9 +128,9 @@ impl ZwpLinuxDmabufV1 for DisplayState {
         ) {
             return;
         }
-        if let Err(error) = self
-            .dmabuf_manager
-            .create_feedback(ctx.client_id, *params.id(), version)
+        if let Err(error) =
+            self.dmabuf_manager
+                .create_feedback(ctx.client_id, *params.id(), version)
         {
             debug!("linux-dmabuf feedback create failed: {error}");
             ctx.writer
@@ -173,9 +171,9 @@ impl ZwpLinuxDmabufV1 for DisplayState {
         ) {
             return;
         }
-        if let Err(error) = self
-            .dmabuf_manager
-            .create_feedback(ctx.client_id, *params.id(), version)
+        if let Err(error) =
+            self.dmabuf_manager
+                .create_feedback(ctx.client_id, *params.id(), version)
         {
             debug!("linux-dmabuf feedback create failed: {error}");
             ctx.writer
@@ -198,17 +196,11 @@ impl ZwpLinuxBufferParamsV1 for DisplayState {
         object_id: ObjectId,
         _params: &ZwpLinuxBufferParamsV1Destroy<'_>,
     ) {
-        self.dmabuf_manager
-            .destroy_params(ctx.client_id, object_id);
+        self.dmabuf_manager.destroy_params(ctx.client_id, object_id);
         ctx.registry.free_object(object_id, ctx.writer);
     }
 
-    fn add(
-        &mut self,
-        ctx: &mut Ctx,
-        object_id: ObjectId,
-        params: &ZwpLinuxBufferParamsV1Add<'_>,
-    ) {
+    fn add(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &ZwpLinuxBufferParamsV1Add<'_>) {
         if let Err(error) = self.dmabuf_manager.add_plane(
             ctx.client_id,
             object_id,
@@ -229,12 +221,8 @@ impl ZwpLinuxBufferParamsV1 for DisplayState {
         object_id: ObjectId,
         params: &ZwpLinuxBufferParamsV1Create<'_>,
     ) {
-        let Ok(buffer_id) = ctx
-            .registry
-            .create_object(InterfaceIndex::WlBuffer, 1)
-        else {
-            ctx.writer
-                .zwp_linux_buffer_params_v1_failed(object_id);
+        let Ok(buffer_id) = ctx.registry.create_object(InterfaceIndex::WlBuffer, 1) else {
+            ctx.writer.zwp_linux_buffer_params_v1_failed(object_id);
             return;
         };
         match self.dmabuf_manager.create_from_params(
@@ -265,8 +253,7 @@ impl ZwpLinuxBufferParamsV1 for DisplayState {
                 ) {
                     report_params_error(ctx, object_id, &error);
                 } else {
-                    ctx.writer
-                        .zwp_linux_buffer_params_v1_failed(object_id);
+                    ctx.writer.zwp_linux_buffer_params_v1_failed(object_id);
                 }
             }
         }

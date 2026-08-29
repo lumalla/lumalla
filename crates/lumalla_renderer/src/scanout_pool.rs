@@ -109,13 +109,9 @@ fn create_scanout_buffer(
     vulkan.ensure_scanout_render_pass()?;
     let render_pass = vulkan.scanout_render_pass()?;
     let device = vulkan.device();
-    let framebuffer = Framebuffer::from_view(
-        device,
-        render_pass,
-        dma_image.view(),
-        dma_image.extent(),
-    )
-    .context("Failed to create scanout framebuffer")?;
+    let framebuffer =
+        Framebuffer::from_view(device, render_pass, dma_image.view(), dma_image.extent())
+            .context("Failed to create scanout framebuffer")?;
 
     let dma_buf = dma_image
         .export_dma_buf()

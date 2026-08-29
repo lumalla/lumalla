@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    os::unix::io::RawFd,
-};
+use std::{collections::HashMap, os::unix::io::RawFd};
 
 use lumalla_wayland_protocol::{
     ClientId, ObjectId,
@@ -317,12 +314,7 @@ impl DataDeviceManager {
                     source_state.version,
                 )
             }
-            None => (
-                None,
-                WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE,
-                Vec::new(),
-                1,
-            ),
+            None => (None, WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE, Vec::new(), 1),
         };
 
         if self.drag.is_some() {
@@ -514,9 +506,7 @@ impl DataDeviceManager {
             && let Some((source_client, source_id)) = offer.source
             && source_client == client_id
         {
-            writer
-                .wl_data_source_target(source_id)
-                .mime_type(mime_type);
+            writer.wl_data_source_target(source_id).mime_type(mime_type);
         }
         Ok(())
     }
@@ -656,22 +646,19 @@ impl DataDeviceManager {
         }
         offer.dnd_actions = dnd_actions;
         offer.preferred_action = preferred_action;
-        offer.selected_action = negotiate_action(offer.source_actions, dnd_actions, preferred_action);
+        offer.selected_action =
+            negotiate_action(offer.source_actions, dnd_actions, preferred_action);
         let selected = offer.selected_action;
         let source = offer.source;
         if offer.version >= 3 {
-            writer
-                .wl_data_offer_action(offer_id)
-                .dnd_action(selected);
+            writer.wl_data_offer_action(offer_id).dnd_action(selected);
         }
         if let Some((source_client, source_id)) = source
             && source_client == client_id
             && let Some(source_state) = self.sources.get(&(source_client, source_id))
             && source_state.version >= 3
         {
-            writer
-                .wl_data_source_action(source_id)
-                .dnd_action(selected);
+            writer.wl_data_source_action(source_id).dnd_action(selected);
         }
         Ok(())
     }
@@ -717,9 +704,7 @@ impl DataDeviceManager {
 
     #[cfg(test)]
     pub fn selection_source(&self) -> Option<(ClientId, ObjectId)> {
-        self.selection
-            .as_ref()
-            .map(|s| (s.source_client, s.source))
+        self.selection.as_ref().map(|s| (s.source_client, s.source))
     }
 
     #[cfg(test)]
@@ -728,11 +713,7 @@ impl DataDeviceManager {
     }
 
     #[cfg(test)]
-    pub fn selection_offer(
-        &self,
-        client_id: ClientId,
-        device_id: ObjectId,
-    ) -> Option<ObjectId> {
+    pub fn selection_offer(&self, client_id: ClientId, device_id: ObjectId) -> Option<ObjectId> {
         self.devices
             .get(&(client_id, device_id))
             .and_then(|d| d.selection_offer)
@@ -810,11 +791,7 @@ impl DataDeviceManager {
             writer.wl_data_offer_offer(offer_id).mime_type(mime);
         }
         let selected = if kind == OfferKind::Drag {
-            negotiate_action(
-                source_actions,
-                source_actions,
-                first_action(source_actions),
-            )
+            negotiate_action(source_actions, source_actions, first_action(source_actions))
         } else {
             WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE
         };
@@ -822,9 +799,7 @@ impl DataDeviceManager {
             writer
                 .wl_data_offer_source_actions(offer_id)
                 .source_actions(source_actions);
-            writer
-                .wl_data_offer_action(offer_id)
-                .dnd_action(selected);
+            writer.wl_data_offer_action(offer_id).dnd_action(selected);
         }
         self.offers.insert(
             (client_id, offer_id),
@@ -853,9 +828,7 @@ impl DataDeviceManager {
             return;
         }
         let action = first_action(source.dnd_actions);
-        writer
-            .wl_data_source_action(source_id)
-            .dnd_action(action);
+        writer.wl_data_source_action(source_id).dnd_action(action);
     }
 
     fn clear_selection_offers(&mut self, client_id: ClientId, writer: &mut Writer) {
@@ -948,11 +921,7 @@ mod tests {
         os::{fd::AsRawFd, unix::net::UnixStream},
     };
 
-    use lumalla_wayland_protocol::{
-        ClientId, ObjectId,
-        buffer::Writer,
-        registry::Registry,
-    };
+    use lumalla_wayland_protocol::{ClientId, ObjectId, buffer::Writer, registry::Registry};
 
     use super::*;
 
@@ -990,10 +959,7 @@ mod tests {
             .unwrap();
         writer.flush().unwrap();
 
-        assert_eq!(
-            manager.selection_source(),
-            Some((client_id, source))
-        );
+        assert_eq!(manager.selection_source(), Some((client_id, source)));
         let offer_id = manager
             .selection_offer(client_id, device)
             .expect("selection should create an offer");
@@ -1044,11 +1010,7 @@ mod tests {
         manager.create_data_source(client_id, source, 3);
         manager.offer(client_id, source, "text/plain").unwrap();
         manager
-            .set_source_actions(
-                client_id,
-                source,
-                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
-            )
+            .set_source_actions(client_id, source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)
             .unwrap();
         manager.create_data_device(client_id, device, seat, 3, &mut registry, &mut writer);
         manager
