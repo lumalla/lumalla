@@ -2,7 +2,8 @@ use std::{
     collections::HashMap,
     ffi::c_void,
     fmt,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    mem::ManuallyDrop,
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
 };
 
 use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, fstat, mmap, munmap, stat};
@@ -66,6 +67,7 @@ pub struct ShmManager {
 }
 
 impl ShmManager {
+    /// Create a pool, taking ownership of `fd` (closes it on all failure paths).
     pub fn create_pool(
         &mut self,
         client_id: ClientId,
@@ -79,8 +81,10 @@ impl ShmManager {
                 "Missing shared-memory file descriptor",
             ));
         }
+        // SAFETY: caller transfers ownership of a message SCM_RIGHTS fd.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         if size <= 0 {
+            close_owned_fd(fd);
             return Err(ShmError::new(
                 ShmErrorKind::InvalidStride,
                 "Shared-memory pool size must be positive",
@@ -88,6 +92,7 @@ impl ShmManager {
         }
         let key = (client_id, object_id);
         if self.pool_index.contains_key(&key) {
+            close_owned_fd(fd);
             return Err(ShmError::new(
                 ShmErrorKind::InvalidObject,
                 "Shared-memory pool already exists",
@@ -317,7 +322,8 @@ impl ShmManager {
 
 #[derive(Debug)]
 struct ShmPool {
-    fd: OwnedFd,
+    /// Wrapped so [`Drop`] can close without `OwnedFd`'s debug abort on EBADF.
+    fd: ManuallyDrop<OwnedFd>,
     size: usize,
     address: *mut c_void,
     ref_count: usize,
@@ -325,10 +331,19 @@ struct ShmPool {
 
 impl ShmPool {
     fn new(fd: OwnedFd, size: usize) -> Result<Self> {
-        ensure_file_size(&fd, size)?;
-        let address = map_region(fd.as_raw_fd(), size)?;
+        if let Err(error) = ensure_file_size(&fd, size) {
+            close_owned_fd(fd);
+            return Err(error);
+        }
+        let address = match map_region(fd.as_raw_fd(), size) {
+            Ok(address) => address,
+            Err(error) => {
+                close_owned_fd(fd);
+                return Err(error);
+            }
+        };
         Ok(Self {
-            fd,
+            fd: ManuallyDrop::new(fd),
             size,
             address,
             ref_count: 1,
@@ -362,7 +377,17 @@ impl Drop for ShmPool {
     fn drop(&mut self) {
         unsafe {
             munmap(self.address, self.size);
+            // Prefer quiet close(2): a double-closed fd must not abort the compositor.
+            close_owned_fd(ManuallyDrop::take(&mut self.fd));
         }
+    }
+}
+
+/// Close an [`OwnedFd`] without `debug_assert_fd_is_open` (which aborts on EBADF).
+fn close_owned_fd(fd: OwnedFd) {
+    let raw = fd.into_raw_fd();
+    unsafe {
+        libc::close(raw);
     }
 }
 
@@ -591,5 +616,45 @@ mod tests {
         assert!(manager.pool_index.is_empty());
         assert!(manager.buffers.is_empty());
         assert!(manager.pools.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn create_pool_with_non_mappable_fd_does_not_abort() {
+        let mut manager = ShmManager::default();
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        // Keep fds[1] open so fds[0]'s number cannot be recycled by parallel tests
+        // while create_pool inspects/closes it.
+        let error = manager
+            .create_pool(client(1), object(2), fds[0], 4)
+            .unwrap_err();
+        assert_eq!(error.kind(), ShmErrorKind::InvalidFd);
+        assert!(manager.pools.iter().all(Option::is_none));
+        assert!(manager.pool_index.is_empty());
+        unsafe {
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn create_pool_rejects_non_positive_size_without_leaking_slot() {
+        let mut manager = ShmManager::default();
+        let fd = memory_file(&[1, 2, 3, 4], 4);
+        let error = manager
+            .create_pool(client(1), object(2), fd, 0)
+            .unwrap_err();
+        assert_eq!(error.kind(), ShmErrorKind::InvalidStride);
+        assert!(manager.pools.iter().all(Option::is_none));
+        assert!(manager.pool_index.is_empty());
     }
 }

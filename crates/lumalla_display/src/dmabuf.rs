@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt,
     io::Write,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     path::Path,
 };
 
@@ -154,11 +154,7 @@ impl DmabufManager {
     ///
     /// Rebuilds the format table memfd. Call [`Self::send_all_feedback`] afterward
     /// if clients already hold feedback objects.
-    pub fn set_supported_formats(
-        &mut self,
-        formats: Vec<(u32, u64)>,
-        device_path: Option<&Path>,
-    ) {
+    pub fn set_supported_formats(&mut self, formats: Vec<(u32, u64)>, device_path: Option<&Path>) {
         self.supported = formats;
         self.main_device = device_path.and_then(device_rdev);
         self.format_table = match build_format_table(self.supported_formats()) {
@@ -184,8 +180,7 @@ impl DmabufManager {
                 "dmabuf feedback object already exists",
             ));
         }
-        self.feedbacks
-            .insert(key, FeedbackObject { version });
+        self.feedbacks.insert(key, FeedbackObject { version });
         Ok(())
     }
 
@@ -330,26 +325,31 @@ impl DmabufManager {
                 "Missing dmabuf file descriptor",
             ));
         }
+        // SAFETY: caller transfers ownership of a message SCM_RIGHTS fd.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let params = self
-            .params
-            .get_mut(&(client_id, params_id))
-            .ok_or_else(|| {
-                DmabufError::new(DmabufErrorKind::InvalidObject, "Unknown dmabuf params")
-            })?;
+        let Some(params) = self.params.get_mut(&(client_id, params_id)) else {
+            close_owned_fd(fd);
+            return Err(DmabufError::new(
+                DmabufErrorKind::InvalidObject,
+                "Unknown dmabuf params",
+            ));
+        };
         if params.used {
+            close_owned_fd(fd);
             return Err(DmabufError::new(
                 DmabufErrorKind::AlreadyUsed,
                 "dmabuf params already used",
             ));
         }
         if plane_idx as usize >= params.planes.len() {
+            close_owned_fd(fd);
             return Err(DmabufError::new(
                 DmabufErrorKind::PlaneIdx,
                 "plane index out of bounds",
             ));
         }
         if params.planes[plane_idx as usize].is_some() {
+            close_owned_fd(fd);
             return Err(DmabufError::new(
                 DmabufErrorKind::PlaneSet,
                 "plane index already set",
@@ -631,7 +631,12 @@ fn build_format_table(formats: &[(u32, u64)]) -> std::io::Result<FormatTable> {
         .len()
         .checked_mul(FORMAT_TABLE_ENTRY_SIZE)
         .ok_or_else(|| std::io::Error::other("format table too large"))?;
-    let fd = unsafe { libc::memfd_create(c"lumalla-dmabuf-format-table".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    let fd = unsafe {
+        libc::memfd_create(
+            c"lumalla-dmabuf-format-table".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -659,6 +664,13 @@ fn build_format_table(formats: &[(u32, u64)]) -> std::io::Result<FormatTable> {
         size: size as u32,
         entry_count: formats.len() as u32,
     })
+}
+
+fn close_owned_fd(fd: OwnedFd) {
+    let raw = fd.into_raw_fd();
+    unsafe {
+        libc::close(raw);
+    }
 }
 
 fn dup_fd(fd: RawFd) -> Result<OwnedFd> {

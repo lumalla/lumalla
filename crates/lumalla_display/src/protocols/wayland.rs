@@ -550,17 +550,28 @@ impl WlCompositor for DisplayState {
 
 impl WlShm for DisplayState {
     fn create_pool(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &WlShmCreatePool) {
+        let fd = params.fd();
+        let size = params.size();
         let version = ctx
             .registry
             .object_metadata(object_id)
             .map_or(1, |object| object.version.min(WL_SHM_POOL_VERSION));
         if !register_object(ctx, params.id(), InterfaceIndex::WlShmPool, version) {
+            // Request parser already released OwnedFd into a bare RawFd; close it.
+            if fd >= 0 {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             return;
         }
-        if let Err(error) =
-            self.shm_manager
-                .create_pool(ctx.client_id, *params.id(), params.fd(), params.size())
+        if let Err(error) = self
+            .shm_manager
+            .create_pool(ctx.client_id, *params.id(), fd, size)
         {
+            // create_pool consumes/closes `fd` on every path; drop the registry object
+            // so we do not leave a wl_shm_pool id without a backing pool.
+            ctx.registry.free_object(*params.id(), &mut ctx.writer);
             report_shm_error(ctx, *params.id(), &error);
         }
     }

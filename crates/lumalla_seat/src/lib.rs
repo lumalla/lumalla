@@ -74,18 +74,25 @@ impl SeatState {
 
     /// Release a libseat device by fd (used by libinput `close_restricted`).
     ///
-    /// Always closes the local fd. `libseat_close_device` may fail after the seat
-    /// has already been disabled; that is logged and ignored.
+    /// Only acts when this fd is still tracked in [`Self::devices_by_fd`]. A second
+    /// close for the same number (or a close after [`Self::close_device`]) must not
+    /// call `close(2)`: that fd slot may already belong to an unrelated file such as
+    /// a Wayland SHM pool, and double-closing aborts debug builds on `OwnedFd` drop.
+    ///
+    /// When tracked, closes the local fd even if `libseat_close_device` fails (e.g.
+    /// after the seat has already been disabled).
     pub fn close_device_fd(&self, fd: RawFd) {
         // Drop the RefMut before calling into libseat: ReleaseDevice may re-enter
         // libseat/libinput and try to borrow this map again.
-        let device_id = self.devices_by_fd.borrow_mut().remove(&fd);
-        if let Some(device_id) = device_id {
-            debug!("Closing libseat device via fd: device_id={device_id} fd={fd}");
-            if let Err(err) = self.main_seat.close_device_by_id(device_id) {
-                warn!("libseat_close_device({device_id}) failed (fd={fd}): {err:#}");
-            }
+        let Some(device_id) = self.devices_by_fd.borrow_mut().remove(&fd) else {
+            debug!("Ignoring close for untracked libseat fd={fd}");
+            return;
+        };
+        debug!("Closing libseat device via fd: device_id={device_id} fd={fd}");
+        if let Err(err) = self.main_seat.close_device_by_id(device_id) {
+            warn!("libseat_close_device({device_id}) failed (fd={fd}): {err:#}");
         }
+        // libseat releases the device claim but does not close the local fd.
         unsafe {
             libc::close(fd);
         }
