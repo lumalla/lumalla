@@ -318,19 +318,26 @@ impl SeatManager {
         }
 
         if let Some(new_surface) = surface {
-            // Reject if another pointer already owns this cursor surface, or if the
-            // surface has a non-cursor role.
+            // ObjectIds are per-client namespaces: only compare within the same client.
             let owned_by_other = self.pointers.iter().any(|p| {
-                p.cursor_surface == Some(new_surface)
-                    && !(p.client_id == client_id && p.id == pointer_id)
+                p.client_id == client_id
+                    && p.cursor_surface == Some(new_surface)
+                    && p.id != pointer_id
             });
             if owned_by_other {
+                log::debug!(
+                    "set_cursor rejected: surface {new_surface:?} already used as cursor by another pointer (client={client_id:?} pointer={pointer_id:?})"
+                );
                 return Err(SurfaceError::RoleAlreadyAssigned);
             }
             if surface_manager.surface_role_is_cursor(client_id, new_surface) {
                 // Already a cursor; allow reclaiming if no other pointer owns it.
-            } else {
-                surface_manager.assign_cursor_role(client_id, new_surface)?;
+            } else if let Err(err) = surface_manager.assign_cursor_role(client_id, new_surface) {
+                log::debug!(
+                    "set_cursor rejected: cannot assign cursor role to {new_surface:?} for client={client_id:?} pointer={pointer_id:?}: {err:?} (focus={:?})",
+                    self.pointers[pointer_index].focus
+                );
+                return Err(err);
             }
         }
 
@@ -594,12 +601,15 @@ impl SeatManager {
     pub fn handle_pointer_button(
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,
-        _surface_manager: &SurfaceManager,
+        surface_manager: &SurfaceManager,
         time_msec: u32,
         button: u32,
         pressed: bool,
     ) {
         if pressed {
+            // Resolve the top-most surface under the cursor before focusing; do not
+            // trust sticky pointer focus from a covered window.
+            self.update_pointer_focus_and_motion(clients, surface_manager, time_msec, false);
             if let Some((client_id, surface)) = self
                 .pointers
                 .iter()
@@ -813,20 +823,15 @@ impl SeatManager {
         }
     }
 
-    fn update_pointer_focus_and_motion(
+    pub fn update_pointer_focus_and_motion(
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,
         surface_manager: &SurfaceManager,
         time_msec: u32,
         send_motion: bool,
     ) {
-        let preferred = self
-            .pointers
-            .iter()
-            .find(|p| p.focus.is_some())
-            .map(|p| p.client_id);
         let target =
-            surface_manager.global_pointer_target(preferred, self.pointer_x, self.pointer_y);
+            surface_manager.global_pointer_target(None, self.pointer_x, self.pointer_y);
 
         // Leave pointers whose focus no longer matches the target.
         let leave_list: Vec<(ClientId, ObjectId, ObjectId, u32)> = self
@@ -860,6 +865,8 @@ impl SeatManager {
             {
                 pointer.focus = None;
                 pointer.enter_serial = None;
+                // Keep cursor_surface so a later set_cursor with the same surface
+                // can no-op; ObjectIds are only compared within a client.
             }
         }
 
@@ -1169,6 +1176,65 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, SurfaceError::RoleAlreadyAssigned);
+    }
+
+    #[test]
+    fn set_cursor_object_ids_are_per_client() {
+        let mut seat = SeatManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let (_keep, mut writer) = writer();
+        let client_a = client(1);
+        let client_b = client(2);
+        let pointer_a = object(10);
+        let pointer_b = object(10);
+        let surface_a = object(20);
+        let surface_b = object(20);
+        // Same numeric id, different clients — distinct cursor surfaces.
+        let cursor = object(21);
+
+        for (cid, sid) in [(client_a, surface_a), (client_b, surface_b)] {
+            surfaces.create_surface(cid, sid);
+            surfaces.create_surface(cid, cursor);
+            surfaces
+                .create_shell_surface(cid, object(30), sid)
+                .unwrap();
+            surfaces
+                .set_shell_mode(cid, object(30), ShellMode::Toplevel)
+                .unwrap();
+            surfaces
+                .attach(cid, sid, Some(object(40)), 0, 0, 1)
+                .unwrap();
+            let _ = surfaces.commit(cid, sid).unwrap();
+        }
+
+        seat.create_pointer(client_a, pointer_a, 5, &mut writer, Some(surface_a), &surfaces);
+        seat.create_pointer(client_b, pointer_b, 5, &mut writer, Some(surface_b), &surfaces);
+        let serial_a = seat.pointers[0].enter_serial.unwrap();
+        let serial_b = seat.pointers[1].enter_serial.unwrap();
+
+        seat.set_cursor(
+            client_a,
+            pointer_a,
+            serial_a,
+            Some(cursor),
+            0,
+            0,
+            &mut surfaces,
+        )
+        .unwrap();
+        // Must not treat client A's cursor ObjectId as conflicting with client B.
+        seat.set_cursor(
+            client_b,
+            pointer_b,
+            serial_b,
+            Some(cursor),
+            0,
+            0,
+            &mut surfaces,
+        )
+        .unwrap();
+        assert!(surfaces.surface_role_is_cursor(client_a, cursor));
+        assert!(surfaces.surface_role_is_cursor(client_b, cursor));
     }
 
     #[test]

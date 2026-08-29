@@ -51,6 +51,20 @@ fn candidate_key_names(name: &str) -> Vec<String> {
     candidates
 }
 
+/// Split an optional Control chord prefix from a key name.
+///
+/// Accepts `C-c`, `Ctrl+c`, and `Control+c` (any ASCII case on the prefix).
+fn split_ctrl_chord(name: &str) -> (bool, &str) {
+    for prefix in ["C-", "c-", "Ctrl+", "ctrl+", "CTRL+", "Control+", "control+", "CONTROL+"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if !rest.is_empty() {
+                return (true, rest);
+            }
+        }
+    }
+    (false, name)
+}
+
 struct KeyBinding {
     key: u32,
     mods: Mods,
@@ -202,14 +216,24 @@ impl InputState {
         Ok(())
     }
 
-    /// Inject a named key press and release (e.g. `"Return"`, `"a"`).
+    /// Inject a named key press and release (e.g. `"Return"`, `"a"`, `"C-c"`).
+    ///
+    /// Control chords are accepted as `C-<key>`, `Ctrl+<key>`, or `Control+<key>`.
     pub fn inject_key_name(
         &mut self,
         name: &str,
         on_event: &mut impl FnMut(SeatEvent),
     ) -> anyhow::Result<()> {
-        let keysym = Xkb::keysym_from_name(name)?;
-        self.inject_keysym(keysym, on_event)
+        let (ctrl, key_name) = split_ctrl_chord(name);
+        let keysym = Xkb::keysym_from_name(key_name)?;
+        if ctrl {
+            self.inject_key(libinput::bindings::KEY_LEFTCTRL, true, on_event);
+        }
+        let result = self.inject_keysym(keysym, on_event);
+        if ctrl {
+            self.inject_key(libinput::bindings::KEY_LEFTCTRL, false, on_event);
+        }
+        result
     }
 
     /// Inject a UTF-8 string as individual key presses.
@@ -450,5 +474,14 @@ mod tests {
         assert_eq!(evdev_keycode_from_name("m"), Some(50));
         assert_eq!(evdev_keycode_from_name("f1"), Some(59));
         assert_eq!(evdev_keycode_from_name("backspace"), Some(14));
+    }
+
+    #[test]
+    fn splits_control_chord_prefixes() {
+        assert_eq!(split_ctrl_chord("C-c"), (true, "c"));
+        assert_eq!(split_ctrl_chord("Ctrl+c"), (true, "c"));
+        assert_eq!(split_ctrl_chord("Control+Return"), (true, "Return"));
+        assert_eq!(split_ctrl_chord("Return"), (false, "Return"));
+        assert_eq!(split_ctrl_chord("c"), (false, "c"));
     }
 }

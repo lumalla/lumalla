@@ -90,8 +90,12 @@ end)
 
 lum.on_startup(function()
 	enable_all_outputs(lum.get_drm_devices())
-	lum.spawn({ command = "qalculate-qt" })
 	lum.spawn({ command = "wezterm", args = { "start", "--always-new-process" } })
+	-- lum.sleep(2.0)
+	-- lum.type("wezterm start --always-new-process")
+	-- lum.key("Return")
+	-- lum.sleep(2.0)
+	-- lum.key("C-c")
 end)
 
 lum.add_window_rule({

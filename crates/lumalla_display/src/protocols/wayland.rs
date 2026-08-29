@@ -1328,14 +1328,15 @@ impl WlSeat for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::WlPointer, version) {
             return;
         }
-        let (px, py) = self.seat_manager.pointer_position();
-        let focus = self.surface_manager.pointer_target(ctx.client_id, px, py);
+        // Do not send enter here: per-client geometry can match while another
+        // client's surface is on top, and we cannot leave that client from this
+        // request. App refreshes seat pointer focus after dispatch / map.
         self.seat_manager.create_pointer(
             ctx.client_id,
             *params.id(),
             version,
             ctx.writer,
-            focus,
+            None,
             &self.surface_manager,
         );
     }

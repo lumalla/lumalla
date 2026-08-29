@@ -388,6 +388,10 @@ impl AppData {
                     self.display_state
                         .flush_pending_keyboard_leaves(&mut self.connected_clients);
                     self.submit_committed_frames();
+                    // Mapping / get_pointer can change who should own the cursor
+                    // without a motion event; sync enter/leave now.
+                    self.display_state
+                        .refresh_pointer_focus(&mut self.connected_clients);
                     let layout_syncs = self
                         .display_state
                         .drain_pending_geometry(&mut self.connected_clients);

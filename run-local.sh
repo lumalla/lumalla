@@ -9,5 +9,7 @@ if [ ! -f Cargo.toml ] || [ ! -f init.lua ]; then
   exit 1
 fi
 
+export RUST_BACKTRACE=1
+
 cargo build -p lumalla_config
 exec cargo run -- --config ./init.lua --config-command ./target/debug/lumalla-config "$@"

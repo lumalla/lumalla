@@ -134,6 +134,8 @@ impl SurfaceManager {
             presentation_feedbacks.extend(cache.presentation_feedbacks);
         }
 
+        self.remove_painted_surface(client_id, id);
+
         Ok(DestroyedSurface {
             shell_id,
             subsurface_id,
@@ -188,19 +190,16 @@ impl SurfaceManager {
             .map(|(_, surface)| surface)
     }
 
-    /// Geometry hit-test across clients. Prefer `preferred_client` when it owns the hit.
+    /// Geometry hit-test across clients (top-most first).
+    ///
+    /// When `preferred_client` is set, only that client's surfaces are considered.
     pub fn global_pointer_target(
         &self,
         preferred_client: Option<ClientId>,
         x: f64,
         y: f64,
     ) -> Option<(ClientId, ObjectId)> {
-        if let Some(preferred) = preferred_client
-            && let Some(hit) = self.hit_test(Some(preferred), x, y)
-        {
-            return Some(hit);
-        }
-        self.hit_test(None, x, y)
+        self.hit_test(preferred_client, x, y)
     }
 
     fn hit_test(
@@ -218,8 +217,14 @@ impl SurfaceManager {
             if !self.is_mapped(client_id, surface_id).unwrap_or(false) {
                 continue;
             }
-            let surface = self.surfaces.get(&(client_id, surface_id))?;
-            if !matches!(surface.role, Some(Role::Shell(_)) | Some(Role::Xdg(_))) {
+            let Some(surface) = self.surfaces.get(&(client_id, surface_id)) else {
+                continue;
+            };
+            // Include shell/xdg tops and their subsurfaces; skip cursor/dnd icons.
+            if !matches!(
+                surface.role,
+                Some(Role::Shell(_)) | Some(Role::Xdg(_)) | Some(Role::Subsurface(_))
+            ) {
                 continue;
             }
             let Some((bw, bh)) = surface.buffer_size else {
@@ -228,7 +233,9 @@ impl SurfaceManager {
             let scale = surface.current.buffer_scale.max(1);
             let width = (bw / scale).max(0);
             let height = (bh / scale).max(0);
-            let (origin_x, origin_y) = self.surface_origin(client_id, surface_id)?;
+            let Some((origin_x, origin_y)) = self.surface_origin(client_id, surface_id) else {
+                continue;
+            };
             if x < origin_x as f64
                 || y < origin_y as f64
                 || x >= (origin_x + width) as f64
@@ -907,6 +914,7 @@ impl SurfaceManager {
             .retain(|(owner, _), _| *owner != client_id);
         self.subsurfaces.retain(|(owner, _), _| *owner != client_id);
         self.regions.retain(|(owner, _), _| *owner != client_id);
+        self.paint_order.retain(|(owner, _)| *owner != client_id);
     }
 
     fn cache_pending_commit(
@@ -1038,9 +1046,11 @@ impl SurfaceManager {
             .get(&(client_id, id))
             .map(|s| s.layout)
             .unwrap_or((0, 0));
-        if mapped {
+        // Only restack on map/unmap. Re-raising on every commit desyncs hit-testing
+        // from draw order (renderer keeps insertion order) and steals pointer focus.
+        if newly_mapped {
             self.record_painted_surface(client_id, id);
-        } else if was_mapped {
+        } else if was_mapped && !mapped {
             self.remove_painted_surface(client_id, id);
         }
         Ok(SurfaceCommit {
@@ -1650,6 +1660,102 @@ mod tests {
             Some(object(5))
         );
         assert!(manager.pointer_target(client(1), 200.0, 200.0).is_none());
+    }
+
+    #[test]
+    fn global_pointer_target_uses_topmost_across_clients() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(2), object(5));
+        manager
+            .create_shell_surface(client(1), object(3), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(3), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .create_shell_surface(client(2), object(6), object(5))
+            .unwrap();
+        manager
+            .set_shell_mode(client(2), object(6), ShellMode::Toplevel)
+            .unwrap();
+
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
+            .unwrap();
+        assert!(manager.commit(client(1), object(2)).unwrap().primary.mapped);
+        manager
+            .set_committed_buffer_size(client(1), object(2), 100, 100)
+            .unwrap();
+
+        manager
+            .attach(client(2), object(5), Some(object(7)), 0, 0, 1)
+            .unwrap();
+        assert!(manager.commit(client(2), object(5)).unwrap().primary.mapped);
+        manager
+            .set_committed_buffer_size(client(2), object(5), 100, 100)
+            .unwrap();
+
+        // Overlap: later-mapped client is on top.
+        assert_eq!(
+            manager.global_pointer_target(None, 40.0, 40.0),
+            Some((client(2), object(5)))
+        );
+        // Region only covered by the bottom window.
+        assert_eq!(
+            manager.global_pointer_target(None, 10.0, 10.0),
+            Some((client(1), object(2)))
+        );
+    }
+
+    #[test]
+    fn recommit_does_not_restack_paint_order() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(5));
+        manager
+            .create_shell_surface(client(1), object(3), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(3), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .create_shell_surface(client(1), object(6), object(5))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(6), ShellMode::Toplevel)
+            .unwrap();
+
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
+            .unwrap();
+        assert!(manager.commit(client(1), object(2)).unwrap().primary.mapped);
+        manager
+            .set_committed_buffer_size(client(1), object(2), 100, 100)
+            .unwrap();
+
+        manager
+            .attach(client(1), object(5), Some(object(7)), 0, 0, 1)
+            .unwrap();
+        assert!(manager.commit(client(1), object(5)).unwrap().primary.mapped);
+        manager
+            .set_committed_buffer_size(client(1), object(5), 100, 100)
+            .unwrap();
+
+        assert_eq!(
+            manager.pointer_target(client(1), 40.0, 40.0),
+            Some(object(5))
+        );
+
+        // Damage/commit on the back window must not steal stacking.
+        manager
+            .attach(client(1), object(2), Some(object(8)), 0, 0, 1)
+            .unwrap();
+        assert!(manager.commit(client(1), object(2)).unwrap().primary.mapped);
+        assert_eq!(
+            manager.pointer_target(client(1), 40.0, 40.0),
+            Some(object(5))
+        );
     }
 
     #[test]

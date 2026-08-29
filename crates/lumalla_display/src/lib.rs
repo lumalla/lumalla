@@ -200,6 +200,18 @@ impl DisplayState {
             .handle_pointer_absolute(clients, &self.surface_manager, time_msec, x, y);
     }
 
+    /// Recompute pointer enter/leave from current coordinates and stacking.
+    ///
+    /// Call after client dispatch or when mapping changes under a stationary cursor.
+    pub fn refresh_pointer_focus(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
+        self.seat_manager.update_pointer_focus_and_motion(
+            clients,
+            &self.surface_manager,
+            0,
+            false,
+        );
+    }
+
     pub fn set_output_geometry(&mut self, width: u32, height: u32) {
         self.seat_manager.set_output_geometry(width, height);
     }
