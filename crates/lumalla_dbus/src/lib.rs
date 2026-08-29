@@ -19,7 +19,7 @@ use lumalla_ipc::{
 };
 use lumalla_shared::{
     Comms, Completion, DbusMessage, DrmDeviceState, EventLoop, MESSAGE_CHANNEL_TOKEN, MainMessage,
-    OpKind, Output, monotonic_deadline_after,
+    OpKind, Output,
 };
 use zbus::{Error as ZbusError, blocking::connection};
 
@@ -129,9 +129,9 @@ impl DbusState {
 
     fn run(&mut self) -> anyhow::Result<()> {
         let mut completions = Vec::with_capacity(16);
+        // Block on the channel waker only. A periodic timeout here previously
+        // cancel/re-armed every iteration and busy-spun on TimeoutRemove CQEs.
         loop {
-            let (sec, nsec) = monotonic_deadline_after(std::time::Duration::from_millis(50))?;
-            self.event_loop.set_absolute_timeout_timespec(sec, nsec)?;
             if let Err(err) = self.event_loop.wait(&mut completions) {
                 error!("Unable to wait on D-Bus event loop: {err}");
             }

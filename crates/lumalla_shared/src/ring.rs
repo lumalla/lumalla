@@ -118,6 +118,8 @@ pub struct EventLoop {
     timeout_ts: Box<Timespec>,
     timeout_armed: bool,
     timeout_generation: u64,
+    /// Last absolute deadline submitted (`None` if cleared / never armed).
+    timeout_deadline: Option<(u64, u32)>,
     waker_fd: OwnedFd,
     /// Buffer for the permanent eventfd Read SQE.
     waker_buf: Box<u64>,
@@ -139,6 +141,7 @@ impl EventLoop {
             timeout_ts: Box::new(Timespec::new()),
             timeout_armed: false,
             timeout_generation: 0,
+            timeout_deadline: None,
             waker_fd,
             waker_buf: Box::new(0),
             waker_armed: false,
@@ -288,8 +291,17 @@ impl EventLoop {
     }
 
     /// Arm or replace an absolute CLOCK_MONOTONIC timeout.
+    ///
+    /// `Some(duration)` is interpreted as a deadline `duration` from now.
     pub fn set_absolute_timeout(&mut self, deadline: Option<Duration>) -> io::Result<()> {
-        // Cancel previous timeout if any.
+        let Some(deadline) = deadline else {
+            return self.clear_timeout_deadline();
+        };
+        let (abs_sec, abs_nsec) = monotonic_deadline_after(deadline)?;
+        self.set_absolute_timeout_timespec(abs_sec, abs_nsec)
+    }
+
+    fn clear_timeout_deadline(&mut self) -> io::Result<()> {
         if self.timeout_armed {
             let old = encode_user_data(OpKind::Timeout, self.timeout_generation);
             let entry = opcode::TimeoutRemove::new(old)
@@ -298,27 +310,15 @@ impl EventLoop {
             self.push(entry)?;
             self.timeout_armed = false;
         }
-
-        let Some(deadline) = deadline else {
-            return Ok(());
-        };
-
-        self.timeout_generation = self.timeout_generation.wrapping_add(1);
-        let sec = deadline.as_secs();
-        let nsec = deadline.subsec_nanos();
-        *self.timeout_ts = Timespec::new().sec(sec).nsec(nsec);
-        let ts = self.timeout_ts.as_ref() as *const Timespec;
-        let entry = opcode::Timeout::new(ts)
-            .flags(TimeoutFlags::ABS)
-            .build()
-            .user_data(encode_user_data(OpKind::Timeout, self.timeout_generation));
-        self.push(entry)?;
-        self.timeout_armed = true;
+        self.timeout_deadline = None;
         Ok(())
     }
 
     /// Absolute timeout from a monotonic timespec (sec, nsec).
     pub fn set_absolute_timeout_timespec(&mut self, sec: u64, nsec: u32) -> io::Result<()> {
+        if self.timeout_armed && self.timeout_deadline == Some((sec, nsec)) {
+            return Ok(());
+        }
         if self.timeout_armed {
             let old = encode_user_data(OpKind::Timeout, self.timeout_generation);
             let entry = opcode::TimeoutRemove::new(old)
@@ -336,11 +336,12 @@ impl EventLoop {
             .user_data(encode_user_data(OpKind::Timeout, self.timeout_generation));
         self.push(entry)?;
         self.timeout_armed = true;
+        self.timeout_deadline = Some((sec, nsec));
         Ok(())
     }
 
     pub fn clear_timeout(&mut self) -> io::Result<()> {
-        self.set_absolute_timeout(None)
+        self.clear_timeout_deadline()
     }
 
     /// Submit pending SQEs and wait for at least one CQE.
@@ -368,6 +369,7 @@ impl EventLoop {
                 OpKind::Timeout => {
                     if id == self.timeout_generation {
                         self.timeout_armed = false;
+                        self.timeout_deadline = None;
                     }
                 }
                 OpKind::Accept => {
@@ -384,16 +386,35 @@ impl EventLoop {
         }
     }
 
-    /// Wait until at least one CQE is available, then drain all.
+    /// Wait until at least one meaningful CQE is available, then drain all.
+    ///
+    /// Completions from replacing/canceling in-flight ops (`Cancel`, and
+    /// `Timeout` with `-ECANCELED`) are ignored so callers that refresh an
+    /// absolute timeout every lap do not busy-spin on `TimeoutRemove`.
     pub fn wait(&mut self, out: &mut Vec<Completion>) -> io::Result<()> {
         out.clear();
-        self.drain_completions(out);
-        if !out.is_empty() {
-            return Ok(());
+        loop {
+            if out.is_empty() {
+                self.drain_completions(out);
+            }
+            if out.is_empty() {
+                self.ring.submit_and_wait(1)?;
+                self.drain_completions(out);
+            }
+
+            out.retain(|completion| match completion.kind {
+                OpKind::Cancel => false,
+                OpKind::Timeout if completion.result == -libc::ECANCELED => false,
+                _ => true,
+            });
+
+            if !out.is_empty() {
+                return Ok(());
+            }
+            if self.inflight == 0 {
+                return Ok(());
+            }
         }
-        self.ring.submit_and_wait(1)?;
-        self.drain_completions(out);
-        Ok(())
     }
 
     /// Re-arm the waker read after a Wake completion was handled.
@@ -528,5 +549,40 @@ mod tests {
             loop_.wait(&mut completions).unwrap();
         }
         panic!("timeout did not fire: {completions:?}");
+    }
+
+    #[test]
+    fn replacing_timeout_each_wait_does_not_busy_spin() {
+        use std::time::Instant;
+
+        let mut loop_ = EventLoop::new(32).unwrap();
+        let waker = loop_.waker();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            waker.wake().unwrap();
+        });
+
+        let started = Instant::now();
+        let mut completions = Vec::new();
+        loop {
+            // Same pattern that previously spun the D-Bus thread: refresh an
+            // absolute timeout every lap, then wait.
+            let (sec, nsec) = monotonic_deadline_after(Duration::from_secs(3600)).unwrap();
+            loop_.set_absolute_timeout_timespec(sec, nsec).unwrap();
+            loop_.wait(&mut completions).unwrap();
+            if completions.iter().any(|c| c.kind == OpKind::Wake && c.result >= 0) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "wait returned without wake too many times: {completions:?}"
+            );
+            completions.clear();
+        }
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "returned too quickly; likely busy-spinning on TimeoutRemove"
+        );
     }
 }
