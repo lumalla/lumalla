@@ -40,6 +40,9 @@ pub struct SurfaceCommit {
     pub newly_mapped: bool,
     pub shell_id: Option<ObjectId>,
     pub frame_callbacks: Vec<ObjectId>,
+    pub presentation_feedbacks: Vec<ObjectId>,
+    /// True when this commit was cached for a synchronized subsurface (not applied yet).
+    pub deferred: bool,
     pub buffer_scale: i32,
     pub buffer_transform: u32,
     pub offset: (i32, i32),
@@ -63,6 +66,7 @@ pub struct DestroyedSurface {
     pub xdg_surface_id: Option<ObjectId>,
     pub orphaned_subsurface_ids: Vec<ObjectId>,
     pub callbacks: Vec<ObjectId>,
+    pub presentation_feedbacks: Vec<ObjectId>,
     pub was_mapped: bool,
 }
 
@@ -124,8 +128,10 @@ impl SurfaceManager {
         };
 
         let mut callbacks = surface.pending.frame_callbacks;
+        let mut presentation_feedbacks = surface.pending.presentation_feedbacks;
         if let Some(cache) = surface.cache {
             callbacks.extend(cache.frame_callbacks);
+            presentation_feedbacks.extend(cache.presentation_feedbacks);
         }
 
         Ok(DestroyedSurface {
@@ -134,6 +140,7 @@ impl SurfaceManager {
             xdg_surface_id,
             orphaned_subsurface_ids,
             callbacks,
+            presentation_feedbacks,
             was_mapped,
         })
     }
@@ -541,6 +548,21 @@ impl SurfaceManager {
         Ok(())
     }
 
+    pub fn add_presentation_feedback(
+        &mut self,
+        client_id: ClientId,
+        id: ObjectId,
+        feedback: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        self.surfaces
+            .get_mut(&(client_id, id))
+            .ok_or(SurfaceError::UnknownSurface)?
+            .pending
+            .presentation_feedbacks
+            .push(feedback);
+        Ok(())
+    }
+
     pub fn set_opaque_region(
         &mut self,
         client_id: ClientId,
@@ -927,6 +949,8 @@ impl SurfaceManager {
             newly_mapped: false,
             shell_id: None,
             frame_callbacks: Vec::new(),
+            presentation_feedbacks: Vec::new(),
+            deferred: true,
             buffer_scale: surface.current.buffer_scale,
             buffer_transform: surface.current.buffer_transform,
             offset,
@@ -978,6 +1002,7 @@ impl SurfaceManager {
             surface.current.buffer_transform = transform;
         }
         let frame_callbacks = std::mem::take(&mut surface.pending.frame_callbacks);
+        let presentation_feedbacks = std::mem::take(&mut surface.pending.presentation_feedbacks);
         let shell_id = match surface.role {
             Some(Role::Shell(shell_id)) => Some(shell_id),
             _ => None,
@@ -1030,6 +1055,8 @@ impl SurfaceManager {
             newly_mapped,
             shell_id,
             frame_callbacks,
+            presentation_feedbacks,
+            deferred: false,
             buffer_scale,
             buffer_transform,
             offset,
@@ -1304,6 +1331,9 @@ fn merge_pending(cache: &mut PendingState, mut pending: PendingState) {
     cache.damage.append(&mut pending.damage);
     cache.buffer_damage.append(&mut pending.buffer_damage);
     cache.frame_callbacks.append(&mut pending.frame_callbacks);
+    cache
+        .presentation_feedbacks
+        .append(&mut pending.presentation_feedbacks);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1391,6 +1421,7 @@ struct PendingState {
     buffer_scale: Option<i32>,
     buffer_transform: Option<u32>,
     frame_callbacks: Vec<ObjectId>,
+    presentation_feedbacks: Vec<ObjectId>,
     opaque_region: Option<Option<Region>>,
     input_region: Option<Option<Region>>,
 }
@@ -1517,6 +1548,8 @@ mod tests {
         assert!(commit.newly_mapped);
         assert_eq!(commit.shell_id, Some(object(3)));
         assert_eq!(commit.frame_callbacks, [object(5)]);
+        assert!(commit.presentation_feedbacks.is_empty());
+        assert!(!commit.deferred);
         assert_eq!(commit.buffer_scale, 2);
         assert_eq!(commit.buffer_transform, 1);
         assert_eq!(commit.offset, (5, 6));
@@ -1535,6 +1568,25 @@ mod tests {
         assert!(!second.newly_mapped);
         assert!(second.frame_callbacks.is_empty());
         assert_eq!(second.buffer_scale, 2);
+    }
+
+    #[test]
+    fn presentation_feedback_is_taken_on_commit() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .add_presentation_feedback(client(1), object(2), object(5))
+            .unwrap();
+        manager
+            .add_presentation_feedback(client(1), object(2), object(6))
+            .unwrap();
+
+        let commit = manager.commit(client(1), object(2)).unwrap().primary;
+        assert_eq!(commit.presentation_feedbacks, [object(5), object(6)]);
+        assert!(!commit.deferred);
+
+        let second = manager.commit(client(1), object(2)).unwrap().primary;
+        assert!(second.presentation_feedbacks.is_empty());
     }
 
     #[test]

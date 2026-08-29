@@ -356,7 +356,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
             }
         }
         ctx.writer.wl_buffer_release(buffer_id);
-    } else if commit.attached_buffer == Some(None) {
+        } else if commit.attached_buffer == Some(None) {
         state.seat_manager.leave_keyboards_on_surface(
             ctx.client_id,
             commit.surface_id,
@@ -379,12 +379,29 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                 .wl_surface_leave(commit.surface_id)
                 .output(output);
         }
+        state.discard_presentation_feedbacks_for_surface(
+            ctx.client_id,
+            commit.surface_id,
+            Vec::new(),
+            ctx.writer,
+            ctx.registry,
+        );
     }
 
     for callback in commit.frame_callbacks {
         state
             .pending_frame_callbacks
             .push_back((ctx.client_id, callback));
+    }
+
+    if !commit.deferred {
+        state.queue_presentation_feedbacks(
+            ctx.client_id,
+            commit.surface_id,
+            commit.presentation_feedbacks,
+            ctx.writer,
+            ctx.registry,
+        );
     }
 }
 
@@ -484,6 +501,11 @@ impl WlRegistry for DisplayState {
                     *id,
                     self.dmabuf_manager.supported_formats(),
                 );
+            }
+            _ if interface_name == InterfaceIndex::WpPresentation.interface_name() => {
+                ctx.writer
+                    .wp_presentation_clock_id(*id)
+                    .clk_id(libc::CLOCK_MONOTONIC as u32);
             }
             _ => {}
         }
@@ -1075,6 +1097,13 @@ impl WlSurface for DisplayState {
                 for callback in destroyed.callbacks {
                     ctx.registry.free_object(callback, ctx.writer);
                 }
+                self.discard_presentation_feedbacks_for_surface(
+                    ctx.client_id,
+                    object_id,
+                    destroyed.presentation_feedbacks,
+                    ctx.writer,
+                    ctx.registry,
+                );
                 if let Some(shell_id) = destroyed.shell_id {
                     ctx.registry.free_object(shell_id, ctx.writer);
                 }
@@ -1784,6 +1813,10 @@ mod tests {
             lumalla_wayland_protocol::protocols::linux_dmabuf::ZWP_LINUX_DMABUF_V1_NAME,
             4
         )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::presentation_time::WP_PRESENTATION_NAME,
+            2
+        )));
     }
 
     #[test]
@@ -1866,6 +1899,34 @@ mod tests {
         let metadata = ctx.registry.object_metadata(object_id(2)).unwrap();
         assert_eq!(metadata.interface_index, InterfaceIndex::WlCompositor);
         assert_eq!(metadata.version, 5);
+    }
+
+    #[test]
+    fn registry_bind_wp_presentation_registers_object() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let mut registry = Registry::new();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
+        };
+        let global_name = state
+            .globals
+            .iter()
+            .find(|(_, global)| global.interface_index == InterfaceIndex::WpPresentation)
+            .map(|(id, _)| *id)
+            .expect("wp_presentation global");
+        let data = bind_data(global_name, "wp_presentation", 2, 20);
+        let mut fds = VecDeque::new();
+        let params = WlRegistryBind::new(&data, &mut fds);
+        WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
+        assert_eq!(
+            ctx.registry.interface_index(object_id(20)),
+            Some(InterfaceIndex::WpPresentation)
+        );
+        assert!(ctx.writer.has_pending_output());
     }
 
     #[test]
@@ -2016,6 +2077,81 @@ mod tests {
                 surface_id: unmapped,
             }] if *owner == client_id && *unmapped == surface_id
         ));
+    }
+
+    #[test]
+    fn presentation_feedback_queues_discards_on_supersede() {
+        use lumalla_wayland_protocol::protocols::presentation_time::{
+            WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK, WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION,
+            WP_PRESENTATION_FEEDBACK_KIND_VSYNC,
+        };
+
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let client_id = ClientId::new(NonZeroU32::new(1).unwrap());
+        let surface_id = object_id(2);
+        let feedback_a = object_id(7);
+        let feedback_b = object_id(8);
+        state.surface_manager.create_surface(client_id, surface_id);
+
+        let mut registry = Registry::new();
+        for (id, interface) in [
+            (surface_id, InterfaceIndex::WlSurface),
+            (feedback_a, InterfaceIndex::WpPresentationFeedback),
+            (feedback_b, InterfaceIndex::WpPresentationFeedback),
+        ] {
+            registry
+                .register_client_object_with_version(NewObjectId::new(id), interface, 2)
+                .unwrap();
+        }
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id,
+        };
+        let mut fds = VecDeque::new();
+        let params = WlSurfaceCommit::new(&[], &mut fds);
+
+        state
+            .surface_manager
+            .add_presentation_feedback(client_id, surface_id, feedback_a)
+            .unwrap();
+        WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
+        assert_eq!(state.pending_presentation_feedback_count(), 1);
+
+        state
+            .surface_manager
+            .add_presentation_feedback(client_id, surface_id, feedback_b)
+            .unwrap();
+        WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
+        assert_eq!(
+            state.pending_presentation_feedback_count(),
+            1,
+            "superseded feedback must be discarded"
+        );
+        assert!(ctx.registry.object_metadata(feedback_a).is_none());
+        assert!(ctx.registry.object_metadata(feedback_b).is_some());
+
+        let flags = WP_PRESENTATION_FEEDBACK_KIND_VSYNC
+            | WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK
+            | WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION;
+        while let Some(pending) = state.pending_presentation_feedbacks.pop_front() {
+            assert_eq!(pending.feedback_id, feedback_b);
+            ctx.writer
+                .wp_presentation_feedback_presented(pending.feedback_id)
+                .tv_sec_hi(0)
+                .tv_sec_lo(10)
+                .tv_nsec(500_000)
+                .refresh(16_666_666)
+                .seq_hi(0)
+                .seq_lo(99)
+                .flags(flags);
+            ctx.registry
+                .free_object(pending.feedback_id, ctx.writer);
+        }
+        assert!(ctx.registry.object_metadata(feedback_b).is_none());
+        assert_eq!(state.pending_presentation_feedback_count(), 0);
     }
 
     #[test]

@@ -15,8 +15,8 @@ use anyhow::Context;
 use log::{debug, error, info, warn};
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::{
-    ClientConnection, ClientId, DisplayState, KeyboardModifiers, OutputInfo, ReadResult,
-    SurfaceUpdate, Wayland, create_wayland_display,
+    ClientConnection, ClientId, DisplayState, KeyboardModifiers, OutputInfo, PresentationFlipInfo,
+    ReadResult, SurfaceUpdate, Wayland, create_wayland_display,
 };
 use lumalla_input::{InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent, BTN_LEFT};
 use lumalla_renderer::{
@@ -1028,6 +1028,7 @@ impl AppData {
         }
         if self.renderer_state.scene_dirty()
             || self.display_state.pending_frame_callback_count() > 0
+            || self.display_state.pending_presentation_feedback_count() > 0
         {
             self.render_scheduler.mark_dirty(Instant::now());
         }
@@ -1036,7 +1037,8 @@ impl AppData {
     fn tick_render_scheduler(&mut self) {
         let now = Instant::now();
         let scene_dirty = self.renderer_state.scene_dirty();
-        let pending_callbacks = self.display_state.pending_frame_callback_count() > 0;
+        let pending_callbacks = self.display_state.pending_frame_callback_count() > 0
+            || self.display_state.pending_presentation_feedback_count() > 0;
         let flip_idle = self.renderer_state.flip_idle();
 
         if !self
@@ -1070,10 +1072,27 @@ impl AppData {
             Ok(outcome) => {
                 let now = Instant::now();
                 if !outcome.completed.is_empty() {
+                    let refresh_ns = self
+                        .render_scheduler
+                        .frame_period()
+                        .as_nanos()
+                        .min(u128::from(u32::MAX)) as u32;
+                    if let Some(flip) = outcome.completed.last() {
+                        self.display_state.complete_presentation_feedbacks(
+                            &mut self.connected_clients,
+                            PresentationFlipInfo {
+                                tv_sec: flip.tv_sec,
+                                tv_usec: flip.tv_usec,
+                                sequence: flip.sequence,
+                                refresh_ns,
+                            },
+                        );
+                    }
                     self.render_scheduler.after_flip(
                         now,
                         self.renderer_state.scene_dirty(),
-                        self.display_state.pending_frame_callback_count() > 0,
+                        self.display_state.pending_frame_callback_count() > 0
+                            || self.display_state.pending_presentation_feedback_count() > 0,
                     );
                 }
                 self.maybe_complete_frame_callbacks(outcome.status);

@@ -9,8 +9,8 @@ use crate::{
     buffer::{MessageHeader, Writer},
     client::Ctx,
     protocols::{
-        LinuxDmabufV1Protocol, WaylandProtocol, WlDisplay, XdgShellProtocol, linux_dmabuf::*,
-        wayland::*, xdg_shell::*,
+        LinuxDmabufV1Protocol, PresentationTimeProtocol, WaylandProtocol, WlDisplay,
+        XdgShellProtocol, linux_dmabuf::*, presentation_time::*, wayland::*, xdg_shell::*,
     },
 };
 
@@ -47,6 +47,8 @@ pub enum InterfaceIndex {
     ZwpLinuxDmabufV1,
     ZwpLinuxBufferParamsV1,
     ZwpLinuxDmabufFeedbackV1,
+    WpPresentation,
+    WpPresentationFeedback,
 }
 
 impl InterfaceIndex {
@@ -83,6 +85,8 @@ impl InterfaceIndex {
             InterfaceIndex::ZwpLinuxDmabufV1 => ZWP_LINUX_DMABUF_V1_NAME,
             InterfaceIndex::ZwpLinuxBufferParamsV1 => ZWP_LINUX_BUFFER_PARAMS_V1_NAME,
             InterfaceIndex::ZwpLinuxDmabufFeedbackV1 => ZWP_LINUX_DMABUF_FEEDBACK_V1_NAME,
+            InterfaceIndex::WpPresentation => WP_PRESENTATION_NAME,
+            InterfaceIndex::WpPresentationFeedback => WP_PRESENTATION_FEEDBACK_NAME,
         }
     }
 
@@ -119,6 +123,8 @@ impl InterfaceIndex {
             InterfaceIndex::ZwpLinuxDmabufV1 => ZWP_LINUX_DMABUF_V1_VERSION,
             InterfaceIndex::ZwpLinuxBufferParamsV1 => ZWP_LINUX_BUFFER_PARAMS_V1_VERSION,
             InterfaceIndex::ZwpLinuxDmabufFeedbackV1 => ZWP_LINUX_DMABUF_FEEDBACK_V1_VERSION,
+            InterfaceIndex::WpPresentation => WP_PRESENTATION_VERSION,
+            InterfaceIndex::WpPresentationFeedback => WP_PRESENTATION_FEEDBACK_VERSION,
         }
     }
 }
@@ -283,7 +289,7 @@ pub trait RequestHandler {
 
 impl<T> RequestHandler for T
 where
-    T: WaylandProtocol + XdgShellProtocol + LinuxDmabufV1Protocol,
+    T: WaylandProtocol + XdgShellProtocol + LinuxDmabufV1Protocol + PresentationTimeProtocol,
 {
     fn handle_request(
         &mut self,
@@ -393,6 +399,13 @@ where
                 fds,
                 object.version,
             ),
+            InterfaceIndex::WpPresentation => {
+                WpPresentation::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::WpPresentationFeedback => {
+                write_invalid_method_error(ctx, header.object_id);
+                anyhow::bail!("Invalid method");
+            }
         }
     }
 }

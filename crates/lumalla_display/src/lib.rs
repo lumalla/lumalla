@@ -3,7 +3,11 @@ use std::collections::{HashMap, VecDeque};
 use anyhow::Context;
 use lumalla_shared::{Comms, WindowGeometryUpdate, WindowRule, WindowState};
 use lumalla_wayland_protocol::registry::InterfaceIndex;
-use lumalla_wayland_protocol::{ObjectId, buffer::Writer};
+use lumalla_wayland_protocol::{ObjectId, buffer::Writer, registry::Registry};
+use lumalla_wayland_protocol::protocols::presentation_time::{
+    WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK, WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION,
+    WP_PRESENTATION_FEEDBACK_KIND_VSYNC,
+};
 
 use crate::{
     data_device::DataDeviceManager, dmabuf::DmabufManager, output::OutputManager,
@@ -29,6 +33,22 @@ pub use output::OutputInfo;
 pub use surface::Rectangle;
 pub use dmabuf::ExportedDmabuf;
 pub use window_manager::{WindowError, WindowGeometryChange};
+
+/// Presentation timing for a completed DRM page-flip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentationFlipInfo {
+    pub tv_sec: u32,
+    pub tv_usec: u32,
+    pub sequence: u32,
+    pub refresh_ns: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingPresentationFeedback {
+    client_id: ClientId,
+    surface_id: ObjectId,
+    feedback_id: ObjectId,
+}
 
 pub struct DisplayMessage;
 
@@ -91,6 +111,7 @@ pub struct DisplayState {
     surface_updates: VecDeque<SurfaceUpdate>,
     pending_geometry_changes: Vec<WindowGeometryChange>,
     pending_frame_callbacks: VecDeque<(ClientId, lumalla_wayland_protocol::ObjectId)>,
+    pending_presentation_feedbacks: VecDeque<PendingPresentationFeedback>,
 }
 
 impl DisplayState {
@@ -109,6 +130,7 @@ impl DisplayState {
             surface_updates: VecDeque::new(),
             pending_geometry_changes: Vec::new(),
             pending_frame_callbacks: VecDeque::new(),
+            pending_presentation_feedbacks: VecDeque::new(),
         })
     }
 
@@ -335,6 +357,8 @@ impl DisplayState {
         self.window_manager.delete_client(client_id);
         self.pending_frame_callbacks
             .retain(|(owner, _)| *owner != client_id);
+        self.pending_presentation_feedbacks
+            .retain(|pending| pending.client_id != client_id);
         self.surface_updates.retain(|update| match update {
             SurfaceUpdate::Frame(frame) | SurfaceUpdate::Cursor(frame) => {
                 frame.client_id != client_id
@@ -353,6 +377,65 @@ impl DisplayState {
         self.pending_frame_callbacks.len()
     }
 
+    pub fn pending_presentation_feedback_count(&self) -> usize {
+        self.pending_presentation_feedbacks.len()
+    }
+
+    /// Queues presentation feedback for a committed surface, discarding any prior
+    /// in-flight feedback for the same surface (superseded content).
+    pub(crate) fn queue_presentation_feedbacks(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        feedbacks: Vec<ObjectId>,
+        writer: &mut Writer,
+        registry: &mut Registry,
+    ) {
+        self.discard_in_flight_presentation_feedbacks(client_id, surface_id, writer, registry);
+        for feedback_id in feedbacks {
+            self.pending_presentation_feedbacks
+                .push_back(PendingPresentationFeedback {
+                    client_id,
+                    surface_id,
+                    feedback_id,
+                });
+        }
+    }
+
+    /// Discards in-flight feedback for a surface, plus any still-pending object IDs
+    /// returned from surface destroy (not yet committed).
+    pub(crate) fn discard_presentation_feedbacks_for_surface(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        pending_on_surface: Vec<ObjectId>,
+        writer: &mut Writer,
+        registry: &mut Registry,
+    ) {
+        self.discard_in_flight_presentation_feedbacks(client_id, surface_id, writer, registry);
+        for feedback_id in pending_on_surface {
+            send_presentation_discarded(writer, registry, feedback_id);
+        }
+    }
+
+    fn discard_in_flight_presentation_feedbacks(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        writer: &mut Writer,
+        registry: &mut Registry,
+    ) {
+        let mut remaining = VecDeque::new();
+        while let Some(pending) = self.pending_presentation_feedbacks.pop_front() {
+            if pending.client_id == client_id && pending.surface_id == surface_id {
+                send_presentation_discarded(writer, registry, pending.feedback_id);
+            } else {
+                remaining.push_back(pending);
+            }
+        }
+        self.pending_presentation_feedbacks = remaining;
+    }
+
     /// Completes deferred `wl_surface.frame` callbacks after presentation.
     pub fn complete_frame_callbacks(
         &mut self,
@@ -366,6 +449,42 @@ impl DisplayState {
             let (registry, writer) = client.registry_and_writer_mut();
             writer.wl_callback_done(callback).callback_data(time_msec);
             registry.free_object(callback, writer);
+        }
+    }
+
+    /// Completes pending `wp_presentation_feedback` objects after a DRM page-flip.
+    pub fn complete_presentation_feedbacks(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        flip: PresentationFlipInfo,
+    ) {
+        let flags = WP_PRESENTATION_FEEDBACK_KIND_VSYNC
+            | WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK
+            | WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION;
+        let tv_nsec = flip.tv_usec.saturating_mul(1000);
+        while let Some(pending) = self.pending_presentation_feedbacks.pop_front() {
+            let Some(client) = clients.get_mut(&pending.client_id) else {
+                continue;
+            };
+            let outputs = self
+                .output_manager
+                .bound_outputs_for_client(pending.client_id);
+            let (registry, writer) = client.registry_and_writer_mut();
+            for output in outputs {
+                writer
+                    .wp_presentation_feedback_sync_output(pending.feedback_id)
+                    .output(output);
+            }
+            writer
+                .wp_presentation_feedback_presented(pending.feedback_id)
+                .tv_sec_hi(0)
+                .tv_sec_lo(flip.tv_sec)
+                .tv_nsec(tv_nsec)
+                .refresh(flip.refresh_ns)
+                .seq_hi(0)
+                .seq_lo(flip.sequence)
+                .flags(flags);
+            registry.free_object(pending.feedback_id, writer);
         }
     }
 
@@ -582,6 +701,11 @@ impl DisplayState {
     }
 }
 
+fn send_presentation_discarded(writer: &mut Writer, registry: &mut Registry, feedback_id: ObjectId) {
+    writer.wp_presentation_feedback_discarded(feedback_id);
+    registry.free_object(feedback_id, writer);
+}
+
 pub fn create_wayland_display(socket_path: Option<String>) -> anyhow::Result<Wayland> {
     if let Some(socket_path) = socket_path {
         Wayland::new(socket_path).context("Failed to create Wayland display at given socket path")
@@ -629,6 +753,7 @@ impl Default for Globals {
         // Stable linux-dmabuf keeps the zwp_ interface name; advertise v4 for
         // format/modifier events, create_immed, and feedback format_table.
         globals.register_version(InterfaceIndex::ZwpLinuxDmabufV1, 4, [].into_iter());
+        globals.register_version(InterfaceIndex::WpPresentation, 2, [].into_iter());
         globals
     }
 }

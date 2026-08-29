@@ -123,6 +123,18 @@ fn snake_to_pascal_case(s: &str) -> String {
         .collect()
 }
 
+fn parse_wayland_u32(value: &str) -> u32 {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).unwrap_or(0)
+    } else {
+        value.parse::<u32>().unwrap_or(0)
+    }
+}
+
 /// Generate Wayland protocol structs from an XML file
 #[proc_macro]
 pub fn wayland_protocol(input: TokenStream) -> TokenStream {
@@ -307,7 +319,7 @@ fn generate_interface_code_parts(
                     &format!("{}_{}", enum_prefix, entry.name.to_uppercase()),
                     proc_macro2::Span::call_site(),
                 );
-                let value = entry.value.parse::<u32>().unwrap_or(0);
+                let value = parse_wayland_u32(&entry.value);
 
                 // Generate entry documentation
                 let entry_summary = entry
