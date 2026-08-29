@@ -66,6 +66,11 @@ pub struct CommittedFrame {
     pub offset_y: i32,
     pub x: i32,
     pub y: i32,
+    /// Surface-local size after viewport destination / crop (or buffer/scale).
+    pub surface_width: i32,
+    pub surface_height: i32,
+    /// Viewport source rectangle in post-scale coords, if set.
+    pub viewport_src: Option<(f32, f32, f32, f32)>,
     /// Populated for linux-dmabuf commits; renderer imports this FD on the GPU.
     pub dmabuf: Option<ExportedDmabuf>,
     /// Output-space regions that changed this commit.
@@ -757,6 +762,7 @@ impl Default for Globals {
         // format/modifier events, create_immed, and feedback format_table.
         globals.register_version(InterfaceIndex::ZwpLinuxDmabufV1, 4, [].into_iter());
         globals.register_version(InterfaceIndex::WpPresentation, 2, [].into_iter());
+        globals.register_version(InterfaceIndex::WpViewporter, 1, [].into_iter());
         globals
     }
 }

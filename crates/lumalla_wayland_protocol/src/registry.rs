@@ -9,8 +9,9 @@ use crate::{
     buffer::{MessageHeader, Writer},
     client::Ctx,
     protocols::{
-        LinuxDmabufV1Protocol, PresentationTimeProtocol, WaylandProtocol, WlDisplay,
-        XdgShellProtocol, linux_dmabuf::*, presentation_time::*, wayland::*, xdg_shell::*,
+        LinuxDmabufV1Protocol, PresentationTimeProtocol, ViewporterProtocol, WaylandProtocol,
+        WlDisplay, XdgShellProtocol, linux_dmabuf::*, presentation_time::*, viewporter::*,
+        wayland::*, xdg_shell::*,
     },
 };
 
@@ -49,6 +50,8 @@ pub enum InterfaceIndex {
     ZwpLinuxDmabufFeedbackV1,
     WpPresentation,
     WpPresentationFeedback,
+    WpViewporter,
+    WpViewport,
 }
 
 impl InterfaceIndex {
@@ -87,6 +90,8 @@ impl InterfaceIndex {
             InterfaceIndex::ZwpLinuxDmabufFeedbackV1 => ZWP_LINUX_DMABUF_FEEDBACK_V1_NAME,
             InterfaceIndex::WpPresentation => WP_PRESENTATION_NAME,
             InterfaceIndex::WpPresentationFeedback => WP_PRESENTATION_FEEDBACK_NAME,
+            InterfaceIndex::WpViewporter => WP_VIEWPORTER_NAME,
+            InterfaceIndex::WpViewport => WP_VIEWPORT_NAME,
         }
     }
 
@@ -125,6 +130,8 @@ impl InterfaceIndex {
             InterfaceIndex::ZwpLinuxDmabufFeedbackV1 => ZWP_LINUX_DMABUF_FEEDBACK_V1_VERSION,
             InterfaceIndex::WpPresentation => WP_PRESENTATION_VERSION,
             InterfaceIndex::WpPresentationFeedback => WP_PRESENTATION_FEEDBACK_VERSION,
+            InterfaceIndex::WpViewporter => WP_VIEWPORTER_VERSION,
+            InterfaceIndex::WpViewport => WP_VIEWPORT_VERSION,
         }
     }
 }
@@ -289,7 +296,11 @@ pub trait RequestHandler {
 
 impl<T> RequestHandler for T
 where
-    T: WaylandProtocol + XdgShellProtocol + LinuxDmabufV1Protocol + PresentationTimeProtocol,
+    T: WaylandProtocol
+        + XdgShellProtocol
+        + LinuxDmabufV1Protocol
+        + PresentationTimeProtocol
+        + ViewporterProtocol,
 {
     fn handle_request(
         &mut self,
@@ -405,6 +416,12 @@ where
             InterfaceIndex::WpPresentationFeedback => {
                 write_invalid_method_error(ctx, header.object_id);
                 anyhow::bail!("Invalid method");
+            }
+            InterfaceIndex::WpViewporter => {
+                WpViewporter::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::WpViewport => {
+                WpViewport::handle_request(self, ctx, header, data, fds, object.version)
             }
         }
     }

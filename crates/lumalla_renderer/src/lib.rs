@@ -116,6 +116,11 @@ pub struct SurfaceFrame {
     pub x: i32,
     pub y: i32,
     pub buffer_scale: i32,
+    /// Destination size in surface-local coordinates (after viewport).
+    pub surface_width: i32,
+    pub surface_height: i32,
+    /// Source crop in post-scale surface coordinates, if set.
+    pub viewport_src: Option<(f32, f32, f32, f32)>,
     pub dmabuf: Option<DmabufAttachment>,
     /// Output-space regions updated by this commit.
     pub damage: Vec<DamageRect>,
@@ -1452,6 +1457,9 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            surface_width: 2,
+            surface_height: 2,
+            viewport_src: None,
             dmabuf: None,
             damage: Vec::new(),
             buffer_damage: Vec::new(),
@@ -1523,6 +1531,9 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            surface_width: 2,
+            surface_height: 1,
+            viewport_src: None,
             dmabuf: None,
             damage: Vec::new(),
             buffer_damage: Vec::new(),
@@ -1545,6 +1556,8 @@ mod tests {
             x: 1,
             y: 0,
             buffer_scale: 1,
+            surface_width: 1,
+            surface_height: 1,
             damage: Vec::new(),
             full_surface: true,
             ..frame()

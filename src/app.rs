@@ -970,6 +970,9 @@ impl AppData {
                         x: frame.x,
                         y: frame.y,
                         buffer_scale: frame.buffer_scale,
+                        surface_width: frame.surface_width,
+                        surface_height: frame.surface_height,
+                        viewport_src: frame.viewport_src,
                         dmabuf,
                         damage: frame
                             .damage

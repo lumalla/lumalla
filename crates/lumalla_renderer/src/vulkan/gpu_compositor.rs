@@ -113,6 +113,7 @@ impl PendingGpuSubmit {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LayerPushConstants {
     dest: [f32; 4],
+    src_uv: [f32; 4],
     output_size: [f32; 2],
     force_opaque: f32,
     _padding: f32,
@@ -174,6 +175,7 @@ impl GpuCompositor {
         recorder: &mut CommandBufferRecorder,
         texture: &SurfaceTexture,
         dest: [f32; 4],
+        src_uv: [f32; 4],
         output_width: u32,
         output_height: u32,
         force_opaque: bool,
@@ -183,6 +185,7 @@ impl GpuCompositor {
         recorder.bind_descriptor_sets(self.pipeline.layout(), 0, &[texture.descriptor_set], &[]);
         let push = LayerPushConstants {
             dest,
+            src_uv,
             output_size: [output_width as f32, output_height as f32],
             force_opaque: if force_opaque { 1.0 } else { 0.0 },
             _padding: 0.0,
@@ -685,6 +688,9 @@ impl SurfaceTexture {
 }
 
 fn cursor_surface_view(cursor: &CursorFrame) -> SurfaceFrame {
+    let scale = cursor.buffer_scale.max(1);
+    let surface_width = div_ceil_i32(cursor.width as i32, scale);
+    let surface_height = div_ceil_i32(cursor.height as i32, scale);
     SurfaceFrame {
         owner_id: cursor.owner_id,
         surface_id: cursor.surface_id,
@@ -697,6 +703,9 @@ fn cursor_surface_view(cursor: &CursorFrame) -> SurfaceFrame {
         x: 0,
         y: 0,
         buffer_scale: cursor.buffer_scale,
+        surface_width,
+        surface_height,
+        viewport_src: None,
         dmabuf: None,
         damage: Vec::new(),
         buffer_damage: Vec::new(),
@@ -1062,6 +1071,7 @@ fn draw_scene_layers(
             recorder,
             texture,
             dest,
+            surface_src_uv(frame),
             output_width,
             output_height,
             frame.format == WL_SHM_FORMAT_XRGB8888,
@@ -1100,6 +1110,7 @@ fn draw_cursor_layer(
                     recorder,
                     texture,
                     dest,
+                    [0.0, 0.0, 1.0, 1.0],
                     output_width,
                     output_height,
                     cursor_frame.format == WL_SHM_FORMAT_XRGB8888,
@@ -1119,6 +1130,7 @@ fn draw_cursor_layer(
                     recorder,
                     texture,
                     dest,
+                    [0.0, 0.0, 1.0, 1.0],
                     output_width,
                     output_height,
                     default.format == WL_SHM_FORMAT_XRGB8888,
@@ -1130,13 +1142,28 @@ fn draw_cursor_layer(
 }
 
 fn surface_dest_rect(frame: &SurfaceFrame) -> [f32; 4] {
-    let scale = frame.buffer_scale.max(1) as f32;
     [
         frame.x as f32,
         frame.y as f32,
-        frame.width as f32 / scale,
-        frame.height as f32 / scale,
+        frame.surface_width.max(0) as f32,
+        frame.surface_height.max(0) as f32,
     ]
+}
+
+fn surface_src_uv(frame: &SurfaceFrame) -> [f32; 4] {
+    let scale = frame.buffer_scale.max(1) as f32;
+    let bw = frame.width.max(1) as f32;
+    let bh = frame.height.max(1) as f32;
+    match frame.viewport_src {
+        Some((sx, sy, sw, sh)) => {
+            let u0 = (sx * scale) / bw;
+            let v0 = (sy * scale) / bh;
+            let u1 = ((sx + sw) * scale) / bw;
+            let v1 = ((sy + sh) * scale) / bh;
+            [u0, v0, u1, v1]
+        }
+        None => [0.0, 0.0, 1.0, 1.0],
+    }
 }
 
 fn cursor_dest_rect(cursor: &CursorFrame, pointer_x: i32, pointer_y: i32) -> [f32; 4] {
@@ -1435,22 +1462,32 @@ fn rects_intersect(a: DamageRect, b: DamageRect) -> bool {
 
 fn output_damage_to_buffer_rect(frame: &SurfaceFrame, damage: DamageRect) -> Option<UploadRect> {
     let scale = frame.buffer_scale.max(1);
-    let dest_w = div_ceil_i32(frame.width as i32, scale);
-    let dest_h = div_ceil_i32(frame.height as i32, scale);
     let dest = DamageRect {
         x: frame.x,
         y: frame.y,
-        width: dest_w,
-        height: dest_h,
+        width: frame.surface_width.max(0),
+        height: frame.surface_height.max(0),
     };
     let intersect = intersect_damage(damage, dest)?;
     let local_x = intersect.x.saturating_sub(frame.x);
     let local_y = intersect.y.saturating_sub(frame.y);
+    // Map surface-local damage into the viewport source region in buffer pixels.
+    let (src_x, src_y, src_w, src_h) = match frame.viewport_src {
+        Some((sx, sy, sw, sh)) => (
+            (sx * scale as f32) as i32,
+            (sy * scale as f32) as i32,
+            (sw * scale as f32).ceil() as i32,
+            (sh * scale as f32).ceil() as i32,
+        ),
+        None => (0, 0, frame.width as i32, frame.height as i32),
+    };
+    let dest_w = frame.surface_width.max(1);
+    let dest_h = frame.surface_height.max(1);
     Some(UploadRect {
-        x: (local_x * scale) as u32,
-        y: (local_y * scale) as u32,
-        width: (intersect.width * scale) as u32,
-        height: (intersect.height * scale) as u32,
+        x: (src_x + local_x.saturating_mul(src_w) / dest_w).max(0) as u32,
+        y: (src_y + local_y.saturating_mul(src_h) / dest_h).max(0) as u32,
+        width: (intersect.width.saturating_mul(src_w) / dest_w).max(1) as u32,
+        height: (intersect.height.saturating_mul(src_h) / dest_h).max(1) as u32,
     })
 }
 

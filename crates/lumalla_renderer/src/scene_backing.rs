@@ -328,12 +328,24 @@ fn composite_frame_in_rect(
     let row_bytes = output_width
         .checked_mul(4)
         .context("Output row size overflows")?;
-    let scale = frame.buffer_scale.max(1) as usize;
-    let dest_w = frame.width / scale;
-    let dest_h = frame.height / scale;
+    let dest_w = frame.surface_width.max(0) as usize;
+    let dest_h = frame.surface_height.max(0) as usize;
     if dest_w == 0 || dest_h == 0 {
         return Ok(());
     }
+
+    let scale = frame.buffer_scale.max(1) as f32;
+    let (src_x0, src_y0, src_x1, src_y1) = match frame.viewport_src {
+        Some((sx, sy, sw, sh)) => (
+            (sx * scale) as f64,
+            (sy * scale) as f64,
+            ((sx + sw) * scale) as f64,
+            ((sy + sh) * scale) as f64,
+        ),
+        None => (0.0, 0.0, frame.width as f64, frame.height as f64),
+    };
+    let src_w = (src_x1 - src_x0).max(1.0);
+    let src_h = (src_y1 - src_y0).max(1.0);
 
     for dy in 0..dest_h {
         let out_y = frame.y + dy as i32;
@@ -344,7 +356,8 @@ fn composite_frame_in_rect(
         if oy < clip_y0 || oy >= clip_y1 {
             continue;
         }
-        let source_y = ((dy as u128 * frame.height as u128) / dest_h as u128) as usize;
+        let source_y = (src_y0 + (dy as f64 + 0.5) * src_h / dest_h as f64).floor() as usize;
+        let source_y = source_y.min(frame.height.saturating_sub(1));
         for dx in 0..dest_w {
             let out_x = frame.x + dx as i32;
             if out_x < 0 || out_x as usize >= output_width {
@@ -354,7 +367,8 @@ fn composite_frame_in_rect(
             if ox < clip_x0 || ox >= clip_x1 {
                 continue;
             }
-            let source_x = ((dx as u128 * frame.width as u128) / dest_w as u128) as usize;
+            let source_x = (src_x0 + (dx as f64 + 0.5) * src_w / dest_w as f64).floor() as usize;
+            let source_x = source_x.min(frame.width.saturating_sub(1));
             let source = source_y * frame.stride + source_x * 4;
             let destination = oy * row_bytes + ox * 4;
             pixels[destination..destination + 4].copy_from_slice(&frame.pixels[source..source + 4]);
@@ -463,24 +477,38 @@ pub fn composite_surface_full(
 
     for frame in frames {
         frame.validate()?;
-        let scale = frame.buffer_scale.max(1) as usize;
-        let dest_w = frame.width / scale;
-        let dest_h = frame.height / scale;
+        let dest_w = frame.surface_width.max(0) as usize;
+        let dest_h = frame.surface_height.max(0) as usize;
         if dest_w == 0 || dest_h == 0 {
             continue;
         }
+        let scale = frame.buffer_scale.max(1) as f32;
+        let (src_x0, src_y0, src_x1, src_y1) = match frame.viewport_src {
+            Some((sx, sy, sw, sh)) => (
+                (sx * scale) as f64,
+                (sy * scale) as f64,
+                ((sx + sw) * scale) as f64,
+                ((sy + sh) * scale) as f64,
+            ),
+            None => (0.0, 0.0, frame.width as f64, frame.height as f64),
+        };
+        let src_w = (src_x1 - src_x0).max(1.0);
+        let src_h = (src_y1 - src_y0).max(1.0);
         for dy in 0..dest_h {
             let out_y = frame.y + dy as i32;
             if out_y < 0 || out_y as usize >= height {
                 continue;
             }
-            let source_y = ((dy as u128 * frame.height as u128) / dest_h as u128) as usize;
+            let source_y = (src_y0 + (dy as f64 + 0.5) * src_h / dest_h as f64).floor() as usize;
+            let source_y = source_y.min(frame.height.saturating_sub(1));
             for dx in 0..dest_w {
                 let out_x = frame.x + dx as i32;
                 if out_x < 0 || out_x as usize >= width {
                     continue;
                 }
-                let source_x = ((dx as u128 * frame.width as u128) / dest_w as u128) as usize;
+                let source_x =
+                    (src_x0 + (dx as f64 + 0.5) * src_w / dest_w as f64).floor() as usize;
+                let source_x = source_x.min(frame.width.saturating_sub(1));
                 let source = source_y * frame.stride + source_x * 4;
                 let destination = out_y as usize * row_bytes + out_x as usize * 4;
                 pixels[destination..destination + 4]
@@ -690,6 +718,9 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            surface_width: 2,
+            surface_height: 2,
+            viewport_src: None,
             dmabuf: None,
             damage: Vec::new(),
             buffer_damage: Vec::new(),
@@ -709,6 +740,8 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            surface_width: 2,
+            surface_height: 1,
             damage: vec![DamageRect {
                 x: 0,
                 y: 0,

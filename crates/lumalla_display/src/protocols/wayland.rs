@@ -9,7 +9,9 @@ use crate::{
     CommittedFrame, DisplayState, GlobalId, SurfaceUpdate,
     data_device::DataDeviceError,
     shm::{ShmError, ShmErrorKind},
-    surface::{Rectangle, ShellMode, SurfaceCommit, SurfaceError},
+    surface::{
+        Rectangle, ShellMode, SurfaceCommit, SurfaceError, effective_surface_size,
+    },
 };
 
 impl WaylandProtocol for DisplayState {}
@@ -77,6 +79,9 @@ fn report_surface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError)
             WL_SURFACE_ERROR_INVALID_OFFSET,
             "Attach offset must be zero since version 5",
         ),
+        SurfaceError::ViewportExists
+        | SurfaceError::NoSurface
+        | SurfaceError::ViewportBadValue => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Viewport error"),
     };
     ctx.writer
         .wl_display_error(DISPLAY_OBJECT_ID)
@@ -171,6 +176,8 @@ fn commit_damage(
     output_y: i32,
     buffer_width: usize,
     buffer_height: usize,
+    surface_width: i32,
+    surface_height: i32,
 ) -> (Vec<Rectangle>, Vec<Rectangle>, bool) {
     let full_surface =
         commit.newly_mapped || (commit.damage.is_empty() && commit.buffer_damage.is_empty());
@@ -187,11 +194,38 @@ fn commit_damage(
                 continue;
             }
             buffer_damage.push(*rect);
+            // Buffer damage → output: approximate via surface size mapping when viewport scales.
+            let out_w = if buffer_width == 0 {
+                0
+            } else {
+                div_ceil_i32(
+                    rect.width.saturating_mul(surface_width),
+                    buffer_width as i32,
+                )
+            };
+            let out_h = if buffer_height == 0 {
+                0
+            } else {
+                div_ceil_i32(
+                    rect.height.saturating_mul(surface_height),
+                    buffer_height as i32,
+                )
+            };
+            let out_x_off = if buffer_width == 0 {
+                0
+            } else {
+                rect.x.saturating_mul(surface_width) / buffer_width as i32
+            };
+            let out_y_off = if buffer_height == 0 {
+                0
+            } else {
+                rect.y.saturating_mul(surface_height) / buffer_height as i32
+            };
             output_damage.push(Rectangle {
-                x: output_x + rect.x / scale,
-                y: output_y + rect.y / scale,
-                width: div_ceil_i32(rect.width, scale),
-                height: div_ceil_i32(rect.height, scale),
+                x: output_x + out_x_off,
+                y: output_y + out_y_off,
+                width: out_w,
+                height: out_h,
             });
         }
     } else {
@@ -205,183 +239,346 @@ fn commit_damage(
                 width: rect.width,
                 height: rect.height,
             });
-            buffer_damage.push(Rectangle {
-                x: rect.x.saturating_mul(scale),
-                y: rect.y.saturating_mul(scale),
-                width: rect.width.saturating_mul(scale),
-                height: rect.height.saturating_mul(scale),
-            });
+            // Surface-local damage → buffer space via viewport source or scale.
+            if let Some((sx, sy, sw, sh)) = commit.viewport.source {
+                let src_x = (sx * scale as f32) as i32;
+                let src_y = (sy * scale as f32) as i32;
+                let src_w = (sw * scale as f32).ceil() as i32;
+                let src_h = (sh * scale as f32).ceil() as i32;
+                let bw = if surface_width <= 0 {
+                    0
+                } else {
+                    rect.width.saturating_mul(src_w) / surface_width
+                };
+                let bh = if surface_height <= 0 {
+                    0
+                } else {
+                    rect.height.saturating_mul(src_h) / surface_height
+                };
+                buffer_damage.push(Rectangle {
+                    x: src_x + if surface_width <= 0 {
+                        0
+                    } else {
+                        rect.x.saturating_mul(src_w) / surface_width
+                    },
+                    y: src_y + if surface_height <= 0 {
+                        0
+                    } else {
+                        rect.y.saturating_mul(src_h) / surface_height
+                    },
+                    width: bw.max(1),
+                    height: bh.max(1),
+                });
+            } else {
+                buffer_damage.push(Rectangle {
+                    x: rect.x.saturating_mul(scale),
+                    y: rect.y.saturating_mul(scale),
+                    width: rect.width.saturating_mul(scale),
+                    height: rect.height.saturating_mul(scale),
+                });
+            }
         }
     }
 
     if output_damage.is_empty() {
-        let width = div_ceil_i32(buffer_width as i32, scale);
-        let height = div_ceil_i32(buffer_height as i32, scale);
         output_damage.push(Rectangle {
             x: output_x,
             y: output_y,
-            width,
-            height,
+            width: surface_width,
+            height: surface_height,
         });
-        buffer_damage.push(Rectangle {
-            x: 0,
-            y: 0,
-            width: buffer_width as i32,
-            height: buffer_height as i32,
-        });
+        if let Some((sx, sy, sw, sh)) = commit.viewport.source {
+            buffer_damage.push(Rectangle {
+                x: (sx * scale as f32) as i32,
+                y: (sy * scale as f32) as i32,
+                width: (sw * scale as f32).ceil() as i32,
+                height: (sh * scale as f32).ceil() as i32,
+            });
+        } else {
+            buffer_damage.push(Rectangle {
+                x: 0,
+                y: 0,
+                width: buffer_width as i32,
+                height: buffer_height as i32,
+            });
+        }
     }
 
     (output_damage, buffer_damage, false)
 }
 
 fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: SurfaceCommit) {
-    if let Some(Some(buffer_id)) = commit.attached_buffer {
-        let is_cursor = state
-            .surface_manager
-            .surface_role_is_cursor(ctx.client_id, commit.surface_id);
-        if is_cursor || commit.mapped {
-            let (pixels, width, height, stride, format, dmabuf) =
-                if state.dmabuf_manager.has_buffer(ctx.client_id, buffer_id) {
-                    match state.dmabuf_manager.export_buffer(ctx.client_id, buffer_id) {
-                        Ok(exported) => {
-                            let width = exported.width as usize;
-                            let height = exported.height as usize;
-                            let stride = exported.stride as usize;
-                            let format = exported.wl_format;
-                            (Vec::new(), width, height, stride, format, Some(exported))
+    match commit.attached_buffer {
+        Some(Some(buffer_id)) => {
+            let is_cursor = state
+                .surface_manager
+                .surface_role_is_cursor(ctx.client_id, commit.surface_id);
+            if is_cursor || commit.mapped {
+                let (pixels, width, height, stride, format, dmabuf) =
+                    if state.dmabuf_manager.has_buffer(ctx.client_id, buffer_id) {
+                        match state.dmabuf_manager.export_buffer(ctx.client_id, buffer_id) {
+                            Ok(exported) => {
+                                let width = exported.width as usize;
+                                let height = exported.height as usize;
+                                let stride = exported.stride as usize;
+                                let format = exported.wl_format;
+                                (Vec::new(), width, height, stride, format, Some(exported))
+                            }
+                            Err(error) => {
+                                debug!("dmabuf export failed: {error}");
+                                let message = error.to_string();
+                                ctx.writer
+                                    .wl_display_error(DISPLAY_OBJECT_ID)
+                                    .object_id(buffer_id)
+                                    .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
+                                    .message(&message);
+                                return;
+                            }
                         }
-                        Err(error) => {
-                            debug!("dmabuf export failed: {error}");
-                            let message = error.to_string();
-                            ctx.writer
-                                .wl_display_error(DISPLAY_OBJECT_ID)
-                                .object_id(buffer_id)
-                                .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
-                                .message(&message);
-                            return;
+                    } else {
+                        match state.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
+                            Ok(snapshot) => (
+                                snapshot.pixels,
+                                snapshot.width,
+                                snapshot.height,
+                                snapshot.stride,
+                                snapshot.format,
+                                None,
+                            ),
+                            Err(error) => {
+                                report_shm_error(ctx, buffer_id, &error);
+                                return;
+                            }
                         }
-                    }
-                } else {
-                    match state.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
-                        Ok(snapshot) => (
-                            snapshot.pixels,
-                            snapshot.width,
-                            snapshot.height,
-                            snapshot.stride,
-                            snapshot.format,
-                            None,
-                        ),
-                        Err(error) => {
-                            report_shm_error(ctx, buffer_id, &error);
-                            return;
-                        }
-                    }
-                };
-            let _ = state.surface_manager.set_committed_buffer_size(
-                ctx.client_id,
-                commit.surface_id,
-                width as i32,
-                height as i32,
-            );
-            let output_x = commit.layout.0 + commit.offset.0;
-            let output_y = commit.layout.1 + commit.offset.1;
-            let (damage, buffer_damage, full_surface) =
-                commit_damage(&commit, output_x, output_y, width, height);
-            if is_cursor {
-                state
-                    .surface_updates
-                    .push_back(SurfaceUpdate::Cursor(CommittedFrame {
-                        client_id: ctx.client_id,
-                        surface_id: commit.surface_id,
-                        buffer_id,
-                        pixels,
-                        width,
-                        height,
-                        stride,
-                        format,
-                        buffer_scale: commit.buffer_scale,
-                        buffer_transform: commit.buffer_transform,
-                        offset_x: commit.offset.0,
-                        offset_y: commit.offset.1,
-                        x: 0,
-                        y: 0,
-                        dmabuf,
-                        damage,
-                        buffer_damage: Vec::new(),
-                        full_surface: true,
-                    }));
-            } else {
-                state
-                    .surface_updates
-                    .push_back(SurfaceUpdate::Frame(CommittedFrame {
-                        client_id: ctx.client_id,
-                        surface_id: commit.surface_id,
-                        buffer_id,
-                        pixels,
-                        width,
-                        height,
-                        stride,
-                        format,
-                        buffer_scale: commit.buffer_scale,
-                        buffer_transform: commit.buffer_transform,
-                        offset_x: commit.offset.0,
-                        offset_y: commit.offset.1,
-                        x: output_x,
-                        y: output_y,
-                        dmabuf,
-                        damage,
-                        buffer_damage,
-                        full_surface,
-                    }));
-            }
-            if commit.newly_mapped {
-                if let Some(shell_id) = commit.shell_id {
-                    let serial = state.seat_manager.next_serial();
-                    if state
-                        .surface_manager
-                        .set_pending_shell_ping(ctx.client_id, shell_id, serial)
-                        .is_ok()
-                    {
-                        ctx.writer.wl_shell_surface_ping(shell_id).serial(serial);
-                    }
-                }
-                state.seat_manager.focus_keyboards_on_surface(
+                    };
+                if let Err((viewport_id, error)) = state.surface_manager.validate_viewport_commit(
                     ctx.client_id,
                     commit.surface_id,
-                    ctx.writer,
+                    Some(width as i32),
+                    Some(height as i32),
+                ) {
+                    super::viewporter::report_viewport_commit_error(ctx, viewport_id, error);
+                    return;
+                }
+                let _ = state.surface_manager.set_committed_buffer_size(
+                    ctx.client_id,
+                    commit.surface_id,
+                    width as i32,
+                    height as i32,
                 );
-                state.on_surface_focused(ctx.client_id, commit.surface_id);
-                for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
-                    ctx.writer
-                        .wl_surface_enter(commit.surface_id)
-                        .output(output);
+                let (surface_width, surface_height) = effective_surface_size(
+                    Some((width as i32, height as i32)),
+                    commit.buffer_scale,
+                    &commit.viewport,
+                )
+                .unwrap_or((0, 0));
+                let output_x = commit.layout.0 + commit.offset.0;
+                let output_y = commit.layout.1 + commit.offset.1;
+                let (damage, buffer_damage, full_surface) = commit_damage(
+                    &commit,
+                    output_x,
+                    output_y,
+                    width,
+                    height,
+                    surface_width,
+                    surface_height,
+                );
+                let frame = CommittedFrame {
+                    client_id: ctx.client_id,
+                    surface_id: commit.surface_id,
+                    buffer_id,
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    format,
+                    buffer_scale: commit.buffer_scale,
+                    buffer_transform: commit.buffer_transform,
+                    offset_x: commit.offset.0,
+                    offset_y: commit.offset.1,
+                    x: if is_cursor { 0 } else { output_x },
+                    y: if is_cursor { 0 } else { output_y },
+                    surface_width,
+                    surface_height,
+                    viewport_src: commit.viewport.source,
+                    dmabuf,
+                    damage,
+                    buffer_damage: if is_cursor {
+                        Vec::new()
+                    } else {
+                        buffer_damage
+                    },
+                    full_surface: is_cursor || full_surface,
+                };
+                if is_cursor {
+                    state
+                        .surface_updates
+                        .push_back(SurfaceUpdate::Cursor(frame));
+                } else {
+                    state
+                        .surface_updates
+                        .push_back(SurfaceUpdate::Frame(frame));
+                }
+                if commit.newly_mapped {
+                    if let Some(shell_id) = commit.shell_id {
+                        let serial = state.seat_manager.next_serial();
+                        if state
+                            .surface_manager
+                            .set_pending_shell_ping(ctx.client_id, shell_id, serial)
+                            .is_ok()
+                        {
+                            ctx.writer.wl_shell_surface_ping(shell_id).serial(serial);
+                        }
+                    }
+                    state.seat_manager.focus_keyboards_on_surface(
+                        ctx.client_id,
+                        commit.surface_id,
+                        ctx.writer,
+                    );
+                    state.on_surface_focused(ctx.client_id, commit.surface_id);
+                    for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
+                        ctx.writer
+                            .wl_surface_enter(commit.surface_id)
+                            .output(output);
+                    }
+                }
+            }
+            ctx.writer.wl_buffer_release(buffer_id);
+        }
+        Some(None) => {
+            if let Err((viewport_id, error)) = state.surface_manager.validate_viewport_commit(
+                ctx.client_id,
+                commit.surface_id,
+                None,
+                None,
+            ) {
+                super::viewporter::report_viewport_commit_error(ctx, viewport_id, error);
+                return;
+            }
+            let _ = state
+                .surface_manager
+                .clear_committed_buffer_size(ctx.client_id, commit.surface_id);
+            state.seat_manager.leave_keyboards_on_surface(
+                ctx.client_id,
+                commit.surface_id,
+                ctx.writer,
+            );
+            state.seat_manager.leave_pointers_on_surface(
+                ctx.client_id,
+                commit.surface_id,
+                ctx.writer,
+            );
+            state.surface_updates.push_back(SurfaceUpdate::Unmapped {
+                client_id: ctx.client_id,
+                surface_id: commit.surface_id,
+            });
+            for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
+                ctx.writer
+                    .wl_surface_leave(commit.surface_id)
+                    .output(output);
+            }
+            state.discard_presentation_feedbacks_for_surface(
+                ctx.client_id,
+                commit.surface_id,
+                Vec::new(),
+                ctx.writer,
+                ctx.registry,
+            );
+        }
+        None => {
+            let buffer_dims = state
+                .surface_manager
+                .committed_buffer_size(ctx.client_id, commit.surface_id);
+            if let Err((viewport_id, error)) = state.surface_manager.validate_viewport_commit(
+                ctx.client_id,
+                commit.surface_id,
+                buffer_dims.map(|(w, _)| w),
+                buffer_dims.map(|(_, h)| h),
+            ) {
+                super::viewporter::report_viewport_commit_error(ctx, viewport_id, error);
+                return;
+            }
+            if commit.viewport_changed
+                && commit.mapped
+                && let Some(buffer_id) = commit.buffer
+            {
+                let is_cursor = state
+                    .surface_manager
+                    .surface_role_is_cursor(ctx.client_id, commit.surface_id);
+                let (pixels, width, height, stride, format, dmabuf) =
+                    if state.dmabuf_manager.has_buffer(ctx.client_id, buffer_id) {
+                        match state.dmabuf_manager.export_buffer(ctx.client_id, buffer_id) {
+                            Ok(exported) => (
+                                Vec::new(),
+                                exported.width as usize,
+                                exported.height as usize,
+                                exported.stride as usize,
+                                exported.wl_format,
+                                Some(exported),
+                            ),
+                            Err(error) => {
+                                debug!("dmabuf export failed on viewport update: {error}");
+                                return;
+                            }
+                        }
+                    } else {
+                        match state.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
+                            Ok(snapshot) => (
+                                snapshot.pixels,
+                                snapshot.width,
+                                snapshot.height,
+                                snapshot.stride,
+                                snapshot.format,
+                                None,
+                            ),
+                            Err(error) => {
+                                debug!("shm snapshot failed on viewport update: {error}");
+                                return;
+                            }
+                        }
+                    };
+                let (surface_width, surface_height) = effective_surface_size(
+                    Some((width as i32, height as i32)),
+                    commit.buffer_scale,
+                    &commit.viewport,
+                )
+                .unwrap_or((0, 0));
+                let output_x = commit.layout.0 + commit.offset.0;
+                let output_y = commit.layout.1 + commit.offset.1;
+                let frame = CommittedFrame {
+                    client_id: ctx.client_id,
+                    surface_id: commit.surface_id,
+                    buffer_id,
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    format,
+                    buffer_scale: commit.buffer_scale,
+                    buffer_transform: commit.buffer_transform,
+                    offset_x: commit.offset.0,
+                    offset_y: commit.offset.1,
+                    x: if is_cursor { 0 } else { output_x },
+                    y: if is_cursor { 0 } else { output_y },
+                    surface_width,
+                    surface_height,
+                    viewport_src: commit.viewport.source,
+                    dmabuf,
+                    damage: Vec::new(),
+                    buffer_damage: Vec::new(),
+                    full_surface: true,
+                };
+                if is_cursor {
+                    state
+                        .surface_updates
+                        .push_back(SurfaceUpdate::Cursor(frame));
+                } else {
+                    state
+                        .surface_updates
+                        .push_back(SurfaceUpdate::Frame(frame));
                 }
             }
         }
-        ctx.writer.wl_buffer_release(buffer_id);
-    } else if commit.attached_buffer == Some(None) {
-        state
-            .seat_manager
-            .leave_keyboards_on_surface(ctx.client_id, commit.surface_id, ctx.writer);
-        state
-            .seat_manager
-            .leave_pointers_on_surface(ctx.client_id, commit.surface_id, ctx.writer);
-        state.surface_updates.push_back(SurfaceUpdate::Unmapped {
-            client_id: ctx.client_id,
-            surface_id: commit.surface_id,
-        });
-        for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
-            ctx.writer
-                .wl_surface_leave(commit.surface_id)
-                .output(output);
-        }
-        state.discard_presentation_feedbacks_for_surface(
-            ctx.client_id,
-            commit.surface_id,
-            Vec::new(),
-            ctx.writer,
-            ctx.registry,
-        );
     }
 
     for callback in commit.frame_callbacks {
@@ -1914,6 +2111,33 @@ mod tests {
             Some(InterfaceIndex::WpPresentation)
         );
         assert!(ctx.writer.has_pending_output());
+    }
+
+    #[test]
+    fn registry_bind_wp_viewporter_registers_object() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let mut registry = Registry::new();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
+        };
+        let global_name = state
+            .globals
+            .iter()
+            .find(|(_, global)| global.interface_index == InterfaceIndex::WpViewporter)
+            .map(|(id, _)| *id)
+            .expect("wp_viewporter global");
+        let data = bind_data(global_name, "wp_viewporter", 1, 20);
+        let mut fds = VecDeque::new();
+        let params = WlRegistryBind::new(&data, &mut fds);
+        WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
+        assert_eq!(
+            ctx.registry.interface_index(object_id(20)),
+            Some(InterfaceIndex::WpViewporter)
+        );
     }
 
     #[test]

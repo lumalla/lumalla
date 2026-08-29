@@ -17,6 +17,24 @@ pub enum SurfaceError {
     InvalidScale,
     InvalidTransform,
     InvalidOffset,
+    ViewportExists,
+    NoSurface,
+    ViewportBadValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewportCommitError {
+    BadSize,
+    OutOfBuffer,
+}
+
+/// Crop and scale state from wp_viewport (committed).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ViewportState {
+    /// Source rectangle in post-scale surface coordinates, or unset.
+    pub source: Option<(f32, f32, f32, f32)>,
+    /// Destination surface size, or unset.
+    pub destination: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +69,11 @@ pub struct SurfaceCommit {
     pub damage: Vec<Rectangle>,
     #[allow(dead_code)]
     pub buffer_damage: Vec<Rectangle>,
+    pub viewport: ViewportState,
+    #[allow(dead_code)]
+    pub viewport_id: Option<ObjectId>,
+    /// True when viewport source/destination pending was applied this commit.
+    pub viewport_changed: bool,
 }
 
 #[derive(Debug)]
@@ -76,9 +99,17 @@ pub struct SurfaceManager {
     shell_surfaces: HashMap<ResourceKey, ObjectId>,
     subsurfaces: HashMap<ResourceKey, SubsurfaceState>,
     regions: HashMap<ResourceKey, Region>,
+    /// wp_viewport object → surface binding (surface may be destroyed).
+    viewports: HashMap<ResourceKey, ViewportBinding>,
     next_cascade: i32,
     /// Mapped surfaces in paint order (back to front).
     paint_order: Vec<(ClientId, ObjectId)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ViewportBinding {
+    surface_id: ObjectId,
+    surface_alive: bool,
 }
 
 impl SurfaceManager {
@@ -132,6 +163,12 @@ impl SurfaceManager {
         if let Some(cache) = surface.cache {
             callbacks.extend(cache.frame_callbacks);
             presentation_feedbacks.extend(cache.presentation_feedbacks);
+        }
+
+        if let Some(viewport_id) = surface.viewport_id
+            && let Some(binding) = self.viewports.get_mut(&(client_id, viewport_id))
+        {
+            binding.surface_alive = false;
         }
 
         self.remove_painted_surface(client_id, id);
@@ -231,8 +268,11 @@ impl SurfaceManager {
                 continue;
             };
             let scale = surface.current.buffer_scale.max(1);
-            let width = (bw / scale).max(0);
-            let height = (bh / scale).max(0);
+            let Some((width, height)) =
+                effective_surface_size(Some((bw, bh)), scale, &surface.current.viewport)
+            else {
+                continue;
+            };
             let Some((origin_x, origin_y)) = self.surface_origin(client_id, surface_id) else {
                 continue;
             };
@@ -335,6 +375,29 @@ impl SurfaceManager {
             .ok_or(SurfaceError::UnknownSurface)?;
         surface.buffer_size = Some((width, height));
         Ok(())
+    }
+
+    pub fn clear_committed_buffer_size(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        surface.buffer_size = None;
+        Ok(())
+    }
+
+    pub fn committed_buffer_size(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Option<(i32, i32)> {
+        self.surfaces
+            .get(&(client_id, surface_id))
+            .and_then(|surface| surface.buffer_size)
     }
 
     pub fn set_surface_layout(
@@ -487,6 +550,157 @@ impl SurfaceManager {
             .pending
             .buffer_scale = Some(scale);
         Ok(())
+    }
+
+    pub fn create_viewport(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        viewport_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        if surface.viewport_id.is_some() {
+            return Err(SurfaceError::ViewportExists);
+        }
+        surface.viewport_id = Some(viewport_id);
+        self.viewports.insert(
+            (client_id, viewport_id),
+            ViewportBinding {
+                surface_id,
+                surface_alive: true,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn destroy_viewport(
+        &mut self,
+        client_id: ClientId,
+        viewport_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let Some(binding) = self.viewports.remove(&(client_id, viewport_id)) else {
+            return Ok(());
+        };
+        if binding.surface_alive
+            && let Some(surface) = self.surfaces.get_mut(&(client_id, binding.surface_id))
+        {
+            if surface.viewport_id == Some(viewport_id) {
+                surface.viewport_id = None;
+            }
+            // Crop/scale state is removed on the next commit.
+            surface.pending.viewport_source = Some(None);
+            surface.pending.viewport_destination = Some(None);
+        }
+        Ok(())
+    }
+
+    pub fn viewport_surface(
+        &self,
+        client_id: ClientId,
+        viewport_id: ObjectId,
+    ) -> Result<ObjectId, SurfaceError> {
+        let binding = self
+            .viewports
+            .get(&(client_id, viewport_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        if !binding.surface_alive {
+            return Err(SurfaceError::NoSurface);
+        }
+        Ok(binding.surface_id)
+    }
+
+    pub fn set_viewport_source(
+        &mut self,
+        client_id: ClientId,
+        viewport_id: ObjectId,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Result<(), SurfaceError> {
+        let surface_id = self.viewport_surface(client_id, viewport_id)?;
+        let unset = x == -1.0 && y == -1.0 && width == -1.0 && height == -1.0;
+        if !unset && (x < 0.0 || y < 0.0 || width <= 0.0 || height <= 0.0) {
+            return Err(SurfaceError::ViewportBadValue);
+        }
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::NoSurface)?;
+        surface.pending.viewport_source = Some(if unset {
+            None
+        } else {
+            Some((x, y, width, height))
+        });
+        Ok(())
+    }
+
+    pub fn set_viewport_destination(
+        &mut self,
+        client_id: ClientId,
+        viewport_id: ObjectId,
+        width: i32,
+        height: i32,
+    ) -> Result<(), SurfaceError> {
+        let surface_id = self.viewport_surface(client_id, viewport_id)?;
+        let unset = width == -1 && height == -1;
+        if !unset && (width <= 0 || height <= 0) {
+            return Err(SurfaceError::ViewportBadValue);
+        }
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::NoSurface)?;
+        surface.pending.viewport_destination = Some(if unset {
+            None
+        } else {
+            Some((width, height))
+        });
+        Ok(())
+    }
+
+    /// Validates committed viewport state against buffer content size.
+    pub fn validate_viewport_commit(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        buffer_width: Option<i32>,
+        buffer_height: Option<i32>,
+    ) -> Result<(), (ObjectId, ViewportCommitError)> {
+        let Some(surface) = self.surfaces.get(&(client_id, surface_id)) else {
+            return Ok(());
+        };
+        let Some(viewport_id) = surface.viewport_id else {
+            return Ok(());
+        };
+        let viewport = &surface.current.viewport;
+        let scale = surface.current.buffer_scale.max(1);
+        if let Some((sx, sy, sw, sh)) = viewport.source {
+            if viewport.destination.is_none() && (!is_whole_number(sw) || !is_whole_number(sh)) {
+                return Err((viewport_id, ViewportCommitError::BadSize));
+            }
+            if let (Some(bw), Some(bh)) = (buffer_width, buffer_height) {
+                let (cw, ch) = content_size(bw, bh, scale);
+                if sx < 0.0 || sy < 0.0 || sx + sw > cw as f32 || sy + sh > ch as f32 {
+                    return Err((viewport_id, ViewportCommitError::OutOfBuffer));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn committed_viewport(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> ViewportState {
+        self.surfaces
+            .get(&(client_id, surface_id))
+            .map(|s| s.current.viewport)
+            .unwrap_or_default()
     }
 
     pub fn damage_buffer(
@@ -914,6 +1128,7 @@ impl SurfaceManager {
             .retain(|(owner, _), _| *owner != client_id);
         self.subsurfaces.retain(|(owner, _), _| *owner != client_id);
         self.regions.retain(|(owner, _), _| *owner != client_id);
+        self.viewports.retain(|(owner, _), _| *owner != client_id);
         self.paint_order.retain(|(owner, _)| *owner != client_id);
     }
 
@@ -961,6 +1176,9 @@ impl SurfaceManager {
             layout: surface.layout,
             damage: surface.current.damage.clone(),
             buffer_damage: surface.current.buffer_damage.clone(),
+            viewport: surface.current.viewport,
+            viewport_id: surface.viewport_id,
+            viewport_changed: false,
         })
     }
 
@@ -984,6 +1202,8 @@ impl SurfaceManager {
             surface.pending = cache;
         }
 
+        let viewport_changed = surface.pending.viewport_source.is_some()
+            || surface.pending.viewport_destination.is_some();
         let attached_buffer = surface.pending.buffer.take();
         if let Some(buffer) = attached_buffer {
             surface.current.buffer = buffer;
@@ -1005,6 +1225,12 @@ impl SurfaceManager {
         if let Some(transform) = surface.pending.buffer_transform.take() {
             surface.current.buffer_transform = transform;
         }
+        if let Some(source) = surface.pending.viewport_source.take() {
+            surface.current.viewport.source = source;
+        }
+        if let Some(destination) = surface.pending.viewport_destination.take() {
+            surface.current.viewport.destination = destination;
+        }
         let frame_callbacks = std::mem::take(&mut surface.pending.frame_callbacks);
         let presentation_feedbacks = std::mem::take(&mut surface.pending.presentation_feedbacks);
         let shell_id = match surface.role {
@@ -1014,6 +1240,8 @@ impl SurfaceManager {
         let buffer = surface.current.buffer;
         let buffer_scale = surface.current.buffer_scale;
         let buffer_transform = surface.current.buffer_transform;
+        let viewport = surface.current.viewport;
+        let viewport_id = surface.viewport_id;
         let damage = surface.current.damage.clone();
         let buffer_damage = surface.current.buffer_damage.clone();
         let surface_offset = surface.current.offset;
@@ -1069,6 +1297,9 @@ impl SurfaceManager {
             layout,
             damage,
             buffer_damage,
+            viewport,
+            viewport_id,
+            viewport_changed,
         })
     }
 
@@ -1324,12 +1555,45 @@ fn merge_pending(cache: &mut PendingState, mut pending: PendingState) {
     if let Some(transform) = pending.buffer_transform.take() {
         cache.buffer_transform = Some(transform);
     }
+    if let Some(source) = pending.viewport_source.take() {
+        cache.viewport_source = Some(source);
+    }
+    if let Some(destination) = pending.viewport_destination.take() {
+        cache.viewport_destination = Some(destination);
+    }
     cache.damage.append(&mut pending.damage);
     cache.buffer_damage.append(&mut pending.buffer_damage);
     cache.frame_callbacks.append(&mut pending.frame_callbacks);
     cache
         .presentation_feedbacks
         .append(&mut pending.presentation_feedbacks);
+}
+
+/// Buffer size after buffer_scale (identity transform).
+pub fn content_size(buffer_width: i32, buffer_height: i32, buffer_scale: i32) -> (i32, i32) {
+    let scale = buffer_scale.max(1);
+    (buffer_width / scale, buffer_height / scale)
+}
+
+/// Effective surface size from buffer + viewport destination/source.
+pub fn effective_surface_size(
+    buffer_size: Option<(i32, i32)>,
+    buffer_scale: i32,
+    viewport: &ViewportState,
+) -> Option<(i32, i32)> {
+    let (bw, bh) = buffer_size?;
+    if let Some((dw, dh)) = viewport.destination {
+        return Some((dw.max(1), dh.max(1)));
+    }
+    if let Some((_, _, sw, sh)) = viewport.source {
+        return Some((sw as i32, sh as i32));
+    }
+    let (cw, ch) = content_size(bw, bh, buffer_scale);
+    Some((cw.max(0), ch.max(0)))
+}
+
+fn is_whole_number(value: f32) -> bool {
+    value == value.trunc()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1351,6 +1615,8 @@ struct Surface {
     buffer_size: Option<(i32, i32)>,
     /// For Role::Xdg: true after an ack_configure has been applied (ready to map with buffer).
     xdg_map_ready: bool,
+    /// Associated wp_viewport object, if any.
+    viewport_id: Option<ObjectId>,
     current: SurfaceState,
     pending: PendingState,
     cache: Option<PendingState>,
@@ -1391,6 +1657,7 @@ struct SurfaceState {
     buffer_transform: u32,
     opaque_region: Option<Region>,
     input_region: Option<Region>,
+    viewport: ViewportState,
 }
 
 impl Default for SurfaceState {
@@ -1404,6 +1671,7 @@ impl Default for SurfaceState {
             buffer_transform: 0, // WL_OUTPUT_TRANSFORM_NORMAL
             opaque_region: None,
             input_region: None,
+            viewport: ViewportState::default(),
         }
     }
 }
@@ -1420,6 +1688,8 @@ struct PendingState {
     presentation_feedbacks: Vec<ObjectId>,
     opaque_region: Option<Option<Region>>,
     input_region: Option<Option<Region>>,
+    viewport_source: Option<Option<(f32, f32, f32, f32)>>,
+    viewport_destination: Option<Option<(i32, i32)>>,
 }
 
 #[derive(Debug)]
@@ -2042,6 +2312,122 @@ mod tests {
         assert_eq!(
             surface.current.opaque_region.as_ref().unwrap().operations,
             [RegionOperation::Add(first)]
+        );
+    }
+
+    #[test]
+    fn viewport_destination_sets_surface_size() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_viewport(client(1), object(2), object(3))
+            .unwrap();
+        manager
+            .set_viewport_destination(client(1), object(3), 40, 30)
+            .unwrap();
+        manager.commit(client(1), object(2)).unwrap();
+        manager
+            .set_committed_buffer_size(client(1), object(2), 200, 100)
+            .unwrap();
+        let viewport = manager.committed_viewport(client(1), object(2));
+        assert_eq!(viewport.destination, Some((40, 30)));
+        assert_eq!(
+            effective_surface_size(Some((200, 100)), 1, &viewport),
+            Some((40, 30))
+        );
+    }
+
+    #[test]
+    fn viewport_source_only_requires_integer_size() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_viewport(client(1), object(2), object(3))
+            .unwrap();
+        manager
+            .set_viewport_source(client(1), object(3), 0.0, 0.0, 10.5, 10.0)
+            .unwrap();
+        manager.commit(client(1), object(2)).unwrap();
+        manager
+            .set_committed_buffer_size(client(1), object(2), 100, 100)
+            .unwrap();
+        assert_eq!(
+            manager.validate_viewport_commit(client(1), object(2), Some(100), Some(100)),
+            Err((object(3), ViewportCommitError::BadSize))
+        );
+    }
+
+    #[test]
+    fn viewport_out_of_buffer_is_detected() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_viewport(client(1), object(2), object(3))
+            .unwrap();
+        manager
+            .set_viewport_source(client(1), object(3), 0.0, 0.0, 80.0, 80.0)
+            .unwrap();
+        manager
+            .set_viewport_destination(client(1), object(3), 40, 40)
+            .unwrap();
+        manager.commit(client(1), object(2)).unwrap();
+        // Content size with scale 2 is 50x50; source 80x80 is out of buffer.
+        manager
+            .set_buffer_scale(client(1), object(2), 2)
+            .unwrap();
+        manager.commit(client(1), object(2)).unwrap();
+        assert_eq!(
+            manager.validate_viewport_commit(client(1), object(2), Some(100), Some(100)),
+            Err((object(3), ViewportCommitError::OutOfBuffer))
+        );
+    }
+
+    #[test]
+    fn viewport_exists_rejects_second_viewport() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_viewport(client(1), object(2), object(3))
+            .unwrap();
+        assert_eq!(
+            manager
+                .create_viewport(client(1), object(2), object(4))
+                .unwrap_err(),
+            SurfaceError::ViewportExists
+        );
+    }
+
+    #[test]
+    fn destroy_viewport_clears_state_on_commit() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_viewport(client(1), object(2), object(3))
+            .unwrap();
+        manager
+            .set_viewport_destination(client(1), object(3), 40, 30)
+            .unwrap();
+        manager.commit(client(1), object(2)).unwrap();
+        manager.destroy_viewport(client(1), object(3)).unwrap();
+        manager.commit(client(1), object(2)).unwrap();
+        let viewport = manager.committed_viewport(client(1), object(2));
+        assert_eq!(viewport.destination, None);
+        assert_eq!(viewport.source, None);
+    }
+
+    #[test]
+    fn surface_destroy_makes_viewport_no_surface() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_viewport(client(1), object(2), object(3))
+            .unwrap();
+        manager.destroy_surface(client(1), object(2)).unwrap();
+        assert_eq!(
+            manager
+                .set_viewport_destination(client(1), object(3), 10, 10)
+                .unwrap_err(),
+            SurfaceError::NoSurface
         );
     }
 }
