@@ -107,10 +107,18 @@ struct ToplevelState {
 #[derive(Debug)]
 struct PopupState {
     xdg_surface: ObjectId,
-    #[allow(dead_code)]
     parent: ObjectId,
-    #[allow(dead_code)]
     positioner: ObjectId,
+    geometry: PopupGeometry,
+}
+
+/// Result of resolving an xdg_positioner into a popup configure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PopupGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 impl XdgManager {
@@ -500,10 +508,12 @@ impl XdgManager {
         xdg_surface_id: ObjectId,
         parent: ObjectId,
         positioner: ObjectId,
-    ) -> Result<u32, XdgError> {
-        if !self.positioners.contains_key(&(client_id, positioner)) {
-            return Err(XdgError::UnknownPositioner);
-        }
+    ) -> Result<(u32, PopupGeometry), XdgError> {
+        let geometry = self
+            .positioners
+            .get(&(client_id, positioner))
+            .ok_or(XdgError::UnknownPositioner)?
+            .compute_geometry();
         let surface = self
             .xdg_surfaces
             .get_mut(&(client_id, xdg_surface_id))
@@ -518,11 +528,46 @@ impl XdgManager {
                 xdg_surface: xdg_surface_id,
                 parent,
                 positioner,
+                geometry,
             },
         );
-        // Consume positioner copy semantics: leave positioner object alive but ok.
-        let _ = parent;
-        self.send_configure_serial(client_id, xdg_surface_id)
+        let serial = self.send_configure_serial(client_id, xdg_surface_id)?;
+        Ok((serial, geometry))
+    }
+
+    /// wl_surface backing an xdg_surface, if known.
+    pub fn xdg_surface_wl(&self, client_id: ClientId, xdg_surface: ObjectId) -> Option<ObjectId> {
+        self.xdg_surfaces
+            .get(&(client_id, xdg_surface))
+            .map(|s| s.wl_surface)
+    }
+
+    /// Apply a new positioner to an existing popup and allocate a configure serial.
+    pub fn reposition_popup(
+        &mut self,
+        client_id: ClientId,
+        popup_id: ObjectId,
+        positioner: ObjectId,
+    ) -> Result<(u32, PopupGeometry, ObjectId), XdgError> {
+        let geometry = self
+            .positioners
+            .get(&(client_id, positioner))
+            .ok_or(XdgError::UnknownPositioner)?
+            .compute_geometry();
+        let popup = self
+            .popups
+            .get_mut(&(client_id, popup_id))
+            .ok_or(XdgError::UnknownPopup)?;
+        popup.positioner = positioner;
+        popup.geometry = geometry;
+        let xdg_surface = popup.xdg_surface;
+        let serial = self.send_configure_serial(client_id, xdg_surface)?;
+        Ok((serial, geometry, xdg_surface))
+    }
+
+    /// Parent xdg_surface for a popup, if known.
+    pub fn popup_parent_xdg(&self, client_id: ClientId, popup_id: ObjectId) -> Option<ObjectId> {
+        self.popups.get(&(client_id, popup_id)).map(|p| p.parent)
     }
 
     pub fn destroy_popup(
@@ -687,5 +732,140 @@ impl PositionerState {
 
     pub fn set_parent_configure(&mut self, serial: u32) {
         self.parent_configure = Some(serial);
+    }
+
+    /// Resolve positioner rules into popup configure geometry (parent-relative).
+    ///
+    /// Constraint adjustment is accepted but not yet applied; unadjusted placement
+    /// is enough for clients that size popups correctly via set_size.
+    ///
+    /// Width/height are advertised as 0 so the client chooses its own surface size.
+    /// Forcing the positioner size (or the old 800×600 default) made Xwayland/Steam
+    /// menu buffers either stretched or solid white; 0×0 matches the protocol's
+    /// "client decides" path and lets the attached buffer define the extent.
+    pub fn compute_geometry(&self) -> PopupGeometry {
+        let (anchor_x, anchor_y) = anchor_point(
+            self.anchor,
+            self.anchor_x,
+            self.anchor_y,
+            self.anchor_width,
+            self.anchor_height,
+        );
+        // Gravity offset uses the positioner size for placement only.
+        let place_w = self.width.max(0);
+        let place_h = self.height.max(0);
+        let (gravity_x, gravity_y) = gravity_offset(self.gravity, place_w, place_h);
+        let _ = self.constraint_adjustment;
+        let _ = self.reactive;
+        let _ = self.parent_size;
+        let _ = self.parent_configure;
+        PopupGeometry {
+            x: anchor_x + gravity_x + self.offset_x,
+            y: anchor_y + gravity_y + self.offset_y,
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
+/// xdg_positioner.anchor values from the protocol.
+const ANCHOR_NONE: u32 = 0;
+const ANCHOR_TOP: u32 = 1;
+const ANCHOR_BOTTOM: u32 = 2;
+const ANCHOR_LEFT: u32 = 3;
+const ANCHOR_RIGHT: u32 = 4;
+const ANCHOR_TOP_LEFT: u32 = 5;
+const ANCHOR_BOTTOM_LEFT: u32 = 6;
+const ANCHOR_TOP_RIGHT: u32 = 7;
+const ANCHOR_BOTTOM_RIGHT: u32 = 8;
+
+fn anchor_point(anchor: u32, x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
+    let mid_x = x + width / 2;
+    let mid_y = y + height / 2;
+    let right = x + width;
+    let bottom = y + height;
+    match anchor {
+        ANCHOR_TOP => (mid_x, y),
+        ANCHOR_BOTTOM => (mid_x, bottom),
+        ANCHOR_LEFT => (x, mid_y),
+        ANCHOR_RIGHT => (right, mid_y),
+        ANCHOR_TOP_LEFT => (x, y),
+        ANCHOR_BOTTOM_LEFT => (x, bottom),
+        ANCHOR_TOP_RIGHT => (right, y),
+        ANCHOR_BOTTOM_RIGHT => (right, bottom),
+        ANCHOR_NONE | _ => (mid_x, mid_y),
+    }
+}
+
+fn gravity_offset(gravity: u32, width: i32, height: i32) -> (i32, i32) {
+    // Offset from the anchor point to the popup's top-left corner.
+    match gravity {
+        ANCHOR_TOP => (-width / 2, -height),
+        ANCHOR_BOTTOM => (-width / 2, 0),
+        ANCHOR_LEFT => (-width, -height / 2),
+        ANCHOR_RIGHT => (0, -height / 2),
+        ANCHOR_TOP_LEFT => (-width, -height),
+        ANCHOR_BOTTOM_LEFT => (-width, 0),
+        ANCHOR_TOP_RIGHT => (0, -height),
+        ANCHOR_BOTTOM_RIGHT => (0, 0),
+        ANCHOR_NONE | _ => (-width / 2, -height / 2),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positioner_bottom_gravity_places_popup_below_anchor() {
+        let mut positioner = PositionerState::default();
+        positioner.set_size(200, 100);
+        positioner.set_anchor_rect(10, 20, 40, 16);
+        positioner.set_anchor(ANCHOR_BOTTOM);
+        positioner.set_gravity(ANCHOR_BOTTOM);
+        positioner.set_offset(0, 0);
+
+        let geo = positioner.compute_geometry();
+        // Anchor at bottom-center of rect: (10+20, 20+16) = (30, 36)
+        // Bottom gravity: top-left at (30 - 100, 36) = (-70, 36)
+        // Size is 0×0 so the client chooses buffer extent.
+        assert_eq!(
+            geo,
+            PopupGeometry {
+                x: -70,
+                y: 36,
+                width: 0,
+                height: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn positioner_configure_size_is_client_chosen() {
+        let mut positioner = PositionerState::default();
+        positioner.set_size(205, 399);
+        positioner.set_anchor_rect(0, 0, 10, 10);
+        let geo = positioner.compute_geometry();
+        assert_eq!(geo.width, 0);
+        assert_eq!(geo.height, 0);
+    }
+
+    #[test]
+    fn positioner_uses_offset() {
+        let mut positioner = PositionerState::default();
+        positioner.set_size(10, 10);
+        positioner.set_anchor_rect(0, 0, 0, 0);
+        positioner.set_anchor(ANCHOR_TOP_LEFT);
+        positioner.set_gravity(ANCHOR_BOTTOM_RIGHT);
+        positioner.set_offset(5, 7);
+        assert_eq!(
+            positioner.compute_geometry(),
+            PopupGeometry {
+                x: 5,
+                y: 7,
+                width: 0,
+                height: 0,
+            }
+        );
     }
 }

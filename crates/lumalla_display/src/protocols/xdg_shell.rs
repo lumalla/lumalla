@@ -414,13 +414,28 @@ impl XdgSurface for DisplayState {
             parent,
             params.positioner(),
         ) {
-            Ok(serial) => {
+            Ok((serial, geometry)) => {
+                if let (Some(popup_wl), Some(parent_wl)) = (
+                    self.xdg_manager.xdg_surface_wl(ctx.client_id, object_id),
+                    self.xdg_manager.xdg_surface_wl(ctx.client_id, parent),
+                ) {
+                    let (parent_x, parent_y) = self
+                        .surface_manager
+                        .surface_layout(ctx.client_id, parent_wl)
+                        .unwrap_or((0, 0));
+                    let _ = self.surface_manager.set_surface_layout(
+                        ctx.client_id,
+                        popup_wl,
+                        parent_x + geometry.x,
+                        parent_y + geometry.y,
+                    );
+                }
                 ctx.writer
                     .xdg_popup_configure(*params.id())
-                    .x(0)
-                    .y(0)
-                    .width(DEFAULT_TOPLEVEL_WIDTH)
-                    .height(DEFAULT_TOPLEVEL_HEIGHT);
+                    .x(geometry.x)
+                    .y(geometry.y)
+                    .width(geometry.width)
+                    .height(geometry.height);
                 ctx.writer.xdg_surface_configure(object_id).serial(serial);
             }
             Err(error) => report_xdg_error(ctx, object_id, error),
@@ -637,12 +652,49 @@ impl XdgPopup for DisplayState {
 
     fn grab(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &XdgPopupGrab<'_>) {}
 
-    fn reposition(
-        &mut self,
-        _ctx: &mut Ctx,
-        _object_id: ObjectId,
-        _params: &XdgPopupReposition<'_>,
-    ) {
+    fn reposition(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &XdgPopupReposition<'_>) {
+        if ctx.registry.interface_index(params.positioner()) != Some(InterfaceIndex::XdgPositioner)
+        {
+            report_xdg_error(ctx, object_id, XdgError::UnknownPositioner);
+            return;
+        }
+        match self
+            .xdg_manager
+            .reposition_popup(ctx.client_id, object_id, params.positioner())
+        {
+            Ok((serial, geometry, xdg_surface)) => {
+                if let (Some(popup_wl), Some(parent_xdg)) = (
+                    self.xdg_manager.xdg_surface_wl(ctx.client_id, xdg_surface),
+                    self.xdg_manager.popup_parent_xdg(ctx.client_id, object_id),
+                ) {
+                    if let Some(parent_wl) =
+                        self.xdg_manager.xdg_surface_wl(ctx.client_id, parent_xdg)
+                    {
+                        let (parent_x, parent_y) = self
+                            .surface_manager
+                            .surface_layout(ctx.client_id, parent_wl)
+                            .unwrap_or((0, 0));
+                        let _ = self.surface_manager.set_surface_layout(
+                            ctx.client_id,
+                            popup_wl,
+                            parent_x + geometry.x,
+                            parent_y + geometry.y,
+                        );
+                    }
+                }
+                ctx.writer
+                    .xdg_popup_repositioned(object_id)
+                    .token(params.token());
+                ctx.writer
+                    .xdg_popup_configure(object_id)
+                    .x(geometry.x)
+                    .y(geometry.y)
+                    .width(geometry.width)
+                    .height(geometry.height);
+                ctx.writer.xdg_surface_configure(xdg_surface).serial(serial);
+            }
+            Err(error) => report_xdg_error(ctx, object_id, error),
+        }
     }
 }
 
