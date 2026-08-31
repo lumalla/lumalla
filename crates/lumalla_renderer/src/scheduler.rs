@@ -81,13 +81,40 @@ impl RenderScheduler {
         self.next_present_at = Some(Instant::now());
     }
 
-    /// Timeout for the main event loop so a scheduled present fires without input.
-    pub fn poll_timeout(&self, now: Instant) -> Option<Duration> {
-        if self.force_immediate {
-            return Some(Duration::ZERO);
+    fn clear_wake_state(&mut self) {
+        self.force_immediate = false;
+        self.next_present_at = None;
+    }
+
+    /// Absolute time when the main loop should next consider presenting.
+    ///
+    /// Returns `None` when idle (nothing to present): wake state is cleared so
+    /// the event loop does not arm a timer. Returns `Some(now)` when work is
+    /// due immediately — the caller must skip blocking wait rather than arm a
+    /// zero io_uring timeout. While a page flip is in flight, returns `None`
+    /// so the loop sleeps on DRM poll instead of spinning.
+    pub fn next_wake_at(
+        &mut self,
+        now: Instant,
+        scene_dirty: bool,
+        pending_frame_callbacks: bool,
+        flip_idle: bool,
+    ) -> Option<Instant> {
+        if !scene_dirty && !pending_frame_callbacks {
+            self.clear_wake_state();
+            return None;
         }
-        self.next_present_at
-            .map(|at| at.saturating_duration_since(now))
+        if !flip_idle {
+            return None;
+        }
+        if self.force_immediate {
+            return Some(now);
+        }
+        match self.next_present_at {
+            Some(at) if at > now => Some(at),
+            Some(_) => Some(now),
+            None => Some(now),
+        }
     }
 
     /// Whether the compositor should run a present pass now.
@@ -153,7 +180,7 @@ impl RenderScheduler {
                 self.next_present_at = Some(now);
             }
         } else {
-            self.next_present_at = None;
+            self.clear_wake_state();
         }
     }
 
@@ -233,9 +260,38 @@ mod tests {
     }
 
     #[test]
-    fn poll_timeout_returns_zero_when_immediate() {
+    fn next_wake_at_due_now_when_immediate_with_work() {
+        let now = Instant::now();
         let mut scheduler = RenderScheduler::default();
         scheduler.request_immediate();
-        assert_eq!(scheduler.poll_timeout(Instant::now()), Some(Duration::ZERO));
+        let wake = scheduler.next_wake_at(now, true, false, true);
+        assert_eq!(wake, Some(now));
+    }
+
+    #[test]
+    fn next_wake_at_none_when_idle_even_after_immediate() {
+        let now = Instant::now();
+        let mut scheduler = RenderScheduler::default();
+        scheduler.request_immediate();
+        assert_eq!(scheduler.next_wake_at(now, false, false, true), None);
+        assert!(!scheduler.force_immediate);
+        assert!(scheduler.next_present_at.is_none());
+    }
+
+    #[test]
+    fn next_wake_at_none_while_flip_in_flight() {
+        let now = Instant::now();
+        let mut scheduler = RenderScheduler::default();
+        scheduler.mark_dirty(now);
+        assert_eq!(scheduler.next_wake_at(now, true, false, false), None);
+    }
+
+    #[test]
+    fn next_wake_at_future_deadline() {
+        let now = Instant::now();
+        let mut scheduler = RenderScheduler::default();
+        scheduler.next_present_at = Some(now + Duration::from_millis(10));
+        let wake = scheduler.next_wake_at(now, true, false, true);
+        assert_eq!(wake, Some(now + Duration::from_millis(10)));
     }
 }

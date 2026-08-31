@@ -102,33 +102,61 @@ impl AppData {
         main_channel: Receiver<MainMessage>,
     ) -> anyhow::Result<()> {
         let mut completions = Vec::with_capacity(64);
+        // Last Instant we armed on the uring timeout; re-arm only when it changes
+        // so a stable present deadline does not churn TimeoutRemove every lap.
+        let mut armed_wake_at: Option<Instant> = None;
         loop {
             let now = Instant::now();
-            let (shutdown_now, event_loop_timeout) = self.check_for_shutdown();
+            let (shutdown_now, shutdown_wake_at) = self.check_for_shutdown();
             if shutdown_now {
                 break;
             }
-            let render_timeout = self.render_scheduler.poll_timeout(now);
-            let poll_timeout = match (event_loop_timeout, render_timeout) {
+
+            let scene_dirty = self.renderer_state.scene_dirty();
+            let pending_callbacks = self.pending_present_work();
+            let flip_idle = self.renderer_state.flip_idle();
+            let render_wake_at =
+                self.render_scheduler
+                    .next_wake_at(now, scene_dirty, pending_callbacks, flip_idle);
+            let wake_at = match (shutdown_wake_at, render_wake_at) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (Some(a), None) => Some(a),
                 (None, Some(b)) => Some(b),
                 (None, None) => None,
             };
-            match poll_timeout {
-                Some(duration) => {
-                    let (sec, nsec) = monotonic_deadline_after(duration)?;
-                    event_loop.set_absolute_timeout_timespec(sec, nsec)?;
-                }
-                None => {
-                    event_loop.clear_timeout()?;
-                }
-            }
 
             self.ensure_pending_io(event_loop)?;
 
-            if let Err(err) = event_loop.wait(&mut completions) {
-                warn!("Unable to wait on event loop: {err}");
+            if wake_at.is_some_and(|at| at <= now) {
+                // Work is due now: never arm a zero/past uring timeout.
+                if armed_wake_at.take().is_some() {
+                    event_loop.clear_timeout()?;
+                }
+                if let Err(err) = event_loop.submit_and_drain(&mut completions) {
+                    warn!("Unable to drain event loop: {err}");
+                }
+            } else {
+                match wake_at {
+                    Some(at) => {
+                        if armed_wake_at != Some(at) {
+                            let remaining = at.saturating_duration_since(now);
+                            // Only future deadlines reach this branch.
+                            debug_assert!(!remaining.is_zero());
+                            let (sec, nsec) = monotonic_deadline_after(remaining)?;
+                            event_loop.set_absolute_timeout_timespec(sec, nsec)?;
+                            armed_wake_at = Some(at);
+                        }
+                    }
+                    None => {
+                        if armed_wake_at.take().is_some() {
+                            event_loop.clear_timeout()?;
+                        }
+                    }
+                }
+
+                if let Err(err) = event_loop.wait(&mut completions) {
+                    warn!("Unable to wait on event loop: {err}");
+                }
             }
 
             for completion in completions.drain(..) {
@@ -1089,8 +1117,7 @@ impl AppData {
     fn tick_render_scheduler(&mut self) {
         let now = Instant::now();
         let scene_dirty = self.renderer_state.scene_dirty();
-        let pending_callbacks = self.display_state.pending_frame_callback_count() > 0
-            || self.display_state.pending_presentation_feedback_count() > 0;
+        let pending_callbacks = self.pending_present_work();
         let flip_idle = self.renderer_state.flip_idle();
 
         if !self
@@ -1143,8 +1170,7 @@ impl AppData {
                     self.render_scheduler.after_flip(
                         now,
                         self.renderer_state.scene_dirty(),
-                        self.display_state.pending_frame_callback_count() > 0
-                            || self.display_state.pending_presentation_feedback_count() > 0,
+                        self.pending_present_work(),
                     );
                 }
                 self.maybe_complete_frame_callbacks(outcome.status);
@@ -1218,7 +1244,7 @@ impl AppData {
         self.shutdown_timeout = Some(Instant::now() + Duration::from_millis(1000));
     }
 
-    fn check_for_shutdown(&mut self) -> (bool, Option<Duration>) {
+    fn check_for_shutdown(&mut self) -> (bool, Option<Instant>) {
         let startup_finished =
             self.startup_child
                 .as_mut()
@@ -1239,28 +1265,32 @@ impl AppData {
         if !self.shutting_down {
             return (false, None);
         }
-        let event_loop_timeout = if let Some(timeout) = self.shutdown_timeout {
+        let shutdown_wake_at = if let Some(timeout) = self.shutdown_timeout {
             let now = Instant::now();
             if now >= timeout {
                 info!("Shutdown timeout reached. Shutting down now");
                 return (true, None);
             }
-
-            Some(timeout - now)
+            Some(timeout)
         } else {
             None
         };
         if !self.dbus_join_handle.is_finished() {
-            return (false, event_loop_timeout);
+            return (false, shutdown_wake_at);
         }
         if let Some(child) = self.config_child.as_mut() {
             match child.try_wait() {
                 Ok(Some(_)) => {}
-                Ok(None) => return (false, event_loop_timeout),
+                Ok(None) => return (false, shutdown_wake_at),
                 Err(_) => {}
             }
         }
-        (true, event_loop_timeout)
+        (true, shutdown_wake_at)
+    }
+
+    fn pending_present_work(&self) -> bool {
+        self.display_state.pending_frame_callback_count() > 0
+            || self.display_state.pending_presentation_feedback_count() > 0
     }
 }
 

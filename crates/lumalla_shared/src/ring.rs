@@ -349,6 +349,21 @@ impl EventLoop {
         self.ring.submit_and_wait(want)
     }
 
+    /// Submit pending SQEs and drain ready CQEs without blocking.
+    ///
+    /// Filters the same cancel/timeout-cancel noise as [`Self::wait`].
+    pub fn submit_and_drain(&mut self, out: &mut Vec<Completion>) -> io::Result<()> {
+        out.clear();
+        self.ring.submit()?;
+        self.drain_completions(out);
+        out.retain(|completion| match completion.kind {
+            OpKind::Cancel => false,
+            OpKind::Timeout if completion.result == -libc::ECANCELED => false,
+            _ => true,
+        });
+        Ok(())
+    }
+
     /// Drain all currently available completions.
     ///
     /// Multishot requests (e.g. `POLL_ADD` with `multi`) only decrement
