@@ -7,7 +7,7 @@ set -eu
 # Usage:
 #   ./mem-profiling.sh [scenario]
 #
-# Scenarios are Lua configs under profiling/scenarios/. The default is "idle".
+# Scenarios are Lua configs under profiling/scenarios/. The default is "manual".
 # Set LUMALLA_PROFILE_SCENARIO to override without a positional argument.
 
 if [ ! -f Cargo.toml ] || [ ! -f init.lua ]; then
@@ -15,7 +15,7 @@ if [ ! -f Cargo.toml ] || [ ! -f init.lua ]; then
   exit 1
 fi
 
-scenario="${LUMALLA_PROFILE_SCENARIO:-idle}"
+scenario="${LUMALLA_PROFILE_SCENARIO:-manual}"
 if [ "$#" -gt 0 ]; then
   scenario="$1"
   shift
