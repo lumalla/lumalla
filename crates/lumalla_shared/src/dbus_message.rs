@@ -19,6 +19,13 @@ pub enum DbusMessage {
     EmitBindingActivated(String),
     /// Set `WAYLAND_DISPLAY` used for processes spawned over D-Bus.
     SetWaylandDisplay(String),
+    /// Spawn a process over D-Bus.
+    Spawn {
+        /// Program to spawn.
+        command: String,
+        /// Arguments to pass to the program.
+        args: Vec<String>,
+    },
     /// Replace the window list returned by `GetWindows`.
     SetWindows(Vec<WindowState>),
     /// Region capture finished; encode/write PNG on the D-Bus thread.

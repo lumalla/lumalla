@@ -13,14 +13,14 @@ use lumalla_ipc::{
     DrmDeviceInfo, KeyBindingInfo, LayoutOutputInfo, LayoutSpacesInfo, ModsInfo, OutputConfigInfo,
     OutputInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo,
 };
-use lumalla_shared::{CallbackRef, GlobalArgs, Mods, Output, geometry_field_to_dbus};
+use lumalla_shared::{CallbackRef, Mods, Output, geometry_field_to_dbus};
 use mlua::{
     Error as LuaError, FromLua, Function as LuaFunction, IntoLua, Lua, Result as LuaResult,
     Table as LuaTable, Value as LuaValue,
 };
 use zbus::blocking::Connection;
 
-use crate::callback::CallbackState;
+use crate::{args::Args, callback::CallbackState};
 
 const LUA_MODULE_NAME: &str = "lumalla";
 
@@ -945,8 +945,8 @@ impl FromLua for ConfigWindowRule {
     }
 }
 
-pub(crate) fn load_config_files(lua: &Lua, args: &GlobalArgs) -> anyhow::Result<()> {
-    if let Some(config_path) = &args.config {
+pub(crate) fn load_config_files(lua: &Lua, args: &Args) -> anyhow::Result<()> {
+    if let Some(config_path) = &args.config_path {
         exec_config_file(lua, config_path.as_ref())?;
     } else {
         let xdg_dirs = xdg::BaseDirectories::with_prefix("lumalla").unwrap();
@@ -959,9 +959,9 @@ pub(crate) fn load_config_files(lua: &Lua, args: &GlobalArgs) -> anyhow::Result<
 
 pub(crate) fn watch_config_files(
     watcher: &mut crate::config_watcher::ConfigWatcher,
-    args: &GlobalArgs,
+    args: &Args,
 ) -> anyhow::Result<()> {
-    if let Some(config_path) = &args.config {
+    if let Some(config_path) = &args.config_path {
         watcher.watch(config_path.as_ref())?;
     } else {
         let xdg_dirs = xdg::BaseDirectories::with_prefix("lumalla").unwrap();

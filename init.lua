@@ -91,12 +91,12 @@ end)
 lum.on_startup(function()
 	enable_all_outputs(lum.get_drm_devices())
 	lum.spawn({ command = "wezterm", args = { "start", "--always-new-process" } })
-	lum.spawn({ command = "xwayland-satellite", args = { ":12" } })
-	lum.sleep(2.0)
-	lum.spawn({
-		command = "env",
-		args = { "DISPLAY=:12", "steam" },
-	})
+	-- lum.spawn({ command = "xwayland-satellite", args = { ":12" } })
+	-- lum.sleep(2.0)
+	-- lum.spawn({
+	-- 	command = "env",
+	-- 	args = { "DISPLAY=:12", "steam" },
+	-- })
 	-- lum.type("wezterm start --always-new-process")
 	-- lum.key("Return")
 	-- lum.sleep(2.0)

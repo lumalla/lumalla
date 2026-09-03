@@ -1840,7 +1840,6 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use lumalla_shared::{DbusMessage, MainMessage, message_loop_with_channel};
     use lumalla_wayland_protocol::{
         ClientId,
         buffer::Writer,
@@ -1868,9 +1867,7 @@ mod tests {
     }
 
     fn display_state() -> DisplayState {
-        let (_main_poll, _main_rx, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
-        let (_dbus_poll, _dbus_rx, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
-        DisplayState::new(lumalla_shared::Comms::new(to_main, to_dbus)).unwrap()
+        DisplayState::default()
     }
 
     fn memory_file(bytes: &[u8]) -> i32 {
@@ -2364,9 +2361,7 @@ mod tests {
             std::process::id(),
             NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut wayland =
-            lumalla_wayland_protocol::Wayland::new(socket_path.to_string_lossy().into_owned())
-                .unwrap();
+        let mut wayland = lumalla_wayland_protocol::Wayland::new(socket_path.clone()).unwrap();
         let client_stream = UnixStream::connect(&socket_path).unwrap();
         let mut client = wayland.next_client().unwrap();
         let mut state = display_state();
@@ -2422,9 +2417,7 @@ mod tests {
             std::process::id(),
             NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut wayland =
-            lumalla_wayland_protocol::Wayland::new(socket_path.to_string_lossy().into_owned())
-                .unwrap();
+        let mut wayland = lumalla_wayland_protocol::Wayland::new(socket_path.clone()).unwrap();
         let mut client_stream = UnixStream::connect(&socket_path).unwrap();
         let mut client = wayland.next_client().unwrap();
         let mut state = display_state();
@@ -2508,9 +2501,7 @@ mod tests {
             std::process::id(),
             NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut wayland =
-            lumalla_wayland_protocol::Wayland::new(socket_path.to_string_lossy().into_owned())
-                .unwrap();
+        let mut wayland = lumalla_wayland_protocol::Wayland::new(socket_path.clone()).unwrap();
         let mut client_stream = UnixStream::connect(&socket_path).unwrap();
         let mut client = wayland.next_client().unwrap();
         let mut state = display_state();

@@ -42,8 +42,8 @@ echo "Recording memory profile for scenario '${scenario}' to ${heap_output}"
 status=0
 heaptrack -o "$heap_output" \
   ./target/profiling/lumalla \
+  -- ./target/profiling/lumalla-config \
   --config "$config" \
-  --config-command ./target/profiling/lumalla-config \
   "$@" || status=$?
 
 # heaptrack may write the exact -o path or add a compression suffix.

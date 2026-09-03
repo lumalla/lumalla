@@ -12,4 +12,4 @@ fi
 export RUST_BACKTRACE=1
 
 cargo build -p lumalla_config
-exec cargo run -- --config ./init.lua --config-command ./target/debug/lumalla-config "$@"
+exec cargo run -- -- ./target/debug/lumalla-config --config ./init.lua

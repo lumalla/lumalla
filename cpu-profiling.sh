@@ -46,8 +46,8 @@ echo "Recording CPU profile for scenario '${scenario}' to ${perf_data}"
 status=0
 perf record --no-inherit --mmap-pages=32 -F 99 -g --call-graph fp -o "$perf_data" -- \
   ./target/profiling/lumalla \
+  -- ./target/profiling/lumalla-config \
   --config "$config" \
-  --config-command ./target/profiling/lumalla-config \
   "$@" || status=$?
 
 echo "Opening Hotspot for ${perf_data}"

@@ -7,10 +7,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumalla/lumalla"
 include = ["src/**/*", "LICENSE-*"]
 
-[[bin]]
-name = "lumalla-config"
-path = "src/bin/lumalla_config.rs"
-
 [dependencies]
 lumalla_ipc = { path = "../lumalla_ipc" }
 lumalla_shared = { path = "../lumalla_shared" }

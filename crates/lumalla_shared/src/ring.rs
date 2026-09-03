@@ -11,7 +11,7 @@ use io_uring::{
     IoUring, cqueue, opcode,
     types::{CancelBuilder, Fd, TimeoutFlags, Timespec},
 };
-use libc::{EFD_CLOEXEC, EFD_NONBLOCK, POLLIN, POLLOUT, eventfd};
+use libc::{EFD_CLOEXEC, EFD_NONBLOCK, P_PID, POLLIN, POLLOUT, WEXITED, eventfd};
 
 /// Cross-thread / accept / library poll token for the message channel waker.
 pub const MESSAGE_CHANNEL_TOKEN: u64 = 0;
@@ -27,6 +27,7 @@ pub enum OpKind {
     Recv = 4,
     Send = 5,
     Poll = 6,
+    Waitid = 7,
 }
 
 impl OpKind {
@@ -39,6 +40,7 @@ impl OpKind {
             4 => Some(Self::Recv),
             5 => Some(Self::Send),
             6 => Some(Self::Poll),
+            7 => Some(Self::Waitid),
             _ => None,
         }
     }
@@ -253,6 +255,17 @@ impl EventLoop {
             .multi(true)
             .build()
             .user_data(encode_user_data(OpKind::Poll, id));
+        self.push(entry)
+    }
+
+    /// Submit a `waitid(2)` SQE that completes when the process with `pid` changes state.
+    ///
+    /// The `id` is stored in `user_data` and returned in the `Completion`.
+    /// Requires Linux 6.7+.
+    pub fn submit_waitid(&mut self, pid: u32, id: u64) -> io::Result<()> {
+        let entry = opcode::WaitId::new(P_PID, pid, WEXITED)
+            .build()
+            .user_data(encode_user_data(OpKind::Waitid, id));
         self.push(entry)
     }
 

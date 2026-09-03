@@ -6,22 +6,24 @@ mod iface;
 
 use std::{
     collections::HashMap,
+    process::Child,
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
 };
 
 use anyhow::Context;
 use iface::{CompositorHandler, ServiceState, complete_screenshot, emit_signal};
-use log::{error, info};
+use log::{error, info, warn};
 use lumalla_ipc::{
     BUS_NAME, OBJECT_PATH, WindowManager, signals,
     types::{DrmDeviceInfo, OutputInfo},
 };
 use lumalla_shared::{
-    Comms, Completion, DbusMessage, DrmDeviceState, EventLoop, MESSAGE_CHANNEL_TOKEN, MainMessage,
-    OpKind, Output,
+    Comms, Completion, DbusMessage, DrmDeviceState, EventLoop, MainMessage, OpKind, Output,
 };
 use zbus::{Error as ZbusError, blocking::connection};
+
+use crate::iface::spawn_process;
 
 /// A registered D-Bus service that must be kept alive for the lifetime of the compositor.
 pub struct DbusService {
@@ -94,6 +96,9 @@ impl DbusService {
     }
 }
 
+/// `user_data` id used for the config-child `WaitId` SQE.
+const CONFIG_CHILD_WAITID_ID: u64 = 1;
+
 struct DbusState {
     channel: mpsc::Receiver<DbusMessage>,
     event_loop: EventLoop,
@@ -105,6 +110,8 @@ struct DbusState {
     wayland_display: Arc<Mutex<Option<String>>>,
     windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
     pending_screenshots: Arc<Mutex<HashMap<usize, Arc<iface::PendingScreenshot>>>>,
+    /// Config child process; kept alive so we can reap it via `WaitId` SQE.
+    config_child: Option<Child>,
 }
 
 impl DbusState {
@@ -124,6 +131,7 @@ impl DbusState {
             wayland_display: service.wayland_display,
             windows: service.windows,
             pending_screenshots: service.pending_screenshots,
+            config_child: None,
         }
     }
 
@@ -162,6 +170,15 @@ impl DbusState {
                 }
             }
             OpKind::Timeout | OpKind::Cancel => {}
+            OpKind::Waitid => {
+                if let Some(mut child) = self.config_child.take() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => info!("Config process exited with {status}"),
+                        Ok(None) => info!("Config process waitid fired but process still running"),
+                        Err(err) => warn!("Failed to reap config process: {err}"),
+                    }
+                }
+            }
             other => {
                 debug_assert!(
                     false,
@@ -170,7 +187,6 @@ impl DbusState {
                 );
             }
         }
-        let _ = MESSAGE_CHANNEL_TOKEN;
     }
 
     fn handle_message(&mut self, message: DbusMessage) -> anyhow::Result<()> {
@@ -205,6 +221,17 @@ impl DbusState {
             DbusMessage::SetWaylandDisplay(wayland_display) => {
                 info!("Setting WAYLAND_DISPLAY for D-Bus spawns to {wayland_display}");
                 *self.wayland_display.lock().unwrap() = Some(wayland_display);
+            }
+            DbusMessage::Spawn { command, args } => {
+                if let Some(child) =
+                    spawn_process(&command, &args, &self.wayland_display, &Default::default())
+                {
+                    let pid = child.id();
+                    self.config_child = Some(child);
+                    if let Err(err) = self.event_loop.submit_waitid(pid, CONFIG_CHILD_WAITID_ID) {
+                        warn!("Failed to submit waitid SQE for config process: {err}");
+                    }
+                }
             }
             DbusMessage::SetWindows(windows) => {
                 *self.windows.lock().unwrap() = windows;

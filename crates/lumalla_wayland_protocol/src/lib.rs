@@ -8,7 +8,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::net::UnixListener,
     },
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 pub mod buffer;
@@ -53,13 +53,13 @@ type Opcode = u16;
 pub struct Wayland {
     listener: UnixListener,
     next_client_id: ClientId,
-    socket_path: String,
+    socket_path: PathBuf,
 }
 
 impl Wayland {
-    pub fn new(socket_path: String) -> anyhow::Result<Self> {
-        if Path::new(&socket_path).exists() {
-            anyhow::bail!("Wayland socket already exists: {socket_path}");
+    pub fn new(socket_path: PathBuf) -> anyhow::Result<Self> {
+        if socket_path.exists() {
+            anyhow::bail!("Wayland socket already exists: {socket_path:?}");
         }
         let listener = UnixListener::bind(&socket_path).context("Failed to bind to socket")?;
         listener
@@ -125,14 +125,14 @@ impl Wayland {
         }
     }
 
-    pub fn socket_path(&self) -> &str {
-        self.socket_path.as_str()
+    pub fn socket_path(&self) -> &Path {
+        self.socket_path.as_path()
     }
 }
 
 impl Drop for Wayland {
     fn drop(&mut self) {
-        if Path::new(&self.socket_path).exists() {
+        if self.socket_path.exists() {
             if let Err(e) = fs::remove_file(&self.socket_path) {
                 error!("Failed to remove socket file: {}", e);
             }

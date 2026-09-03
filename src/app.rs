@@ -3,9 +3,8 @@ use std::{
     io,
     num::NonZeroU32,
     os::fd::RawFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
-    process::{Child, Command},
     sync::mpsc::Receiver,
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -25,11 +24,14 @@ use lumalla_renderer::{
 };
 use lumalla_seat::SeatState;
 use lumalla_shared::{
-    Comms, Completion, DbusMessage, EventLoop, GlobalArgs, InjectedInput, Interest,
-    MESSAGE_CHANNEL_TOKEN, MainMessage, MessageSender, OpKind, encode_user_data,
-    message_loop_with_channel, monotonic_deadline_after,
+    Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
+    OpKind, encode_user_data, message_loop_with_channel, monotonic_deadline_after,
+    ring::MESSAGE_CHANNEL_TOKEN,
 };
 
+use crate::args::Args;
+
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1000);
 pub const LIBSEAT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 1;
 pub const LIBINPUT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 2;
 pub const UDEV_DRM_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 3;
@@ -45,14 +47,12 @@ struct DrmDeviceRegistration {
 /// Represents the data for the main app thread
 struct AppData {
     comms: Comms,
-    config_child: Option<Child>,
-    startup_child: Option<Child>,
     dbus_join_handle: JoinHandle<()>,
     // `seat_state` must outlive `input_state`; fields drop in reverse declaration order.
     seat_state: Pin<Box<SeatState>>,
     input_state: InputState,
     shutting_down: bool,
-    shutdown_timeout: Option<Instant>,
+    shutdown_timeout_at: Option<Instant>,
     wayland: Wayland,
     connected_clients: HashMap<ClientId, ClientConnection>,
     display_state: DisplayState,
@@ -66,30 +66,25 @@ struct AppData {
 impl AppData {
     fn new(
         comms: Comms,
-        config_child: Option<Child>,
-        startup_child: Option<Child>,
         dbus_join_handle: JoinHandle<()>,
         seat_state: Pin<Box<SeatState>>,
         input_state: InputState,
         wayland: Wayland,
         display_state: DisplayState,
         renderer_state: RendererState,
-        render_scheduler: RenderScheduler,
     ) -> Self {
         Self {
             comms,
-            config_child,
-            startup_child,
             dbus_join_handle,
             seat_state,
             input_state,
             shutting_down: false,
-            shutdown_timeout: None,
+            shutdown_timeout_at: None,
             wayland,
             connected_clients: HashMap::new(),
             display_state,
             renderer_state,
-            render_scheduler,
+            render_scheduler: RenderScheduler::default(),
             frame_clock: Instant::now(),
             drm_device_poll: HashMap::new(),
             next_drm_device_token: 0,
@@ -160,7 +155,8 @@ impl AppData {
             }
 
             for completion in completions.drain(..) {
-                if let Err(err) = self.handle_completion(event_loop, &main_channel, completion) {
+                if let Err(err) = self.handle_completion(event_loop, &main_channel, completion, now)
+                {
                     error!("Unable to handle completion: {err:#}");
                 }
             }
@@ -187,10 +183,11 @@ impl AppData {
         event_loop: &mut EventLoop,
         main_channel: &Receiver<MainMessage>,
         completion: Completion,
+        now: Instant,
     ) -> anyhow::Result<()> {
         match completion.kind {
             OpKind::Wake => {
-                self.handle_channel_messages(main_channel, event_loop)?;
+                self.handle_channel_messages(main_channel, event_loop, now)?;
                 event_loop.rearm_waker()?;
             }
             OpKind::Timeout => {}
@@ -215,6 +212,7 @@ impl AppData {
             OpKind::Poll => {
                 self.handle_poll(event_loop, completion)?;
             }
+            OpKind::Waitid => {}
         }
         Ok(())
     }
@@ -563,6 +561,7 @@ impl AppData {
         &mut self,
         main_channel: &Receiver<MainMessage>,
         event_loop: &mut EventLoop,
+        now: Instant,
     ) -> anyhow::Result<()> {
         while let Ok(msg) = main_channel.try_recv() {
             match msg {
@@ -707,7 +706,7 @@ impl AppData {
                 }
                 MainMessage::Shutdown => {
                     if !self.shutting_down {
-                        self.init_shutdown();
+                        self.init_shutdown(now);
                     }
                 }
                 MainMessage::InjectInput(input) => {
@@ -1233,39 +1232,17 @@ impl AppData {
         Ok(())
     }
 
-    fn init_shutdown(&mut self) {
+    fn init_shutdown(&mut self, now: Instant) {
         self.shutting_down = true;
         self.comms.dbus(DbusMessage::Shutdown);
-        if let Some(child) = &mut self.config_child {
-            if let Err(err) = child.kill() {
-                warn!("Failed to stop config process: {err}");
-            }
-        }
-        self.shutdown_timeout = Some(Instant::now() + Duration::from_millis(1000));
+        self.shutdown_timeout_at = Some(now + SHUTDOWN_TIMEOUT);
     }
 
     fn check_for_shutdown(&mut self) -> (bool, Option<Instant>) {
-        let startup_finished =
-            self.startup_child
-                .as_mut()
-                .is_some_and(|child| match child.try_wait() {
-                    Ok(Some(status)) => {
-                        info!("Startup command exited with {status}");
-                        true
-                    }
-                    Ok(None) => false,
-                    Err(err) => {
-                        warn!("Unable to query startup command: {err}");
-                        true
-                    }
-                });
-        if startup_finished {
-            self.startup_child = None;
-        }
         if !self.shutting_down {
             return (false, None);
         }
-        let shutdown_wake_at = if let Some(timeout) = self.shutdown_timeout {
+        let shutdown_wake_at = if let Some(timeout) = self.shutdown_timeout_at {
             let now = Instant::now();
             if now >= timeout {
                 info!("Shutdown timeout reached. Shutting down now");
@@ -1278,13 +1255,6 @@ impl AppData {
         if !self.dbus_join_handle.is_finished() {
             return (false, shutdown_wake_at);
         }
-        if let Some(child) = self.config_child.as_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) => {}
-                Ok(None) => return (false, shutdown_wake_at),
-                Err(_) => {}
-            }
-        }
         (true, shutdown_wake_at)
     }
 
@@ -1295,89 +1265,38 @@ impl AppData {
 }
 
 pub(crate) fn run_app(
-    args: &'static GlobalArgs,
+    args: Args,
     mut main_event_loop: EventLoop,
     main_channel: Receiver<MainMessage>,
     to_main: MessageSender<MainMessage>,
-    config_child: Option<Child>,
 ) -> anyhow::Result<()> {
     let (dbus_event_loop, dbus_channel, to_dbus) = message_loop_with_channel::<DbusMessage>()?;
     let comms = Comms::new(to_main.clone(), to_dbus);
-    let dbus_join_handle = start_dbus_service(comms.clone(), dbus_event_loop, dbus_channel)?;
     let seat_state = init_and_register_seat_state(comms.clone(), &mut main_event_loop)?;
     let input_state =
         init_and_register_input_state(comms.clone(), &mut main_event_loop, seat_state.as_ref())?;
-    let wayland =
-        init_and_register_wayland_display(args.socket_path.clone(), &mut main_event_loop)?;
-    let wayland_display = wayland_display_env(wayland.socket_path())?;
-    comms.dbus(DbusMessage::SetWaylandDisplay(wayland_display.clone()));
-    let mut display_state = DisplayState::new(comms.clone())?;
-    match input_state.keymap_memfd() {
-        Ok(keymap) => {
-            display_state.set_keyboard_keymap(keymap);
-            let mods = input_state.modifiers();
-            display_state.set_keyboard_modifiers(KeyboardModifiers {
-                depressed: mods.depressed,
-                latched: mods.latched,
-                locked: mods.locked,
-                group: mods.group,
-            });
-        }
-        Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
-    }
+    let wayland = init_and_register_wayland_display(args.socket_path, &mut main_event_loop)?;
     let mut renderer_state = init_and_register_renderer_state(&mut main_event_loop)?;
-    let mut no_clients = HashMap::new();
-    if let Err(err) =
-        configure_dmabuf_formats(&mut display_state, &mut renderer_state, &mut no_clients)
-    {
-        warn!("Unable to query GPU dmabuf formats; using linear defaults: {err:#}");
-    }
-    let render_scheduler = RenderScheduler::default();
-    comms.dbus(DbusMessage::SetDrmDevices(
-        renderer_state.drm_device_states(),
-    ));
-    let startup_child = spawn_startup_command(&args.startup_command, &wayland_display)?;
-    let mut data = AppData::new(
+    let display_state = init_display_state(&input_state, &mut renderer_state);
+    let dbus_join_handle = start_dbus_service(
         comms.clone(),
-        config_child,
-        startup_child,
+        dbus_event_loop,
+        dbus_channel,
+        &mut renderer_state,
+        &wayland,
+        args.config_command,
+        Some(args.config_args),
+    )?;
+    let mut data = AppData::new(
+        comms,
         dbus_join_handle,
         seat_state,
         input_state,
         wayland,
         display_state,
         renderer_state,
-        render_scheduler,
     );
     data.run_event_loop(&mut main_event_loop, main_channel)
-}
-
-fn wayland_display_env(wayland_socket: &str) -> anyhow::Result<String> {
-    let wayland_display = if wayland_socket.starts_with('/') {
-        wayland_socket.to_owned()
-    } else {
-        std::env::current_dir()?
-            .join(wayland_socket)
-            .to_string_lossy()
-            .into_owned()
-    };
-    Ok(wayland_display)
-}
-
-fn spawn_startup_command(
-    startup_command: &[String],
-    wayland_display: &str,
-) -> anyhow::Result<Option<Child>> {
-    let Some((program, program_args)) = startup_command.split_first() else {
-        return Ok(None);
-    };
-    info!("Spawning startup command `{program}` with WAYLAND_DISPLAY={wayland_display}");
-    let child = Command::new(program)
-        .args(program_args)
-        .env("WAYLAND_DISPLAY", wayland_display)
-        .spawn()
-        .with_context(|| format!("Failed to spawn startup command `{program}`"))?;
-    Ok(Some(child))
 }
 
 fn init_and_register_renderer_state(
@@ -1413,12 +1332,12 @@ fn configure_dmabuf_formats(
 }
 
 fn init_and_register_wayland_display(
-    socket_path: Option<String>,
+    socket_path: Option<PathBuf>,
     main_event_loop: &mut EventLoop,
 ) -> anyhow::Result<Wayland> {
     let wayland = create_wayland_display(socket_path)?;
     info!(
-        "Created wayland display socket at: {}",
+        "Created wayland display socket at: {:?}",
         wayland.socket_path()
     );
     main_event_loop
@@ -1430,6 +1349,42 @@ fn init_and_register_wayland_display(
         )
         .context("Unable to listen on wayland display socket")?;
     Ok(wayland)
+}
+
+fn set_wayland_display(comms: &Comms, wayland_socket_path: &Path) -> anyhow::Result<()> {
+    let wayland_display = wayland_socket_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    comms.dbus(DbusMessage::SetWaylandDisplay(wayland_display));
+    Ok(())
+}
+
+fn init_display_state(
+    input_state: &InputState,
+    renderer_state: &mut RendererState,
+) -> DisplayState {
+    let mut display_state = DisplayState::default();
+    match input_state.keymap_memfd() {
+        Ok(keymap) => {
+            display_state.set_keyboard_keymap(keymap);
+            let mods = input_state.modifiers();
+            display_state.set_keyboard_modifiers(KeyboardModifiers {
+                depressed: mods.depressed,
+                latched: mods.latched,
+                locked: mods.locked,
+                group: mods.group,
+            });
+        }
+        Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
+    }
+    let mut no_clients = HashMap::new();
+    if let Err(err) = configure_dmabuf_formats(&mut display_state, renderer_state, &mut no_clients)
+    {
+        warn!("Unable to query GPU dmabuf formats; using linear defaults: {err:#}");
+    }
+    display_state
 }
 
 fn init_and_register_seat_state(
@@ -1459,9 +1414,23 @@ fn start_dbus_service(
     comms: Comms,
     dbus_event_loop: EventLoop,
     dbus_channel: Receiver<DbusMessage>,
+    renderer_state: &mut RendererState,
+    wayland: &Wayland,
+    config_command: Option<String>,
+    config_args: Option<Vec<String>>,
 ) -> anyhow::Result<JoinHandle<()>> {
     let dbus_service =
         DbusService::register(comms.clone()).context("Failed to register D-Bus service")?;
+    comms.dbus(DbusMessage::SetDrmDevices(
+        renderer_state.drm_device_states(),
+    ));
+    set_wayland_display(&comms, wayland.socket_path())?;
+    if let Some(config_command) = config_command {
+        comms.dbus(DbusMessage::Spawn {
+            command: config_command,
+            args: config_args.unwrap_or_default(),
+        });
+    }
     run_dbus_thread(comms, dbus_event_loop, dbus_channel, dbus_service)
         .context("Unable to run D-Bus thread")
 }

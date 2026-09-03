@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 
 use anyhow::Context;
 use lumalla_shared::{Comms, WindowGeometryUpdate, WindowRule, WindowState};
@@ -101,7 +102,6 @@ pub struct RendererLayoutSync {
 }
 
 pub struct DisplayState {
-    _comms: Comms,
     globals: Globals,
     surface_manager: SurfaceManager,
     shm_manager: ShmManager,
@@ -117,10 +117,9 @@ pub struct DisplayState {
     pending_presentation_feedbacks: VecDeque<PendingPresentationFeedback>,
 }
 
-impl DisplayState {
-    pub fn new(comms: Comms) -> anyhow::Result<Self> {
-        Ok(Self {
-            _comms: comms,
+impl Default for DisplayState {
+    fn default() -> Self {
+        Self {
             globals: Globals::default(),
             surface_manager: SurfaceManager::default(),
             shm_manager: ShmManager::default(),
@@ -134,9 +133,11 @@ impl DisplayState {
             pending_geometry_changes: Vec::new(),
             pending_frame_callbacks: VecDeque::new(),
             pending_presentation_feedbacks: VecDeque::new(),
-        })
+        }
     }
+}
 
+impl DisplayState {
     pub fn set_keyboard_keymap(&mut self, keymap: lumalla_shared::KeymapMemfd) {
         self.seat_manager.set_keymap(keymap);
     }
@@ -719,14 +720,15 @@ fn send_presentation_discarded(
     registry.free_object(feedback_id, writer);
 }
 
-pub fn create_wayland_display(socket_path: Option<String>) -> anyhow::Result<Wayland> {
+pub fn create_wayland_display(socket_path: Option<PathBuf>) -> anyhow::Result<Wayland> {
     if let Some(socket_path) = socket_path {
         Wayland::new(socket_path).context("Failed to create Wayland display at given socket path")
     } else {
         let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR")
             .context("XDG_RUNTIME_DIR not set. Set the socket path manually using --socket-path")?;
+        let xdg_runtime_dir = PathBuf::from(xdg_runtime_dir);
         for i in 0..10 {
-            let socket_path = format!("{xdg_runtime_dir}/wayland-{i}");
+            let socket_path = xdg_runtime_dir.join(format!("wayland-{i}"));
             if let Ok(wayland) = Wayland::new(socket_path) {
                 return Ok(wayland);
             }

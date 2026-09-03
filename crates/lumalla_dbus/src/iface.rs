@@ -432,12 +432,12 @@ fn write_png(path: &str, image: &CapturedImage) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn_process(
+pub(crate) fn spawn_process(
     command: &str,
     args: &[String],
     wayland_display: &Arc<Mutex<Option<String>>>,
     extra_env: &Arc<Mutex<HashMap<String, String>>>,
-) {
+) -> Option<std::process::Child> {
     info!("Starting program: {command} {args:?}");
     let mut cmd = Command::new(command);
     cmd.args(args).envs(extra_env.lock().unwrap().iter());
@@ -449,8 +449,12 @@ fn spawn_process(
             "Spawning `{command}` without WAYLAND_DISPLAY; client may connect to the wrong compositor"
         );
     }
-    if let Err(e) = cmd.spawn() {
-        error!("Failed to start program {command}: {e}");
+    match cmd.spawn() {
+        Ok(child) => Some(child),
+        Err(e) => {
+            error!("Failed to start program {command}: {e}");
+            None
+        }
     }
 }
 

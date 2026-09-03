@@ -10,9 +10,10 @@ use std::time::Duration;
 use anyhow::Context;
 use log::{error, info, warn};
 use lumalla_ipc::OutputInfo;
-use lumalla_shared::{CallbackRef, GlobalArgs, Output};
+use lumalla_shared::{CallbackRef, Output};
 use mlua::Lua;
 
+use crate::args::Args;
 use crate::callback::CallbackState;
 use crate::config_watcher::ConfigWatcher;
 use crate::dbus_lua::{
@@ -36,7 +37,7 @@ pub struct ExternalConfig {
 
 impl ExternalConfig {
     /// Connect to the compositor and load Lua configuration.
-    pub fn new(args: &GlobalArgs) -> anyhow::Result<Self> {
+    pub fn new(args: &Args) -> anyhow::Result<Self> {
         let client = DbusConfigClient::connect().context("Failed to connect to compositor")?;
         let lua = Lua::new();
         let callback_state = CallbackState::default();
