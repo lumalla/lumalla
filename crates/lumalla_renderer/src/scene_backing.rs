@@ -1,6 +1,7 @@
 //! Persistent CPU backing store and incremental compositing.
 
 use anyhow::Context;
+use lumalla_shared::BufferTransform;
 
 use crate::default_cursor::default_cursor_frame;
 use crate::{CursorFrame, SurfaceFrame};
@@ -334,19 +335,6 @@ fn composite_frame_in_rect(
         return Ok(());
     }
 
-    let scale = frame.buffer_scale.max(1) as f32;
-    let (src_x0, src_y0, src_x1, src_y1) = match frame.viewport_src {
-        Some((sx, sy, sw, sh)) => (
-            (sx * scale) as f64,
-            (sy * scale) as f64,
-            ((sx + sw) * scale) as f64,
-            ((sy + sh) * scale) as f64,
-        ),
-        None => (0.0, 0.0, frame.width as f64, frame.height as f64),
-    };
-    let src_w = (src_x1 - src_x0).max(1.0);
-    let src_h = (src_y1 - src_y0).max(1.0);
-
     for dy in 0..dest_h {
         let out_y = frame.y + dy as i32;
         if out_y < 0 || out_y as usize >= output_height {
@@ -356,8 +344,6 @@ fn composite_frame_in_rect(
         if oy < clip_y0 || oy >= clip_y1 {
             continue;
         }
-        let source_y = (src_y0 + (dy as f64 + 0.5) * src_h / dest_h as f64).floor() as usize;
-        let source_y = source_y.min(frame.height.saturating_sub(1));
         for dx in 0..dest_w {
             let out_x = frame.x + dx as i32;
             if out_x < 0 || out_x as usize >= output_width {
@@ -367,17 +353,43 @@ fn composite_frame_in_rect(
             if ox < clip_x0 || ox >= clip_x1 {
                 continue;
             }
-            let source_x = (src_x0 + (dx as f64 + 0.5) * src_w / dest_w as f64).floor() as usize;
-            let source_x = source_x.min(frame.width.saturating_sub(1));
+            let (source_x, source_y) = frame_source_pixel(frame, dx, dy, dest_w, dest_h);
             let source = source_y * frame.stride + source_x * 4;
             let destination = oy * row_bytes + ox * 4;
-            pixels[destination..destination + 4].copy_from_slice(&frame.pixels[source..source + 4]);
-            if frame.format == WL_SHM_FORMAT_XRGB8888 {
-                pixels[destination + 3] = u8::MAX;
-            }
+            blend_premultiplied_pixel(
+                &mut pixels[destination..destination + 4],
+                &frame.pixels[source..source + 4],
+                frame.format == WL_SHM_FORMAT_XRGB8888,
+            );
         }
     }
     Ok(())
+}
+
+fn frame_source_pixel(
+    frame: &SurfaceFrame,
+    dest_x: usize,
+    dest_y: usize,
+    dest_width: usize,
+    dest_height: usize,
+) -> (usize, usize) {
+    let transform = BufferTransform::from_raw(frame.buffer_transform)
+        .expect("SurfaceFrame::validate rejects invalid transforms");
+    let (transformed_width, transformed_height) =
+        transform.transformed_size(frame.width, frame.height);
+    let [src_x, src_y, src_width, src_height] = transform.transformed_source_rect(
+        frame.width,
+        frame.height,
+        frame.buffer_scale,
+        frame.viewport_src,
+    );
+    let transformed_x = (src_x + (dest_x as f64 + 0.5) * src_width.max(1.0) / dest_width as f64)
+        .floor()
+        .clamp(0.0, transformed_width.saturating_sub(1) as f64) as usize;
+    let transformed_y = (src_y + (dest_y as f64 + 0.5) * src_height.max(1.0) / dest_height as f64)
+        .floor()
+        .clamp(0.0, transformed_height.saturating_sub(1) as f64) as usize;
+    transform.transformed_to_buffer(transformed_x, transformed_y, frame.width, frame.height)
 }
 
 fn composite_cursor_in_rect(
@@ -394,8 +406,12 @@ fn composite_cursor_in_rect(
         .checked_mul(4)
         .context("Output row size overflows")?;
     let scale = cursor.buffer_scale.max(1) as usize;
-    let dest_w = cursor.width / scale;
-    let dest_h = cursor.height / scale;
+    let transform = BufferTransform::from_raw(cursor.buffer_transform)
+        .context("Invalid cursor buffer transform")?;
+    let (transformed_width, transformed_height) =
+        transform.transformed_size(cursor.width, cursor.height);
+    let dest_w = transformed_width / scale;
+    let dest_h = transformed_height / scale;
     if dest_w == 0 || dest_h == 0 {
         return Ok(());
     }
@@ -421,7 +437,6 @@ fn composite_cursor_in_rect(
         if oy < clip_y0 || oy >= clip_y1 {
             continue;
         }
-        let source_y = ((dy as u128 * cursor.height as u128) / dest_h as u128) as usize;
         for dx in 0..dest_w {
             let out_x = dest_x + dx as i32;
             if out_x < 0 || out_x as usize >= output_width {
@@ -431,32 +446,24 @@ fn composite_cursor_in_rect(
             if ox < clip_x0 || ox >= clip_x1 {
                 continue;
             }
-            let source_x = ((dx as u128 * cursor.width as u128) / dest_w as u128) as usize;
+            let transformed_x =
+                ((dx as u128 * transformed_width as u128) / dest_w as u128) as usize;
+            let transformed_y =
+                ((dy as u128 * transformed_height as u128) / dest_h as u128) as usize;
+            let (source_x, source_y) = transform.transformed_to_buffer(
+                transformed_x,
+                transformed_y,
+                cursor.width,
+                cursor.height,
+            );
             let source = source_y * cursor.stride + source_x * 4;
             let destination = oy * row_bytes + ox * 4;
             let src = &cursor.pixels[source..source + 4];
-            let alpha = if cursor.format == WL_SHM_FORMAT_ARGB8888 {
-                src[3] as u16
-            } else {
-                255
-            };
-            if alpha == 0 {
-                continue;
-            }
-            if alpha == 255 {
-                pixels[destination..destination + 4].copy_from_slice(src);
-                if cursor.format == WL_SHM_FORMAT_XRGB8888 {
-                    pixels[destination + 3] = u8::MAX;
-                }
-                continue;
-            }
-            let inv = 255 - alpha;
-            for channel in 0..3 {
-                let dst = pixels[destination + channel] as u16;
-                let src_channel = src[channel] as u16;
-                pixels[destination + channel] = ((src_channel * alpha + dst * inv) / 255) as u8;
-            }
-            pixels[destination + 3] = u8::MAX;
+            blend_premultiplied_pixel(
+                &mut pixels[destination..destination + 4],
+                src,
+                cursor.format == WL_SHM_FORMAT_XRGB8888,
+            );
         }
     }
     Ok(())
@@ -482,45 +489,47 @@ pub fn composite_surface_full(
         if dest_w == 0 || dest_h == 0 {
             continue;
         }
-        let scale = frame.buffer_scale.max(1) as f32;
-        let (src_x0, src_y0, src_x1, src_y1) = match frame.viewport_src {
-            Some((sx, sy, sw, sh)) => (
-                (sx * scale) as f64,
-                (sy * scale) as f64,
-                ((sx + sw) * scale) as f64,
-                ((sy + sh) * scale) as f64,
-            ),
-            None => (0.0, 0.0, frame.width as f64, frame.height as f64),
-        };
-        let src_w = (src_x1 - src_x0).max(1.0);
-        let src_h = (src_y1 - src_y0).max(1.0);
         for dy in 0..dest_h {
             let out_y = frame.y + dy as i32;
             if out_y < 0 || out_y as usize >= height {
                 continue;
             }
-            let source_y = (src_y0 + (dy as f64 + 0.5) * src_h / dest_h as f64).floor() as usize;
-            let source_y = source_y.min(frame.height.saturating_sub(1));
             for dx in 0..dest_w {
                 let out_x = frame.x + dx as i32;
                 if out_x < 0 || out_x as usize >= width {
                     continue;
                 }
-                let source_x =
-                    (src_x0 + (dx as f64 + 0.5) * src_w / dest_w as f64).floor() as usize;
-                let source_x = source_x.min(frame.width.saturating_sub(1));
+                let (source_x, source_y) = frame_source_pixel(frame, dx, dy, dest_w, dest_h);
                 let source = source_y * frame.stride + source_x * 4;
                 let destination = out_y as usize * row_bytes + out_x as usize * 4;
-                pixels[destination..destination + 4]
-                    .copy_from_slice(&frame.pixels[source..source + 4]);
-                if frame.format == WL_SHM_FORMAT_XRGB8888 {
-                    pixels[destination + 3] = u8::MAX;
-                }
+                blend_premultiplied_pixel(
+                    &mut pixels[destination..destination + 4],
+                    &frame.pixels[source..source + 4],
+                    frame.format == WL_SHM_FORMAT_XRGB8888,
+                );
             }
         }
     }
 
     Ok(pixels)
+}
+
+fn blend_premultiplied_pixel(destination: &mut [u8], source: &[u8], force_opaque: bool) {
+    let alpha = if force_opaque { 255 } else { source[3] as u16 };
+    if alpha == 0 {
+        return;
+    }
+    if alpha == 255 {
+        destination.copy_from_slice(source);
+        destination[3] = 255;
+        return;
+    }
+    let inverse = 255 - alpha;
+    for channel in 0..3 {
+        destination[channel] =
+            (source[channel] as u16 + destination[channel] as u16 * inverse / 255).min(255) as u8;
+    }
+    destination[3] = (alpha + destination[3] as u16 * inverse / 255).min(255) as u8;
 }
 
 pub fn composite_cursor_into(
@@ -652,8 +661,10 @@ fn clip_damage(rect: DamageRect, output_width: u32, output_height: u32) -> Optio
 
 fn cursor_bounds(cursor: &CursorFrame, pointer_x: i32, pointer_y: i32) -> Option<DamageRect> {
     let scale = cursor.buffer_scale.max(1);
-    let dest_w = div_ceil_i32(cursor.width as i32, scale);
-    let dest_h = div_ceil_i32(cursor.height as i32, scale);
+    let transform = BufferTransform::from_raw(cursor.buffer_transform)?;
+    let (width, height) = transform.transformed_size(cursor.width, cursor.height);
+    let dest_w = div_ceil_i32(width as i32, scale);
+    let dest_h = div_ceil_i32(height as i32, scale);
     if dest_w <= 0 || dest_h <= 0 {
         return None;
     }
@@ -718,6 +729,7 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            buffer_transform: 0,
             surface_width: 2,
             surface_height: 2,
             viewport_src: None,
@@ -779,6 +791,22 @@ mod tests {
     }
 
     #[test]
+    fn argb_surface_uses_premultiplied_alpha_blending() {
+        let frame = SurfaceFrame {
+            pixels: vec![0, 0, 128, 128],
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: WL_SHM_FORMAT_ARGB8888,
+            surface_width: 1,
+            surface_height: 1,
+            ..frame()
+        };
+        let pixels = composite_surface_full(&[&frame], 1, 1, [0.0, 0.0, 1.0, 1.0]).unwrap();
+        assert_eq!(pixels, vec![127, 0, 128, 255]);
+    }
+
+    #[test]
     fn cursor_damage_covers_motion() {
         let cursor = CursorFrame {
             owner_id: 1,
@@ -792,6 +820,7 @@ mod tests {
             hotspot_x: 0,
             hotspot_y: 0,
             buffer_scale: 1,
+            buffer_transform: 0,
             dmabuf: None,
         };
         let rects = cursor_damage_rects(&cursor, (0, 0), (3, 0));
@@ -814,6 +843,7 @@ mod tests {
             hotspot_x: 0,
             hotspot_y: 0,
             buffer_scale: 1,
+            buffer_transform: 0,
             dmabuf: None,
         };
         let first = cursor_damage_rects(&cursor, (0, 0), (10, 0));
@@ -906,5 +936,81 @@ mod tests {
             true,
         );
         assert!(matches!(mode, CompositeMode::Partial(_)));
+    }
+
+    fn indexed_frame(transform: BufferTransform) -> SurfaceFrame {
+        let mut pixels = Vec::new();
+        for index in 0..6u8 {
+            pixels.extend_from_slice(&[index, 0, 0, 255]);
+        }
+        let (surface_width, surface_height) = transform.transformed_size(3, 2);
+        SurfaceFrame {
+            pixels,
+            width: 3,
+            height: 2,
+            stride: 12,
+            buffer_transform: transform as u32,
+            surface_width: surface_width as i32,
+            surface_height: surface_height as i32,
+            ..frame()
+        }
+    }
+
+    #[test]
+    fn cpu_sampling_is_deterministic_for_all_eight_transforms() {
+        let expected: [&[u8]; 8] = [
+            &[0, 1, 2, 3, 4, 5],
+            &[2, 5, 1, 4, 0, 3],
+            &[5, 4, 3, 2, 1, 0],
+            &[3, 0, 4, 1, 5, 2],
+            &[2, 1, 0, 5, 4, 3],
+            &[0, 3, 1, 4, 2, 5],
+            &[3, 4, 5, 0, 1, 2],
+            &[5, 2, 4, 1, 3, 0],
+        ];
+        for (transform, expected) in BufferTransform::ALL.into_iter().zip(expected) {
+            let frame = indexed_frame(transform);
+            let pixels = composite_surface_full(
+                &[&frame],
+                frame.surface_width as u32,
+                frame.surface_height as u32,
+                [0.0; 4],
+            )
+            .unwrap();
+            let actual: Vec<u8> = pixels.chunks_exact(4).map(|pixel| pixel[0]).collect();
+            assert_eq!(actual, expected, "{transform:?}");
+        }
+    }
+
+    #[test]
+    fn transformed_cpu_full_and_partial_composites_match() {
+        for transform in BufferTransform::ALL {
+            let frame = indexed_frame(transform);
+            let width = frame.surface_width as u32;
+            let height = frame.surface_height as u32;
+            let expected =
+                composite_surface_full(&[&frame], width, height, [0.0, 0.0, 0.0, 1.0]).unwrap();
+            let mut backing = Some(SceneBacking::new(width, height, [1.0, 0.0, 0.0, 1.0]).unwrap());
+            let mode = prepare_composite(
+                &mut backing,
+                width,
+                height,
+                [0.0, 0.0, 0.0, 1.0],
+                &[DamageRect {
+                    x: 0,
+                    y: 0,
+                    width: width as i32,
+                    height: height as i32,
+                }],
+                false,
+                &[&frame],
+                None,
+                100,
+                100,
+            )
+            .unwrap();
+            assert!(matches!(mode, CompositeMode::Partial(_)));
+            assert_eq!(backing.unwrap().pixels, expected, "{transform:?}");
+        }
     }
 }

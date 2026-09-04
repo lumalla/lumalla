@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use lumalla_shared::BufferTransform;
 use lumalla_wayland_protocol::{ClientId, ObjectId};
 
 type ResourceKey = (ClientId, ObjectId);
@@ -80,6 +81,8 @@ pub struct SurfaceCommit {
 pub struct CommitResult {
     pub primary: SurfaceCommit,
     pub synchronized_children: Vec<SurfaceCommit>,
+    /// Descendants made invisible by this commit without their own commit.
+    pub unmapped_descendants: Vec<ObjectId>,
 }
 
 #[derive(Debug)]
@@ -91,6 +94,16 @@ pub struct DestroyedSurface {
     pub callbacks: Vec<ObjectId>,
     pub presentation_feedbacks: Vec<ObjectId>,
     pub was_mapped: bool,
+    pub unmapped_descendants: Vec<ObjectId>,
+}
+
+/// A mapped surface's authoritative compositor placement and paint order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneSurface {
+    pub client_id: ClientId,
+    pub surface_id: ObjectId,
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Debug, Default)]
@@ -123,10 +136,25 @@ impl SurfaceManager {
         id: ObjectId,
     ) -> Result<DestroyedSurface, SurfaceError> {
         let was_mapped = self.is_mapped(client_id, id)?;
+        let unmapped_descendants = self
+            .mapped_descendants(client_id, id)
+            .into_iter()
+            .filter(|child| *child != id)
+            .collect();
         let surface = self
             .surfaces
             .remove(&(client_id, id))
             .ok_or(SurfaceError::UnknownSurface)?;
+        if let Some(parent_id) = surface.role_parent
+            && let Some(parent) = self.surfaces.get_mut(&(client_id, parent_id))
+        {
+            parent.role_children.retain(|child| *child != id);
+        }
+        for child_id in &surface.role_children {
+            if let Some(child) = self.surfaces.get_mut(&(client_id, *child_id)) {
+                child.role_parent = None;
+            }
+        }
 
         let mut orphaned_subsurface_ids = Vec::new();
         let children: Vec<ObjectId> = surface
@@ -181,6 +209,7 @@ impl SurfaceManager {
             callbacks,
             presentation_feedbacks,
             was_mapped,
+            unmapped_descendants,
         })
     }
 
@@ -207,6 +236,61 @@ impl SurfaceManager {
             (global_x - origin_x as f64) as f32,
             (global_y - origin_y as f64) as f32,
         ))
+    }
+
+    /// Complete mapped scene in back-to-front order.
+    pub fn scene_surfaces(&self) -> Vec<SceneSurface> {
+        let mut scene = Vec::new();
+        for &(client_id, surface_id) in &self.paint_order {
+            let Some(surface) = self.surfaces.get(&(client_id, surface_id)) else {
+                continue;
+            };
+            if matches!(surface.role, Some(Role::Subsurface(_)))
+                || surface.role_parent.is_some()
+                || !self.is_mapped(client_id, surface_id).unwrap_or(false)
+            {
+                continue;
+            }
+            self.flatten_surface_tree(client_id, surface_id, &mut scene);
+        }
+        scene
+    }
+
+    fn flatten_surface_tree(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        scene: &mut Vec<SceneSurface>,
+    ) {
+        let Some(surface) = self.surfaces.get(&(client_id, surface_id)) else {
+            return;
+        };
+        let split = surface
+            .current_below_count
+            .min(surface.current_children.len());
+        for child in &surface.current_children[..split] {
+            if self.is_mapped(client_id, *child).unwrap_or(false) {
+                self.flatten_surface_tree(client_id, *child, scene);
+            }
+        }
+        if let Some((x, y)) = self.content_origin(client_id, surface_id) {
+            scene.push(SceneSurface {
+                client_id,
+                surface_id,
+                x,
+                y,
+            });
+        }
+        for child in &surface.current_children[split..] {
+            if self.is_mapped(client_id, *child).unwrap_or(false) {
+                self.flatten_surface_tree(client_id, *child, scene);
+            }
+        }
+        for child in &surface.role_children {
+            if self.is_mapped(client_id, *child).unwrap_or(false) {
+                self.flatten_surface_tree(client_id, *child, scene);
+            }
+        }
     }
 
     pub fn record_painted_surface(&mut self, client_id: ClientId, surface_id: ObjectId) {
@@ -245,7 +329,9 @@ impl SurfaceManager {
         x: f64,
         y: f64,
     ) -> Option<(ClientId, ObjectId)> {
-        for &(client_id, surface_id) in self.paint_order.iter().rev() {
+        for entry in self.scene_surfaces().iter().rev() {
+            let client_id = entry.client_id;
+            let surface_id = entry.surface_id;
             if let Some(preferred) = preferred_client
                 && client_id != preferred
             {
@@ -268,23 +354,29 @@ impl SurfaceManager {
                 continue;
             };
             let scale = surface.current.buffer_scale.max(1);
-            let Some((width, height)) =
-                effective_surface_size(Some((bw, bh)), scale, &surface.current.viewport)
-            else {
+            let Some((width, height)) = effective_surface_size(
+                Some((bw, bh)),
+                scale,
+                surface.current.buffer_transform,
+                &surface.current.viewport,
+            ) else {
                 continue;
             };
-            let Some((origin_x, origin_y)) = self.surface_origin(client_id, surface_id) else {
+            let Some((content_x, content_y)) = self.content_origin(client_id, surface_id) else {
                 continue;
             };
-            if x < origin_x as f64
-                || y < origin_y as f64
-                || x >= (origin_x + width) as f64
-                || y >= (origin_y + height) as f64
+            if x < content_x as f64
+                || y < content_y as f64
+                || x >= (content_x + width) as f64
+                || y >= (content_y + height) as f64
             {
                 continue;
             }
-            let local_x = (x - origin_x as f64) as i32;
-            let local_y = (y - origin_y as f64) as i32;
+            let Some((surface_x, surface_y)) = self.surface_origin(client_id, surface_id) else {
+                continue;
+            };
+            let local_x = (x - surface_x as f64) as i32;
+            let local_y = (y - surface_y as f64) as i32;
             if !self.surface_accepts_input_at(surface, local_x, local_y) {
                 continue;
             }
@@ -295,16 +387,61 @@ impl SurfaceManager {
 
     fn surface_origin(&self, client_id: ClientId, surface_id: ObjectId) -> Option<(i32, i32)> {
         let surface = self.surfaces.get(&(client_id, surface_id))?;
-        let (layout_x, layout_y) = surface.layout;
-        let (offset_x, offset_y) = match surface.role {
-            Some(Role::Subsurface(sub_id)) => self
-                .subsurfaces
-                .get(&(client_id, sub_id))
-                .map(|sub| sub.current_position)
-                .unwrap_or(surface.current.offset),
-            _ => surface.current.offset,
-        };
-        Some((layout_x + offset_x, layout_y + offset_y))
+        if let Some(Role::Subsurface(sub_id)) = surface.role {
+            let sub = self.subsurfaces.get(&(client_id, sub_id))?;
+            let (parent_x, parent_y) = self.surface_origin(client_id, sub.parent)?;
+            return Some((
+                parent_x.saturating_add(sub.current_position.0),
+                parent_y.saturating_add(sub.current_position.1),
+            ));
+        }
+        if let Some(parent) = surface.role_parent {
+            let (parent_x, parent_y) = self.window_origin(client_id, parent)?;
+            return Some((
+                parent_x
+                    .saturating_add(surface.layout.0)
+                    .saturating_sub(surface.window_geometry_offset.0),
+                parent_y
+                    .saturating_add(surface.layout.1)
+                    .saturating_sub(surface.window_geometry_offset.1),
+            ));
+        }
+        Some((
+            surface
+                .layout
+                .0
+                .saturating_sub(surface.window_geometry_offset.0),
+            surface
+                .layout
+                .1
+                .saturating_sub(surface.window_geometry_offset.1),
+        ))
+    }
+
+    fn content_origin(&self, client_id: ClientId, surface_id: ObjectId) -> Option<(i32, i32)> {
+        let surface = self.surfaces.get(&(client_id, surface_id))?;
+        let (x, y) = self.surface_origin(client_id, surface_id)?;
+        Some((
+            x.saturating_add(surface.current.offset.0),
+            y.saturating_add(surface.current.offset.1),
+        ))
+    }
+
+    fn window_origin(&self, client_id: ClientId, surface_id: ObjectId) -> Option<(i32, i32)> {
+        let surface = self.surfaces.get(&(client_id, surface_id))?;
+        let (x, y) = self.surface_origin(client_id, surface_id)?;
+        Some((
+            x.saturating_add(surface.window_geometry_offset.0),
+            y.saturating_add(surface.window_geometry_offset.1),
+        ))
+    }
+
+    pub fn surface_window_origin(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Option<(i32, i32)> {
+        self.window_origin(client_id, surface_id)
     }
 
     fn surface_accepts_input_at(&self, surface: &Surface, local_x: i32, local_y: i32) -> bool {
@@ -415,6 +552,72 @@ impl SurfaceManager {
         Ok(())
     }
 
+    pub fn set_window_geometry_offset(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        x: i32,
+        y: i32,
+    ) -> Result<(), SurfaceError> {
+        self.surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?
+            .window_geometry_offset = (x, y);
+        Ok(())
+    }
+
+    /// Establish a parent-relative role relationship (used by xdg popups).
+    pub fn set_role_parent(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        parent_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        if surface_id == parent_id
+            || !self.surfaces.contains_key(&(client_id, parent_id))
+            || !self.surfaces.contains_key(&(client_id, surface_id))
+        {
+            return Err(SurfaceError::BadParent);
+        }
+        let mut ancestor = Some(parent_id);
+        while let Some(id) = ancestor {
+            if id == surface_id {
+                return Err(SurfaceError::BadParent);
+            }
+            ancestor = self
+                .surfaces
+                .get(&(client_id, id))
+                .and_then(|surface| surface.role_parent);
+        }
+        self.clear_role_parent(client_id, surface_id);
+        self.surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?
+            .role_parent = Some(parent_id);
+        let parent = self
+            .surfaces
+            .get_mut(&(client_id, parent_id))
+            .ok_or(SurfaceError::BadParent)?;
+        parent.role_children.retain(|child| *child != surface_id);
+        parent.role_children.push(surface_id);
+        Ok(())
+    }
+
+    pub fn clear_role_parent(&mut self, client_id: ClientId, surface_id: ObjectId) {
+        let parent = self
+            .surfaces
+            .get(&(client_id, surface_id))
+            .and_then(|surface| surface.role_parent);
+        if let Some(parent_id) = parent
+            && let Some(parent) = self.surfaces.get_mut(&(client_id, parent_id))
+        {
+            parent.role_children.retain(|child| *child != surface_id);
+        }
+        if let Some(surface) = self.surfaces.get_mut(&(client_id, surface_id)) {
+            surface.role_parent = None;
+        }
+    }
+
     pub fn surface_layout(&self, client_id: ClientId, surface_id: ObjectId) -> Option<(i32, i32)> {
         self.surfaces
             .get(&(client_id, surface_id))
@@ -516,6 +719,30 @@ impl SurfaceManager {
             surface.pending.offset = Some((x, y));
         }
         Ok(())
+    }
+
+    /// Pending buffer attachment for commit preflight, including explicit NULL.
+    pub fn pending_buffer_attachment(
+        &self,
+        client_id: ClientId,
+        id: ObjectId,
+    ) -> Result<Option<Option<ObjectId>>, SurfaceError> {
+        self.surfaces
+            .get(&(client_id, id))
+            .map(|surface| surface.pending.buffer)
+            .ok_or(SurfaceError::UnknownSurface)
+    }
+
+    pub fn has_attached_or_committed_buffer(
+        &self,
+        client_id: ClientId,
+        id: ObjectId,
+    ) -> Result<bool, SurfaceError> {
+        let surface = self
+            .surfaces
+            .get(&(client_id, id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        Ok(surface.current.buffer.is_some() || matches!(surface.pending.buffer, Some(Some(_))))
     }
 
     pub fn set_buffer_transform(
@@ -680,7 +907,7 @@ impl SurfaceManager {
                 return Err((viewport_id, ViewportCommitError::BadSize));
             }
             if let (Some(bw), Some(bh)) = (buffer_width, buffer_height) {
-                let (cw, ch) = content_size(bw, bh, scale);
+                let (cw, ch) = content_size(bw, bh, scale, surface.current.buffer_transform);
                 if sx < 0.0 || sy < 0.0 || sx + sw > cw as f32 || sy + sh > ch as f32 {
                     return Err((viewport_id, ViewportCommitError::OutOfBuffer));
                 }
@@ -818,15 +1045,47 @@ impl SurfaceManager {
             return Ok(CommitResult {
                 primary,
                 synchronized_children: Vec::new(),
+                unmapped_descendants: Vec::new(),
             });
         }
 
+        let mapped_before = self.mapped_descendants(client_id, id);
         let primary = self.apply_commit(client_id, id)?;
         let synchronized_children = self.apply_synchronized_children(client_id, id)?;
+        let unmapped_descendants = mapped_before
+            .into_iter()
+            .filter(|surface| *surface != id)
+            .filter(|surface| !self.is_mapped(client_id, *surface).unwrap_or(false))
+            .collect();
         Ok(CommitResult {
             primary,
             synchronized_children,
+            unmapped_descendants,
         })
+    }
+
+    fn mapped_descendants(&self, client_id: ClientId, root: ObjectId) -> Vec<ObjectId> {
+        fn visit(
+            manager: &SurfaceManager,
+            client_id: ClientId,
+            id: ObjectId,
+            out: &mut Vec<ObjectId>,
+        ) {
+            if manager.is_mapped(client_id, id).unwrap_or(false) {
+                out.push(id);
+            }
+            if let Some(surface) = manager.surfaces.get(&(client_id, id)) {
+                for child in &surface.current_children {
+                    visit(manager, client_id, *child, out);
+                }
+                for child in &surface.role_children {
+                    visit(manager, client_id, *child, out);
+                }
+            }
+        }
+        let mut result = Vec::new();
+        visit(self, client_id, root, &mut result);
+        result
     }
 
     pub fn create_subsurface(
@@ -877,6 +1136,9 @@ impl SurfaceManager {
             .pending_children
             .get_or_insert_with(|| parent_surface.current_children.clone());
         pending.push(surface);
+        if parent_surface.pending_below_count.is_none() {
+            parent_surface.pending_below_count = Some(parent_surface.current_below_count);
+        }
         Ok(())
     }
 
@@ -1153,6 +1415,7 @@ impl SurfaceManager {
             .ok_or(SurfaceError::UnknownSurface)?;
         let mapped = self.is_mapped(client_id, id)?;
         let offset = self.presentation_offset(client_id, surface);
+        let layout = self.surface_origin(client_id, id).unwrap_or(surface.layout);
         Ok(SurfaceCommit {
             surface_id: id,
             buffer: surface.current.buffer,
@@ -1166,7 +1429,7 @@ impl SurfaceManager {
             buffer_scale: surface.current.buffer_scale,
             buffer_transform: surface.current.buffer_transform,
             offset,
-            layout: surface.layout,
+            layout,
             damage: surface.current.damage.clone(),
             buffer_damage: surface.current.buffer_damage.clone(),
             viewport: surface.current.viewport,
@@ -1237,17 +1500,7 @@ impl SurfaceManager {
         let viewport_id = surface.viewport_id;
         let damage = surface.current.damage.clone();
         let buffer_damage = surface.current.buffer_damage.clone();
-        let surface_offset = surface.current.offset;
-        let subsurface_role = surface.role;
-
-        let offset = match subsurface_role {
-            Some(Role::Subsurface(sub_id)) => self
-                .subsurfaces
-                .get(&(client_id, sub_id))
-                .map(|sub| sub.current_position)
-                .unwrap_or(surface_offset),
-            _ => surface_offset,
-        };
+        let offset = surface.current.offset;
 
         let mapped = self.is_mapped(client_id, id)?;
         let newly_mapped = mapped && !was_mapped;
@@ -1262,11 +1515,7 @@ impl SurfaceManager {
                 surface.layout = (pos, pos);
             }
         }
-        let layout = self
-            .surfaces
-            .get(&(client_id, id))
-            .map(|s| s.layout)
-            .unwrap_or((0, 0));
+        let layout = self.surface_origin(client_id, id).unwrap_or((0, 0));
         // Only restack on map/unmap. Re-raising on every commit desyncs hit-testing
         // from draw order (renderer keeps insertion order) and steals pointer focus.
         if newly_mapped {
@@ -1336,6 +1585,9 @@ impl SurfaceManager {
             if let Some(pending) = parent.pending_children.take() {
                 parent.current_children = pending;
             }
+            if let Some(pending) = parent.pending_below_count.take() {
+                parent.current_below_count = pending.min(parent.current_children.len());
+            }
             parent.current_children.clone()
         };
         for child_id in children {
@@ -1356,11 +1608,7 @@ impl SurfaceManager {
     }
 
     fn presentation_offset(&self, client_id: ClientId, surface: &Surface) -> (i32, i32) {
-        if let Some(Role::Subsurface(sub_id)) = surface.role
-            && let Some(sub) = self.subsurfaces.get(&(client_id, sub_id))
-        {
-            return sub.current_position;
-        }
+        let _ = client_id;
         surface.current.offset
     }
 
@@ -1381,7 +1629,15 @@ impl SurfaceManager {
                     | ShellMode::Popup
                     | ShellMode::Maximized
             )),
-            Some(Role::Xdg(_)) => Ok(surface.xdg_map_ready),
+            Some(Role::Xdg(_)) => {
+                if !surface.xdg_map_ready {
+                    return Ok(false);
+                }
+                if let Some(parent) = surface.role_parent {
+                    return self.is_mapped(client_id, parent);
+                }
+                Ok(true)
+            }
             Some(Role::Subsurface(sub_id)) => {
                 let parent = self
                     .subsurfaces
@@ -1431,9 +1687,25 @@ impl SurfaceManager {
 
     fn remove_child_from_parent(&mut self, client_id: ClientId, parent: ObjectId, child: ObjectId) {
         if let Some(parent_surface) = self.surfaces.get_mut(&(client_id, parent)) {
-            parent_surface.current_children.retain(|id| *id != child);
+            if let Some(index) = parent_surface
+                .current_children
+                .iter()
+                .position(|id| *id == child)
+            {
+                parent_surface.current_children.remove(index);
+                if index < parent_surface.current_below_count {
+                    parent_surface.current_below_count -= 1;
+                }
+            }
             if let Some(pending) = parent_surface.pending_children.as_mut() {
-                pending.retain(|id| *id != child);
+                if let Some(index) = pending.iter().position(|id| *id == child) {
+                    pending.remove(index);
+                    if let Some(below) = parent_surface.pending_below_count.as_mut()
+                        && index < *below
+                    {
+                        *below -= 1;
+                    }
+                }
             }
         }
     }
@@ -1477,21 +1749,37 @@ impl SurfaceManager {
         let pending = parent_surface
             .pending_children
             .get_or_insert_with(|| parent_surface.current_children.clone());
-        pending.retain(|id| *id != surface);
+        let below = parent_surface
+            .pending_below_count
+            .get_or_insert(parent_surface.current_below_count);
+        if let Some(old_index) = pending.iter().position(|id| *id == surface) {
+            pending.remove(old_index);
+            if old_index < *below {
+                *below -= 1;
+            }
+        }
         let insert_at = if sibling == parent {
             match mode {
-                Restack::Above => 0,
-                Restack::Below => 0,
+                Restack::Above => *below,
+                Restack::Below => {
+                    let index = *below;
+                    *below += 1;
+                    index
+                }
             }
         } else {
             let sibling_index = pending
                 .iter()
                 .position(|id| *id == sibling)
                 .ok_or(SurfaceError::BadSurface)?;
-            match mode {
+            let index = match mode {
                 Restack::Above => sibling_index + 1,
                 Restack::Below => sibling_index,
+            };
+            if index <= *below && sibling_index < *below {
+                *below += 1;
             }
+            index
         };
         pending.insert(insert_at, surface);
         Ok(())
@@ -1563,15 +1851,26 @@ fn merge_pending(cache: &mut PendingState, mut pending: PendingState) {
 }
 
 /// Buffer size after buffer_scale (identity transform).
-pub fn content_size(buffer_width: i32, buffer_height: i32, buffer_scale: i32) -> (i32, i32) {
-    let scale = buffer_scale.max(1);
-    (buffer_width / scale, buffer_height / scale)
+pub fn content_size(
+    buffer_width: i32,
+    buffer_height: i32,
+    buffer_scale: i32,
+    buffer_transform: u32,
+) -> (i32, i32) {
+    let transform = BufferTransform::from_raw(buffer_transform).unwrap_or_default();
+    let (width, height) = transform.scaled_size(
+        buffer_width.max(0) as usize,
+        buffer_height.max(0) as usize,
+        buffer_scale,
+    );
+    (width as i32, height as i32)
 }
 
 /// Effective surface size from buffer + viewport destination/source.
 pub fn effective_surface_size(
     buffer_size: Option<(i32, i32)>,
     buffer_scale: i32,
+    buffer_transform: u32,
     viewport: &ViewportState,
 ) -> Option<(i32, i32)> {
     let (bw, bh) = buffer_size?;
@@ -1581,7 +1880,7 @@ pub fn effective_surface_size(
     if let Some((_, _, sw, sh)) = viewport.source {
         return Some((sw as i32, sh as i32));
     }
-    let (cw, ch) = content_size(bw, bh, buffer_scale);
+    let (cw, ch) = content_size(bw, bh, buffer_scale, buffer_transform);
     Some((cw.max(0), ch.max(0)))
 }
 
@@ -1606,8 +1905,13 @@ struct Surface {
     layout: (i32, i32),
     /// Last committed buffer size in surface-local pixels (before scale).
     buffer_size: Option<(i32, i32)>,
+    /// Committed xdg window-geometry origin inside this wl_surface.
+    window_geometry_offset: (i32, i32),
     /// For Role::Xdg: true after an ack_configure has been applied (ready to map with buffer).
     xdg_map_ready: bool,
+    /// Parent for role-defined child surfaces such as xdg_popup.
+    role_parent: Option<ObjectId>,
+    role_children: Vec<ObjectId>,
     /// Associated wp_viewport object, if any.
     viewport_id: Option<ObjectId>,
     current: SurfaceState,
@@ -1615,6 +1919,9 @@ struct Surface {
     cache: Option<PendingState>,
     current_children: Vec<ObjectId>,
     pending_children: Option<Vec<ObjectId>>,
+    /// Number of `current_children` painted below this surface.
+    current_below_count: usize,
+    pending_below_count: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -2261,7 +2568,8 @@ mod tests {
             .attach(client(1), object(2), Some(object(8)), 0, 0, 1)
             .unwrap();
         let parent = manager.commit(client(1), object(2)).unwrap();
-        assert_eq!(parent.synchronized_children[0].offset, (12, 34));
+        assert_eq!(parent.synchronized_children[0].layout, (12, 34));
+        assert_eq!(parent.synchronized_children[0].offset, (0, 0));
         assert_eq!(
             manager
                 .subsurfaces
@@ -2269,6 +2577,196 @@ mod tests {
                 .unwrap()
                 .current_position,
             (12, 34)
+        );
+    }
+
+    #[test]
+    fn nested_subsurface_scene_positions_are_parent_relative() {
+        let mut manager = SurfaceManager::default();
+        for id in [2, 3, 4] {
+            manager.create_surface(client(1), object(id));
+        }
+        manager
+            .create_shell_surface(client(1), object(10), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(10), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .set_surface_layout(client(1), object(2), 100, 200)
+            .unwrap();
+        manager
+            .create_subsurface(client(1), object(11), object(3), object(2))
+            .unwrap();
+        manager
+            .create_subsurface(client(1), object(12), object(4), object(3))
+            .unwrap();
+        manager.set_position(client(1), object(11), 10, 20).unwrap();
+        manager.set_position(client(1), object(12), 3, 4).unwrap();
+
+        for (surface, buffer) in [(3, 20), (4, 21)] {
+            manager
+                .attach(client(1), object(surface), Some(object(buffer)), 0, 0, 1)
+                .unwrap();
+            manager.commit(client(1), object(surface)).unwrap();
+        }
+        manager
+            .attach(client(1), object(2), Some(object(22)), 0, 0, 1)
+            .unwrap();
+        manager.commit(client(1), object(2)).unwrap();
+        manager
+            .set_surface_layout(client(1), object(2), 100, 200)
+            .unwrap();
+
+        let scene = manager.scene_surfaces();
+        assert_eq!(
+            scene
+                .iter()
+                .map(|entry| (entry.surface_id, entry.x, entry.y))
+                .collect::<Vec<_>>(),
+            vec![
+                (object(2), 100, 200),
+                (object(3), 110, 220),
+                (object(4), 113, 224),
+            ]
+        );
+    }
+
+    #[test]
+    fn subsurface_scene_order_distinguishes_below_and_above_parent() {
+        let mut manager = SurfaceManager::default();
+        for id in [2, 3, 4] {
+            manager.create_surface(client(1), object(id));
+        }
+        manager
+            .create_shell_surface(client(1), object(10), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(10), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .create_subsurface(client(1), object(11), object(3), object(2))
+            .unwrap();
+        manager
+            .create_subsurface(client(1), object(12), object(4), object(2))
+            .unwrap();
+        manager
+            .place_below(client(1), object(11), object(2))
+            .unwrap();
+        manager
+            .place_above(client(1), object(12), object(2))
+            .unwrap();
+        for (surface, buffer) in [(3, 20), (4, 21)] {
+            manager
+                .attach(client(1), object(surface), Some(object(buffer)), 0, 0, 1)
+                .unwrap();
+            manager.commit(client(1), object(surface)).unwrap();
+        }
+        manager
+            .attach(client(1), object(2), Some(object(22)), 0, 0, 1)
+            .unwrap();
+        manager.commit(client(1), object(2)).unwrap();
+
+        assert_eq!(
+            manager
+                .scene_surfaces()
+                .iter()
+                .map(|entry| entry.surface_id)
+                .collect::<Vec<_>>(),
+            vec![object(3), object(2), object(4)]
+        );
+    }
+
+    #[test]
+    fn parent_unmap_reports_all_mapped_descendants() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(3));
+        manager
+            .create_shell_surface(client(1), object(10), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(10), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .create_subsurface(client(1), object(11), object(3), object(2))
+            .unwrap();
+        manager
+            .attach(client(1), object(3), Some(object(20)), 0, 0, 1)
+            .unwrap();
+        manager.commit(client(1), object(3)).unwrap();
+        manager
+            .attach(client(1), object(2), Some(object(21)), 0, 0, 1)
+            .unwrap();
+        manager.commit(client(1), object(2)).unwrap();
+
+        manager.attach(client(1), object(2), None, 0, 0, 1).unwrap();
+        let result = manager.commit(client(1), object(2)).unwrap();
+        assert_eq!(result.unmapped_descendants, vec![object(3)]);
+        assert!(manager.scene_surfaces().is_empty());
+    }
+
+    #[test]
+    fn role_child_follows_parent_and_window_geometry_origins() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(3));
+        manager
+            .assign_xdg_role(client(1), object(2), object(10))
+            .unwrap();
+        manager
+            .assign_xdg_role(client(1), object(3), object(11))
+            .unwrap();
+        manager
+            .set_xdg_map_ready(client(1), object(2), true)
+            .unwrap();
+        manager
+            .set_xdg_map_ready(client(1), object(3), true)
+            .unwrap();
+        manager
+            .set_surface_layout(client(1), object(2), 100, 200)
+            .unwrap();
+        manager
+            .set_window_geometry_offset(client(1), object(2), 8, 12)
+            .unwrap();
+        manager
+            .set_surface_layout(client(1), object(3), 20, 30)
+            .unwrap();
+        manager
+            .set_window_geometry_offset(client(1), object(3), 2, 3)
+            .unwrap();
+        manager
+            .set_role_parent(client(1), object(3), object(2))
+            .unwrap();
+        for (surface, buffer) in [(2, 20), (3, 21)] {
+            manager
+                .attach(client(1), object(surface), Some(object(buffer)), 0, 0, 1)
+                .unwrap();
+            manager.commit(client(1), object(surface)).unwrap();
+        }
+
+        assert_eq!(
+            manager.surface_origin(client(1), object(2)),
+            Some((92, 188))
+        );
+        assert_eq!(
+            manager.surface_origin(client(1), object(3)),
+            Some((118, 227))
+        );
+        manager
+            .set_surface_layout(client(1), object(2), 140, 250)
+            .unwrap();
+        assert_eq!(
+            manager.surface_origin(client(1), object(3)),
+            Some((158, 277))
+        );
+        assert_eq!(
+            manager
+                .scene_surfaces()
+                .iter()
+                .map(|entry| entry.surface_id)
+                .collect::<Vec<_>>(),
+            vec![object(2), object(3)]
         );
     }
 
@@ -2325,8 +2823,17 @@ mod tests {
         let viewport = manager.committed_viewport(client(1), object(2));
         assert_eq!(viewport.destination, Some((40, 30)));
         assert_eq!(
-            effective_surface_size(Some((200, 100)), 1, &viewport),
+            effective_surface_size(Some((200, 100)), 1, 0, &viewport),
             Some((40, 30))
+        );
+    }
+
+    #[test]
+    fn buffer_transform_swaps_unscaled_surface_extent() {
+        let viewport = ViewportState::default();
+        assert_eq!(
+            effective_surface_size(Some((6, 4)), 2, BufferTransform::Rotate90 as u32, &viewport),
+            Some((2, 3))
         );
     }
 

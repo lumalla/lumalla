@@ -8,6 +8,7 @@ use std::ptr;
 
 use anyhow::Context;
 use ash::vk;
+use lumalla_shared::BufferTransform;
 
 use crate::default_cursor::default_cursor_frame;
 use crate::scene_backing::{CompositeMode, DamageRect, UploadRect, buffer_damage_to_upload_rect};
@@ -116,7 +117,7 @@ struct LayerPushConstants {
     src_uv: [f32; 4],
     output_size: [f32; 2],
     force_opaque: f32,
-    _padding: f32,
+    buffer_transform: u32,
 }
 
 pub struct GpuCompositor {
@@ -179,6 +180,7 @@ impl GpuCompositor {
         output_width: u32,
         output_height: u32,
         force_opaque: bool,
+        buffer_transform: BufferTransform,
         clip: Option<&vk::Rect2D>,
     ) {
         recorder.bind_pipeline(&self.pipeline);
@@ -188,7 +190,7 @@ impl GpuCompositor {
             src_uv,
             output_size: [output_width as f32, output_height as f32],
             force_opaque: if force_opaque { 1.0 } else { 0.0 },
-            _padding: 0.0,
+            buffer_transform: buffer_transform as u32,
         };
         unsafe {
             device.handle().cmd_push_constants(
@@ -689,8 +691,10 @@ impl SurfaceTexture {
 
 fn cursor_surface_view(cursor: &CursorFrame) -> SurfaceFrame {
     let scale = cursor.buffer_scale.max(1);
-    let surface_width = div_ceil_i32(cursor.width as i32, scale);
-    let surface_height = div_ceil_i32(cursor.height as i32, scale);
+    let transform = BufferTransform::from_raw(cursor.buffer_transform).unwrap_or_default();
+    let (width, height) = transform.transformed_size(cursor.width, cursor.height);
+    let surface_width = div_ceil_i32(width as i32, scale);
+    let surface_height = div_ceil_i32(height as i32, scale);
     SurfaceFrame {
         owner_id: cursor.owner_id,
         surface_id: cursor.surface_id,
@@ -703,6 +707,7 @@ fn cursor_surface_view(cursor: &CursorFrame) -> SurfaceFrame {
         x: 0,
         y: 0,
         buffer_scale: cursor.buffer_scale,
+        buffer_transform: cursor.buffer_transform,
         surface_width,
         surface_height,
         viewport_src: None,
@@ -1075,6 +1080,7 @@ fn draw_scene_layers(
             output_width,
             output_height,
             frame.format == WL_SHM_FORMAT_XRGB8888,
+            BufferTransform::from_raw(frame.buffer_transform).unwrap_or_default(),
             clip,
         );
     }
@@ -1114,6 +1120,7 @@ fn draw_cursor_layer(
                     output_width,
                     output_height,
                     cursor_frame.format == WL_SHM_FORMAT_XRGB8888,
+                    BufferTransform::from_raw(cursor_frame.buffer_transform).unwrap_or_default(),
                     clip,
                 );
             }
@@ -1134,6 +1141,7 @@ fn draw_cursor_layer(
                     output_width,
                     output_height,
                     default.format == WL_SHM_FORMAT_XRGB8888,
+                    BufferTransform::from_raw(default.buffer_transform).unwrap_or_default(),
                     clip,
                 );
             }
@@ -1151,24 +1159,29 @@ fn surface_dest_rect(frame: &SurfaceFrame) -> [f32; 4] {
 }
 
 fn surface_src_uv(frame: &SurfaceFrame) -> [f32; 4] {
-    let scale = frame.buffer_scale.max(1) as f32;
-    let bw = frame.width.max(1) as f32;
-    let bh = frame.height.max(1) as f32;
-    match frame.viewport_src {
-        Some((sx, sy, sw, sh)) => {
-            let u0 = (sx * scale) / bw;
-            let v0 = (sy * scale) / bh;
-            let u1 = ((sx + sw) * scale) / bw;
-            let v1 = ((sy + sh) * scale) / bh;
-            [u0, v0, u1, v1]
-        }
-        None => [0.0, 0.0, 1.0, 1.0],
-    }
+    let transform = BufferTransform::from_raw(frame.buffer_transform).unwrap_or_default();
+    let (width, height) = transform.transformed_size(frame.width, frame.height);
+    let [x, y, source_width, source_height] = transform.transformed_source_rect(
+        frame.width,
+        frame.height,
+        frame.buffer_scale,
+        frame.viewport_src,
+    );
+    let width = width.max(1) as f64;
+    let height = height.max(1) as f64;
+    [
+        (x / width) as f32,
+        (y / height) as f32,
+        ((x + source_width) / width) as f32,
+        ((y + source_height) / height) as f32,
+    ]
 }
 
 fn cursor_dest_rect(cursor: &CursorFrame, pointer_x: i32, pointer_y: i32) -> [f32; 4] {
-    let dest_w = div_ceil_i32(cursor.width as i32, cursor.buffer_scale.max(1)) as f32;
-    let dest_h = div_ceil_i32(cursor.height as i32, cursor.buffer_scale.max(1)) as f32;
+    let transform = BufferTransform::from_raw(cursor.buffer_transform).unwrap_or_default();
+    let (width, height) = transform.transformed_size(cursor.width, cursor.height);
+    let dest_w = div_ceil_i32(width as i32, cursor.buffer_scale.max(1)) as f32;
+    let dest_h = div_ceil_i32(height as i32, cursor.buffer_scale.max(1)) as f32;
     [
         (pointer_x - cursor.hotspot_x) as f32,
         (pointer_y - cursor.hotspot_y) as f32,
@@ -1462,6 +1475,7 @@ fn rects_intersect(a: DamageRect, b: DamageRect) -> bool {
 
 fn output_damage_to_buffer_rect(frame: &SurfaceFrame, damage: DamageRect) -> Option<UploadRect> {
     let scale = frame.buffer_scale.max(1);
+    let transform = BufferTransform::from_raw(frame.buffer_transform)?;
     let dest = DamageRect {
         x: frame.x,
         y: frame.y,
@@ -1479,16 +1493,51 @@ fn output_damage_to_buffer_rect(frame: &SurfaceFrame, damage: DamageRect) -> Opt
             (sw * scale as f32).ceil() as i32,
             (sh * scale as f32).ceil() as i32,
         ),
-        None => (0, 0, frame.width as i32, frame.height as i32),
+        None => {
+            let (width, height) = transform.transformed_size(frame.width, frame.height);
+            (0, 0, width as i32, height as i32)
+        }
     };
     let dest_w = frame.surface_width.max(1);
     let dest_h = frame.surface_height.max(1);
-    Some(UploadRect {
-        x: (src_x + local_x.saturating_mul(src_w) / dest_w).max(0) as u32,
-        y: (src_y + local_y.saturating_mul(src_h) / dest_h).max(0) as u32,
-        width: (intersect.width.saturating_mul(src_w) / dest_w).max(1) as u32,
-        height: (intersect.height.saturating_mul(src_h) / dest_h).max(1) as u32,
-    })
+    let tx0 = src_x + local_x.saturating_mul(src_w) / dest_w;
+    let ty0 = src_y + local_y.saturating_mul(src_h) / dest_h;
+    let tx1 = src_x
+        + div_ceil_i32(
+            local_x
+                .saturating_add(intersect.width)
+                .saturating_mul(src_w),
+            dest_w,
+        );
+    let ty1 = src_y
+        + div_ceil_i32(
+            local_y
+                .saturating_add(intersect.height)
+                .saturating_mul(src_h),
+            dest_h,
+        );
+    let tx = tx0.max(0) as u32;
+    let ty = ty0.max(0) as u32;
+    let tw = tx1.saturating_sub(tx0).max(1) as u32;
+    let th = ty1.saturating_sub(ty0).max(1) as u32;
+    let (x, y, width, height) = transform.transformed_rect_to_buffer(
+        tx,
+        ty,
+        tw,
+        th,
+        frame.width as u32,
+        frame.height as u32,
+    );
+    buffer_damage_to_upload_rect(
+        DamageRect {
+            x: x as i32,
+            y: y as i32,
+            width: width as i32,
+            height: height as i32,
+        },
+        frame.width as u32,
+        frame.height as u32,
+    )
 }
 
 fn intersect_damage(a: DamageRect, b: DamageRect) -> Option<DamageRect> {
@@ -1641,4 +1690,58 @@ fn find_host_memory_type(
         host_visible = Some((index, false));
     }
     host_visible
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_damage_maps_through_all_buffer_transforms() {
+        for transform in BufferTransform::ALL {
+            let (surface_width, surface_height) = transform.transformed_size(4, 3);
+            let frame = SurfaceFrame {
+                owner_id: 1,
+                surface_id: 2,
+                buffer_id: 3,
+                pixels: vec![0; 4 * 3 * 4],
+                width: 4,
+                height: 3,
+                stride: 16,
+                format: 0,
+                x: 10,
+                y: 20,
+                buffer_scale: 1,
+                buffer_transform: transform as u32,
+                surface_width: surface_width as i32,
+                surface_height: surface_height as i32,
+                viewport_src: None,
+                dmabuf: None,
+                damage: Vec::new(),
+                buffer_damage: Vec::new(),
+                full_surface: false,
+            };
+            let upload = output_damage_to_buffer_rect(
+                &frame,
+                DamageRect {
+                    x: 10,
+                    y: 20,
+                    width: 1,
+                    height: 1,
+                },
+            )
+            .unwrap();
+            let (expected_x, expected_y) = transform.transformed_to_buffer(0, 0, 4, 3);
+            assert_eq!(
+                upload,
+                UploadRect {
+                    x: expected_x as u32,
+                    y: expected_y as u32,
+                    width: 1,
+                    height: 1,
+                },
+                "{transform:?}"
+            );
+        }
+    }
 }

@@ -8,6 +8,7 @@ mod main_message;
 mod mods;
 mod output;
 pub mod ring;
+mod surface_geometry;
 pub mod udev;
 mod window_geometry;
 mod window_rule;
@@ -28,6 +29,7 @@ pub use ring::{
     Completion, EventLoop, Interest, OpKind, SharedWaker, Waker, decode_user_data,
     encode_user_data, monotonic_deadline_after, monotonic_now,
 };
+pub use surface_geometry::BufferTransform;
 pub use udev::{Udev, UdevDevice, UdevEnumerate, UdevMonitor};
 pub use window_geometry::{
     WINDOW_GEOMETRY_UNSET, WindowGeometryUpdate, geometry_field_from_dbus, geometry_field_to_dbus,

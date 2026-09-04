@@ -989,6 +989,7 @@ impl AppData {
                 error!("Unable to update surface frame position: {err:#}");
             }
         }
+        self.sync_renderer_scene();
         if !layout_syncs.is_empty() && self.renderer_state.scene_dirty() {
             self.render_scheduler.mark_dirty(Instant::now());
         }
@@ -997,6 +998,23 @@ impl AppData {
     fn sync_windows_to_dbus(&mut self) {
         self.comms
             .dbus(DbusMessage::SetWindows(self.display_state.window_states()));
+    }
+
+    fn sync_renderer_scene(&mut self) {
+        let scene: Vec<_> = self
+            .display_state
+            .scene_surfaces()
+            .into_iter()
+            .map(|surface| {
+                (
+                    surface.client_id.get(),
+                    surface.surface_id.get(),
+                    surface.x,
+                    surface.y,
+                )
+            })
+            .collect();
+        self.renderer_state.sync_surface_scene(&scene);
     }
 
     fn submit_committed_frames(&mut self) {
@@ -1024,6 +1042,7 @@ impl AppData {
                         x: frame.x,
                         y: frame.y,
                         buffer_scale: frame.buffer_scale,
+                        buffer_transform: frame.buffer_transform,
                         surface_width: frame.surface_width,
                         surface_height: frame.surface_height,
                         viewport_src: frame.viewport_src,
@@ -1083,6 +1102,7 @@ impl AppData {
                         hotspot_x: hotspot.0,
                         hotspot_y: hotspot.1,
                         buffer_scale: frame.buffer_scale,
+                        buffer_transform: frame.buffer_transform,
                         dmabuf,
                     };
                     if let Err(err) = self.renderer_state.set_cursor_frame(cursor) {
@@ -1102,6 +1122,7 @@ impl AppData {
                 }
             }
         }
+        self.sync_renderer_scene();
         if had_updates {
             self.sync_windows_to_dbus();
         }

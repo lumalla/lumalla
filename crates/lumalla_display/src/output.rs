@@ -142,6 +142,33 @@ impl OutputManager {
         self.outputs.values()
     }
 
+    /// Logical output bounds containing a point, or the first output as fallback.
+    pub fn work_area_for_point(&self, x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
+        let contains = |output: &&OutputInfo| {
+            x >= output.x
+                && y >= output.y
+                && x < output.x.saturating_add(output.width)
+                && y < output.y.saturating_add(output.height)
+        };
+        self.outputs()
+            .find(contains)
+            .or_else(|| self.outputs().next())
+            .map(|output| (output.x, output.y, output.width, output.height))
+    }
+
+    pub fn logical_size_for_client_output(
+        &self,
+        client_id: ClientId,
+        output_id: Option<ObjectId>,
+    ) -> Option<(i32, i32)> {
+        let selected = output_id
+            .and_then(|id| self.bindings.get(&(client_id, id)))
+            .and_then(|global| self.outputs.get(global));
+        selected
+            .or_else(|| self.outputs().next())
+            .map(|output| (output.width, output.height))
+    }
+
     #[cfg(test)]
     fn get_by_name(&self, name: &str) -> Option<&OutputInfo> {
         self.by_name.get(name).and_then(|id| self.outputs.get(id))

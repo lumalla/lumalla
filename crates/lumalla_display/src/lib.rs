@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use anyhow::Context;
-use lumalla_shared::{Comms, WindowGeometryUpdate, WindowRule, WindowState};
+use lumalla_shared::{WindowGeometryUpdate, WindowRule, WindowState};
 use lumalla_wayland_protocol::protocols::presentation_time::{
     WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK, WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION,
     WP_PRESENTATION_FEEDBACK_KIND_VSYNC,
@@ -30,7 +30,7 @@ pub use dmabuf::ExportedDmabuf;
 pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland, buffer::ReadResult};
 pub use output::OutputInfo;
 pub use seat::{ActiveCursor, KeyboardModifiers};
-pub use surface::Rectangle;
+pub use surface::{Rectangle, SceneSurface};
 pub use window_manager::{WindowError, WindowGeometryChange};
 
 /// Presentation timing for a completed DRM page-flip.
@@ -383,6 +383,11 @@ impl DisplayState {
         self.surface_updates.drain(..)
     }
 
+    /// Current mapped scene in authoritative back-to-front order.
+    pub fn scene_surfaces(&self) -> Vec<SceneSurface> {
+        self.surface_manager.scene_surfaces()
+    }
+
     pub fn pending_frame_callback_count(&self) -> usize {
         self.pending_frame_callbacks.len()
     }
@@ -663,25 +668,10 @@ impl DisplayState {
         xdg_surface_id: ObjectId,
         toplevel_id: ObjectId,
     ) {
-        let Ok(serial) = self
-            .xdg_manager
-            .send_configure_serial(client_id, xdg_surface_id)
-        else {
+        let Ok(snapshot) = self.xdg_manager.toplevel_configure(client_id, toplevel_id) else {
             return;
         };
-        let (width, height) = self
-            .xdg_manager
-            .toplevel_configure_size(client_id, toplevel_id)
-            .unwrap_or((
-                window_manager::DEFAULT_WINDOW_WIDTH,
-                window_manager::DEFAULT_WINDOW_HEIGHT,
-            ));
-        writer
-            .xdg_toplevel_configure(toplevel_id)
-            .width(width)
-            .height(height)
-            .states(&[]);
-        writer.xdg_surface_configure(xdg_surface_id).serial(serial);
+        protocols::xdg_shell::write_configure_snapshot(writer, xdg_surface_id, snapshot);
     }
 
     fn apply_geometry_changes(

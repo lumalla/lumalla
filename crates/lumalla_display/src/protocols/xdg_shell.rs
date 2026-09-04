@@ -1,16 +1,21 @@
 use log::debug;
 use lumalla_wayland_protocol::{
     Ctx, NewObjectId, ObjectId,
+    buffer::Writer,
     protocols::{XdgShellProtocol, wayland::WL_DISPLAY_ERROR_INVALID_OBJECT, xdg_shell::*},
     registry::{DISPLAY_OBJECT_ID, InterfaceIndex},
 };
 
-use crate::{DisplayState, surface::SurfaceError, xdg::XdgError};
+use crate::{
+    DisplayState,
+    surface::SurfaceError,
+    xdg::{
+        ConfigurePayload, ConfigureSnapshot, TOPLEVEL_STATE_FULLSCREEN, TOPLEVEL_STATE_MAXIMIZED,
+        XdgError,
+    },
+};
 
 impl XdgShellProtocol for DisplayState {}
-
-const DEFAULT_TOPLEVEL_WIDTH: i32 = 800;
-const DEFAULT_TOPLEVEL_HEIGHT: i32 = 600;
 
 fn register_object(
     ctx: &mut Ctx,
@@ -49,6 +54,41 @@ fn report_xdg_error(ctx: &mut Ctx, object_id: ObjectId, error: XdgError) {
             XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER,
             "Buffer attached before configure ack",
         ),
+        XdgError::DefunctSurfaces => (
+            XDG_WM_BASE_ERROR_DEFUNCT_SURFACES,
+            "xdg_wm_base destroyed before its children",
+        ),
+        XdgError::DefunctRoleObject => (
+            XDG_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT,
+            "xdg_surface destroyed before its role object",
+        ),
+        XdgError::NotTopmostPopup => (
+            XDG_WM_BASE_ERROR_NOT_THE_TOPMOST_POPUP,
+            "xdg_popup is not the topmost popup",
+        ),
+        XdgError::InvalidPopupParent => (
+            XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT,
+            "Invalid or unmapped popup parent",
+        ),
+        XdgError::InvalidSurfaceState => (
+            XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE,
+            "wl_surface already has attached or committed content",
+        ),
+        XdgError::InvalidParent => (XDG_TOPLEVEL_ERROR_INVALID_PARENT, "Invalid toplevel parent"),
+        XdgError::InvalidPositioner => (
+            XDG_WM_BASE_ERROR_INVALID_POSITIONER,
+            "Incomplete or invalid positioner",
+        ),
+        XdgError::InvalidPositionerInput => (
+            XDG_POSITIONER_ERROR_INVALID_INPUT,
+            "Invalid positioner input",
+        ),
+        XdgError::InvalidWindowGeometry => (
+            XDG_SURFACE_ERROR_INVALID_SIZE,
+            "Invalid window geometry size",
+        ),
+        XdgError::InvalidToplevelSize => (XDG_TOPLEVEL_ERROR_INVALID_SIZE, "Invalid toplevel size"),
+        XdgError::InvalidGrab => (XDG_POPUP_ERROR_INVALID_GRAB, "Invalid popup grab"),
         XdgError::UnknownPositioner => (
             XDG_WM_BASE_ERROR_INVALID_POSITIONER,
             "Unknown xdg_positioner",
@@ -83,30 +123,71 @@ fn report_surface_role_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceE
         .message(message);
 }
 
-fn emit_toplevel_configure(
-    state: &mut DisplayState,
+pub(crate) fn emit_configure_snapshot(
     ctx: &mut Ctx,
     xdg_surface_id: ObjectId,
-    toplevel_id: ObjectId,
+    snapshot: ConfigureSnapshot,
 ) {
-    let Ok(serial) = state
-        .xdg_manager
-        .send_configure_serial(ctx.client_id, xdg_surface_id)
-    else {
-        return;
-    };
-    let (width, height) = state
-        .xdg_manager
-        .toplevel_configure_size(ctx.client_id, toplevel_id)
-        .unwrap_or((DEFAULT_TOPLEVEL_WIDTH, DEFAULT_TOPLEVEL_HEIGHT));
-    ctx.writer
-        .xdg_toplevel_configure(toplevel_id)
-        .width(width)
-        .height(height)
-        .states(&[]);
-    ctx.writer
+    write_configure_snapshot(ctx.writer, xdg_surface_id, snapshot);
+}
+
+pub(crate) fn write_configure_snapshot(
+    writer: &mut Writer,
+    xdg_surface_id: ObjectId,
+    snapshot: ConfigureSnapshot,
+) {
+    match snapshot.payload {
+        ConfigurePayload::Toplevel {
+            width,
+            height,
+            states,
+        } => {
+            let mut state_bytes = Vec::with_capacity(8);
+            if states & TOPLEVEL_STATE_MAXIMIZED != 0 {
+                state_bytes.extend_from_slice(&XDG_TOPLEVEL_STATE_MAXIMIZED.to_ne_bytes());
+            }
+            if states & TOPLEVEL_STATE_FULLSCREEN != 0 {
+                state_bytes.extend_from_slice(&XDG_TOPLEVEL_STATE_FULLSCREEN.to_ne_bytes());
+            }
+            writer
+                .xdg_toplevel_configure(snapshot.role_id)
+                .width(width)
+                .height(height)
+                .states(&state_bytes);
+        }
+        ConfigurePayload::Popup { geometry, .. } => {
+            writer
+                .xdg_popup_configure(snapshot.role_id)
+                .x(geometry.x)
+                .y(geometry.y)
+                .width(geometry.width)
+                .height(geometry.height);
+        }
+    }
+    writer
         .xdg_surface_configure(xdg_surface_id)
-        .serial(serial);
+        .serial(snapshot.serial);
+}
+
+fn popup_constraint_bounds(
+    state: &DisplayState,
+    client_id: lumalla_wayland_protocol::ClientId,
+    parent_xdg: ObjectId,
+) -> Option<(i32, i32, i32, i32)> {
+    let parent_wl = state.xdg_manager.xdg_surface_wl(client_id, parent_xdg)?;
+    let (parent_x, parent_y) = state
+        .surface_manager
+        .surface_window_origin(client_id, parent_wl)
+        .unwrap_or((0, 0));
+    let (work_x, work_y, work_width, work_height) = state
+        .output_manager
+        .work_area_for_point(parent_x, parent_y)?;
+    Some((
+        work_x - parent_x,
+        work_y - parent_y,
+        work_width,
+        work_height,
+    ))
 }
 
 impl XdgWmBase for DisplayState {
@@ -131,8 +212,13 @@ impl XdgWmBase for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::XdgPositioner, version) {
             return;
         }
-        self.xdg_manager
-            .create_positioner(ctx.client_id, *params.id());
+        if let Err(error) =
+            self.xdg_manager
+                .create_positioner_for_wm_base(ctx.client_id, object_id, *params.id())
+        {
+            ctx.registry.free_object(*params.id(), ctx.writer);
+            report_xdg_error(ctx, object_id, error);
+        }
     }
 
     fn get_xdg_surface(
@@ -143,6 +229,14 @@ impl XdgWmBase for DisplayState {
     ) {
         if ctx.registry.interface_index(params.surface()) != Some(InterfaceIndex::WlSurface) {
             report_xdg_error(ctx, params.surface(), XdgError::UnknownSurface);
+            return;
+        }
+        if self
+            .surface_manager
+            .has_attached_or_committed_buffer(ctx.client_id, params.surface())
+            .unwrap_or(false)
+        {
+            report_xdg_error(ctx, object_id, XdgError::InvalidSurfaceState);
             return;
         }
         let version = ctx
@@ -156,16 +250,20 @@ impl XdgWmBase for DisplayState {
             self.surface_manager
                 .assign_xdg_role(ctx.client_id, params.surface(), *params.id())
         {
+            ctx.registry.free_object(*params.id(), ctx.writer);
             report_surface_role_error(ctx, object_id, error);
             return;
         }
-        if let Err(error) =
-            self.xdg_manager
-                .create_xdg_surface(ctx.client_id, *params.id(), params.surface())
-        {
+        if let Err(error) = self.xdg_manager.create_xdg_surface_owned(
+            ctx.client_id,
+            object_id,
+            *params.id(),
+            params.surface(),
+        ) {
             let _ = self
                 .surface_manager
                 .clear_xdg_role(ctx.client_id, params.surface());
+            ctx.registry.free_object(*params.id(), ctx.writer);
             report_xdg_error(ctx, object_id, error);
         }
     }
@@ -325,10 +423,7 @@ impl XdgSurface for DisplayState {
             .xdg_manager
             .destroy_xdg_surface(ctx.client_id, object_id)
         {
-            Ok(wl_surface) => {
-                let _ = self
-                    .surface_manager
-                    .clear_xdg_role(ctx.client_id, wl_surface);
+            Ok(_wl_surface) => {
                 ctx.registry.free_object(object_id, ctx.writer);
             }
             Err(error) => report_xdg_error(ctx, object_id, error),
@@ -352,6 +447,7 @@ impl XdgSurface for DisplayState {
             .xdg_manager
             .wl_surface_for_xdg(ctx.client_id, object_id)
         else {
+            ctx.registry.free_object(*params.id(), ctx.writer);
             report_xdg_error(ctx, object_id, XdgError::UnknownXdgSurface);
             return;
         };
@@ -364,16 +460,10 @@ impl XdgSurface for DisplayState {
             width,
             height,
         ) {
-            Ok(serial) => {
-                ctx.writer
-                    .xdg_toplevel_configure(*params.id())
-                    .width(width)
-                    .height(height)
-                    .states(&[]);
-                ctx.writer.xdg_surface_configure(object_id).serial(serial);
-            }
+            Ok(()) => {}
             Err(error) => {
                 self.unregister_toplevel(ctx.client_id, *params.id());
+                ctx.registry.free_object(*params.id(), ctx.writer);
                 report_xdg_error(ctx, object_id, error);
             }
         }
@@ -407,38 +497,23 @@ impl XdgSurface for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::XdgPopup, version) {
             return;
         }
-        match self.xdg_manager.create_popup(
+        let constraint_bounds = popup_constraint_bounds(self, ctx.client_id, parent);
+        match self.xdg_manager.create_popup_with_bounds(
             ctx.client_id,
             *params.id(),
             object_id,
             parent,
             params.positioner(),
+            constraint_bounds,
         ) {
-            Ok((serial, geometry)) => {
-                if let (Some(popup_wl), Some(parent_wl)) = (
-                    self.xdg_manager.xdg_surface_wl(ctx.client_id, object_id),
-                    self.xdg_manager.xdg_surface_wl(ctx.client_id, parent),
-                ) {
-                    let (parent_x, parent_y) = self
-                        .surface_manager
-                        .surface_layout(ctx.client_id, parent_wl)
-                        .unwrap_or((0, 0));
-                    let _ = self.surface_manager.set_surface_layout(
-                        ctx.client_id,
-                        popup_wl,
-                        parent_x + geometry.x,
-                        parent_y + geometry.y,
-                    );
-                }
-                ctx.writer
-                    .xdg_popup_configure(*params.id())
-                    .x(geometry.x)
-                    .y(geometry.y)
-                    .width(geometry.width)
-                    .height(geometry.height);
-                ctx.writer.xdg_surface_configure(object_id).serial(serial);
+            Ok(_geometry) => {
+                // Initial popup configure is emitted after the required
+                // bufferless wl_surface commit.
             }
-            Err(error) => report_xdg_error(ctx, object_id, error),
+            Err(error) => {
+                ctx.registry.free_object(*params.id(), ctx.writer);
+                report_xdg_error(ctx, object_id, error);
+            }
         }
     }
 
@@ -471,15 +546,6 @@ impl XdgSurface for DisplayState {
                 .ack_configure(ctx.client_id, object_id, params.serial())
         {
             report_xdg_error(ctx, object_id, error);
-            return;
-        }
-        if let Ok(wl_surface) = self
-            .xdg_manager
-            .wl_surface_for_xdg(ctx.client_id, object_id)
-        {
-            let _ = self
-                .surface_manager
-                .set_xdg_map_ready(ctx.client_id, wl_surface, true);
         }
     }
 }
@@ -487,7 +553,19 @@ impl XdgSurface for DisplayState {
 impl XdgToplevel for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &XdgToplevelDestroy<'_>) {
         match self.xdg_manager.destroy_toplevel(ctx.client_id, object_id) {
-            Ok(_) => {
+            Ok(xdg_surface) => {
+                if let Some(wl_surface) =
+                    self.xdg_manager.xdg_surface_wl(ctx.client_id, xdg_surface)
+                {
+                    let _ =
+                        self.surface_manager
+                            .set_xdg_map_ready(ctx.client_id, wl_surface, false);
+                    self.surface_updates
+                        .push_back(crate::SurfaceUpdate::Unmapped {
+                            client_id: ctx.client_id,
+                            surface_id: wl_surface,
+                        });
+                }
                 self.unregister_toplevel(ctx.client_id, object_id);
                 ctx.registry.free_object(object_id, ctx.writer);
             }
@@ -583,11 +661,23 @@ impl XdgToplevel for DisplayState {
         object_id: ObjectId,
         _params: &XdgToplevelSetMaximized<'_>,
     ) {
-        if let Ok(xdg_surface) = self
+        let size = self
+            .output_manager
+            .logical_size_for_client_output(ctx.client_id, None);
+        match self
             .xdg_manager
-            .xdg_surface_for_toplevel(ctx.client_id, object_id)
+            .set_toplevel_maximized_size(ctx.client_id, object_id, true, size)
         {
-            emit_toplevel_configure(self, ctx, xdg_surface, object_id);
+            Ok(Some(snapshot)) => {
+                if let Ok(xdg_surface) = self
+                    .xdg_manager
+                    .xdg_surface_for_toplevel(ctx.client_id, object_id)
+                {
+                    emit_configure_snapshot(ctx, xdg_surface, snapshot);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => report_xdg_error(ctx, object_id, error),
         }
     }
 
@@ -597,11 +687,20 @@ impl XdgToplevel for DisplayState {
         object_id: ObjectId,
         _params: &XdgToplevelUnsetMaximized<'_>,
     ) {
-        if let Ok(xdg_surface) = self
+        match self
             .xdg_manager
-            .xdg_surface_for_toplevel(ctx.client_id, object_id)
+            .set_toplevel_maximized(ctx.client_id, object_id, false)
         {
-            emit_toplevel_configure(self, ctx, xdg_surface, object_id);
+            Ok(Some(snapshot)) => {
+                if let Ok(xdg_surface) = self
+                    .xdg_manager
+                    .xdg_surface_for_toplevel(ctx.client_id, object_id)
+                {
+                    emit_configure_snapshot(ctx, xdg_surface, snapshot);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => report_xdg_error(ctx, object_id, error),
         }
     }
 
@@ -609,13 +708,25 @@ impl XdgToplevel for DisplayState {
         &mut self,
         ctx: &mut Ctx,
         object_id: ObjectId,
-        _params: &XdgToplevelSetFullscreen<'_>,
+        params: &XdgToplevelSetFullscreen<'_>,
     ) {
-        if let Ok(xdg_surface) = self
+        let size = self
+            .output_manager
+            .logical_size_for_client_output(ctx.client_id, params.output());
+        match self
             .xdg_manager
-            .xdg_surface_for_toplevel(ctx.client_id, object_id)
+            .set_toplevel_fullscreen_size(ctx.client_id, object_id, true, size)
         {
-            emit_toplevel_configure(self, ctx, xdg_surface, object_id);
+            Ok(Some(snapshot)) => {
+                if let Ok(xdg_surface) = self
+                    .xdg_manager
+                    .xdg_surface_for_toplevel(ctx.client_id, object_id)
+                {
+                    emit_configure_snapshot(ctx, xdg_surface, snapshot);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => report_xdg_error(ctx, object_id, error),
         }
     }
 
@@ -625,11 +736,20 @@ impl XdgToplevel for DisplayState {
         object_id: ObjectId,
         _params: &XdgToplevelUnsetFullscreen<'_>,
     ) {
-        if let Ok(xdg_surface) = self
+        match self
             .xdg_manager
-            .xdg_surface_for_toplevel(ctx.client_id, object_id)
+            .set_toplevel_fullscreen(ctx.client_id, object_id, false)
         {
-            emit_toplevel_configure(self, ctx, xdg_surface, object_id);
+            Ok(Some(snapshot)) => {
+                if let Ok(xdg_surface) = self
+                    .xdg_manager
+                    .xdg_surface_for_toplevel(ctx.client_id, object_id)
+                {
+                    emit_configure_snapshot(ctx, xdg_surface, snapshot);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => report_xdg_error(ctx, object_id, error),
         }
     }
 
@@ -645,12 +765,36 @@ impl XdgToplevel for DisplayState {
 impl XdgPopup for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &XdgPopupDestroy<'_>) {
         match self.xdg_manager.destroy_popup(ctx.client_id, object_id) {
-            Ok(_) => ctx.registry.free_object(object_id, ctx.writer),
+            Ok(xdg_surface) => {
+                if let Some(wl_surface) =
+                    self.xdg_manager.xdg_surface_wl(ctx.client_id, xdg_surface)
+                {
+                    let _ =
+                        self.surface_manager
+                            .set_xdg_map_ready(ctx.client_id, wl_surface, false);
+                    self.surface_manager
+                        .clear_role_parent(ctx.client_id, wl_surface);
+                    self.surface_updates
+                        .push_back(crate::SurfaceUpdate::Unmapped {
+                            client_id: ctx.client_id,
+                            surface_id: wl_surface,
+                        });
+                }
+                ctx.registry.free_object(object_id, ctx.writer);
+            }
             Err(error) => report_xdg_error(ctx, object_id, error),
         }
     }
 
-    fn grab(&mut self, _ctx: &mut Ctx, _object_id: ObjectId, _params: &XdgPopupGrab<'_>) {}
+    fn grab(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &XdgPopupGrab<'_>) {
+        if ctx.registry.interface_index(params.seat()) != Some(InterfaceIndex::WlSeat) {
+            report_xdg_error(ctx, object_id, XdgError::InvalidGrab);
+            return;
+        }
+        if let Err(error) = self.xdg_manager.grab_popup(ctx.client_id, object_id) {
+            report_xdg_error(ctx, object_id, error);
+        }
+    }
 
     fn reposition(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &XdgPopupReposition<'_>) {
         if ctx.registry.interface_index(params.positioner()) != Some(InterfaceIndex::XdgPositioner)
@@ -658,30 +802,18 @@ impl XdgPopup for DisplayState {
             report_xdg_error(ctx, object_id, XdgError::UnknownPositioner);
             return;
         }
-        match self
+        let constraint_bounds = self
             .xdg_manager
-            .reposition_popup(ctx.client_id, object_id, params.positioner())
-        {
+            .popup_parent_xdg(ctx.client_id, object_id)
+            .and_then(|parent| popup_constraint_bounds(self, ctx.client_id, parent));
+        match self.xdg_manager.reposition_popup_with_bounds(
+            ctx.client_id,
+            object_id,
+            params.positioner(),
+            params.token(),
+            constraint_bounds,
+        ) {
             Ok((serial, geometry, xdg_surface)) => {
-                if let (Some(popup_wl), Some(parent_xdg)) = (
-                    self.xdg_manager.xdg_surface_wl(ctx.client_id, xdg_surface),
-                    self.xdg_manager.popup_parent_xdg(ctx.client_id, object_id),
-                ) {
-                    if let Some(parent_wl) =
-                        self.xdg_manager.xdg_surface_wl(ctx.client_id, parent_xdg)
-                    {
-                        let (parent_x, parent_y) = self
-                            .surface_manager
-                            .surface_layout(ctx.client_id, parent_wl)
-                            .unwrap_or((0, 0));
-                        let _ = self.surface_manager.set_surface_layout(
-                            ctx.client_id,
-                            popup_wl,
-                            parent_x + geometry.x,
-                            parent_y + geometry.y,
-                        );
-                    }
-                }
                 ctx.writer
                     .xdg_popup_repositioned(object_id)
                     .token(params.token());
@@ -698,15 +830,59 @@ impl XdgPopup for DisplayState {
     }
 }
 
-/// Hook called from wl_surface.commit path for xdg bookkeeping.
-pub(crate) fn on_xdg_surface_commit(
+/// Apply xdg double-buffered state before the matching wl_surface state becomes
+/// visible, so mapping and placement are atomic with the commit.
+pub(crate) fn apply_xdg_surface_commit_with_buffer(
     state: &mut DisplayState,
     client_id: lumalla_wayland_protocol::ClientId,
     surface_id: ObjectId,
-) {
-    state
+    buffer: Option<bool>,
+) -> crate::xdg::CommitOutcome {
+    let outcome = state
         .xdg_manager
-        .on_wl_surface_commit(client_id, surface_id);
+        .on_wl_surface_commit_with_buffer(client_id, surface_id, buffer);
+
+    if let Some(geometry) = outcome.window_geometry {
+        let _ = state
+            .surface_manager
+            .set_window_geometry_offset(client_id, surface_id, geometry.x, geometry.y);
+    }
+    if let Some(snapshot) = outcome.applied_configure
+        && let ConfigurePayload::Popup { geometry, .. } = snapshot.payload
+    {
+        let _ = state
+            .surface_manager
+            .set_surface_layout(client_id, surface_id, geometry.x, geometry.y);
+        if let Some(parent_xdg) = state
+            .xdg_manager
+            .popup_parent_xdg(client_id, snapshot.role_id)
+            && let Some(parent_wl) = state.xdg_manager.xdg_surface_wl(client_id, parent_xdg)
+        {
+            let _ = state
+                .surface_manager
+                .set_role_parent(client_id, surface_id, parent_wl);
+        }
+    }
+    let ready = state.xdg_manager.can_map_wl_surface(client_id, surface_id);
+    let _ = state
+        .surface_manager
+        .set_xdg_map_ready(client_id, surface_id, ready);
+    outcome
+}
+
+pub(crate) fn emit_xdg_commit_events(
+    state: &DisplayState,
+    ctx: &mut Ctx,
+    surface_id: ObjectId,
+    outcome: crate::xdg::CommitOutcome,
+) {
+    if let Some(snapshot) = outcome.initial_configure
+        && let Some(xdg_surface) = state
+            .xdg_manager
+            .xdg_surface_for_wl(ctx.client_id, surface_id)
+    {
+        emit_configure_snapshot(ctx, xdg_surface, snapshot);
+    }
 }
 
 /// Report an xdg error from the wl_surface.commit path.

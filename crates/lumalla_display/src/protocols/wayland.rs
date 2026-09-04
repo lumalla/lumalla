@@ -1,4 +1,5 @@
 use log::debug;
+use lumalla_shared::BufferTransform;
 use lumalla_wayland_protocol::{
     Ctx, NewObjectId, ObjectId,
     protocols::{WaylandProtocol, WlDisplay, wayland::*},
@@ -159,14 +160,6 @@ fn report_data_device_error(ctx: &mut Ctx, object_id: ObjectId, error: DataDevic
         .message(message);
 }
 
-fn div_ceil_i32(value: i32, divisor: i32) -> i32 {
-    let divisor = i64::from(divisor.max(1));
-    let value = i64::from(value.max(0));
-    ((value + divisor - 1) / divisor)
-        .try_into()
-        .unwrap_or(i32::MAX)
-}
-
 /// Maps commit damage hints to output-space and buffer-space rectangles.
 fn commit_damage(
     commit: &SurfaceCommit,
@@ -184,6 +177,13 @@ fn commit_damage(
     }
 
     let scale = commit.buffer_scale.max(1);
+    let transform = BufferTransform::from_raw(commit.buffer_transform).unwrap_or_default();
+    let source = transform.transformed_source_rect(
+        buffer_width,
+        buffer_height,
+        scale,
+        commit.viewport.source,
+    );
     let mut output_damage = Vec::new();
     let mut buffer_damage = Vec::new();
     if !commit.buffer_damage.is_empty() {
@@ -192,33 +192,22 @@ fn commit_damage(
                 continue;
             }
             buffer_damage.push(*rect);
-            // Buffer damage → output: approximate via surface size mapping when viewport scales.
-            let out_w = if buffer_width == 0 {
-                0
-            } else {
-                div_ceil_i32(
-                    rect.width.saturating_mul(surface_width),
-                    buffer_width as i32,
-                )
-            };
-            let out_h = if buffer_height == 0 {
-                0
-            } else {
-                div_ceil_i32(
-                    rect.height.saturating_mul(surface_height),
-                    buffer_height as i32,
-                )
-            };
-            let out_x_off = if buffer_width == 0 {
-                0
-            } else {
-                rect.x.saturating_mul(surface_width) / buffer_width as i32
-            };
-            let out_y_off = if buffer_height == 0 {
-                0
-            } else {
-                rect.y.saturating_mul(surface_height) / buffer_height as i32
-            };
+            let (tx, ty, tw, th) = transform.buffer_rect_to_transformed(
+                rect.x.max(0) as u32,
+                rect.y.max(0) as u32,
+                rect.width as u32,
+                rect.height as u32,
+                buffer_width as u32,
+                buffer_height as u32,
+            );
+            let src_w = source[2].max(1.0);
+            let src_h = source[3].max(1.0);
+            let out_x_off =
+                (((tx as f64 - source[0]) * surface_width as f64) / src_w).floor() as i32;
+            let out_y_off =
+                (((ty as f64 - source[1]) * surface_height as f64) / src_h).floor() as i32;
+            let out_w = ((tw as f64 * surface_width as f64) / src_w).ceil() as i32;
+            let out_h = ((th as f64 * surface_height as f64) / src_h).ceil() as i32;
             output_damage.push(Rectangle {
                 x: output_x + out_x_off,
                 y: output_y + out_y_off,
@@ -237,46 +226,27 @@ fn commit_damage(
                 width: rect.width,
                 height: rect.height,
             });
-            // Surface-local damage → buffer space via viewport source or scale.
-            if let Some((sx, sy, sw, sh)) = commit.viewport.source {
-                let src_x = (sx * scale as f32) as i32;
-                let src_y = (sy * scale as f32) as i32;
-                let src_w = (sw * scale as f32).ceil() as i32;
-                let src_h = (sh * scale as f32).ceil() as i32;
-                let bw = if surface_width <= 0 {
-                    0
-                } else {
-                    rect.width.saturating_mul(src_w) / surface_width
-                };
-                let bh = if surface_height <= 0 {
-                    0
-                } else {
-                    rect.height.saturating_mul(src_h) / surface_height
-                };
-                buffer_damage.push(Rectangle {
-                    x: src_x
-                        + if surface_width <= 0 {
-                            0
-                        } else {
-                            rect.x.saturating_mul(src_w) / surface_width
-                        },
-                    y: src_y
-                        + if surface_height <= 0 {
-                            0
-                        } else {
-                            rect.y.saturating_mul(src_h) / surface_height
-                        },
-                    width: bw.max(1),
-                    height: bh.max(1),
-                });
-            } else {
-                buffer_damage.push(Rectangle {
-                    x: rect.x.saturating_mul(scale),
-                    y: rect.y.saturating_mul(scale),
-                    width: rect.width.saturating_mul(scale),
-                    height: rect.height.saturating_mul(scale),
-                });
-            }
+            let transformed_x = source[0] + rect.x as f64 * source[2] / surface_width.max(1) as f64;
+            let transformed_y =
+                source[1] + rect.y as f64 * source[3] / surface_height.max(1) as f64;
+            let transformed_w =
+                (rect.width as f64 * source[2] / surface_width.max(1) as f64).ceil();
+            let transformed_h =
+                (rect.height as f64 * source[3] / surface_height.max(1) as f64).ceil();
+            let (bx, by, bw, bh) = transform.transformed_rect_to_buffer(
+                transformed_x.floor().max(0.0) as u32,
+                transformed_y.floor().max(0.0) as u32,
+                transformed_w.max(1.0) as u32,
+                transformed_h.max(1.0) as u32,
+                buffer_width as u32,
+                buffer_height as u32,
+            );
+            buffer_damage.push(Rectangle {
+                x: bx as i32,
+                y: by as i32,
+                width: bw as i32,
+                height: bh as i32,
+            });
         }
     }
 
@@ -369,6 +339,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                 let (surface_width, surface_height) = effective_surface_size(
                     Some((width as i32, height as i32)),
                     commit.buffer_scale,
+                    commit.buffer_transform,
                     &commit.viewport,
                 )
                 .unwrap_or((0, 0));
@@ -492,7 +463,10 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                 super::viewporter::report_viewport_commit_error(ctx, viewport_id, error);
                 return;
             }
-            if commit.viewport_changed
+            let visual_change = commit.viewport_changed
+                || !commit.damage.is_empty()
+                || !commit.buffer_damage.is_empty();
+            if visual_change
                 && commit.mapped
                 && let Some(buffer_id) = commit.buffer
             {
@@ -534,11 +508,25 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                 let (surface_width, surface_height) = effective_surface_size(
                     Some((width as i32, height as i32)),
                     commit.buffer_scale,
+                    commit.buffer_transform,
                     &commit.viewport,
                 )
                 .unwrap_or((0, 0));
                 let output_x = commit.layout.0 + commit.offset.0;
                 let output_y = commit.layout.1 + commit.offset.1;
+                let (damage, buffer_damage, full_surface) = if commit.viewport_changed {
+                    (Vec::new(), Vec::new(), true)
+                } else {
+                    commit_damage(
+                        &commit,
+                        output_x,
+                        output_y,
+                        width,
+                        height,
+                        surface_width,
+                        surface_height,
+                    )
+                };
                 let frame = CommittedFrame {
                     client_id: ctx.client_id,
                     surface_id: commit.surface_id,
@@ -558,9 +546,9 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                     surface_height,
                     viewport_src: commit.viewport.source,
                     dmabuf,
-                    damage: Vec::new(),
-                    buffer_damage: Vec::new(),
-                    full_surface: true,
+                    damage,
+                    buffer_damage,
+                    full_surface,
                 };
                 if is_cursor {
                     state
@@ -1278,6 +1266,13 @@ impl WlShellSurface for DisplayState {
 
 impl WlSurface for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSurfaceDestroy<'_>) {
+        if let Err(error) = self
+            .xdg_manager
+            .validate_wl_surface_destroy(ctx.client_id, object_id)
+        {
+            crate::protocols::xdg_shell::report_commit_error(ctx, object_id, error);
+            return;
+        }
         match self
             .surface_manager
             .destroy_surface(ctx.client_id, object_id)
@@ -1319,6 +1314,16 @@ impl WlSurface for DisplayState {
                     self.surface_updates.push_back(SurfaceUpdate::Unmapped {
                         client_id: ctx.client_id,
                         surface_id: object_id,
+                    });
+                }
+                for child in destroyed.unmapped_descendants {
+                    self.seat_manager
+                        .leave_keyboards_on_surface(ctx.client_id, child, ctx.writer);
+                    self.seat_manager
+                        .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
+                    self.surface_updates.push_back(SurfaceUpdate::Unmapped {
+                        client_id: ctx.client_id,
+                        surface_id: child,
                     });
                 }
             }
@@ -1425,15 +1430,11 @@ impl WlSurface for DisplayState {
     }
 
     fn commit(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSurfaceCommit<'_>) {
-        let result = match self.surface_manager.commit(ctx.client_id, object_id) {
-            Ok(result) => result,
-            Err(error) => {
-                report_surface_error(ctx, object_id, error);
-                return;
-            }
-        };
-
-        let attaching_buffer = matches!(result.primary.attached_buffer, Some(Some(_)));
+        let pending_attachment = self
+            .surface_manager
+            .pending_buffer_attachment(ctx.client_id, object_id)
+            .unwrap_or(None);
+        let attaching_buffer = matches!(pending_attachment, Some(Some(_)));
         if attaching_buffer
             && let Err(error) = self
                 .xdg_manager
@@ -1443,10 +1444,34 @@ impl WlSurface for DisplayState {
             return;
         }
 
-        crate::protocols::xdg_shell::on_xdg_surface_commit(self, ctx.client_id, object_id);
+        let xdg_outcome = crate::protocols::xdg_shell::apply_xdg_surface_commit_with_buffer(
+            self,
+            ctx.client_id,
+            object_id,
+            pending_attachment.map(|buffer| buffer.is_some()),
+        );
+        let result = match self.surface_manager.commit(ctx.client_id, object_id) {
+            Ok(result) => result,
+            Err(error) => {
+                report_surface_error(ctx, object_id, error);
+                return;
+            }
+        };
+
+        crate::protocols::xdg_shell::emit_xdg_commit_events(self, ctx, object_id, xdg_outcome);
         process_surface_commit(self, ctx, result.primary);
         for child in result.synchronized_children {
             process_surface_commit(self, ctx, child);
+        }
+        for child in result.unmapped_descendants {
+            self.seat_manager
+                .leave_keyboards_on_surface(ctx.client_id, child, ctx.writer);
+            self.seat_manager
+                .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
+            self.surface_updates.push_back(SurfaceUpdate::Unmapped {
+                client_id: ctx.client_id,
+                surface_id: child,
+            });
         }
     }
 
@@ -2266,6 +2291,31 @@ mod tests {
 
         state
             .surface_manager
+            .damage(
+                client_id,
+                surface_id,
+                Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            )
+            .unwrap();
+        WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
+        let updates: Vec<_> = state.take_surface_updates().collect();
+        let [SurfaceUpdate::Frame(frame)] = updates.as_slice() else {
+            panic!("damage-only commit must refresh the existing buffer");
+        };
+        assert_eq!(frame.buffer_id, buffer_id);
+        assert!(!frame.full_surface);
+
+        // A commit containing no visual state must not force a renderer update.
+        WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
+        assert_eq!(state.take_surface_updates().count(), 0);
+
+        state
+            .surface_manager
             .attach(client_id, surface_id, None, 0, 0, 1)
             .unwrap();
         WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
@@ -2452,6 +2502,7 @@ mod tests {
         ));
         wire.extend(wire_message(5, XDG_WM_BASE_GET_XDG_SURFACE_OPCODE, &[9, 6]));
         wire.extend(wire_message(9, XDG_SURFACE_GET_TOPLEVEL_OPCODE, &[10]));
+        wire.extend(wire_message(6, WL_SURFACE_COMMIT_OPCODE, &[]));
 
         let fd = memory_file(&[1, 2, 3, 0xff]);
         send_wire_with_fd(&client_stream, &wire, fd);
@@ -2541,6 +2592,7 @@ mod tests {
         wire.extend(wire_message(3, WL_COMPOSITOR_CREATE_SURFACE_OPCODE, &[6]));
         wire.extend(wire_message(4, XDG_WM_BASE_GET_XDG_SURFACE_OPCODE, &[7, 6]));
         wire.extend(wire_message(7, XDG_SURFACE_GET_TOPLEVEL_OPCODE, &[8]));
+        wire.extend(wire_message(6, WL_SURFACE_COMMIT_OPCODE, &[]));
         client_stream.write_all(&wire).unwrap();
         client.handle_messages(&mut state).unwrap();
 

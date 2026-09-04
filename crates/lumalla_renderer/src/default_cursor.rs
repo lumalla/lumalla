@@ -54,6 +54,7 @@ pub fn default_cursor_frame() -> &'static CursorFrame {
         hotspot_x: 0,
         hotspot_y: 0,
         buffer_scale: 1,
+        buffer_transform: 0,
         dmabuf: None,
     })
 }

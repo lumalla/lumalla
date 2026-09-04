@@ -3,6 +3,7 @@ struct Push {
     src_uv: vec4f,
     output_size: vec2f,
     force_opaque: f32,
+    buffer_transform: u32,
 }
 
 var<push_constant> pc: Push;

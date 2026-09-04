@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -8,7 +7,7 @@ use anyhow::Context;
 use ash::vk;
 use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
-use lumalla_shared::{CapturedImage, DrmDeviceState, Output, OutputConfig};
+use lumalla_shared::{BufferTransform, CapturedImage, DrmDeviceState, Output, OutputConfig};
 
 pub mod drm;
 pub mod vulkan;
@@ -116,6 +115,7 @@ pub struct SurfaceFrame {
     pub x: i32,
     pub y: i32,
     pub buffer_scale: i32,
+    pub buffer_transform: u32,
     /// Destination size in surface-local coordinates (after viewport).
     pub surface_width: i32,
     pub surface_height: i32,
@@ -159,6 +159,11 @@ impl SurfaceFrame {
             "Unsupported Wayland SHM format {:#x}",
             self.format
         );
+        anyhow::ensure!(
+            BufferTransform::from_raw(self.buffer_transform).is_some(),
+            "Unsupported buffer transform {}",
+            self.buffer_transform
+        );
         Ok(())
     }
 }
@@ -176,6 +181,7 @@ pub struct CursorFrame {
     pub hotspot_x: i32,
     pub hotspot_y: i32,
     pub buffer_scale: i32,
+    pub buffer_transform: u32,
     pub dmabuf: Option<DmabufAttachment>,
 }
 
@@ -207,6 +213,11 @@ impl CursorFrame {
             matches!(self.format, WL_SHM_FORMAT_ARGB8888 | WL_SHM_FORMAT_XRGB8888),
             "Unsupported cursor SHM format {:#x}",
             self.format
+        );
+        anyhow::ensure!(
+            BufferTransform::from_raw(self.buffer_transform).is_some(),
+            "Unsupported cursor buffer transform {}",
+            self.buffer_transform
         );
         Ok(())
     }
@@ -433,6 +444,46 @@ impl RendererState {
         Ok(())
     }
 
+    /// Replace cached placement and z-order from the display's authoritative
+    /// back-to-front scene.
+    pub fn sync_surface_scene(&mut self, scene: &[(u32, u32, i32, i32)]) {
+        let new_order: Vec<(u32, u32)> = scene
+            .iter()
+            .map(|(owner, surface, _, _)| (*owner, *surface))
+            .filter(|key| self.surface_frames.contains_key(key))
+            .collect();
+        let mut changed = new_order != self.surface_order;
+        for &(owner, surface, x, y) in scene {
+            if let Some(frame) = self.surface_frames.get_mut(&(owner, surface))
+                && (frame.x != x || frame.y != y)
+            {
+                frame.x = x;
+                frame.y = y;
+                changed = true;
+            }
+        }
+        let visible: HashSet<(u32, u32)> = new_order.iter().copied().collect();
+        let removed: Vec<(u32, u32)> = self
+            .surface_frames
+            .keys()
+            .copied()
+            .filter(|key| !visible.contains(key))
+            .collect();
+        for key in removed {
+            self.surface_frames.remove(&key);
+            self.gpu.surface_textures.remove(key);
+            self.dirty_surface_keys.remove(&key);
+            self.pending_surface_buffer_damage.remove(&key);
+            changed = true;
+        }
+        self.surface_order = new_order;
+        if changed {
+            self.pending_full_redraw = true;
+            self.pending_damage.clear();
+            self.mark_dirty_if_active();
+        }
+    }
+
     pub fn remove_surface_frame(&mut self, owner_id: u32, surface_id: u32) -> anyhow::Result<()> {
         let key = (owner_id, surface_id);
         if self.surface_frames.remove(&key).is_some() {
@@ -528,6 +579,7 @@ impl RendererState {
                 hotspot_x,
                 hotspot_y,
                 buffer_scale: cursor.buffer_scale,
+                buffer_transform: cursor.buffer_transform,
                 dmabuf: None,
             };
             cursor_damage_rects(&scratch, pointer, pointer)
@@ -1457,6 +1509,7 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            buffer_transform: 0,
             surface_width: 2,
             surface_height: 2,
             viewport_src: None,
@@ -1501,6 +1554,45 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_scene_sync_reorders_and_moves_existing_frames() {
+        let mut state = RendererState::new().unwrap();
+        let first = frame();
+        let mut second = frame();
+        second.surface_id = 3;
+        second.buffer_id = 4;
+        state.set_surface_frame(first).unwrap();
+        state.set_surface_frame(second).unwrap();
+
+        state.sync_surface_scene(&[(1, 3, 40, 50), (1, 2, 10, 20)]);
+
+        assert_eq!(state.surface_order, vec![(1, 3), (1, 2)]);
+        assert_eq!(
+            (
+                state.surface_frames[&(1, 3)].x,
+                state.surface_frames[&(1, 3)].y
+            ),
+            (40, 50)
+        );
+        assert_eq!(
+            (
+                state.surface_frames[&(1, 2)].x,
+                state.surface_frames[&(1, 2)].y
+            ),
+            (10, 20)
+        );
+        assert!(state.pending_full_redraw);
+    }
+
+    #[test]
+    fn authoritative_scene_sync_removes_invisible_frames() {
+        let mut state = RendererState::new().unwrap();
+        state.set_surface_frame(frame()).unwrap();
+        state.sync_surface_scene(&[]);
+        assert!(state.surface_frames.is_empty());
+        assert!(state.surface_order.is_empty());
+    }
+
+    #[test]
     fn validates_surface_frame_layout() {
         assert!(frame().validate().is_ok());
 
@@ -1531,6 +1623,7 @@ mod tests {
             x: 0,
             y: 0,
             buffer_scale: 1,
+            buffer_transform: 0,
             surface_width: 2,
             surface_height: 1,
             viewport_src: None,
@@ -1556,6 +1649,7 @@ mod tests {
             x: 1,
             y: 0,
             buffer_scale: 1,
+            buffer_transform: 0,
             surface_width: 1,
             surface_height: 1,
             damage: Vec::new(),
@@ -1563,7 +1657,7 @@ mod tests {
             ..frame()
         };
         let upload = composite_surface_full(&[&frame], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
-        assert_eq!(upload, vec![0, 0, 0, 255, 9, 8, 7, 6]);
+        assert_eq!(upload, vec![0, 0, 0, 255, 9, 8, 7, 255]);
     }
 
     #[test]
@@ -1580,6 +1674,7 @@ mod tests {
             hotspot_x: 0,
             hotspot_y: 0,
             buffer_scale: 1,
+            buffer_transform: 0,
             dmabuf: None,
         };
         let mut upload = composite_surface_full(&[], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
