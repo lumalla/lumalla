@@ -14,7 +14,14 @@ pub use types::{
 pub use window_manager::{WindowManager, WindowManagerHandler, WindowManagerProxy, signals};
 
 /// Well-known session bus name for the compositor.
-pub const BUS_NAME: &str = "org.lumalla.wm";
+///
+/// Debug builds use a distinct name so a release compositor and a debug
+/// compositor can own names on the same session bus at once.
+pub const BUS_NAME: &str = if cfg!(debug_assertions) {
+    "org.lumalla.wm.debug"
+} else {
+    "org.lumalla.wm"
+};
 
 /// Object path exported by the compositor.
 pub const OBJECT_PATH: &str = "/org/lumalla/wm";

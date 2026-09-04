@@ -150,13 +150,28 @@ pub mod signals {
     pub const BINDING_ACTIVATED: &str = "BindingActivated";
 }
 
-#[interface(
-    name = "org.lumalla.WindowManager",
-    proxy(
-        default_service = "org.lumalla.wm",
-        default_path = "/org/lumalla/wm",
-        gen_blocking = true,
-        gen_async = false,
+#[cfg_attr(
+    debug_assertions,
+    interface(
+        name = "org.lumalla.WindowManager",
+        proxy(
+            default_service = "org.lumalla.wm.debug",
+            default_path = "/org/lumalla/wm",
+            gen_blocking = true,
+            gen_async = false,
+        )
+    )
+)]
+#[cfg_attr(
+    not(debug_assertions),
+    interface(
+        name = "org.lumalla.WindowManager",
+        proxy(
+            default_service = "org.lumalla.wm",
+            default_path = "/org/lumalla/wm",
+            gen_blocking = true,
+            gen_async = false,
+        )
     )
 )]
 impl WindowManager {

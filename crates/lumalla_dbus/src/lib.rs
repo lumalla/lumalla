@@ -41,7 +41,7 @@ pub struct DbusService {
 }
 
 impl DbusService {
-    /// Connect to the session bus and acquire `org.lumalla.wm`.
+    /// Connect to the session bus and acquire [`BUS_NAME`].
     pub fn register(comms: Comms) -> anyhow::Result<Self> {
         let outputs = Arc::new(Mutex::new(Vec::new()));
         let output_lookup = Arc::new(Mutex::new(HashMap::new()));
