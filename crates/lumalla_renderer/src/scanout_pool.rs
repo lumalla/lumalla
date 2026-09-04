@@ -1,8 +1,8 @@
-//! Reusable scanout buffers: Vulkan DMA-BUF images, framebuffers, and DRM FBs.
+//! Reusable scanout buffers: Vulkan images (optionally exported as DRM FBs).
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use ash::vk;
@@ -13,6 +13,9 @@ use crate::vulkan::{DmaBufImage, Framebuffer, VulkanContext};
 /// Pool capacity per `(drm device, width, height, fourcc)` tuple.
 const POOL_MAX_PER_KEY: usize = 3;
 
+/// Sentinel path key for virtual (non-KMS) scanout buffers.
+pub(crate) const VIRTUAL_SCANOUT_PATH: &str = "virtual";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ScanoutBufferKey {
     pub drm_path: PathBuf,
@@ -21,10 +24,11 @@ pub(crate) struct ScanoutBufferKey {
     pub fourcc: u32,
 }
 
-/// A KMS-ready scanout target with persistent Vulkan and DRM resources.
+/// A scanout target with persistent Vulkan resources, and an optional DRM FB for KMS.
 pub(crate) struct ScanoutBuffer {
     pub key: ScanoutBufferKey,
-    pub drm_fb: DrmFramebuffer,
+    /// Present for physical/KMS outputs; `None` for virtual outputs.
+    pub drm_fb: Option<DrmFramebuffer>,
     pub dma_image: DmaBufImage,
     pub framebuffer: Framebuffer,
     /// True until the first GPU upload fills the buffer.
@@ -34,8 +38,8 @@ pub(crate) struct ScanoutBuffer {
 }
 
 impl ScanoutBuffer {
-    pub fn drm_fb_id(&self) -> u32 {
-        self.drm_fb.id()
+    pub fn drm_fb_id(&self) -> Option<u32> {
+        self.drm_fb.as_ref().map(|fb| fb.id())
     }
 }
 
@@ -76,7 +80,31 @@ impl ScanoutBufferPool {
             }
             return Ok(buffer);
         }
-        create_scanout_buffer(vulkan, drm_path, drm_fd, width, height, format, fourcc)
+        create_kms_scanout_buffer(vulkan, drm_path, drm_fd, width, height, format, fourcc)
+    }
+
+    /// Acquire a Vulkan-only scanout buffer (no DMA-BUF export / DRM FB).
+    pub fn acquire_virtual(
+        &mut self,
+        vulkan: &mut VulkanContext,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        fourcc: u32,
+    ) -> anyhow::Result<ScanoutBuffer> {
+        let key = ScanoutBufferKey {
+            drm_path: PathBuf::from(VIRTUAL_SCANOUT_PATH),
+            width,
+            height,
+            fourcc,
+        };
+        if let Some(mut buffer) = self.free.get_mut(&key).and_then(|free| free.pop()) {
+            if let Some(pending) = buffer.gpu_pending.take() {
+                pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
+            }
+            return Ok(buffer);
+        }
+        create_virtual_scanout_buffer(vulkan, width, height, format, fourcc)
     }
 
     pub fn release(&mut self, buffer: ScanoutBuffer) {
@@ -88,15 +116,12 @@ impl ScanoutBufferPool {
     }
 }
 
-fn create_scanout_buffer(
+fn create_image_and_framebuffer(
     vulkan: &mut VulkanContext,
-    drm_path: &PathBuf,
-    drm_fd: BorrowedFd<'_>,
     width: u32,
     height: u32,
     format: vk::Format,
-    fourcc: u32,
-) -> anyhow::Result<ScanoutBuffer> {
+) -> anyhow::Result<(DmaBufImage, Framebuffer)> {
     let dma_image = DmaBufImage::allocate(
         vulkan.device(),
         vulkan.physical_device(),
@@ -112,6 +137,19 @@ fn create_scanout_buffer(
     let framebuffer =
         Framebuffer::from_view(device, render_pass, dma_image.view(), dma_image.extent())
             .context("Failed to create scanout framebuffer")?;
+    Ok((dma_image, framebuffer))
+}
+
+fn create_kms_scanout_buffer(
+    vulkan: &mut VulkanContext,
+    drm_path: &Path,
+    drm_fd: BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    fourcc: u32,
+) -> anyhow::Result<ScanoutBuffer> {
+    let (dma_image, framebuffer) = create_image_and_framebuffer(vulkan, width, height, format)?;
 
     let dma_buf = dma_image
         .export_dma_buf()
@@ -131,12 +169,35 @@ fn create_scanout_buffer(
 
     Ok(ScanoutBuffer {
         key: ScanoutBufferKey {
-            drm_path: drm_path.clone(),
+            drm_path: drm_path.to_path_buf(),
             width,
             height,
             fourcc,
         },
-        drm_fb,
+        drm_fb: Some(drm_fb),
+        dma_image,
+        framebuffer,
+        fresh: true,
+        gpu_pending: None,
+    })
+}
+
+fn create_virtual_scanout_buffer(
+    vulkan: &mut VulkanContext,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    fourcc: u32,
+) -> anyhow::Result<ScanoutBuffer> {
+    let (dma_image, framebuffer) = create_image_and_framebuffer(vulkan, width, height, format)?;
+    Ok(ScanoutBuffer {
+        key: ScanoutBufferKey {
+            drm_path: PathBuf::from(VIRTUAL_SCANOUT_PATH),
+            width,
+            height,
+            fourcc,
+        },
+        drm_fb: None,
         dma_image,
         framebuffer,
         fresh: true,

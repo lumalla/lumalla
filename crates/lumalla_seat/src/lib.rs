@@ -33,9 +33,17 @@ impl SeatState {
     /// Open a libseat session, or fall back to a headless backend if that fails
     /// (e.g. no TTY / no logind seat).
     ///
+    /// When `force_headless` is true, skip libseat entirely (useful when nested under
+    /// another compositor where the seat opens but never enables).
+    ///
     /// Headless mode posts [`MainMessage::MainSeatEnabled`] immediately so the app
     /// can activate the Wayland seat and become Ready without DRM/libinput devices.
-    pub fn new(comms: Comms) -> anyhow::Result<Self> {
+    pub fn new(comms: Comms, force_headless: bool) -> anyhow::Result<Self> {
+        if force_headless {
+            warn!("Running without a session backend (--headless)");
+            return Ok(Self::new_headless(comms));
+        }
+
         match LibSeat::new(comms.clone()) {
             Ok(seat) => {
                 info!("Opened libseat session");
@@ -49,14 +57,18 @@ impl SeatState {
                     "libseat unavailable ({err:#}); continuing without a session backend \
                      (no DRM/libinput device opens)"
                 );
-                comms.main(MainMessage::MainSeatEnabled);
-                Ok(Self {
-                    backend: SeatBackend::Headless {
-                        seat_name: "seat0".to_string(),
-                    },
-                    devices_by_fd: RefCell::new(HashMap::new()),
-                })
+                Ok(Self::new_headless(comms))
             }
+        }
+    }
+
+    fn new_headless(comms: Comms) -> Self {
+        comms.main(MainMessage::MainSeatEnabled);
+        Self {
+            backend: SeatBackend::Headless {
+                seat_name: "seat0".to_string(),
+            },
+            devices_by_fd: RefCell::new(HashMap::new()),
         }
     }
 

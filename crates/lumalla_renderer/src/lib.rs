@@ -223,18 +223,32 @@ impl CursorFrame {
     }
 }
 
-struct OutputScanout {
+struct PhysicalScanout {
     drm_path: PathBuf,
     output: ConnectedOutput,
     /// Owned so the CRTC's MODE_ID blob is not destroyed while still active.
     #[allow(dead_code)]
     mode_blob: ModeBlob,
-    /// Buffer currently owned by the CRTC (or last committed).
+}
+
+struct OutputScanout {
+    /// `None` for virtual (non-KMS) outputs.
+    physical: Option<PhysicalScanout>,
+    /// Buffer currently owned by the CRTC (or last committed / completed virtual present).
     current: ScanoutBuffer,
     /// Buffer waiting for page-flip completion; must not be dropped yet.
     pending: Option<ScanoutBuffer>,
     /// Newest buffer to flip after `pending` completes.
     queued: Option<ScanoutBuffer>,
+}
+
+/// Config-created output that presents without KMS export/modeset.
+#[derive(Debug, Clone)]
+struct VirtualOutput {
+    name: String,
+    width: u32,
+    height: u32,
+    refresh_mhz: i32,
 }
 
 pub struct RendererState {
@@ -246,6 +260,8 @@ pub struct RendererState {
     render_device: Option<PathBuf>,
     /// Per-connector overrides; missing names use defaults (enabled if connected).
     output_configs: HashMap<String, OutputConfig>,
+    /// Virtual outputs registered from config (`add_output` with `virtual = true`).
+    virtual_outputs: HashMap<String, VirtualOutput>,
     scanouts: HashMap<String, OutputScanout>,
     /// Heap-stable queue pointer passed to DRM as page-flip `user_data`.
     flip_events: Box<FlipEventQueue>,
@@ -273,6 +289,7 @@ impl RendererState {
             scanout_pool: ScanoutBufferPool::new(),
             render_device: None,
             output_configs: HashMap::new(),
+            virtual_outputs: HashMap::new(),
             scanouts: HashMap::new(),
             flip_events: Box::new(FlipEventQueue::new()),
             surface_frames: HashMap::new(),
@@ -336,8 +353,51 @@ impl RendererState {
     }
 
     fn mark_dirty_if_active(&mut self) {
-        if !self.drm_devices.opened().is_empty() {
+        if self.has_presentable_outputs() {
             self.scene_dirty = true;
+        }
+    }
+
+    fn has_presentable_outputs(&self) -> bool {
+        !self.drm_devices.opened().is_empty() || !self.virtual_outputs.is_empty()
+    }
+
+    /// Whether any virtual (non-KMS) outputs are registered.
+    pub fn has_virtual_outputs(&self) -> bool {
+        !self.virtual_outputs.is_empty()
+    }
+
+    /// Register or update a virtual output for headless / non-KMS presentation.
+    pub fn add_virtual_output(
+        &mut self,
+        name: String,
+        width: u32,
+        height: u32,
+        refresh_mhz: i32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(width > 0 && height > 0, "virtual output size must be positive");
+        let refresh_mhz = refresh_mhz.max(1);
+        info!("Virtual output: {name} {width}x{height} @{refresh_mhz} mHz");
+        self.virtual_outputs.insert(
+            name.clone(),
+            VirtualOutput {
+                name,
+                width,
+                height,
+                refresh_mhz,
+            },
+        );
+        self.mark_dirty_if_active();
+        Ok(())
+    }
+
+    /// Remove a virtual output and release its scanout resources.
+    pub fn remove_virtual_output(&mut self, name: &str) {
+        if self.virtual_outputs.remove(name).is_some() {
+            info!("Removed virtual output {name}");
+            if let Some(scanout) = self.scanouts.remove(name) {
+                self.release_output_scanout(scanout);
+            }
         }
     }
 
@@ -600,15 +660,14 @@ impl RendererState {
         self.present_status().idle
     }
 
-    /// Geometry of the first enabled present target, if DRM outputs are resolvable.
+    /// Geometry of the first enabled present target (physical or virtual).
     pub fn primary_output_geometry(&self) -> Option<(String, i32, i32, i32)> {
         let target = self.collect_present_targets().into_iter().next()?;
-        let refresh_mhz = (target.output.mode.refresh_hz() as i32).saturating_mul(1000);
         Some((
-            target.connector_name,
-            target.output.mode.width() as i32,
-            target.output.mode.height() as i32,
-            refresh_mhz.max(60_000),
+            target.name,
+            target.width as i32,
+            target.height as i32,
+            target.refresh_mhz.max(60_000),
         ))
     }
 
@@ -682,7 +741,7 @@ impl RendererState {
 
         anyhow::ensure!(
             covered,
-            "screenshot region does not intersect any DRM scanout"
+            "screenshot region does not intersect any presented scanout"
         );
 
         Ok(CapturedImage {
@@ -697,7 +756,11 @@ impl RendererState {
     /// Ensures Vulkan is initialized against the preferred render device so the
     /// advertised set matches what import will accept.
     pub fn supported_dmabuf_formats(&mut self) -> anyhow::Result<Vec<(u32, u64)>> {
-        let Some(path) = self.resolved_render_device_path() else {
+        if let Some(path) = self.resolved_render_device_path() {
+            self.ensure_vulkan(Some(&path))?;
+        } else if self.has_virtual_outputs() {
+            self.ensure_vulkan(None)?;
+        } else {
             return Ok(vec![
                 (
                     crate::vulkan::DRM_FORMAT_XRGB8888,
@@ -708,8 +771,7 @@ impl RendererState {
                     crate::vulkan::DRM_FORMAT_MOD_LINEAR,
                 ),
             ]);
-        };
-        self.ensure_vulkan(&path)?;
+        }
         let vulkan = self
             .vulkan
             .as_ref()
@@ -819,53 +881,62 @@ impl RendererState {
         })
     }
 
-    /// Present a solid clear on every enabled connected output (any card).
+    /// Present a solid clear on every enabled connected or virtual output.
     ///
-    /// Buffers are allocated on the selected render GPU and imported on each
-    /// output's DRM card (same- or cross-device). Failures are logged per output.
+    /// Physical targets allocate buffers on the selected render GPU and import them
+    /// on each output's DRM card. Virtual targets composite without KMS export.
+    /// Failures are logged per output.
     ///
-    /// Unchanged modes schedule a non-blocking page-flip; the previous FB stays
-    /// alive until [`Self::dispatch_page_flips`] reports completion.
+    /// Unchanged physical modes schedule a non-blocking page-flip; the previous FB
+    /// stays alive until [`Self::dispatch_page_flips`] reports completion.
+    /// Virtual presents complete after GPU work with no flip wait.
     pub fn present_enabled_outputs(&mut self, color: [f32; 4]) -> anyhow::Result<PresentStatus> {
-        let Some(render_path) = self.resolved_render_device_path() else {
-            warn!("No render device available; skipping presentation");
+        if !self.ensure_vulkan_ready()? {
             return Ok(self.present_status());
-        };
-
-        debug!("Using render device {}", render_path.display());
-        self.ensure_vulkan(&render_path)?;
+        }
 
         let targets = self.collect_present_targets();
         if targets.is_empty() {
-            warn!("No enabled connected outputs to present");
+            warn!("No enabled connected or virtual outputs to present");
             self.scanouts.clear();
             return Ok(self.present_status());
         }
 
-        let keep: HashSet<String> = targets.iter().map(|t| t.connector_name.clone()).collect();
+        let keep: HashSet<String> = targets.iter().map(|t| t.name.clone()).collect();
         let mut presented = 0usize;
         for target in targets {
             match self.present_one_output(&target, color) {
                 Ok(()) => {
-                    if let Some(scanout) = self.scanouts.get(&target.connector_name) {
-                        debug!(
-                            "Presented {} on {} (CRTC {}, {}x{}@{}Hz)",
-                            scanout.output.connector_name,
-                            scanout.drm_path.display(),
-                            scanout.output.crtc_id,
-                            scanout.output.mode.width(),
-                            scanout.output.mode.height(),
-                            scanout.output.mode.refresh_hz()
-                        );
+                    if let Some(scanout) = self.scanouts.get(&target.name) {
+                        if let Some(physical) = scanout.physical.as_ref() {
+                            debug!(
+                                "Presented {} on {} (CRTC {}, {}x{}@{}Hz)",
+                                physical.output.connector_name,
+                                physical.drm_path.display(),
+                                physical.output.crtc_id,
+                                physical.output.mode.width(),
+                                physical.output.mode.height(),
+                                physical.output.mode.refresh_hz()
+                            );
+                        } else {
+                            debug!(
+                                "Presented virtual output {} ({}x{})",
+                                target.name, target.width, target.height
+                            );
+                        }
                     }
                     presented += 1;
                 }
                 Err(err) => {
-                    error!(
-                        "Failed to present {} on {}: {err:#}",
-                        target.connector_name,
-                        target.drm_path.display()
-                    );
+                    if let Some(physical) = target.physical.as_ref() {
+                        error!(
+                            "Failed to present {} on {}: {err:#}",
+                            target.name,
+                            physical.drm_path.display()
+                        );
+                    } else {
+                        error!("Failed to present virtual output {}: {err:#}", target.name);
+                    }
                 }
             }
         }
@@ -910,10 +981,17 @@ impl RendererState {
                     &mut used_crtcs,
                 ) {
                     Ok(Some(output)) => {
+                        let refresh_mhz =
+                            (output.mode.refresh_hz() as i32).saturating_mul(1000).max(1);
                         targets.push(PresentTarget {
-                            drm_path: drm_path.clone(),
-                            connector_name: connector.name.clone(),
-                            output,
+                            name: connector.name.clone(),
+                            width: output.mode.width(),
+                            height: output.mode.height(),
+                            refresh_mhz,
+                            physical: Some(PhysicalPresent {
+                                drm_path: drm_path.clone(),
+                                output,
+                            }),
                         });
                     }
                     Ok(None) => {}
@@ -928,7 +1006,21 @@ impl RendererState {
             }
         }
 
-        targets.sort_by(|a, b| a.connector_name.cmp(&b.connector_name));
+        for virtual_output in self.virtual_outputs.values() {
+            // Prefer the DRM connector when names collide.
+            if targets.iter().any(|t| t.name == virtual_output.name) {
+                continue;
+            }
+            targets.push(PresentTarget {
+                name: virtual_output.name.clone(),
+                width: virtual_output.width,
+                height: virtual_output.height,
+                refresh_mhz: virtual_output.refresh_mhz,
+                physical: None,
+            });
+        }
+
+        targets.sort_by(|a, b| a.name.cmp(&b.name));
         targets
     }
 
@@ -951,27 +1043,30 @@ impl RendererState {
     ) -> anyhow::Result<()> {
         let mut buffer = self.render_scanout_buffer(target, color)?;
 
-        let reuse_mode = self
-            .scanouts
-            .get(&target.connector_name)
-            .is_some_and(|prev| {
-                prev.drm_path == target.drm_path
-                    && prev.output.connector_id == target.output.connector_id
-                    && prev.output.crtc_id == target.output.crtc_id
-                    && prev.output.plane_id == target.output.plane_id
-                    && prev.output.mode == target.output.mode
-            });
+        let Some(physical) = target.physical.as_ref() else {
+            return self.complete_virtual_present(&target.name, buffer);
+        };
+
+        let reuse_mode = self.scanouts.get(&target.name).is_some_and(|prev| {
+            prev.physical.as_ref().is_some_and(|p| {
+                p.drm_path == physical.drm_path
+                    && p.output.connector_id == physical.output.connector_id
+                    && p.output.crtc_id == physical.output.crtc_id
+                    && p.output.plane_id == physical.output.plane_id
+                    && p.output.mode == physical.output.mode
+            })
+        });
 
         if reuse_mode {
-            return self.schedule_or_queue_flip(&target.connector_name, buffer);
+            return self.schedule_or_queue_flip(&target.name, buffer);
         }
 
         if self
             .scanouts
-            .get(&target.connector_name)
+            .get(&target.name)
             .is_some_and(|scanout| scanout.pending.is_some())
         {
-            self.wait_for_connector_flip(&target.connector_name)?;
+            self.wait_for_connector_flip(&target.name)?;
         }
 
         self.wait_scanout_gpu(&mut buffer)?;
@@ -979,31 +1074,34 @@ impl RendererState {
         let drm_device = self
             .drm_devices
             .opened()
-            .get(&target.drm_path)
+            .get(&physical.drm_path)
             .with_context(|| {
-                format!("DRM device {} is no longer open", target.drm_path.display())
+                format!(
+                    "DRM device {} is no longer open",
+                    physical.drm_path.display()
+                )
             })?;
 
-        let mode_blob = ModeBlob::create(drm_device.fd(), &target.output.mode)
+        let mode_blob = ModeBlob::create(drm_device.fd(), &physical.output.mode)
             .context("Failed to create MODE_ID property blob")?;
 
-        atomic_modeset(
-            drm_device.fd(),
-            &target.output,
-            mode_blob.id(),
-            buffer.drm_fb.id(),
-        )
-        .context("Failed atomic modeset")?;
+        let fb_id = buffer
+            .drm_fb_id()
+            .context("KMS present requires a DRM framebuffer")?;
+        atomic_modeset(drm_device.fd(), &physical.output, mode_blob.id(), fb_id)
+            .context("Failed atomic modeset")?;
 
-        let _previous = if let Some(old) = self.scanouts.remove(&target.connector_name) {
+        if let Some(old) = self.scanouts.remove(&target.name) {
             self.release_output_scanout(old);
-        };
+        }
         self.scanouts.insert(
-            target.connector_name.clone(),
+            target.name.clone(),
             OutputScanout {
-                drm_path: target.drm_path.clone(),
-                output: target.output.clone(),
-                mode_blob,
+                physical: Some(PhysicalScanout {
+                    drm_path: physical.drm_path.clone(),
+                    output: physical.output.clone(),
+                    mode_blob,
+                }),
                 current: buffer,
                 pending: None,
                 queued: None,
@@ -1012,39 +1110,86 @@ impl RendererState {
         Ok(())
     }
 
+    /// Finish a virtual present immediately after GPU work (no KMS flip).
+    fn complete_virtual_present(
+        &mut self,
+        name: &str,
+        mut buffer: ScanoutBuffer,
+    ) -> anyhow::Result<()> {
+        self.wait_scanout_gpu(&mut buffer)?;
+
+        let (old_current, old_pending, old_queued) = if let Some(scanout) = self.scanouts.get_mut(name)
+        {
+            let pending = scanout.pending.take();
+            let queued = scanout.queued.take();
+            let current = std::mem::replace(&mut scanout.current, buffer);
+            scanout.physical = None;
+            (Some(current), pending, queued)
+        } else {
+            self.scanouts.insert(
+                name.to_string(),
+                OutputScanout {
+                    physical: None,
+                    current: buffer,
+                    pending: None,
+                    queued: None,
+                },
+            );
+            (None, None, None)
+        };
+
+        if let Some(old) = old_current {
+            self.release_scanout_buffer(old);
+        }
+        if let Some(old) = old_pending {
+            self.release_scanout_buffer(old);
+        }
+        if let Some(old) = old_queued {
+            self.release_scanout_buffer(old);
+        }
+        Ok(())
+    }
+
     fn render_scanout_buffer(
         &mut self,
         target: &PresentTarget,
         color: [f32; 4],
     ) -> anyhow::Result<ScanoutBuffer> {
-        let width = target.output.mode.width();
-        let height = target.output.mode.height();
+        let width = target.width;
+        let height = target.height;
         let format = vk::Format::B8G8R8A8_UNORM;
         let fourcc = vulkan_to_drm_fourcc(format)
             .with_context(|| format!("Vulkan format {format:?} has no DRM fourcc mapping"))?;
-
-        let drm_device = self
-            .drm_devices
-            .opened()
-            .get(&target.drm_path)
-            .with_context(|| {
-                format!("DRM device {} is no longer open", target.drm_path.display())
-            })?;
 
         let mut buffer = {
             let vulkan = self
                 .vulkan
                 .as_mut()
                 .context("VulkanContext missing during present")?;
-            self.scanout_pool.acquire(
-                vulkan,
-                &target.drm_path,
-                drm_device.fd(),
-                width,
-                height,
-                format,
-                fourcc,
-            )?
+            if let Some(physical) = target.physical.as_ref() {
+                let drm_device = self
+                    .drm_devices
+                    .opened()
+                    .get(&physical.drm_path)
+                    .with_context(|| {
+                        format!(
+                            "DRM device {} is no longer open",
+                            physical.drm_path.display()
+                        )
+                    })?;
+                self.scanout_pool.acquire(
+                    vulkan,
+                    &physical.drm_path,
+                    drm_device.fd(),
+                    width,
+                    height,
+                    format,
+                    fourcc,
+                )?
+            } else {
+                self.scanout_pool
+                    .acquire_virtual(vulkan, width, height, format, fourcc)?
+            }
         };
 
         let _pending_damage = std::mem::take(&mut self.pending_damage);
@@ -1072,7 +1217,7 @@ impl RendererState {
         let mut batch = GpuWorkBatch::new();
 
         if matches!(composite_mode, CompositeMode::Partial(_)) {
-            let src_ptr = self.scanouts.get(&target.connector_name).map(|scanout| {
+            let src_ptr = self.scanouts.get(&target.name).map(|scanout| {
                 let image = scanout
                     .queued
                     .as_ref()
@@ -1185,9 +1330,13 @@ impl RendererState {
                 .scanouts
                 .get(connector_name)
                 .context("Missing scanout for page-flip")?;
+            let physical = scanout
+                .physical
+                .as_ref()
+                .context("Page-flip requires a physical scanout")?;
             (
-                scanout.drm_path.clone(),
-                scanout.output.clone(),
+                physical.drm_path.clone(),
+                physical.output.clone(),
                 scanout.pending.is_some(),
             )
         };
@@ -1206,7 +1355,9 @@ impl RendererState {
         // Overlap CPU flip prep with GPU: wait only when the buffer must be scanout-ready.
         self.wait_scanout_gpu(&mut buffer)?;
 
-        let fb_id = buffer.drm_fb_id();
+        let fb_id = buffer
+            .drm_fb_id()
+            .context("Page-flip requires a DRM framebuffer")?;
         let flip_result = {
             let device =
                 self.drm_devices.opened().get(&drm_path).with_context(|| {
@@ -1261,11 +1412,13 @@ impl RendererState {
     }
 
     fn retire_page_flip(&mut self, crtc_id: u32) -> anyhow::Result<()> {
-        let Some(connector_name) = self
-            .scanouts
-            .iter()
-            .find_map(|(name, scanout)| (scanout.output.crtc_id == crtc_id).then(|| name.clone()))
-        else {
+        let Some(connector_name) = self.scanouts.iter().find_map(|(name, scanout)| {
+            scanout
+                .physical
+                .as_ref()
+                .is_some_and(|p| p.output.crtc_id == crtc_id)
+                .then(|| name.clone())
+        }) else {
             warn!("Ignoring page-flip completion for unknown CRTC {crtc_id}");
             return Ok(());
         };
@@ -1366,22 +1519,44 @@ impl RendererState {
         best.map(|(path, _)| path)
     }
 
-    fn ensure_vulkan(&mut self, preferred_drm_path: &Path) -> anyhow::Result<()> {
+    /// Ensure Vulkan is ready for presentation.
+    ///
+    /// Prefers a seat-opened DRM primary node when available; otherwise initializes
+    /// Vulkan without a preferred path for virtual-only presentation.
+    fn ensure_vulkan_ready(&mut self) -> anyhow::Result<bool> {
+        if let Some(render_path) = self.resolved_render_device_path() {
+            debug!("Using render device {}", render_path.display());
+            self.ensure_vulkan(Some(&render_path))?;
+            return Ok(true);
+        }
+        if !self.virtual_outputs.is_empty() {
+            self.ensure_vulkan(None)?;
+            return Ok(true);
+        }
+        warn!("No render device or virtual outputs available; skipping presentation");
+        Ok(false)
+    }
+
+    fn ensure_vulkan(&mut self, preferred_drm_path: Option<&Path>) -> anyhow::Result<()> {
         let needs_recreate = match &self.vulkan {
             None => true,
-            Some(vk) => match vk.drm_device_path() {
-                Some(selected) => selected != preferred_drm_path,
-                None => false,
+            Some(vk) => match (preferred_drm_path, vk.drm_device_path()) {
+                (Some(preferred), Some(selected)) => selected != preferred,
+                // Keep an existing context when switching to virtual-only (no preferred path).
+                (None, _) => false,
+                // Prefer recreating when a preferred DRM path becomes available.
+                (Some(_), None) => true,
             },
         };
 
         if needs_recreate {
             self.drain_scanouts();
-            info!(
-                "Initializing Vulkan for DRM device {}",
-                preferred_drm_path.display()
-            );
-            self.vulkan = Some(VulkanContext::new(Some(preferred_drm_path))?);
+            self.invalidate_surface_textures();
+            match preferred_drm_path {
+                Some(path) => info!("Initializing Vulkan for DRM device {}", path.display()),
+                None => info!("Initializing Vulkan for virtual outputs (no DRM master)"),
+            }
+            self.vulkan = Some(VulkanContext::new(preferred_drm_path)?);
         }
 
         Ok(())
@@ -1489,10 +1664,18 @@ fn blit_bgra_to_rgba(
     Ok(())
 }
 
-struct PresentTarget {
+struct PhysicalPresent {
     drm_path: PathBuf,
-    connector_name: String,
     output: ConnectedOutput,
+}
+
+struct PresentTarget {
+    name: String,
+    width: u32,
+    height: u32,
+    refresh_mhz: i32,
+    /// `None` for virtual outputs (no KMS).
+    physical: Option<PhysicalPresent>,
 }
 
 impl RendererState {

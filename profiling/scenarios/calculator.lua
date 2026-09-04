@@ -3,7 +3,7 @@ local base = dofile("profiling/lib/base.lua")
 
 -- Launch qalculate-qt, focus the expression field, evaluate 1+1, then exit.
 lum.on_startup(function()
-	base.enable_all_outputs(lum.get_drm_devices())
+	base.enable_virtual_output()
 
 	lum.spawn({ command = "qalculate-qt" })
 	lum.sleep(2)

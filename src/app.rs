@@ -614,6 +614,7 @@ impl AppData {
                         self.renderer_state.mark_scene_dirty();
                     } else {
                         info!("Skipping DRM activate (no session backend for device opens)");
+                        self.sync_primary_output_geometry();
                     }
                     self.comms.dbus(DbusMessage::EmitReady);
                 }
@@ -696,6 +697,22 @@ impl AppData {
                 }
                 MainMessage::AddOutput(output) => {
                     let name = output.name.clone();
+                    let is_virtual = output.is_virtual;
+                    if is_virtual {
+                        let width = output.size.0.max(1) as u32;
+                        let height = output.size.1.max(1) as u32;
+                        if let Err(err) = self.renderer_state.add_virtual_output(
+                            name.clone(),
+                            width,
+                            height,
+                            output.refresh_mhz,
+                        ) {
+                            error!("Unable to register virtual output {name}: {err:#}");
+                        } else {
+                            self.sync_primary_output_geometry();
+                            self.render_scheduler.request_immediate();
+                        }
+                    }
                     if let Err(err) = self.display_state.add_output(
                         lumalla_display::OutputInfo::from(&output),
                         self.connected_clients.values_mut(),
@@ -705,12 +722,14 @@ impl AppData {
                     self.emit_outputs_changed();
                 }
                 MainMessage::RemoveOutput { name } => {
+                    self.renderer_state.remove_virtual_output(&name);
                     if let Err(err) = self
                         .display_state
                         .remove_output(&name, self.connected_clients.values_mut())
                     {
                         error!("Unable to remove output {name}: {err:#}");
                     }
+                    self.sync_primary_output_geometry();
                     self.emit_outputs_changed();
                 }
                 MainMessage::Shutdown => {
@@ -935,6 +954,11 @@ impl AppData {
     }
 
     fn sync_wayland_output_from_drm(&mut self) {
+        self.sync_primary_output_geometry();
+    }
+
+    /// Apply primary present-target geometry to input transform, display layout, and refresh.
+    fn sync_primary_output_geometry(&mut self) {
         let Some((name, width, height, refresh_mhz)) =
             self.renderer_state.primary_output_geometry()
         else {
@@ -945,6 +969,19 @@ impl AppData {
         let height_u = height.max(1) as u32;
         self.input_state.set_output_geometry(width_u, height_u);
         self.display_state.set_output_geometry(width_u, height_u);
+
+        // Only rewrite the primary Wayland output when it already exists and is physical
+        // (DRM hotplug sync). Virtual outputs are owned entirely by config `add_output`.
+        let is_virtual_primary = self
+            .display_state
+            .outputs()
+            .find(|o| o.name == name)
+            .map(|o| o.is_virtual)
+            .unwrap_or(true);
+        if is_virtual_primary {
+            return;
+        }
+
         let info = OutputInfo {
             name: name.clone(),
             description: format!("Lumalla output {name}"),
@@ -1302,7 +1339,7 @@ pub(crate) fn run_app(
 ) -> anyhow::Result<()> {
     let (dbus_event_loop, dbus_channel, to_dbus) = message_loop_with_channel::<DbusMessage>()?;
     let comms = Comms::new(to_main.clone(), to_dbus);
-    let seat_state = init_and_register_seat_state(comms.clone(), &mut main_event_loop)?;
+    let seat_state = init_and_register_seat_state(comms.clone(), &mut main_event_loop, args.headless)?;
     let input_state =
         init_and_register_input_state(comms.clone(), &mut main_event_loop, seat_state.as_ref())?;
     let wayland = init_and_register_wayland_display(args.socket_path, &mut main_event_loop)?;
@@ -1420,8 +1457,9 @@ fn init_display_state(
 fn init_and_register_seat_state(
     comms: Comms,
     main_event_loop: &mut EventLoop,
+    headless: bool,
 ) -> anyhow::Result<Pin<Box<SeatState>>> {
-    let seat_state = Box::new(SeatState::new(comms)?);
+    let seat_state = Box::new(SeatState::new(comms, headless)?);
     if let Some(fd) = seat_state.poll_fd() {
         main_event_loop
             .submit_poll(fd, Interest::READABLE, LIBSEAT_TOKEN)

@@ -7,7 +7,10 @@ mod iface;
 use std::{
     collections::HashMap,
     process::Child,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, mpsc,
+    },
     thread::{self, JoinHandle},
 };
 
@@ -34,6 +37,7 @@ pub struct DbusService {
     wayland_display: Arc<Mutex<Option<String>>>,
     windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
     pending_screenshots: Arc<Mutex<HashMap<usize, Arc<iface::PendingScreenshot>>>>,
+    ready: Arc<AtomicBool>,
 }
 
 impl DbusService {
@@ -44,6 +48,7 @@ impl DbusService {
         let drm_devices = Arc::new(Mutex::new(Vec::new()));
         let wayland_display = Arc::new(Mutex::new(None));
         let pending_screenshots = Arc::new(Mutex::new(HashMap::new()));
+        let ready = Arc::new(AtomicBool::new(false));
         let state = Arc::new(ServiceState {
             comms: comms.clone(),
             outputs: Arc::clone(&outputs),
@@ -55,6 +60,7 @@ impl DbusService {
             xkb_config: Arc::new(Mutex::new(lumalla_shared::XkbConfig::default())),
             windows: Arc::new(Mutex::new(Vec::new())),
             pending_screenshots: Arc::clone(&pending_screenshots),
+            ready: Arc::clone(&ready),
         });
         let connection = connection::Builder::session()
             .context("Failed to connect to session bus")?
@@ -87,6 +93,7 @@ impl DbusService {
             wayland_display,
             windows: state.windows.clone(),
             pending_screenshots,
+            ready,
         })
     }
 
@@ -110,6 +117,7 @@ struct DbusState {
     wayland_display: Arc<Mutex<Option<String>>>,
     windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
     pending_screenshots: Arc<Mutex<HashMap<usize, Arc<iface::PendingScreenshot>>>>,
+    ready: Arc<AtomicBool>,
     /// Config child process; kept alive so we can reap it via `WaitId` SQE.
     config_child: Option<Child>,
 }
@@ -131,6 +139,7 @@ impl DbusState {
             wayland_display: service.wayland_display,
             windows: service.windows,
             pending_screenshots: service.pending_screenshots,
+            ready: service.ready,
             config_child: None,
         }
     }
@@ -201,6 +210,7 @@ impl DbusState {
                 self.update_drm_devices(devices);
             }
             DbusMessage::EmitReady => {
+                self.ready.store(true, Ordering::SeqCst);
                 emit_signal(&self.connection, signals::READY, &())?;
             }
             DbusMessage::EmitOutputChanged(outputs) => {

@@ -116,6 +116,12 @@ pub trait WindowManagerHandler: Send + Sync {
         height: i32,
         path: &str,
     ) -> zbus::fdo::Result<()>;
+
+    /// Whether the compositor has already emitted the Ready signal.
+    ///
+    /// Config clients should check this after subscribing to Ready so a race
+    /// where Ready fires before the subscription is not missed.
+    fn is_ready(&self) -> zbus::fdo::Result<bool>;
 }
 
 /// D-Bus object exported at [`crate::OBJECT_PATH`].
@@ -283,6 +289,10 @@ impl WindowManager {
         path: &str,
     ) -> zbus::fdo::Result<()> {
         self.handler.capture_screenshot(x, y, width, height, path)
+    }
+
+    fn is_ready(&self) -> zbus::fdo::Result<bool> {
+        self.handler.is_ready()
     }
 
     #[zbus(signal)]

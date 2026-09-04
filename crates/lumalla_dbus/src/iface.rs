@@ -5,7 +5,10 @@ use std::{
     fs::File,
     io::BufWriter,
     process::Command,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
 };
 
 use log::{error, info, warn};
@@ -43,6 +46,8 @@ pub(crate) struct ServiceState {
     pub xkb_config: Arc<Mutex<XkbConfig>>,
     pub windows: Arc<Mutex<Vec<WindowState>>>,
     pub pending_screenshots: Arc<Mutex<HashMap<usize, Arc<PendingScreenshot>>>>,
+    /// Set when the compositor emits Ready (sticky for late config subscribers).
+    pub ready: Arc<AtomicBool>,
 }
 
 pub(crate) struct CompositorHandler {
@@ -381,6 +386,10 @@ impl WindowManagerHandler for CompositorHandler {
             Ok(()) => Ok(()),
             Err(err) => Err(zbus::fdo::Error::Failed(err)),
         }
+    }
+
+    fn is_ready(&self) -> zbus::fdo::Result<bool> {
+        Ok(self.state.ready.load(Ordering::SeqCst))
     }
 }
 

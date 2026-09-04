@@ -4,7 +4,7 @@ local base = dofile("profiling/lib/base.lua")
 -- Calculator + terminal: click each and type a unique marker.
 -- Exclusive seat keyboard focus means each marker appears in only one window.
 lum.on_startup(function()
-	base.enable_all_outputs(lum.get_drm_devices())
+	base.enable_virtual_output()
 
 	lum.add_window_rule({
 		app_id = "io.github.Qalculate.qalculate-qt",

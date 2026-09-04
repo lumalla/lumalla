@@ -2,6 +2,47 @@ local lum = require("lumalla")
 
 local M = {}
 
+--- Default virtual output used by profiling scenarios and headless runs.
+local DEFAULT_VIRTUAL = {
+	name = "VIRTUAL-1",
+	description = "Lumalla virtual output",
+	x = 0,
+	y = 0,
+	width = 1920,
+	height = 1080,
+	refresh_mhz = 60000,
+	mm_width = 300,
+	mm_height = 200,
+	scale = 1,
+	virtual = true,
+}
+
+--- Ensure a single virtual output exists (idempotent by name).
+function M.enable_virtual_output(opts)
+	opts = opts or {}
+	local name = opts.name or DEFAULT_VIRTUAL.name
+	local existing = {}
+	for _, output in ipairs(lum.get_outputs()) do
+		existing[output.name] = true
+	end
+	if existing[name] then
+		return
+	end
+	lum.add_output({
+		name = name,
+		description = opts.description or DEFAULT_VIRTUAL.description,
+		x = opts.x or DEFAULT_VIRTUAL.x,
+		y = opts.y or DEFAULT_VIRTUAL.y,
+		width = opts.width or DEFAULT_VIRTUAL.width,
+		height = opts.height or DEFAULT_VIRTUAL.height,
+		refresh_mhz = opts.refresh_mhz or DEFAULT_VIRTUAL.refresh_mhz,
+		mm_width = opts.mm_width or DEFAULT_VIRTUAL.mm_width,
+		mm_height = opts.mm_height or DEFAULT_VIRTUAL.mm_height,
+		scale = opts.scale or DEFAULT_VIRTUAL.scale,
+		virtual = true,
+	})
+end
+
 --- Pick preferred mode, else the first advertised mode.
 local function preferred_mode(connector)
 	for _, mode in ipairs(connector.modes or {}) do
@@ -28,7 +69,8 @@ local function connected_connectors(devices)
 	return connectors
 end
 
-function M.enable_all_outputs(devices)
+--- Enable all connected DRM connectors as physical outputs (real-session use).
+function M.enable_all_drm_outputs(devices)
 	local connectors = connected_connectors(devices)
 	local configs = {}
 	local enabled = {}
@@ -84,6 +126,11 @@ function M.enable_all_outputs(devices)
 	end
 end
 
+--- Default for scenarios: virtual output (works without TTY / libseat).
+function M.enable_all_outputs(_devices)
+	M.enable_virtual_output()
+end
+
 function M.primary_output()
 	local outputs = lum.get_outputs()
 	return outputs[1]
@@ -96,9 +143,5 @@ function M.point_on_primary(px, py)
 	end
 	return output.x + px, output.y + py
 end
-
-lum.on_drm_devices_change(function(devices)
-	M.enable_all_outputs(devices)
-end)
 
 return M

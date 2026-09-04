@@ -33,6 +33,7 @@ pub struct ExternalConfig {
     config_watcher: ConfigWatcher,
     reload_receiver: mpsc::Receiver<PathBuf>,
     shutting_down: bool,
+    startup_done: bool,
 }
 
 impl ExternalConfig {
@@ -67,6 +68,7 @@ impl ExternalConfig {
             config_watcher,
             reload_receiver,
             shutting_down: false,
+            startup_done: false,
         };
 
         if let Err(err) = set_default_keymaps(&state.lua, &state.client, &state.callback_state) {
@@ -93,6 +95,11 @@ impl ExternalConfig {
         let mut binding_activated = proxy.receive_binding_activated()?;
 
         info!("External config connected to compositor");
+
+        // Ready may have been emitted before we subscribed; pick it up via is_ready.
+        if self.client.proxy.is_ready().unwrap_or(false) {
+            self.handle_ready()?;
+        }
 
         loop {
             if self.shutting_down {
@@ -131,6 +138,10 @@ impl ExternalConfig {
     }
 
     fn handle_ready(&mut self) -> anyhow::Result<()> {
+        if self.startup_done {
+            return Ok(());
+        }
+        self.startup_done = true;
         if let Some(on_startup) = *self.on_startup.borrow() {
             self.callback_state.run_callback::<(), ()>(on_startup, ())?;
         }
