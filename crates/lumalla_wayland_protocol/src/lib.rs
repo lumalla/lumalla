@@ -88,8 +88,12 @@ impl Wayland {
 
     /// Create a client from an accepted connection fd.
     pub fn client_from_accepted_fd(&mut self, fd: RawFd) -> Option<ClientConnection> {
-        let client_id = self.allocate_client_id()?;
+        // Take ownership immediately so the fd is closed on every failure path.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let Some(client_id) = self.allocate_client_id() else {
+            error!("Failed to allocate Wayland client id; dropping accepted connection");
+            return None;
+        };
         match ClientConnection::from_accepted_fd(owned, client_id) {
             Ok(client) => {
                 debug!("New client connected with ID: {:?}", client_id);

@@ -27,6 +27,9 @@ type Buffer = [u8; BUFFER_SIZE];
 const SEND_CHUNK_SIZE: usize = 4096;
 const MAX_SEND_BUFFERS: usize = 5;
 const MAX_FDS_IN_CMSG: usize = 253;
+/// `wl_display` is always object id 1; its `error` event is opcode 0.
+const WL_DISPLAY_OBJECT_ID: u32 = 1;
+const WL_DISPLAY_ERROR_OPCODE: Opcode = 0;
 const CMSG_BUFFER_SIZE: usize =
     unsafe { CMSG_SPACE((MAX_FDS_IN_CMSG * mem::size_of::<RawFd>()) as u32) as usize };
 const CMSG_BUFFER_WORDS: usize = CMSG_BUFFER_SIZE.div_ceil(mem::size_of::<usize>());
@@ -80,10 +83,15 @@ impl Reader {
         }
     }
 
+    /// True when the receive buffer cannot accept more bytes (client stalled or flooding).
+    pub fn recv_buffer_full(&mut self) -> bool {
+        self.compact_if_needed();
+        self.bytes_in_buffer == self.buffer.len()
+    }
+
     /// Build a stable `msghdr` for `IORING_OP_RECVMSG`. Valid until the matching CQE is applied.
     pub fn prepare_recv_msghdr(&mut self) -> Option<*mut msghdr> {
-        self.compact_if_needed();
-        if self.bytes_in_buffer == self.buffer.len() {
+        if self.recv_buffer_full() {
             error!("Wayland receive buffer is full");
             return None;
         }
@@ -247,6 +255,8 @@ pub struct Writer {
     message_start_offset: usize,
     last_err: Option<anyhow::Error>,
     send_buffer_limit_exceeded: bool,
+    /// Set when `wl_display.error` is queued; the client must be disconnected.
+    protocol_error: bool,
     send_cmsg: Box<CmsgBuffer>,
     send_iov: iovec,
     send_msghdr: msghdr,
@@ -262,6 +272,7 @@ impl Writer {
             message_start_offset: 0,
             last_err: None,
             send_buffer_limit_exceeded: false,
+            protocol_error: false,
             send_cmsg: unsafe { Box::new_uninit().assume_init() },
             send_iov: iovec {
                 iov_base: ptr::null_mut(),
@@ -275,8 +286,21 @@ impl Writer {
         self.last_err.take()
     }
 
+    pub fn has_write_error(&self) -> bool {
+        self.last_err.is_some()
+    }
+
     pub fn send_buffer_limit_exceeded(&self) -> bool {
         self.send_buffer_limit_exceeded
+    }
+
+    pub fn protocol_error(&self) -> bool {
+        self.protocol_error
+    }
+
+    /// True when the writer is in a fatal state and the client should be disconnected.
+    pub fn should_disconnect(&self) -> bool {
+        self.protocol_error || self.send_buffer_limit_exceeded || self.last_err.is_some()
     }
 
     pub fn send_in_flight(&self) -> bool {
@@ -347,6 +371,11 @@ impl Writer {
     pub fn start_message(&mut self, object_id: ObjectId, opcode: Opcode) {
         if self.last_err.is_some() {
             return;
+        }
+        // Per the Wayland spec, wl_display.error is fatal: after sending it the
+        // compositor must close the client connection.
+        if object_id.get() == WL_DISPLAY_OBJECT_ID && opcode == WL_DISPLAY_ERROR_OPCODE {
+            self.protocol_error = true;
         }
         if let Err(err) = self.flush_if_needed() {
             self.last_err = Some(err);
@@ -887,7 +916,8 @@ mod tests {
         let mut writer = Writer::new(socket.1.as_raw_fd());
 
         let fill_chunk = |writer: &mut Writer| {
-            writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 0);
+            // Use a non-error opcode so this only exercises the send buffer limit.
+            writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 1);
             let words = (SEND_CHUNK_SIZE - HEADER_SIZE) / mem::size_of::<u32>();
             for _ in 0..words {
                 writer.write_u32(0);
@@ -899,9 +929,11 @@ mod tests {
             fill_chunk(&mut writer);
         }
         assert!(!writer.send_buffer_limit_exceeded());
+        assert!(!writer.protocol_error());
 
-        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 0);
+        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 1);
         assert!(writer.send_buffer_limit_exceeded());
+        assert!(writer.should_disconnect());
     }
 
     #[test]
@@ -909,7 +941,7 @@ mod tests {
         let socket = UnixStream::pair().unwrap();
         let mut writer = Writer::new(socket.1.as_raw_fd());
 
-        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 0);
+        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 1);
         writer.write_array(&vec![1u8; 32]);
         writer.write_message_length();
         let _ = writer.prepare_send_msghdr().unwrap();
@@ -923,5 +955,39 @@ mod tests {
         let rest = unsafe { sendmsg(socket.1.as_raw_fd(), &*msg, MSG_NOSIGNAL) };
         assert_eq!(rest as usize, total - partial as usize);
         assert!(!writer.apply_send_result(rest as i32).unwrap());
+    }
+
+    #[test]
+    fn writer_marks_protocol_error_on_display_error_event() {
+        let socket = UnixStream::pair().unwrap();
+        let mut writer = Writer::new(socket.1.as_raw_fd());
+        assert!(!writer.protocol_error());
+        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 0);
+        writer.write_u32(2);
+        writer.write_u32(1);
+        writer.write_str("boom");
+        writer.write_message_length();
+        assert!(writer.protocol_error());
+        assert!(writer.should_disconnect());
+    }
+
+    #[test]
+    fn writer_does_not_mark_protocol_error_on_delete_id() {
+        let socket = UnixStream::pair().unwrap();
+        let mut writer = Writer::new(socket.1.as_raw_fd());
+        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 1);
+        writer.write_u32(2);
+        writer.write_message_length();
+        assert!(!writer.protocol_error());
+        assert!(!writer.should_disconnect());
+    }
+
+    #[test]
+    fn reader_reports_recv_buffer_full() {
+        let socket = UnixStream::pair().unwrap();
+        let mut reader = Reader::new(socket.0.as_raw_fd());
+        reader.bytes_in_buffer = BUFFER_SIZE;
+        assert!(reader.recv_buffer_full());
+        assert!(reader.prepare_recv_msghdr().is_none());
     }
 }

@@ -120,7 +120,7 @@ impl AppData {
                 (None, None) => None,
             };
 
-            self.ensure_pending_io(event_loop)?;
+            self.ensure_pending_io(event_loop);
 
             if wake_at.is_some_and(|at| at <= now) {
                 // Work is due now: never arm a zero/past uring timeout.
@@ -402,9 +402,9 @@ impl AppData {
                         client_id
                     );
                     self.begin_client_disconnect(event_loop, client_id);
-                } else if client.send_buffer_limit_exceeded() {
+                } else if client.should_disconnect() {
                     error!(
-                        "Client {:?} exceeded send buffer limit (unresponsive reader)",
+                        "Client {:?} entered fatal Wayland write/protocol state; disconnecting",
                         client_id
                     );
                     self.begin_client_disconnect(event_loop, client_id);
@@ -453,9 +453,9 @@ impl AppData {
 
         match client.complete_send(result) {
             Ok(_) => {
-                if client.send_buffer_limit_exceeded() {
+                if client.should_disconnect() {
                     error!(
-                        "Client {:?} exceeded send buffer limit (unresponsive reader)",
+                        "Client {:?} entered fatal Wayland write/protocol state; disconnecting",
                         client_id
                     );
                     self.begin_client_disconnect(event_loop, client_id);
@@ -477,6 +477,16 @@ impl AppData {
             return;
         }
         client.closing = true;
+        // Best-effort delivery of queued events (especially wl_display.error)
+        // before cancelling in-flight I/O and dropping the socket.
+        if !client.send_in_flight() {
+            if let Err(err) = client.flush() {
+                debug!(
+                    "Unable to flush pending output for disconnecting client {:?}: {err}",
+                    client_id
+                );
+            }
+        }
         let fd = client.as_raw_fd();
         if let Err(err) = event_loop.cancel_fd_all(fd) {
             error!("Unable to cancel I/O for client {:?}: {err}", client_id);
@@ -503,24 +513,28 @@ impl AppData {
         }
     }
 
-    fn ensure_pending_io(&mut self, event_loop: &mut EventLoop) -> io::Result<()> {
+    fn ensure_pending_io(&mut self, event_loop: &mut EventLoop) {
         // Seat/input/udev/DRM use multishot POLL_ADD (armed once at register / hotplug).
-        event_loop.submit_accept(
+        if let Err(err) = event_loop.submit_accept(
             self.wayland.as_raw_fd(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             WAYLAND_ACCEPT_ID,
-        )?;
+        ) {
+            // Retry next lap; do not tear down the compositor for a transient SQ push failure.
+            warn!("Unable to submit Wayland accept: {err}");
+        }
 
-        self.ensure_client_io(event_loop)
+        self.ensure_client_io(event_loop);
     }
 
-    fn ensure_client_io(&mut self, event_loop: &mut EventLoop) -> io::Result<()> {
+    fn ensure_client_io(&mut self, event_loop: &mut EventLoop) {
         let client_ids: Vec<ClientId> = self.connected_clients.keys().copied().collect();
+        let mut disconnect = Vec::new();
         for client_id in client_ids {
             let id = client_id.get() as u64;
-            let (fd, closing, needs_recv, needs_send) = {
-                let Some(client) = self.connected_clients.get(&client_id) else {
+            let (fd, closing, needs_recv, needs_send, should_disconnect, recv_buffer_full) = {
+                let Some(client) = self.connected_clients.get_mut(&client_id) else {
                     continue;
                 };
                 (
@@ -528,16 +542,41 @@ impl AppData {
                     client.closing,
                     !client.recv_in_flight(),
                     !client.send_in_flight() && client.has_pending_output(),
+                    client.should_disconnect(),
+                    client.recv_buffer_full(),
                 )
             };
             if closing {
                 continue;
             }
+            if should_disconnect {
+                error!(
+                    "Client {:?} entered fatal Wayland write/protocol state; disconnecting",
+                    client_id
+                );
+                disconnect.push(client_id);
+                continue;
+            }
+            if needs_recv && recv_buffer_full {
+                error!(
+                    "Client {:?} filled the Wayland receive buffer; disconnecting",
+                    client_id
+                );
+                disconnect.push(client_id);
+                continue;
+            }
             if needs_recv {
                 if let Some(client) = self.connected_clients.get_mut(&client_id) {
                     if let Some(msg) = client.prepare_recv() {
-                        unsafe {
-                            event_loop.submit_recvmsg(fd, msg, id)?;
+                        let submit_result = unsafe { event_loop.submit_recvmsg(fd, msg, id) };
+                        if let Err(err) = submit_result {
+                            client.cancel_prepared_recv();
+                            error!(
+                                "Unable to submit recv for client {:?}: {err}; disconnecting",
+                                client_id
+                            );
+                            disconnect.push(client_id);
+                            continue;
                         }
                     }
                 }
@@ -545,14 +584,23 @@ impl AppData {
             if needs_send {
                 if let Some(client) = self.connected_clients.get_mut(&client_id) {
                     if let Some(msg) = client.prepare_send() {
-                        unsafe {
-                            event_loop.submit_sendmsg(fd, msg, id)?;
+                        let submit_result = unsafe { event_loop.submit_sendmsg(fd, msg, id) };
+                        if let Err(err) = submit_result {
+                            client.cancel_prepared_send();
+                            error!(
+                                "Unable to submit send for client {:?}: {err}; disconnecting",
+                                client_id
+                            );
+                            disconnect.push(client_id);
+                            continue;
                         }
                     }
                 }
             }
         }
-        Ok(())
+        for client_id in disconnect {
+            self.begin_client_disconnect(event_loop, client_id);
+        }
     }
 
     fn handle_channel_messages(

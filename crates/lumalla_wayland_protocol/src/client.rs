@@ -113,6 +113,29 @@ impl ClientConnection {
         self.writer.send_buffer_limit_exceeded()
     }
 
+    pub fn protocol_error(&self) -> bool {
+        self.writer.protocol_error()
+    }
+
+    /// True when the client has hit a fatal write/protocol condition.
+    pub fn should_disconnect(&self) -> bool {
+        self.writer.should_disconnect()
+    }
+
+    pub fn recv_buffer_full(&mut self) -> bool {
+        self.reader.recv_buffer_full()
+    }
+
+    /// Undo `prepare_recv` if submitting the SQE fails.
+    pub fn cancel_prepared_recv(&mut self) {
+        self.recv_in_flight = false;
+    }
+
+    /// Undo `prepare_send` if submitting the SQE fails.
+    pub fn cancel_prepared_send(&mut self) {
+        self.send_in_flight = false;
+    }
+
     pub fn stream(&self) -> &UnixStream {
         &self.stream
     }
@@ -198,6 +221,14 @@ impl ClientConnection {
             self.reader.message_handled(message_size);
             if result.is_err() {
                 return result;
+            }
+            // Stop dispatching after a fatal protocol error so a misbehaving
+            // client cannot keep mutating compositor state.
+            if self.writer.protocol_error() {
+                anyhow::bail!(
+                    "Fatal Wayland protocol error for client {:?}; disconnecting",
+                    self.client_id
+                );
             }
         }
         Ok(())
