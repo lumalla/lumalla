@@ -723,7 +723,12 @@ impl RendererState {
     }
 
     /// Open missing DRM devices via the seat (fresh open after VT resume).
+    ///
+    /// No-op when the seat backend cannot open devices (headless / no libseat).
     pub fn activate_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
+        if !seat.can_open_devices() {
+            return Ok(());
+        }
         self.drm_devices.activate(seat)
     }
 
@@ -731,11 +736,16 @@ impl RendererState {
     pub fn deactivate_drm(&mut self, seat: &SeatState) {
         self.drain_scanouts();
         let _ = self.flip_events.drain();
-        self.drm_devices.deactivate(seat);
+        if seat.can_open_devices() {
+            self.drm_devices.deactivate(seat);
+        }
     }
 
     /// Close removed / open newly discovered DRM devices while the seat is active.
     pub fn reconcile_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
+        if !seat.can_open_devices() {
+            return Ok(());
+        }
         self.drain_scanouts();
         let _ = self.flip_events.drain();
         self.drm_devices.reconcile(seat)

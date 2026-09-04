@@ -201,6 +201,7 @@ impl InputState {
         self.dispatch(|_| {})
     }
 
+    /// Suspend libinput when the session is disabled. Safe if never enabled.
     pub fn disable_seat(&mut self) -> anyhow::Result<()> {
         self.mods = Mods::default();
         self.xkb.reset()?;

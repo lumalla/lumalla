@@ -272,7 +272,7 @@ impl AppData {
                         result.connectors_changed,
                         self.renderer_state.drm_device_states()
                     );
-                    if self.seat_state.is_enabled() {
+                    if self.seat_state.is_enabled() && self.seat_state.can_open_devices() {
                         if result.devices_changed {
                             if let Err(err) = self
                                 .renderer_state
@@ -336,11 +336,9 @@ impl AppData {
         }
         match token {
             LIBSEAT_TOKEN => {
-                event_loop.submit_poll(
-                    self.seat_state.as_raw_fd(),
-                    Interest::READABLE,
-                    LIBSEAT_TOKEN,
-                )?;
+                if let Some(fd) = self.seat_state.poll_fd() {
+                    event_loop.submit_poll(fd, Interest::READABLE, LIBSEAT_TOKEN)?;
+                }
             }
             LIBINPUT_TOKEN => {
                 event_loop.submit_poll(
@@ -571,8 +569,14 @@ impl AppData {
                         continue;
                     }
                     if let Ok(seat_name) = self.seat_state.seat_name() {
-                        if let Err(err) = self.input_state.enable_seat(&seat_name) {
-                            error!("Unable to enable libinput: {err}");
+                        if self.seat_state.can_open_devices() {
+                            if let Err(err) = self.input_state.enable_seat(&seat_name) {
+                                error!("Unable to enable libinput: {err}");
+                            }
+                        } else {
+                            info!(
+                                "Skipping libinput seat assign (no session backend for device opens)"
+                            );
                         }
                         if let Err(err) = self
                             .display_state
@@ -581,12 +585,15 @@ impl AppData {
                             error!("Unable to activate Wayland seat: {err}");
                         }
                     }
-                    if let Err(err) = self
-                        .renderer_state
-                        .activate_drm(self.seat_state.as_ref().get_ref())
-                    {
-                        error!("Unable to activate DRM devices: {err}");
-                    } else {
+                    if self.seat_state.can_open_devices() {
+                        if let Err(err) = self
+                            .renderer_state
+                            .activate_drm(self.seat_state.as_ref().get_ref())
+                        {
+                            error!("Unable to activate DRM devices: {err}");
+                            // Keep waiting for a later successful activate; do not Ready yet.
+                            continue;
+                        }
                         if let Err(err) = self.sync_drm_device_poll(event_loop) {
                             error!("Unable to register DRM device poll fds: {err}");
                         }
@@ -605,8 +612,10 @@ impl AppData {
                         ));
                         self.render_scheduler.request_immediate();
                         self.renderer_state.mark_scene_dirty();
-                        self.comms.dbus(DbusMessage::EmitReady);
+                    } else {
+                        info!("Skipping DRM activate (no session backend for device opens)");
                     }
+                    self.comms.dbus(DbusMessage::EmitReady);
                 }
                 MainMessage::MainSeatDisabled => {
                     if self.seat_state.is_enabled() {
@@ -1413,9 +1422,11 @@ fn init_and_register_seat_state(
     main_event_loop: &mut EventLoop,
 ) -> anyhow::Result<Pin<Box<SeatState>>> {
     let seat_state = Box::new(SeatState::new(comms)?);
-    main_event_loop
-        .submit_poll(seat_state.as_raw_fd(), Interest::READABLE, LIBSEAT_TOKEN)
-        .context("Unable to listen on seat state")?;
+    if let Some(fd) = seat_state.poll_fd() {
+        main_event_loop
+            .submit_poll(fd, Interest::READABLE, LIBSEAT_TOKEN)
+            .context("Unable to listen on seat state")?;
+    }
     Ok(Box::into_pin(seat_state))
 }
 
