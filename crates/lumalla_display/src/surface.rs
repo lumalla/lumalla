@@ -618,6 +618,46 @@ impl SurfaceManager {
         }
     }
 
+    /// Shell mode for a surface that has a wl_shell role.
+    pub fn shell_mode(&self, client_id: ClientId, surface_id: ObjectId) -> Option<ShellMode> {
+        let surface = self.surfaces.get(&(client_id, surface_id))?;
+        matches!(surface.role, Some(Role::Shell(_))).then_some(surface.shell.mode)
+    }
+
+    /// Walk subsurface and role-parent links upward.
+    pub fn parent_surface(&self, client_id: ClientId, surface_id: ObjectId) -> Option<ObjectId> {
+        let surface = self.surfaces.get(&(client_id, surface_id))?;
+        if let Some(Role::Subsurface(sub_id)) = surface.role {
+            return self
+                .subsurfaces
+                .get(&(client_id, sub_id))
+                .map(|sub| sub.parent);
+        }
+        surface.role_parent
+    }
+
+    /// True when `surface_id` is `ancestor` or nested under it via subsurfaces/role parents.
+    pub fn is_descendant_of(
+        &self,
+        client_id: ClientId,
+        ancestor: ObjectId,
+        surface_id: ObjectId,
+    ) -> bool {
+        let mut current = Some(surface_id);
+        let mut guard = 0;
+        while let Some(id) = current {
+            if id == ancestor {
+                return true;
+            }
+            if guard >= 64 {
+                break;
+            }
+            guard += 1;
+            current = self.parent_surface(client_id, id);
+        }
+        false
+    }
+
     pub fn surface_layout(&self, client_id: ClientId, surface_id: ObjectId) -> Option<(i32, i32)> {
         self.surfaces
             .get(&(client_id, surface_id))

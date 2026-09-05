@@ -41,7 +41,27 @@ pub struct XdgManager {
     popups: HashMap<ResourceKey, PopupState>,
     /// wl_surface → xdg_surface
     surface_to_xdg: HashMap<ResourceKey, ObjectId>,
+    /// Active popup grabs, bottom (oldest) to top (newest).
+    popup_grabs: Vec<(ClientId, ObjectId)>,
     next_configure_serial: u32,
+}
+
+/// Role information for an xdg_popup bound to a wl_surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PopupSurfaceInfo {
+    pub popup_id: ObjectId,
+    pub xdg_surface: ObjectId,
+    pub parent_xdg: ObjectId,
+    pub grabbed: bool,
+}
+
+/// A configure that must be written after activation state changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationConfigure {
+    pub client_id: ClientId,
+    pub xdg_surface: ObjectId,
+    pub toplevel: ObjectId,
+    pub snapshot: ConfigureSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -1045,7 +1065,175 @@ impl XdgManager {
             .get_mut(&(client_id, popup_id))
             .expect("popup checked above")
             .grabbed = true;
+        if !self
+            .popup_grabs
+            .iter()
+            .any(|(owner, id)| *owner == client_id && *id == popup_id)
+        {
+            self.popup_grabs.push((client_id, popup_id));
+        }
         Ok(())
+    }
+
+    /// Whether any popup currently holds a seat grab.
+    pub fn has_popup_grab(&self) -> bool {
+        !self.popup_grabs.is_empty()
+    }
+
+    /// Bottom-most (oldest) active popup grab, if any.
+    pub fn bottom_popup_grab(&self) -> Option<(ClientId, ObjectId)> {
+        self.popup_grabs.first().copied()
+    }
+
+    /// Popup role info for a wl_surface, if it is an xdg_popup.
+    pub fn popup_info_for_wl(
+        &self,
+        client_id: ClientId,
+        wl_surface: ObjectId,
+    ) -> Option<PopupSurfaceInfo> {
+        let xdg_surface = self.xdg_surface_for_wl(client_id, wl_surface)?;
+        let surface = self.xdg_surfaces.get(&(client_id, xdg_surface))?;
+        let XdgRole::Popup(popup_id) = surface.role? else {
+            return None;
+        };
+        let popup = self.popups.get(&(client_id, popup_id))?;
+        Some(PopupSurfaceInfo {
+            popup_id,
+            xdg_surface,
+            parent_xdg: popup.parent,
+            grabbed: popup.grabbed,
+        })
+    }
+
+    /// Parent wl_surface of a popup, if known.
+    pub fn popup_parent_wl(&self, client_id: ClientId, popup_id: ObjectId) -> Option<ObjectId> {
+        let parent_xdg = self.popup_parent_xdg(client_id, popup_id)?;
+        self.xdg_surface_wl(client_id, parent_xdg)
+    }
+
+    /// Walk popup parents until a toplevel wl_surface is found.
+    pub fn activation_root_wl(
+        &self,
+        client_id: ClientId,
+        wl_surface: ObjectId,
+    ) -> Option<ObjectId> {
+        let mut current = wl_surface;
+        for _ in 0..32 {
+            let Some(xdg_surface) = self.xdg_surface_for_wl(client_id, current) else {
+                return Some(current);
+            };
+            let Some(surface) = self.xdg_surfaces.get(&(client_id, xdg_surface)) else {
+                return Some(current);
+            };
+            match surface.role {
+                Some(XdgRole::Toplevel(_)) => return Some(current),
+                Some(XdgRole::Popup(popup_id)) => {
+                    current = self.popup_parent_wl(client_id, popup_id)?;
+                }
+                None => return Some(current),
+            }
+        }
+        None
+    }
+
+    /// Toplevel id for the activation root of `wl_surface`, if any.
+    pub fn toplevel_for_wl(
+        &self,
+        client_id: ClientId,
+        wl_surface: ObjectId,
+    ) -> Option<(ObjectId, ObjectId)> {
+        let root_wl = self.activation_root_wl(client_id, wl_surface)?;
+        let xdg_surface = self.xdg_surface_for_wl(client_id, root_wl)?;
+        let surface = self.xdg_surfaces.get(&(client_id, xdg_surface))?;
+        match surface.role {
+            Some(XdgRole::Toplevel(toplevel_id)) => Some((toplevel_id, xdg_surface)),
+            _ => None,
+        }
+    }
+
+    /// Update activated state so only `target` (client, toplevel) is activated.
+    ///
+    /// Returns configures that must be emitted for surfaces whose state changed.
+    pub fn set_activated(
+        &mut self,
+        target: Option<(ClientId, ObjectId)>,
+    ) -> Vec<ActivationConfigure> {
+        let toplevels: Vec<(ClientId, ObjectId)> =
+            self.toplevels.keys().map(|(c, t)| (*c, *t)).collect();
+        let mut configures = Vec::new();
+        for (client_id, toplevel_id) in toplevels {
+            let should_activate = target == Some((client_id, toplevel_id));
+            let Some(state) = self.toplevels.get_mut(&(client_id, toplevel_id)) else {
+                continue;
+            };
+            let is_activated = state.states & TOPLEVEL_STATE_ACTIVATED != 0;
+            if should_activate == is_activated {
+                continue;
+            }
+            if should_activate {
+                state.states |= TOPLEVEL_STATE_ACTIVATED;
+            } else {
+                state.states &= !TOPLEVEL_STATE_ACTIVATED;
+            }
+            let xdg_surface = state.xdg_surface;
+            let configure_started = self
+                .xdg_surfaces
+                .get(&(client_id, xdg_surface))
+                .is_some_and(|surface| surface.initial_configure_sent);
+            if !configure_started {
+                continue;
+            }
+            if let Ok(snapshot) = self.toplevel_configure(client_id, toplevel_id) {
+                configures.push(ActivationConfigure {
+                    client_id,
+                    xdg_surface,
+                    toplevel: toplevel_id,
+                    snapshot,
+                });
+            }
+        }
+        configures
+    }
+
+    /// True when `target_wl` belongs to any currently grabbed popup tree for `client_id`.
+    ///
+    /// `ancestor_of` should return true when `target_wl` is `popup_wl` or a descendant
+    /// (subsurface / nested role child) of it.
+    pub fn pointer_target_in_popup_grab(
+        &self,
+        client_id: ClientId,
+        target_wl: ObjectId,
+        mut ancestor_of: impl FnMut(ObjectId, ObjectId) -> bool,
+    ) -> bool {
+        for (owner, popup_id) in &self.popup_grabs {
+            if *owner != client_id {
+                continue;
+            }
+            let Some(popup_wl) = self
+                .popups
+                .get(&(*owner, *popup_id))
+                .and_then(|popup| self.xdg_surface_wl(*owner, popup.xdg_surface))
+            else {
+                continue;
+            };
+            if ancestor_of(popup_wl, target_wl) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Clear every active popup grab and return popups that should receive `popup_done`
+    /// (topmost first).
+    pub fn dismiss_all_popup_grabs(&mut self) -> Vec<(ClientId, ObjectId)> {
+        let mut dismissed: Vec<(ClientId, ObjectId)> = self.popup_grabs.drain(..).collect();
+        for (client_id, popup_id) in &dismissed {
+            if let Some(popup) = self.popups.get_mut(&(*client_id, *popup_id)) {
+                popup.grabbed = false;
+            }
+        }
+        dismissed.reverse();
+        dismissed
     }
 
     pub fn destroy_popup(
@@ -1068,6 +1256,8 @@ impl XdgManager {
             .popups
             .remove(&(client_id, popup_id))
             .expect("popup checked above");
+        self.popup_grabs
+            .retain(|(owner, id)| !(*owner == client_id && *id == popup_id));
         if let Some(surface) = self.xdg_surfaces.get_mut(&(client_id, popup.xdg_surface)) {
             surface.role_alive = false;
             surface.mapped = false;
@@ -1151,6 +1341,10 @@ impl XdgManager {
     }
 
     /// Called when a buffer is attached/committed: enforce configure-before-buffer for xdg.
+    ///
+    /// `unconfigured_buffer` applies only before the first usable configure (or after
+    /// unmap clears configure state). A mapped surface may keep committing buffers
+    /// while a newer configure is pending; the client acks only when applying it.
     pub fn check_buffer_commit(
         &self,
         client_id: ClientId,
@@ -1168,11 +1362,9 @@ impl XdgManager {
             return Err(XdgError::NotConstructed);
         }
         if attaching_buffer {
-            let no_usable_configure =
-                surface.current_configure.is_none() && surface.pending_ack.is_none();
-            let newer_configure_unacked =
-                !surface.pending_configures.is_empty() && surface.pending_ack.is_none();
-            if no_usable_configure || newer_configure_unacked {
+            let configured =
+                surface.current_configure.is_some() || surface.pending_ack.is_some();
+            if !configured {
                 return Err(XdgError::UnconfiguredBuffer);
             }
         }
@@ -1256,6 +1448,7 @@ impl XdgManager {
         self.popups.retain(|(owner, _), _| *owner != client_id);
         self.surface_to_xdg
             .retain(|(owner, _), _| *owner != client_id);
+        self.popup_grabs.retain(|(owner, _)| *owner != client_id);
     }
 }
 
@@ -1466,6 +1659,7 @@ const CONSTRAINT_RESIZE_Y: u32 = 32;
 const CONSTRAINT_ALL: u32 = 63;
 pub const TOPLEVEL_STATE_MAXIMIZED: u32 = 1 << 0;
 pub const TOPLEVEL_STATE_FULLSCREEN: u32 = 1 << 1;
+pub const TOPLEVEL_STATE_ACTIVATED: u32 = 1 << 2;
 
 fn anchor_point(anchor: u32, x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
     let mid_x = x + width / 2;
@@ -1594,21 +1788,36 @@ mod tests {
     }
 
     #[test]
-    fn new_buffer_waits_for_latest_configure_ack() {
+    fn mapped_surface_allows_buffer_while_configure_pending() {
         let mut manager = XdgManager::default();
         let client = client_id(1);
         let xdg = object_id(2);
         let wl = object_id(3);
         let toplevel = object_id(4);
         mapped_toplevel(&mut manager, client, xdg, wl, toplevel);
-        let configure = manager.toplevel_configure(client, toplevel).unwrap();
+        let _configure = manager.toplevel_configure(client, toplevel).unwrap();
+        // Already configured surfaces may keep committing buffers until they
+        // choose to ack and apply a newer configure.
+        assert_eq!(manager.check_buffer_commit(client, wl, true), Ok(()));
+    }
+
+    #[test]
+    fn unmapped_surface_rejects_buffer_until_reconfigured() {
+        let mut manager = XdgManager::default();
+        let client = client_id(1);
+        let xdg = object_id(2);
+        let wl = object_id(3);
+        let toplevel = object_id(4);
+        mapped_toplevel(&mut manager, client, xdg, wl, toplevel);
+        let initial = manager
+            .on_wl_surface_commit_with_buffer(client, wl, Some(false))
+            .initial_configure
+            .unwrap();
         assert_eq!(
             manager.check_buffer_commit(client, wl, true),
             Err(XdgError::UnconfiguredBuffer)
         );
-        manager
-            .ack_configure(client, xdg, configure.serial)
-            .unwrap();
+        manager.ack_configure(client, xdg, initial.serial).unwrap();
         assert_eq!(manager.check_buffer_commit(client, wl, true), Ok(()));
     }
 
@@ -2018,5 +2227,163 @@ mod tests {
         );
         manager.destroy_popup(client, object_id(11)).unwrap();
         manager.destroy_popup(client, object_id(7)).unwrap();
+    }
+
+    #[test]
+    fn activated_state_is_exclusive_across_toplevels() {
+        let mut manager = XdgManager::default();
+        let client_a = client_id(1);
+        let client_b = client_id(2);
+        mapped_toplevel(
+            &mut manager,
+            client_a,
+            object_id(2),
+            object_id(3),
+            object_id(4),
+        );
+        mapped_toplevel(
+            &mut manager,
+            client_b,
+            object_id(5),
+            object_id(6),
+            object_id(7),
+        );
+
+        let configures = manager.set_activated(Some((client_a, object_id(4))));
+        assert_eq!(configures.len(), 1);
+        assert_eq!(configures[0].client_id, client_a);
+        assert!(matches!(
+            configures[0].snapshot.payload,
+            ConfigurePayload::Toplevel {
+                states,
+                ..
+            } if states & TOPLEVEL_STATE_ACTIVATED != 0
+        ));
+
+        let configures = manager.set_activated(Some((client_b, object_id(7))));
+        assert_eq!(configures.len(), 2);
+        let a = configures
+            .iter()
+            .find(|c| c.client_id == client_a)
+            .unwrap();
+        let b = configures
+            .iter()
+            .find(|c| c.client_id == client_b)
+            .unwrap();
+        assert!(matches!(
+            a.snapshot.payload,
+            ConfigurePayload::Toplevel { states, .. } if states & TOPLEVEL_STATE_ACTIVATED == 0
+        ));
+        assert!(matches!(
+            b.snapshot.payload,
+            ConfigurePayload::Toplevel { states, .. } if states & TOPLEVEL_STATE_ACTIVATED != 0
+        ));
+    }
+
+    #[test]
+    fn popup_grab_stack_dismisses_topmost_first() {
+        let mut manager = XdgManager::default();
+        let client = client_id(1);
+        mapped_toplevel(
+            &mut manager,
+            client,
+            object_id(2),
+            object_id(3),
+            object_id(4),
+        );
+
+        manager.create_positioner(client, object_id(20));
+        manager
+            .positioner_set_size(client, object_id(20), 20, 10)
+            .unwrap();
+        manager
+            .positioner_set_anchor_rect(client, object_id(20), 10, 10, 10, 10)
+            .unwrap();
+        manager
+            .create_xdg_surface(client, object_id(5), object_id(6))
+            .unwrap();
+        manager
+            .create_popup(client, object_id(7), object_id(5), object_id(2), object_id(20))
+            .unwrap();
+        manager.grab_popup(client, object_id(7)).unwrap();
+
+        let popup_initial = manager
+            .on_wl_surface_commit_with_buffer(client, object_id(6), Some(false))
+            .initial_configure
+            .unwrap();
+        manager
+            .ack_configure(client, object_id(5), popup_initial.serial)
+            .unwrap();
+        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true));
+
+        manager.create_positioner(client, object_id(21));
+        manager
+            .positioner_set_size(client, object_id(21), 10, 10)
+            .unwrap();
+        manager
+            .positioner_set_anchor_rect(client, object_id(21), 0, 0, 10, 10)
+            .unwrap();
+        manager
+            .create_xdg_surface(client, object_id(8), object_id(9))
+            .unwrap();
+        manager
+            .create_popup(client, object_id(10), object_id(8), object_id(5), object_id(21))
+            .unwrap();
+        manager.grab_popup(client, object_id(10)).unwrap();
+
+        assert!(manager.has_popup_grab());
+        assert_eq!(manager.bottom_popup_grab(), Some((client, object_id(7))));
+        let info = manager.popup_info_for_wl(client, object_id(6)).unwrap();
+        assert!(info.grabbed);
+        assert_eq!(
+            manager.activation_root_wl(client, object_id(6)),
+            Some(object_id(3))
+        );
+
+        let dismissed = manager.dismiss_all_popup_grabs();
+        assert_eq!(
+            dismissed,
+            vec![(client, object_id(10)), (client, object_id(7))]
+        );
+        assert!(!manager.has_popup_grab());
+        assert!(!manager.popup_info_for_wl(client, object_id(6)).unwrap().grabbed);
+    }
+
+    #[test]
+    fn grab_after_map_is_invalid() {
+        let mut manager = XdgManager::default();
+        let client = client_id(1);
+        mapped_toplevel(
+            &mut manager,
+            client,
+            object_id(2),
+            object_id(3),
+            object_id(4),
+        );
+        manager.create_positioner(client, object_id(20));
+        manager
+            .positioner_set_size(client, object_id(20), 20, 10)
+            .unwrap();
+        manager
+            .positioner_set_anchor_rect(client, object_id(20), 10, 10, 10, 10)
+            .unwrap();
+        manager
+            .create_xdg_surface(client, object_id(5), object_id(6))
+            .unwrap();
+        manager
+            .create_popup(client, object_id(7), object_id(5), object_id(2), object_id(20))
+            .unwrap();
+        let initial = manager
+            .on_wl_surface_commit_with_buffer(client, object_id(6), Some(false))
+            .initial_configure
+            .unwrap();
+        manager
+            .ack_configure(client, object_id(5), initial.serial)
+            .unwrap();
+        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true));
+        assert_eq!(
+            manager.grab_popup(client, object_id(7)),
+            Err(XdgError::InvalidGrab)
+        );
     }
 }

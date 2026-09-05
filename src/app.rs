@@ -411,6 +411,8 @@ impl AppData {
                 } else {
                     self.display_state
                         .flush_pending_keyboard_leaves(&mut self.connected_clients);
+                    self.display_state
+                        .flush_pending_activation_configures(&mut self.connected_clients);
                     self.submit_committed_frames();
                     // Mapping / get_pointer can change who should own the cursor
                     // without a motion event; sync enter/leave now.

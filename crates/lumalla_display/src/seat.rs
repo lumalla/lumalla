@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use lumalla_shared::KeymapMemfd;
 use lumalla_wayland_protocol::{
@@ -275,6 +275,11 @@ impl SeatManager {
         self.serial.next_serial()
     }
 
+    /// Whether `serial` was recently issued by this seat (for popup grab validation).
+    pub fn is_valid_serial(&self, serial: u32) -> bool {
+        self.serial.is_valid(serial)
+    }
+
     pub fn set_output_geometry(&mut self, width: u32, height: u32) {
         self.output_width = width;
         self.output_height = height;
@@ -309,6 +314,12 @@ impl SeatManager {
         self.keyboards
             .iter()
             .find_map(|keyboard| keyboard.focus.map(|surface| (keyboard.client_id, surface)))
+    }
+
+    pub fn focused_pointer_surface(&self) -> Option<(ClientId, ObjectId)> {
+        self.pointers
+            .iter()
+            .find_map(|pointer| pointer.focus.map(|surface| (pointer.client_id, surface)))
     }
 
     pub fn set_cursor(
@@ -1018,17 +1029,29 @@ impl SeatManager {
 
 struct Serial {
     next_serial: u32,
+    recent_serials: VecDeque<u32>,
 }
 
 impl Serial {
     fn new() -> Self {
-        Self { next_serial: 1 }
+        Self {
+            next_serial: 1,
+            recent_serials: VecDeque::new(),
+        }
     }
 
     fn next_serial(&mut self) -> u32 {
         let serial = self.next_serial;
         self.next_serial = self.next_serial.wrapping_add(1);
+        self.recent_serials.push_back(serial);
+        while self.recent_serials.len() > 128 {
+            self.recent_serials.pop_front();
+        }
         serial
+    }
+
+    fn is_valid(&self, serial: u32) -> bool {
+        self.recent_serials.contains(&serial)
     }
 }
 

@@ -10,8 +10,8 @@ use crate::{
     DisplayState,
     surface::SurfaceError,
     xdg::{
-        ConfigurePayload, ConfigureSnapshot, TOPLEVEL_STATE_FULLSCREEN, TOPLEVEL_STATE_MAXIMIZED,
-        XdgError,
+        ConfigurePayload, ConfigureSnapshot, TOPLEVEL_STATE_ACTIVATED, TOPLEVEL_STATE_FULLSCREEN,
+        TOPLEVEL_STATE_MAXIMIZED, XdgError,
     },
 };
 
@@ -52,7 +52,7 @@ fn report_xdg_error(ctx: &mut Ctx, object_id: ObjectId, error: XdgError) {
         XdgError::InvalidSerial => (XDG_SURFACE_ERROR_INVALID_SERIAL, "Invalid configure serial"),
         XdgError::UnconfiguredBuffer => (
             XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER,
-            "Buffer attached before configure ack",
+            "Buffer attached before first configure",
         ),
         XdgError::DefunctSurfaces => (
             XDG_WM_BASE_ERROR_DEFUNCT_SURFACES,
@@ -148,6 +148,9 @@ pub(crate) fn write_configure_snapshot(
             }
             if states & TOPLEVEL_STATE_FULLSCREEN != 0 {
                 state_bytes.extend_from_slice(&XDG_TOPLEVEL_STATE_FULLSCREEN.to_ne_bytes());
+            }
+            if states & TOPLEVEL_STATE_ACTIVATED != 0 {
+                state_bytes.extend_from_slice(&XDG_TOPLEVEL_STATE_ACTIVATED.to_ne_bytes());
             }
             writer
                 .xdg_toplevel_configure(snapshot.role_id)
@@ -789,6 +792,11 @@ impl XdgPopup for DisplayState {
     fn grab(&mut self, ctx: &mut Ctx, object_id: ObjectId, params: &XdgPopupGrab<'_>) {
         if ctx.registry.interface_index(params.seat()) != Some(InterfaceIndex::WlSeat) {
             report_xdg_error(ctx, object_id, XdgError::InvalidGrab);
+            return;
+        }
+        if !self.seat_manager.is_valid_serial(params.serial()) {
+            // Deny without a protocol error: dismiss the popup immediately.
+            ctx.writer.xdg_popup_popup_done(object_id);
             return;
         }
         if let Err(error) = self.xdg_manager.grab_popup(ctx.client_id, object_id) {

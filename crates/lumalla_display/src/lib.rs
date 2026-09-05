@@ -13,7 +13,7 @@ use lumalla_wayland_protocol::{ObjectId, buffer::Writer, registry::Registry};
 use crate::{
     data_device::DataDeviceManager, dmabuf::DmabufManager, output::OutputManager,
     seat::SeatManager, shm::ShmManager, surface::SurfaceManager, window_manager::WindowManager,
-    xdg::XdgManager,
+    xdg::{ActivationConfigure, XdgManager},
 };
 
 mod data_device;
@@ -115,6 +115,8 @@ pub struct DisplayState {
     pending_geometry_changes: Vec<WindowGeometryChange>,
     pending_frame_callbacks: VecDeque<(ClientId, lumalla_wayland_protocol::ObjectId)>,
     pending_presentation_feedbacks: VecDeque<PendingPresentationFeedback>,
+    /// Activation configures for clients other than the one currently writing.
+    pending_activation_configures: Vec<ActivationConfigure>,
 }
 
 impl Default for DisplayState {
@@ -133,6 +135,7 @@ impl Default for DisplayState {
             pending_geometry_changes: Vec::new(),
             pending_frame_callbacks: VecDeque::new(),
             pending_presentation_feedbacks: VecDeque::new(),
+            pending_activation_configures: Vec::new(),
         }
     }
 }
@@ -172,6 +175,23 @@ impl DisplayState {
         clients: &mut HashMap<ClientId, ClientConnection>,
     ) {
         self.seat_manager.flush_pending_keyboard_leaves(clients);
+    }
+
+    pub fn flush_pending_activation_configures(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) {
+        let pending = std::mem::take(&mut self.pending_activation_configures);
+        for configure in pending {
+            let Some(client) = clients.get_mut(&configure.client_id) else {
+                continue;
+            };
+            protocols::xdg_shell::write_configure_snapshot(
+                client.writer_mut(),
+                configure.xdg_surface,
+                configure.snapshot,
+            );
+        }
     }
 
     pub fn handle_keyboard_key(
@@ -242,6 +262,18 @@ impl DisplayState {
         button: u32,
         pressed: bool,
     ) {
+        if pressed {
+            self.seat_manager.update_pointer_focus_and_motion(
+                clients,
+                &self.surface_manager,
+                time_msec,
+                false,
+            );
+            let click_target = self.seat_manager.focused_pointer_surface();
+            if self.should_dismiss_popup_grab(click_target) {
+                self.dismiss_popup_grabs(clients);
+            }
+        }
         self.seat_manager.handle_pointer_button(
             clients,
             &self.surface_manager,
@@ -251,7 +283,27 @@ impl DisplayState {
         );
         if pressed && let Some((client_id, surface)) = self.seat_manager.focused_keyboard_surface()
         {
-            self.on_surface_focused(client_id, surface);
+            let focus_surface = match self.xdg_manager.popup_info_for_wl(client_id, surface) {
+                Some(popup) if !popup.grabbed => self
+                    .xdg_manager
+                    .popup_parent_wl(client_id, popup.popup_id)
+                    .unwrap_or(surface),
+                _ => surface,
+            };
+            if focus_surface != surface
+                && let Some(client) = clients.get_mut(&client_id)
+            {
+                self.seat_manager.focus_keyboards_on_surface(
+                    client_id,
+                    focus_surface,
+                    client.writer_mut(),
+                );
+            }
+            self.on_surface_focused(client_id, focus_surface);
+            if let Some(client) = clients.get_mut(&client_id) {
+                self.apply_activation(client_id, focus_surface, client.writer_mut());
+            }
+            self.flush_pending_activation_configures(clients);
         }
     }
 
@@ -639,8 +691,115 @@ impl DisplayState {
     }
 
     pub(crate) fn on_surface_focused(&mut self, client_id: ClientId, wl_surface: ObjectId) {
+        let focus_wl = self
+            .xdg_manager
+            .activation_root_wl(client_id, wl_surface)
+            .unwrap_or(wl_surface);
         self.window_manager
-            .set_focus_from_surface(client_id, wl_surface);
+            .set_focus_from_surface(client_id, focus_wl);
+    }
+
+    /// Apply keyboard/activation policy for a newly mapped surface.
+    ///
+    /// Non-grabbed popups keep parent focus. Grabbed popups take keyboard focus
+    /// while the parent toplevel stays activated.
+    pub(crate) fn focus_newly_mapped_surface(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        writer: &mut Writer,
+    ) {
+        if self.surface_manager.shell_mode(client_id, surface_id) == Some(surface::ShellMode::Popup)
+        {
+            return;
+        }
+
+        if let Some(popup) = self.xdg_manager.popup_info_for_wl(client_id, surface_id) {
+            if !popup.grabbed {
+                return;
+            }
+            self.seat_manager
+                .focus_keyboards_on_surface(client_id, surface_id, writer);
+            if let Some(parent_wl) = self.xdg_manager.popup_parent_wl(client_id, popup.popup_id) {
+                self.on_surface_focused(client_id, parent_wl);
+                self.apply_activation(client_id, parent_wl, writer);
+            }
+            return;
+        }
+
+        self.seat_manager
+            .focus_keyboards_on_surface(client_id, surface_id, writer);
+        self.on_surface_focused(client_id, surface_id);
+        self.apply_activation(client_id, surface_id, writer);
+    }
+
+    pub(crate) fn apply_activation(
+        &mut self,
+        client_id: ClientId,
+        wl_surface: ObjectId,
+        writer: &mut Writer,
+    ) {
+        let target = self
+            .xdg_manager
+            .toplevel_for_wl(client_id, wl_surface)
+            .map(|(toplevel, _)| (client_id, toplevel));
+        let configures = self.xdg_manager.set_activated(target);
+        for configure in configures {
+            if configure.client_id == client_id {
+                protocols::xdg_shell::write_configure_snapshot(
+                    writer,
+                    configure.xdg_surface,
+                    configure.snapshot,
+                );
+            } else {
+                self.pending_activation_configures.push(configure);
+            }
+        }
+    }
+
+    fn should_dismiss_popup_grab(&self, click_target: Option<(ClientId, ObjectId)>) -> bool {
+        if !self.xdg_manager.has_popup_grab() {
+            return false;
+        }
+        let Some((client_id, target_wl)) = click_target else {
+            return true;
+        };
+        !self.xdg_manager.pointer_target_in_popup_grab(
+            client_id,
+            target_wl,
+            |popup_wl, target| {
+                self.surface_manager
+                    .is_descendant_of(client_id, popup_wl, target)
+            },
+        )
+    }
+
+    fn dismiss_popup_grabs(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
+        let parent_focus = self
+            .xdg_manager
+            .bottom_popup_grab()
+            .and_then(|(client_id, popup_id)| {
+                self.xdg_manager
+                    .popup_parent_wl(client_id, popup_id)
+                    .map(|parent_wl| (client_id, parent_wl))
+            });
+        let dismissed = self.xdg_manager.dismiss_all_popup_grabs();
+        for (client_id, popup_id) in dismissed {
+            let Some(client) = clients.get_mut(&client_id) else {
+                continue;
+            };
+            client.writer_mut().xdg_popup_popup_done(popup_id);
+        }
+        if let Some((client_id, parent_wl)) = parent_focus
+            && let Some(client) = clients.get_mut(&client_id)
+        {
+            self.seat_manager
+                .focus_keyboards_on_surface(client_id, parent_wl, client.writer_mut());
+            self.on_surface_focused(client_id, parent_wl);
+            self.apply_activation(client_id, parent_wl, client.writer_mut());
+        }
+        self.flush_pending_keyboard_leaves(clients);
+        self.flush_pending_activation_configures(clients);
     }
 
     pub(crate) fn flush_pending_window_configures(

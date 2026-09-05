@@ -47,10 +47,17 @@ impl SeatState {
         match LibSeat::new(comms.clone()) {
             Ok(seat) => {
                 info!("Opened libseat session");
-                Ok(Self {
+                let mut state = Self {
                     backend: SeatBackend::Libseat(seat),
                     devices_by_fd: RefCell::new(HashMap::new()),
-                })
+                };
+                // seatd may already have ENABLE_SEAT in libseat's userspace
+                // buffer after open (fd not readable); logind enable also
+                // waits for the first dispatch. Drain now or Ready never fires.
+                state
+                    .dispatch()
+                    .context("Failed to dispatch initial libseat events")?;
+                Ok(state)
             }
             Err(err) => {
                 warn!(

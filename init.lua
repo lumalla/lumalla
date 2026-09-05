@@ -26,12 +26,12 @@ end
 lum.on_startup(function()
 	enable_virtual_output()
 	lum.spawn({ command = "wezterm", args = { "start", "--always-new-process" } })
-	lum.spawn({ command = "xwayland-satellite", args = { ":12" } })
-	lum.sleep(2.0)
-	lum.spawn({
-		command = "env",
-		args = { "DISPLAY=:12", "steam" },
-	})
+	-- lum.spawn({ command = "xwayland-satellite", args = { ":12" } })
+	-- lum.sleep(2.0)
+	-- lum.spawn({
+	-- 	command = "env",
+	-- 	args = { "DISPLAY=:12", "steam" },
+	-- })
 end)
 
 lum.add_window_rule({
