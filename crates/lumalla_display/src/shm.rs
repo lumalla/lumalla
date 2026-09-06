@@ -6,7 +6,9 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
 };
 
-use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, fstat, mmap, munmap, stat};
+use libc::{
+    MAP_FAILED, MAP_PRIVATE, MAP_SHARED, PROT_READ, fcntl, fstat, mmap, munmap, stat, F_GET_SEALS,
+};
 use log::error;
 use lumalla_wayland_protocol::{
     ClientId, ObjectId,
@@ -425,8 +427,40 @@ fn map_region(fd: RawFd, size: usize) -> Result<*mut c_void> {
     let address = unsafe { mmap(std::ptr::null_mut(), size, PROT_READ, MAP_SHARED, fd, 0) };
     if address == MAP_FAILED {
         let errno = std::io::Error::last_os_error();
+        let mut metadata = std::mem::MaybeUninit::<stat>::zeroed();
+        let (mode, file_size, fstat_ok) =
+            if unsafe { fstat(fd, metadata.as_mut_ptr()) } == 0 {
+                let metadata = unsafe { metadata.assume_init() };
+                (metadata.st_mode, metadata.st_size, true)
+            } else {
+                (0, -1, false)
+            };
+        let seals = unsafe { fcntl(fd, F_GET_SEALS) };
+        let seals_desc = if seals < 0 {
+            format!("errno={}", std::io::Error::last_os_error())
+        } else {
+            format!("{seals:#x}")
+        };
+        let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|err| format!("<unreadable: {err}>"));
+        // Diagnostic only: does MAP_PRIVATE succeed where MAP_SHARED failed?
+        let private = unsafe { mmap(std::ptr::null_mut(), size, PROT_READ, MAP_PRIVATE, fd, 0) };
+        let private_ok = private != MAP_FAILED;
+        if private_ok {
+            unsafe {
+                munmap(private, size);
+            }
+        }
+        let private_err = if private_ok {
+            "ok".to_string()
+        } else {
+            format!("{}", std::io::Error::last_os_error())
+        };
         error!(
-            "wl_shm mmap failed: fd={fd} size={size} errno={} ({errno})",
+            "wl_shm mmap(MAP_SHARED) failed: fd={fd} size={size} errno={} ({errno}); \
+             fstat_ok={fstat_ok} mode={mode:#o} st_size={file_size} seals={seals_desc} \
+             path={path}; MAP_PRIVATE probe={private_err}",
             errno.raw_os_error().unwrap_or(0),
         );
         return Err(ShmError::new(
