@@ -745,7 +745,13 @@ fn collect_shm_upload_regions(
 
 fn dup_fd(fd: std::os::fd::RawFd) -> anyhow::Result<std::os::fd::OwnedFd> {
     let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    anyhow::ensure!(dup >= 0, "Failed to duplicate DMA-BUF fd");
+    if dup < 0 {
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!(
+            "Failed to duplicate DMA-BUF fd={fd}: errno={} ({err})",
+            err.raw_os_error().unwrap_or(0)
+        );
+    }
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) })
 }
 

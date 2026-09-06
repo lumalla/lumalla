@@ -1231,6 +1231,10 @@ impl AppData {
     }
 
     fn tick_render_scheduler(&mut self) {
+        if !self.seat_state.is_enabled() || self.renderer_state.presents_halted() {
+            return;
+        }
+
         let now = Instant::now();
         let scene_dirty = self.renderer_state.scene_dirty();
         let pending_callbacks = self.pending_present_work();

@@ -743,8 +743,9 @@ impl WlShm for DisplayState {
         {
             // create_pool consumes/closes `fd` on every path; drop the registry object
             // so we do not leave a wl_shm_pool id without a backing pool.
+            // Report on wl_shm (this request's object), not the discarded pool id.
+            report_shm_error(ctx, object_id, &error);
             ctx.registry.free_object(*params.id(), &mut ctx.writer);
-            report_shm_error(ctx, *params.id(), &error);
         }
     }
 

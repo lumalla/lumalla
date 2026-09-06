@@ -69,6 +69,38 @@ pub const SOLID_CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.65, 1.0];
 const WL_SHM_FORMAT_ARGB8888: u32 = 0;
 const WL_SHM_FORMAT_XRGB8888: u32 = 1;
 
+/// Whether a present/page-flip error means further presents will only spam logs.
+fn is_unrecoverable_present_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(vk_err) = cause.downcast_ref::<vk::Result>()
+            && matches!(
+                *vk_err,
+                vk::Result::ERROR_DEVICE_LOST | vk::Result::ERROR_SURFACE_LOST_KHR
+            )
+        {
+            return true;
+        }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::PermissionDenied
+        {
+            return true;
+        }
+    }
+    let msg = format!("{err:#}");
+    msg.contains("ERROR_DEVICE_LOST")
+        || msg.contains("device has been lost")
+        || msg.contains("Permission denied")
+}
+
+fn is_drm_permission_denied(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::PermissionDenied)
+            || cause.to_string().contains("Permission denied")
+    })
+}
+
 /// Outcome of a present or page-flip dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentStatus {
@@ -279,6 +311,8 @@ pub struct RendererState {
     pending_pointer_damage: bool,
     dirty_surface_keys: HashSet<(u32, u32)>,
     cursor_buffer_dirty: bool,
+    /// When set, presents are skipped until DRM is reactivated (e.g. after VT return).
+    present_halted: Option<String>,
 }
 
 impl RendererState {
@@ -305,6 +339,7 @@ impl RendererState {
             pending_pointer_damage: false,
             dirty_surface_keys: HashSet::new(),
             cursor_buffer_dirty: false,
+            present_halted: None,
         })
     }
 
@@ -791,7 +826,11 @@ impl RendererState {
         if !seat.can_open_devices() {
             return Ok(());
         }
-        self.drm_devices.activate(seat)
+        self.drm_devices.activate(seat)?;
+        if self.present_halted.take().is_some() {
+            info!("Resuming presents after DRM activate");
+        }
+        Ok(())
     }
 
     /// Close seat-opened DRM devices after session disable was acknowledged.
@@ -801,6 +840,20 @@ impl RendererState {
         if seat.can_open_devices() {
             self.drm_devices.deactivate(seat);
         }
+    }
+
+    /// Whether presents are halted after an unrecoverable GPU/DRM failure.
+    pub fn presents_halted(&self) -> bool {
+        self.present_halted.is_some()
+    }
+
+    fn halt_presents(&mut self, err: &anyhow::Error) {
+        if self.present_halted.is_some() {
+            return;
+        }
+        let reason = format!("{err:#}");
+        error!("Halting presents after unrecoverable failure: {reason}");
+        self.present_halted = Some(reason);
     }
 
     /// Close removed / open newly discovered DRM devices while the seat is active.
@@ -862,6 +915,13 @@ impl RendererState {
 
     /// Run a present pass when `force` is set or the scene is dirty.
     pub fn present(&mut self, color: [f32; 4], force: bool) -> anyhow::Result<PresentOutcome> {
+        if self.present_halted.is_some() {
+            return Ok(PresentOutcome {
+                presented: false,
+                status: self.present_status(),
+                timings: None,
+            });
+        }
         if !force && !self.scene_dirty {
             return Ok(PresentOutcome {
                 presented: false,
@@ -873,7 +933,7 @@ impl RendererState {
         let started = Instant::now();
         let status = self.present_enabled_outputs(color)?;
         Ok(PresentOutcome {
-            presented: true,
+            presented: self.present_halted.is_none(),
             status,
             timings: Some(FrameTimings {
                 render_duration: started.elapsed(),
@@ -891,6 +951,9 @@ impl RendererState {
     /// stays alive until [`Self::dispatch_page_flips`] reports completion.
     /// Virtual presents complete after GPU work with no flip wait.
     pub fn present_enabled_outputs(&mut self, color: [f32; 4]) -> anyhow::Result<PresentStatus> {
+        if self.present_halted.is_some() {
+            return Ok(self.present_status());
+        }
         if !self.ensure_vulkan_ready()? {
             return Ok(self.present_status());
         }
@@ -936,6 +999,10 @@ impl RendererState {
                         );
                     } else {
                         error!("Failed to present virtual output {}: {err:#}", target.name);
+                    }
+                    if is_unrecoverable_present_error(&err) {
+                        self.halt_presents(&err);
+                        break;
                     }
                 }
             }
@@ -1376,13 +1443,27 @@ impl RendererState {
                 Ok(())
             }
             Err(err) => {
+                if is_drm_permission_denied(&err) {
+                    self.release_scanout_buffer(buffer);
+                    return Err(err).context(
+                        "DRM page-flip permission denied; not retrying with blocking commit",
+                    );
+                }
                 warn!("Async page-flip failed on {connector_name}: {err:#}; using blocking update");
                 {
                     let device = self.drm_devices.opened().get(&drm_path).with_context(|| {
                         format!("DRM device {} is no longer open", drm_path.display())
                     })?;
-                    atomic_set_plane_fb(device.fd(), &output, fb_id)
-                        .context("Failed blocking plane FB update after page-flip error")?;
+                    if let Err(blocking_err) = atomic_set_plane_fb(device.fd(), &output, fb_id) {
+                        self.release_scanout_buffer(buffer);
+                        if is_drm_permission_denied(&blocking_err) {
+                            return Err(blocking_err).context(
+                                "DRM blocking plane update permission denied",
+                            );
+                        }
+                        return Err(blocking_err)
+                            .context("Failed blocking plane FB update after page-flip error");
+                    }
                 }
                 let (old, _) = {
                     let scanout = self
