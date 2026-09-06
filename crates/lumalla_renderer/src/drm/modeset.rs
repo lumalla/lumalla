@@ -7,8 +7,8 @@ use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::ptr;
 
-use log::debug;
 use anyhow::Context;
+use log::debug;
 
 use super::sys;
 
@@ -515,9 +515,8 @@ impl AtomicRequest {
     fn commit(&self, fd: RawFd, flags: u32, user_data: *mut c_void) -> anyhow::Result<()> {
         let result = unsafe { sys::drmModeAtomicCommit(fd, self.ptr, flags, user_data) };
         if result != 0 {
-            return Err(io::Error::last_os_error()).with_context(|| {
-                format!("drmModeAtomicCommit(flags={flags:#x}) failed")
-            });
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("drmModeAtomicCommit(flags={flags:#x}) failed"));
         }
         Ok(())
     }

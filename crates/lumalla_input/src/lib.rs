@@ -3,7 +3,7 @@
 mod libinput;
 mod xkb;
 
-use std::{os::fd::RawFd, pin::Pin, time::Instant};
+use std::{collections::HashSet, os::fd::RawFd, pin::Pin, time::Instant};
 
 use log::{debug, warn};
 use lumalla_seat::SeatState;
@@ -79,6 +79,8 @@ struct KeyBinding {
     key: u32,
     mods: Mods,
     binding_id: String,
+    on_release: bool,
+    consume: bool,
 }
 
 /// Keyboard updates for the Wayland seat after libinput dispatch.
@@ -159,6 +161,8 @@ pub struct InputState {
     xkb_config: XkbConfig,
     mods: Mods,
     keymaps: Vec<KeyBinding>,
+    /// Keycodes whose press was consumed; matching releases are also withheld from clients.
+    suppressed_keys: HashSet<u32>,
     start: Instant,
 }
 
@@ -172,6 +176,7 @@ impl InputState {
             xkb_config,
             mods: Mods::default(),
             keymaps: Vec::new(),
+            suppressed_keys: HashSet::new(),
             start: Instant::now(),
         })
     }
@@ -204,16 +209,26 @@ impl InputState {
     /// Suspend libinput when the session is disabled. Safe if never enabled.
     pub fn disable_seat(&mut self) -> anyhow::Result<()> {
         self.mods = Mods::default();
+        self.suppressed_keys.clear();
         self.xkb.reset()?;
         self.libinput.suspend()?;
         self.dispatch(|_| {})
     }
 
-    pub fn add_keymap(&mut self, key: u32, mods: Mods, binding_id: String) {
+    pub fn add_keymap(
+        &mut self,
+        key: u32,
+        mods: Mods,
+        binding_id: String,
+        on_release: bool,
+        consume: bool,
+    ) {
         self.keymaps.push(KeyBinding {
             key,
             mods,
             binding_id,
+            on_release,
+            consume,
         });
     }
 
@@ -425,11 +440,13 @@ impl InputState {
             if self.mods.ctrl && self.mods.alt {
                 if let Some(vt) = fn_key_to_vt(key) {
                     self.comms.main(MainMessage::SwitchVt(vt));
+                    self.suppressed_keys.insert(key);
                     return;
                 }
             }
             if key == libinput::bindings::KEY_F1 {
                 self.comms.main(MainMessage::Shutdown);
+                self.suppressed_keys.insert(key);
                 return;
             }
         }
@@ -442,39 +459,82 @@ impl InputState {
             }
         }
 
+        if is_modifier_key(key) {
+            update_modifier(key, pressed, &mut self.mods);
+        }
+
+        let mut consumed = false;
+        if !synthetic {
+            let match_mods = mods_for_binding_match(key, self.mods);
+            let on_release = !pressed;
+            let activations =
+                select_binding_activations(&self.keymaps, key, match_mods, on_release);
+            for (binding_id, consume) in activations {
+                debug!(
+                    "Key binding activated: key={key} mods={match_mods:?} on_release={on_release} consume={consume} id={binding_id}"
+                );
+                self.comms
+                    .dbus(DbusMessage::EmitBindingActivated(binding_id));
+                if consume {
+                    consumed = true;
+                }
+            }
+        }
+
+        if pressed {
+            if consumed {
+                self.suppressed_keys.insert(key);
+            }
+        } else if self.suppressed_keys.remove(&key) {
+            // Press was consumed: never deliver the matching release to clients.
+            consumed = true;
+        }
+
         let time_msec = self.now_msec();
-        on_event(SeatEvent::Keyboard(KeyboardEvent::Key {
-            time_msec,
-            key,
-            pressed,
-        }));
+        if !consumed {
+            on_event(SeatEvent::Keyboard(KeyboardEvent::Key {
+                time_msec,
+                key,
+                pressed,
+            }));
+        }
         if mods_changed {
             let modifiers = self.xkb.modifiers();
             debug!("xkb modifiers: {modifiers:?}");
             on_event(SeatEvent::Keyboard(KeyboardEvent::Modifiers(modifiers)));
         }
+    }
+}
 
-        if is_modifier_key(key) {
-            update_modifier(key, pressed, &mut self.mods);
-            return;
+/// Mods used when matching bindings for `key`.
+///
+/// For modifier keys, that key's own modifier bit is cleared so bindings like
+/// `Alt_L` with empty mods match on Alt press/release.
+fn mods_for_binding_match(key: u32, mods: Mods) -> Mods {
+    let mut match_mods = mods;
+    if is_modifier_key(key) {
+        update_modifier(key, false, &mut match_mods);
+    }
+    match_mods
+}
+
+fn select_binding_activations(
+    keymaps: &[KeyBinding],
+    key: u32,
+    match_mods: Mods,
+    on_release: bool,
+) -> Vec<(String, bool)> {
+    let mut activations = Vec::new();
+    for binding in keymaps {
+        if binding.key != key || binding.mods != match_mods || binding.on_release != on_release {
+            continue;
         }
-        if !pressed || synthetic {
-            return;
-        }
-        let binding_id = self
-            .keymaps
-            .iter()
-            .find(|binding| binding.key == key && binding.mods == self.mods)
-            .map(|binding| binding.binding_id.clone());
-        if let Some(binding_id) = binding_id {
-            debug!(
-                "Key binding activated: key={key} mods={:?} id={binding_id}",
-                self.mods
-            );
-            self.comms
-                .dbus(DbusMessage::EmitBindingActivated(binding_id));
+        activations.push((binding.binding_id.clone(), binding.consume));
+        if binding.consume {
+            break;
         }
     }
+    activations
 }
 
 /// Map Linux evdev `KEY_F1`..`KEY_F12` to VT numbers 1..12.
@@ -495,6 +555,14 @@ mod tests {
         assert_eq!(evdev_keycode_from_name("m"), Some(50));
         assert_eq!(evdev_keycode_from_name("f1"), Some(59));
         assert_eq!(evdev_keycode_from_name("backspace"), Some(14));
+        assert_eq!(
+            evdev_keycode_from_name("Alt_L"),
+            Some(libinput::bindings::KEY_LEFTALT)
+        );
+        assert_eq!(
+            evdev_keycode_from_name("Tab"),
+            Some(15) // KEY_TAB
+        );
     }
 
     #[test]
@@ -519,5 +587,85 @@ mod tests {
         assert_eq!(split_ctrl_chord("Control+Return"), (true, "Return"));
         assert_eq!(split_ctrl_chord("Return"), (false, "Return"));
         assert_eq!(split_ctrl_chord("c"), (false, "c"));
+    }
+
+    #[test]
+    fn mods_for_binding_match_clears_own_modifier_bit() {
+        let mods = Mods {
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        let matched = mods_for_binding_match(libinput::bindings::KEY_LEFTALT, mods);
+        assert!(!matched.alt);
+        assert!(matched.ctrl);
+
+        let tab_mods = mods_for_binding_match(15, mods); // KEY_TAB
+        assert_eq!(tab_mods, mods);
+    }
+
+    #[test]
+    fn select_binding_activations_stops_at_consume() {
+        let bindings = [
+            KeyBinding {
+                key: 15,
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                binding_id: "first".into(),
+                on_release: false,
+                consume: false,
+            },
+            KeyBinding {
+                key: 15,
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                binding_id: "second".into(),
+                on_release: false,
+                consume: true,
+            },
+            KeyBinding {
+                key: 15,
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                binding_id: "third".into(),
+                on_release: false,
+                consume: true,
+            },
+        ];
+        let activations = select_binding_activations(
+            &bindings,
+            15,
+            Mods {
+                alt: true,
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(
+            activations,
+            vec![("first".into(), false), ("second".into(), true),]
+        );
+    }
+
+    #[test]
+    fn select_binding_activations_filters_edge() {
+        let bindings = [KeyBinding {
+            key: 56,
+            mods: Mods::default(),
+            binding_id: "alt-up".into(),
+            on_release: true,
+            consume: false,
+        }];
+        assert!(select_binding_activations(&bindings, 56, Mods::default(), false).is_empty());
+        assert_eq!(
+            select_binding_activations(&bindings, 56, Mods::default(), true),
+            vec![("alt-up".into(), false)]
+        );
     }
 }

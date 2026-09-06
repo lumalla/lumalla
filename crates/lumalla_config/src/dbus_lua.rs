@@ -190,6 +190,8 @@ fn init_dbus_keymap(
                 binding_id: callback.callback_id.to_string(),
                 key: keymap.key,
                 mods: ModsInfo::from(keymap.mods),
+                on_release: keymap.on_release,
+                consume: keymap.consume,
             }))?;
             Ok(())
         })?,
@@ -367,24 +369,10 @@ impl FromLua for ConfigOutputSetting {
 }
 
 fn init_dbus_spawn(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> LuaResult<()> {
-    let spawn_client = client.clone();
     module.set(
         "spawn",
         lua.create_function(move |_, spawn: ConfigSpawn| {
-            dbus_result(spawn_client.proxy.spawn(&spawn.command, spawn.args))?;
-            Ok(())
-        })?,
-    )?;
-
-    let focus_client = client;
-    module.set(
-        "focus_or_spawn",
-        lua.create_function(move |_, (app_id, command): (String, ConfigSpawn)| {
-            dbus_result(focus_client.proxy.focus_or_spawn(
-                &app_id,
-                &command.command,
-                command.args,
-            ))?;
+            dbus_result(client.proxy.spawn(&spawn.command, spawn.args))?;
             Ok(())
         })?,
     )?;
@@ -472,6 +460,28 @@ fn init_dbus_window(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
                 geometry_field_to_dbus(window.width),
                 geometry_field_to_dbus(window.height),
             ))?;
+            Ok(())
+        })?,
+    )?;
+
+    let focus_win_client = client.clone();
+    module.set(
+        "focus_window",
+        lua.create_function(move |_, window: ConfigFocusWindow| {
+            dbus_result(
+                focus_win_client
+                    .proxy
+                    .focus_window(window.id.unwrap_or(0), window.raise),
+            )?;
+            Ok(())
+        })?,
+    )?;
+
+    let raise_client = client.clone();
+    module.set(
+        "raise_window",
+        lua.create_function(move |_, window: ConfigRaiseWindow| {
+            dbus_result(raise_client.proxy.raise_window(window.id.unwrap_or(0)))?;
             Ok(())
         })?,
     )?;
@@ -656,6 +666,8 @@ pub(crate) fn set_default_keymaps(
                 binding_id: callback_ref.callback_id.to_string(),
                 key: key_name.to_string(),
                 mods: ModsInfo::from(mods),
+                on_release: false,
+                consume: true,
             })
             .context("Failed to register default keymap")?;
     }
@@ -666,6 +678,8 @@ pub(crate) fn set_default_keymaps(
 struct ConfigKeymap {
     key: String,
     mods: Mods,
+    on_release: bool,
+    consume: bool,
     callback: LuaFunction,
 }
 
@@ -710,9 +724,28 @@ impl FromLua for ConfigKeymap {
                 _ => log::warn!("Unhandled mod key: {mod_key}"),
             }
         }
+        let on = table
+            .get::<Option<String>>("on")
+            .unwrap_or(None)
+            .unwrap_or_else(|| String::from("down"));
+        let on_release = match on.as_str() {
+            "down" | "press" => false,
+            "up" | "release" => true,
+            other => {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "LuaKeymap",
+                    to: String::from("ConfigKeymap"),
+                    message: Some(format!(
+                        "Invalid map_key on value `{other}` (expected \"down\" or \"up\")"
+                    )),
+                });
+            }
+        };
         Ok(Self {
             key: table.get("key")?,
             mods,
+            on_release,
+            consume: table.get("consume").unwrap_or(true),
             callback: table.get("callback")?,
         })
     }
@@ -871,6 +904,46 @@ impl FromLua for ConfigWindowUpdate {
             y: table.get("y").unwrap_or(None),
             width: table.get("width").unwrap_or(None),
             height: table.get("height").unwrap_or(None),
+        })
+    }
+}
+
+struct ConfigFocusWindow {
+    id: Option<u32>,
+    raise: bool,
+}
+
+impl FromLua for ConfigFocusWindow {
+    fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaFocusWindow",
+                to: String::from("ConfigFocusWindow"),
+                message: Some(String::from("Expected a Lua table for focus_window")),
+            })?;
+        Ok(Self {
+            id: table.get("id").unwrap_or(None),
+            raise: table.get("raise").unwrap_or(false),
+        })
+    }
+}
+
+struct ConfigRaiseWindow {
+    id: Option<u32>,
+}
+
+impl FromLua for ConfigRaiseWindow {
+    fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaRaiseWindow",
+                to: String::from("ConfigRaiseWindow"),
+                message: Some(String::from("Expected a Lua table for raise_window")),
+            })?;
+        Ok(Self {
+            id: table.get("id").unwrap_or(None),
         })
     }
 }

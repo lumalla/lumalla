@@ -8,8 +8,9 @@ use std::{
     collections::HashMap,
     process::Child,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, mpsc,
+        mpsc,
     },
     thread::{self, JoinHandle},
 };

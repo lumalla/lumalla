@@ -395,11 +395,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                             ctx.writer.wl_shell_surface_ping(shell_id).serial(serial);
                         }
                     }
-                    state.focus_newly_mapped_surface(
-                        ctx.client_id,
-                        commit.surface_id,
-                        ctx.writer,
-                    );
+                    state.focus_newly_mapped_surface(ctx.client_id, commit.surface_id, ctx.writer);
                     for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
                         ctx.writer
                             .wl_surface_enter(commit.surface_id)

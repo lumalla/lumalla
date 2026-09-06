@@ -240,6 +240,24 @@ impl WindowManager {
         self.focused_id
     }
 
+    /// Resolve a window id to its Wayland surface. `None` / `0` → focused window.
+    pub fn resolve_surface(&self, id: Option<u32>) -> Result<(ClientId, ObjectId), WindowError> {
+        let target = match id {
+            Some(id) if id != 0 => {
+                if !self.windows.contains_key(&id) {
+                    return Err(WindowError::UnknownWindow(id));
+                }
+                id
+            }
+            _ => self.focused_id.ok_or(WindowError::NoFocusedWindow)?,
+        };
+        let window = self
+            .windows
+            .get(&target)
+            .ok_or(WindowError::UnknownWindow(target))?;
+        Ok((window.client_id, window.wl_surface))
+    }
+
     fn apply_update(
         &mut self,
         id: u32,

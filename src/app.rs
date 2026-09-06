@@ -692,8 +692,11 @@ impl AppData {
                     key,
                     mods,
                     binding_id,
+                    on_release,
+                    consume,
                 } => {
-                    self.input_state.add_keymap(key, mods, binding_id);
+                    self.input_state
+                        .add_keymap(key, mods, binding_id, on_release, consume);
                 }
                 MainMessage::ClearKeymaps => {
                     self.input_state.clear_keymaps();
@@ -830,6 +833,28 @@ impl AppData {
                         Err(err) => error!("Unable to set window geometry: {err}"),
                     }
                 }
+                MainMessage::FocusWindow { id, raise } => {
+                    match self
+                        .display_state
+                        .focus_window(id, raise, &mut self.connected_clients)
+                    {
+                        Ok(raised) => {
+                            if raised {
+                                self.sync_renderer_scene();
+                            }
+                            self.sync_windows_to_dbus();
+                            self.render_scheduler.request_immediate();
+                        }
+                        Err(err) => error!("Unable to focus window: {err}"),
+                    }
+                }
+                MainMessage::RaiseWindow { id } => match self.display_state.raise_window(id) {
+                    Ok(()) => {
+                        self.sync_renderer_scene();
+                        self.render_scheduler.request_immediate();
+                    }
+                    Err(err) => error!("Unable to raise window: {err}"),
+                },
                 MainMessage::AddWindowRule(rule) => {
                     self.display_state.add_window_rule(rule);
                 }
@@ -1393,7 +1418,8 @@ pub(crate) fn run_app(
 ) -> anyhow::Result<()> {
     let (dbus_event_loop, dbus_channel, to_dbus) = message_loop_with_channel::<DbusMessage>()?;
     let comms = Comms::new(to_main.clone(), to_dbus);
-    let seat_state = init_and_register_seat_state(comms.clone(), &mut main_event_loop, args.headless)?;
+    let seat_state =
+        init_and_register_seat_state(comms.clone(), &mut main_event_loop, args.headless)?;
     let input_state =
         init_and_register_input_state(comms.clone(), &mut main_event_loop, seat_state.as_ref())?;
     let wayland = init_and_register_wayland_display(args.socket_path, &mut main_event_loop)?;

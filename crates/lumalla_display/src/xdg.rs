@@ -1378,8 +1378,7 @@ impl XdgManager {
             return Err(XdgError::NotConstructed);
         }
         if attaching_buffer {
-            let configured =
-                surface.current_configure.is_some() || surface.pending_ack.is_some();
+            let configured = surface.current_configure.is_some() || surface.pending_ack.is_some();
             if !configured {
                 return Err(XdgError::UnconfiguredBuffer);
             }
@@ -1797,7 +1796,9 @@ mod tests {
             .initial_configure
             .unwrap();
         manager.ack_configure(client, xdg, initial.serial).unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, wl, Some(true)).unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, wl, Some(true))
+            .unwrap();
         assert!(manager.is_mapped_xdg_surface(client, xdg));
     }
 
@@ -1817,7 +1818,9 @@ mod tests {
             Err(XdgError::UnconfiguredBuffer)
         );
         assert!(!manager.can_map_wl_surface(client, wl));
-        let outcome = manager.on_wl_surface_commit_with_buffer(client, wl, None).unwrap();
+        let outcome = manager
+            .on_wl_surface_commit_with_buffer(client, wl, None)
+            .unwrap();
         assert!(outcome.initial_configure.is_some());
         assert!(!manager.can_map_wl_surface(client, wl));
     }
@@ -2041,7 +2044,9 @@ mod tests {
         );
         manager.ack_configure(client, xdg, initial.serial).unwrap();
         assert!(!manager.can_map_wl_surface(client, wl));
-        let outcome = manager.on_wl_surface_commit_with_buffer(client, wl, Some(true)).unwrap();
+        let outcome = manager
+            .on_wl_surface_commit_with_buffer(client, wl, Some(true))
+            .unwrap();
         assert_eq!(outcome.applied_configure, Some(initial));
         assert!(manager.can_map_wl_surface(client, wl));
     }
@@ -2226,7 +2231,9 @@ mod tests {
         manager
             .ack_configure(client, popup_xdg, initial.serial)
             .unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, popup_wl, Some(true)).unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, popup_wl, Some(true))
+            .unwrap();
 
         let (serial, repositioned, _) = manager
             .reposition_popup(client, popup, positioner, 42)
@@ -2240,7 +2247,9 @@ mod tests {
             Some(copied)
         );
         manager.ack_configure(client, popup_xdg, serial).unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, popup_wl, Some(true)).unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, popup_wl, Some(true))
+            .unwrap();
         assert_eq!(
             manager
                 .popups
@@ -2290,7 +2299,9 @@ mod tests {
         manager
             .ack_configure(client, object_id(2), initial.serial)
             .unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, object_id(3), Some(true)).unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, object_id(3), Some(true))
+            .unwrap();
         manager
             .create_popup(
                 client,
@@ -2308,7 +2319,9 @@ mod tests {
         manager
             .ack_configure(client, object_id(5), popup_initial.serial)
             .unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true)).unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, object_id(6), Some(true))
+            .unwrap();
 
         manager
             .create_xdg_surface(client, object_id(9), object_id(10))
@@ -2363,14 +2376,8 @@ mod tests {
 
         let configures = manager.set_activated(Some((client_b, object_id(7))));
         assert_eq!(configures.len(), 2);
-        let a = configures
-            .iter()
-            .find(|c| c.client_id == client_a)
-            .unwrap();
-        let b = configures
-            .iter()
-            .find(|c| c.client_id == client_b)
-            .unwrap();
+        let a = configures.iter().find(|c| c.client_id == client_a).unwrap();
+        let b = configures.iter().find(|c| c.client_id == client_b).unwrap();
         assert!(matches!(
             a.snapshot.payload,
             ConfigurePayload::Toplevel { states, .. } if states & TOPLEVEL_STATE_ACTIVATED == 0
@@ -2404,7 +2411,13 @@ mod tests {
             .create_xdg_surface(client, object_id(5), object_id(6))
             .unwrap();
         manager
-            .create_popup(client, object_id(7), object_id(5), object_id(2), object_id(20))
+            .create_popup(
+                client,
+                object_id(7),
+                object_id(5),
+                object_id(2),
+                object_id(20),
+            )
             .unwrap();
         manager.grab_popup(client, object_id(7)).unwrap();
 
@@ -2416,7 +2429,9 @@ mod tests {
         manager
             .ack_configure(client, object_id(5), popup_initial.serial)
             .unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true)).unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, object_id(6), Some(true))
+            .unwrap();
 
         manager.create_positioner(client, object_id(21));
         manager
@@ -2429,7 +2444,13 @@ mod tests {
             .create_xdg_surface(client, object_id(8), object_id(9))
             .unwrap();
         manager
-            .create_popup(client, object_id(10), object_id(8), object_id(5), object_id(21))
+            .create_popup(
+                client,
+                object_id(10),
+                object_id(8),
+                object_id(5),
+                object_id(21),
+            )
             .unwrap();
         manager.grab_popup(client, object_id(10)).unwrap();
 
@@ -2448,7 +2469,12 @@ mod tests {
             vec![(client, object_id(10)), (client, object_id(7))]
         );
         assert!(!manager.has_popup_grab());
-        assert!(!manager.popup_info_for_wl(client, object_id(6)).unwrap().grabbed);
+        assert!(
+            !manager
+                .popup_info_for_wl(client, object_id(6))
+                .unwrap()
+                .grabbed
+        );
     }
 
     #[test]
@@ -2473,7 +2499,13 @@ mod tests {
             .create_xdg_surface(client, object_id(5), object_id(6))
             .unwrap();
         manager
-            .create_popup(client, object_id(7), object_id(5), object_id(2), object_id(20))
+            .create_popup(
+                client,
+                object_id(7),
+                object_id(5),
+                object_id(2),
+                object_id(20),
+            )
             .unwrap();
         let initial = manager
             .on_wl_surface_commit_with_buffer(client, object_id(6), Some(false))
@@ -2483,7 +2515,9 @@ mod tests {
         manager
             .ack_configure(client, object_id(5), initial.serial)
             .unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true)).unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, object_id(6), Some(true))
+            .unwrap();
         assert_eq!(
             manager.grab_popup(client, object_id(7)),
             Err(XdgError::InvalidGrab)

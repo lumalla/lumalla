@@ -598,7 +598,10 @@ mod tests {
             let (sec, nsec) = monotonic_deadline_after(Duration::from_secs(3600)).unwrap();
             loop_.set_absolute_timeout_timespec(sec, nsec).unwrap();
             loop_.wait(&mut completions).unwrap();
-            if completions.iter().any(|c| c.kind == OpKind::Wake && c.result >= 0) {
+            if completions
+                .iter()
+                .any(|c| c.kind == OpKind::Wake && c.result >= 0)
+            {
                 break;
             }
             assert!(

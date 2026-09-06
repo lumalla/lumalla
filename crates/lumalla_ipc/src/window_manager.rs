@@ -61,16 +61,16 @@ pub trait WindowManagerHandler: Send + Sync {
         height: i32,
     ) -> zbus::fdo::Result<()>;
 
+    /// Focus a window. Pass `id = 0` to target the focused window.
+    /// When `raise` is true, also raise the window after focusing.
+    fn focus_window(&mut self, id: u32, raise: bool) -> zbus::fdo::Result<()>;
+
+    /// Raise a window in stacking order without changing focus.
+    /// Pass `id = 0` to target the focused window.
+    fn raise_window(&mut self, id: u32) -> zbus::fdo::Result<()>;
+
     /// Spawn a child process.
     fn spawn(&mut self, command: &str, args: Vec<String>) -> zbus::fdo::Result<()>;
-
-    /// Focus an app or spawn it if missing.
-    fn focus_or_spawn(
-        &mut self,
-        app_id: &str,
-        command: &str,
-        args: Vec<String>,
-    ) -> zbus::fdo::Result<()>;
 
     /// Set an environment variable for future spawns.
     fn set_extra_env(&mut self, name: &str, value: &str) -> zbus::fdo::Result<()>;
@@ -238,17 +238,16 @@ impl WindowManager {
         self.handler.set_window(id, x, y, width, height)
     }
 
-    fn spawn(&mut self, command: &str, args: Vec<String>) -> zbus::fdo::Result<()> {
-        self.handler.spawn(command, args)
+    fn focus_window(&mut self, id: u32, raise: bool) -> zbus::fdo::Result<()> {
+        self.handler.focus_window(id, raise)
     }
 
-    fn focus_or_spawn(
-        &mut self,
-        app_id: &str,
-        command: &str,
-        args: Vec<String>,
-    ) -> zbus::fdo::Result<()> {
-        self.handler.focus_or_spawn(app_id, command, args)
+    fn raise_window(&mut self, id: u32) -> zbus::fdo::Result<()> {
+        self.handler.raise_window(id)
+    }
+
+    fn spawn(&mut self, command: &str, args: Vec<String>) -> zbus::fdo::Result<()> {
+        self.handler.spawn(command, args)
     }
 
     fn set_extra_env(&mut self, name: &str, value: &str) -> zbus::fdo::Result<()> {

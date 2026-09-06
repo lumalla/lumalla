@@ -7,7 +7,7 @@ use std::{
 };
 
 use libc::{
-    MAP_FAILED, MAP_PRIVATE, MAP_SHARED, PROT_READ, fcntl, fstat, mmap, munmap, stat, F_GET_SEALS,
+    F_GET_SEALS, MAP_FAILED, MAP_PRIVATE, MAP_SHARED, PROT_READ, fcntl, fstat, mmap, munmap, stat,
 };
 use log::error;
 use lumalla_wayland_protocol::{
@@ -428,13 +428,12 @@ fn map_region(fd: RawFd, size: usize) -> Result<*mut c_void> {
     if address == MAP_FAILED {
         let errno = std::io::Error::last_os_error();
         let mut metadata = std::mem::MaybeUninit::<stat>::zeroed();
-        let (mode, file_size, fstat_ok) =
-            if unsafe { fstat(fd, metadata.as_mut_ptr()) } == 0 {
-                let metadata = unsafe { metadata.assume_init() };
-                (metadata.st_mode, metadata.st_size, true)
-            } else {
-                (0, -1, false)
-            };
+        let (mode, file_size, fstat_ok) = if unsafe { fstat(fd, metadata.as_mut_ptr()) } == 0 {
+            let metadata = unsafe { metadata.assume_init() };
+            (metadata.st_mode, metadata.st_size, true)
+        } else {
+            (0, -1, false)
+        };
         let seals = unsafe { fcntl(fd, F_GET_SEALS) };
         let seals_desc = if seals < 0 {
             format!("errno={}", std::io::Error::last_os_error())

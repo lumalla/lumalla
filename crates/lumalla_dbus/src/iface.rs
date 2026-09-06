@@ -6,8 +6,8 @@ use std::{
     io::BufWriter,
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -217,6 +217,21 @@ impl WindowManagerHandler for CompositorHandler {
         Ok(())
     }
 
+    fn focus_window(&mut self, id: u32, raise: bool) -> zbus::fdo::Result<()> {
+        self.state.comms.main(MainMessage::FocusWindow {
+            id: if id == 0 { None } else { Some(id) },
+            raise,
+        });
+        Ok(())
+    }
+
+    fn raise_window(&mut self, id: u32) -> zbus::fdo::Result<()> {
+        self.state.comms.main(MainMessage::RaiseWindow {
+            id: if id == 0 { None } else { Some(id) },
+        });
+        Ok(())
+    }
+
     fn spawn(&mut self, command: &str, args: Vec<String>) -> zbus::fdo::Result<()> {
         spawn_process(
             command,
@@ -224,21 +239,6 @@ impl WindowManagerHandler for CompositorHandler {
             &self.state.wayland_display,
             &self.state.extra_env,
         );
-        Ok(())
-    }
-
-    fn focus_or_spawn(
-        &mut self,
-        app_id: &str,
-        command: &str,
-        args: Vec<String>,
-    ) -> zbus::fdo::Result<()> {
-        let _ = (app_id, command, args);
-        // self.state.comms.display(DisplayMessage::FocusOrSpawn {
-        //     app_id: app_id.to_string(),
-        //     command: command.to_string(),
-        //     args,
-        // });
         Ok(())
     }
 
@@ -281,6 +281,8 @@ impl WindowManagerHandler for CompositorHandler {
             key,
             mods: Mods::from(binding.mods),
             binding_id: binding.binding_id,
+            on_release: binding.on_release,
+            consume: binding.consume,
         });
         Ok(())
     }

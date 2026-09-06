@@ -55,6 +55,10 @@ pub enum MainMessage {
         mods: Mods,
         /// Binding id forwarded in `BindingActivated` signals.
         binding_id: String,
+        /// When true, fire on key release instead of press.
+        on_release: bool,
+        /// When true, stop further binding matches and do not forward the key to clients.
+        consume: bool,
     },
     /// Clears all compositor key bindings.
     ClearKeymaps,
@@ -99,4 +103,17 @@ pub enum MainMessage {
     AddWindowRule(WindowRule),
     /// Remove all window placement rules.
     ClearWindowRules,
+    /// Focus a window (`id == None` → focused). Optionally raise it after focusing.
+    FocusWindow {
+        /// Window id, or `None` for the focused window.
+        id: Option<u32>,
+        /// When true, also raise the window to the top of paint order.
+        raise: bool,
+    },
+    /// Raise a window in stacking order without changing keyboard focus.
+    /// `id == None` targets the focused window.
+    RaiseWindow {
+        /// Window id, or `None` for the focused window.
+        id: Option<u32>,
+    },
 }

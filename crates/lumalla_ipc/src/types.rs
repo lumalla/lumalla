@@ -382,6 +382,10 @@ pub struct KeyBindingInfo {
     pub key: String,
     /// Required modifiers.
     pub mods: ModsInfo,
+    /// When true, fire on key release instead of press.
+    pub on_release: bool,
+    /// When true, stop further binding matches and do not forward the key to clients.
+    pub consume: bool,
 }
 
 /// XKB RMLVO configuration. Empty strings select libxkbcommon defaults.

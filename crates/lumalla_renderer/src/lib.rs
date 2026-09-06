@@ -410,7 +410,10 @@ impl RendererState {
         height: u32,
         refresh_mhz: i32,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(width > 0 && height > 0, "virtual output size must be positive");
+        anyhow::ensure!(
+            width > 0 && height > 0,
+            "virtual output size must be positive"
+        );
         let refresh_mhz = refresh_mhz.max(1);
         info!("Virtual output: {name} {width}x{height} @{refresh_mhz} mHz");
         self.virtual_outputs.insert(
@@ -1048,8 +1051,9 @@ impl RendererState {
                     &mut used_crtcs,
                 ) {
                     Ok(Some(output)) => {
-                        let refresh_mhz =
-                            (output.mode.refresh_hz() as i32).saturating_mul(1000).max(1);
+                        let refresh_mhz = (output.mode.refresh_hz() as i32)
+                            .saturating_mul(1000)
+                            .max(1);
                         targets.push(PresentTarget {
                             name: connector.name.clone(),
                             width: output.mode.width(),
@@ -1185,25 +1189,25 @@ impl RendererState {
     ) -> anyhow::Result<()> {
         self.wait_scanout_gpu(&mut buffer)?;
 
-        let (old_current, old_pending, old_queued) = if let Some(scanout) = self.scanouts.get_mut(name)
-        {
-            let pending = scanout.pending.take();
-            let queued = scanout.queued.take();
-            let current = std::mem::replace(&mut scanout.current, buffer);
-            scanout.physical = None;
-            (Some(current), pending, queued)
-        } else {
-            self.scanouts.insert(
-                name.to_string(),
-                OutputScanout {
-                    physical: None,
-                    current: buffer,
-                    pending: None,
-                    queued: None,
-                },
-            );
-            (None, None, None)
-        };
+        let (old_current, old_pending, old_queued) =
+            if let Some(scanout) = self.scanouts.get_mut(name) {
+                let pending = scanout.pending.take();
+                let queued = scanout.queued.take();
+                let current = std::mem::replace(&mut scanout.current, buffer);
+                scanout.physical = None;
+                (Some(current), pending, queued)
+            } else {
+                self.scanouts.insert(
+                    name.to_string(),
+                    OutputScanout {
+                        physical: None,
+                        current: buffer,
+                        pending: None,
+                        queued: None,
+                    },
+                );
+                (None, None, None)
+            };
 
         if let Some(old) = old_current {
             self.release_scanout_buffer(old);
@@ -1457,9 +1461,8 @@ impl RendererState {
                     if let Err(blocking_err) = atomic_set_plane_fb(device.fd(), &output, fb_id) {
                         self.release_scanout_buffer(buffer);
                         if is_drm_permission_denied(&blocking_err) {
-                            return Err(blocking_err).context(
-                                "DRM blocking plane update permission denied",
-                            );
+                            return Err(blocking_err)
+                                .context("DRM blocking plane update permission denied");
                         }
                         return Err(blocking_err)
                             .context("Failed blocking plane FB update after page-flip error");

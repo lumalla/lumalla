@@ -20,7 +20,9 @@ enum SeatBackend {
     Libseat(LibSeat),
     /// No libseat session: Wayland and injected input still work; DRM/libinput device
     /// opens via the seat are unavailable.
-    Headless { seat_name: String },
+    Headless {
+        seat_name: String,
+    },
 }
 
 pub struct SeatState {
@@ -107,9 +109,9 @@ impl SeatState {
 
     pub fn dispatch(&mut self) -> anyhow::Result<()> {
         match &self.backend {
-            SeatBackend::Libseat(seat) => seat
-                .dispatch()
-                .context("Failed to dispatch libseat events"),
+            SeatBackend::Libseat(seat) => {
+                seat.dispatch().context("Failed to dispatch libseat events")
+            }
             SeatBackend::Headless { .. } => Ok(()),
         }
     }
@@ -134,10 +136,7 @@ impl SeatState {
     /// when a no-session path is expected.
     pub fn open_device(&self, path: &Path) -> anyhow::Result<SeatDevice> {
         let SeatBackend::Libseat(seat) = &self.backend else {
-            anyhow::bail!(
-                "Cannot open device {}: no libseat session",
-                path.display()
-            );
+            anyhow::bail!("Cannot open device {}: no libseat session", path.display());
         };
         debug!("Opening device in main seat: {}", path.display());
         let path_str = path.to_str().context("Device path is not valid UTF-8")?;

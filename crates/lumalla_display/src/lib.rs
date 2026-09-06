@@ -11,8 +11,13 @@ use lumalla_wayland_protocol::registry::InterfaceIndex;
 use lumalla_wayland_protocol::{ObjectId, buffer::Writer, registry::Registry};
 
 use crate::{
-    data_device::DataDeviceManager, dmabuf::DmabufManager, output::OutputManager,
-    seat::SeatManager, shm::ShmManager, surface::SurfaceManager, window_manager::WindowManager,
+    data_device::DataDeviceManager,
+    dmabuf::DmabufManager,
+    output::OutputManager,
+    seat::SeatManager,
+    shm::ShmManager,
+    surface::SurfaceManager,
+    window_manager::WindowManager,
     xdg::{ActivationConfigure, XdgManager},
 };
 
@@ -316,9 +321,7 @@ impl DisplayState {
         for _ in 0..32 {
             match self.xdg_manager.popup_info_for_wl(client_id, current) {
                 Some(popup) if !popup.grabbed => {
-                    let Some(parent) = self
-                        .xdg_manager
-                        .popup_parent_wl(client_id, popup.popup_id)
+                    let Some(parent) = self.xdg_manager.popup_parent_wl(client_id, popup.popup_id)
                     else {
                         break;
                     };
@@ -641,6 +644,47 @@ impl DisplayState {
         Ok(self.apply_geometry_changes(changes, clients))
     }
 
+    /// Give keyboard focus and xdg activation to a window.
+    ///
+    /// When `raise` is true, also move the window to the top of paint order.
+    pub fn focus_window(
+        &mut self,
+        id: Option<u32>,
+        raise: bool,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+    ) -> Result<bool, WindowError> {
+        let (client_id, wl_surface) = self.window_manager.resolve_surface(id)?;
+        if let Some(client) = clients.get_mut(&client_id) {
+            self.seat_manager.focus_keyboards_on_surface(
+                client_id,
+                wl_surface,
+                client.writer_mut(),
+            );
+        }
+        self.seat_manager.flush_pending_keyboard_leaves(clients);
+        self.on_surface_focused(client_id, wl_surface);
+        if let Some(client) = clients.get_mut(&client_id) {
+            self.apply_activation(client_id, wl_surface, client.writer_mut());
+        }
+        self.flush_pending_activation_configures(clients);
+
+        let mut raised = false;
+        if raise {
+            self.surface_manager
+                .record_painted_surface(client_id, wl_surface);
+            raised = true;
+        }
+        Ok(raised)
+    }
+
+    /// Raise a window to the top of paint order without changing keyboard focus.
+    pub fn raise_window(&mut self, id: Option<u32>) -> Result<(), WindowError> {
+        let (client_id, wl_surface) = self.window_manager.resolve_surface(id)?;
+        self.surface_manager
+            .record_painted_surface(client_id, wl_surface);
+        Ok(())
+    }
+
     pub fn add_window_rule(&mut self, rule: WindowRule) {
         self.window_manager.add_rule(rule);
     }
@@ -790,25 +834,23 @@ impl DisplayState {
         let Some((client_id, target_wl)) = click_target else {
             return true;
         };
-        !self.xdg_manager.pointer_target_in_popup_grab(
-            client_id,
-            target_wl,
-            |popup_wl, target| {
+        !self
+            .xdg_manager
+            .pointer_target_in_popup_grab(client_id, target_wl, |popup_wl, target| {
                 self.surface_manager
                     .is_descendant_of(client_id, popup_wl, target)
-            },
-        )
+            })
     }
 
     fn dismiss_popup_grabs(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
-        let parent_focus = self
-            .xdg_manager
-            .bottom_popup_grab()
-            .and_then(|(client_id, popup_id)| {
-                self.xdg_manager
-                    .popup_parent_wl(client_id, popup_id)
-                    .map(|parent_wl| (client_id, parent_wl))
-            });
+        let parent_focus =
+            self.xdg_manager
+                .bottom_popup_grab()
+                .and_then(|(client_id, popup_id)| {
+                    self.xdg_manager
+                        .popup_parent_wl(client_id, popup_id)
+                        .map(|parent_wl| (client_id, parent_wl))
+                });
         let dismissed = self.xdg_manager.dismiss_all_popup_grabs();
         for (client_id, popup_id) in dismissed {
             let Some(client) = clients.get_mut(&client_id) else {

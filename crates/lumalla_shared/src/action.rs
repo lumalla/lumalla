@@ -14,13 +14,6 @@ pub enum Action {
         /// The arguments to pass to the command
         args: Vec<String>,
     },
-    /// Focus application or spawn a command
-    FocusOrSpawn {
-        /// The application id of the application to focus
-        app_id: String,
-        /// The command (program) to run
-        command: String,
-    },
     /// Scales output up/down
     ChangeScale {
         /// The percentage points to scale the output up/down
