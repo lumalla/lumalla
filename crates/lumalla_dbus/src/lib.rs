@@ -27,7 +27,7 @@ use lumalla_shared::{
 };
 use zbus::{Error as ZbusError, blocking::connection};
 
-use crate::iface::spawn_process;
+use crate::iface::spawn_process_with_options;
 
 /// A registered D-Bus service that must be kept alive for the lifetime of the compositor.
 pub struct DbusService {
@@ -121,6 +121,8 @@ struct DbusState {
     ready: Arc<AtomicBool>,
     /// Config child process; kept alive so we can reap it via `WaitId` SQE.
     config_child: Option<Child>,
+    /// Pid of the child we submitted waitid for; ignore stale waitid completions.
+    config_child_pid: Option<u32>,
 }
 
 impl DbusState {
@@ -142,6 +144,7 @@ impl DbusState {
             pending_screenshots: service.pending_screenshots,
             ready: service.ready,
             config_child: None,
+            config_child_pid: None,
         }
     }
 
@@ -163,8 +166,51 @@ impl DbusState {
             }
         }
 
+        self.kill_config_child();
         self.event_loop.shutdown_drain()?;
         Ok(())
+    }
+
+    /// Terminate and reap the config child if it is still running.
+    fn kill_config_child(&mut self) {
+        self.config_child_pid = None;
+        let Some(mut child) = self.config_child.take() else {
+            return;
+        };
+        let pid = child.id();
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                info!("Config process already exited with {status}");
+                return;
+            }
+            Ok(None) => {}
+            Err(err) => warn!("Failed to poll config process {pid}: {err}"),
+        }
+
+        info!("Stopping config process {pid}");
+        // Prefer SIGTERM so the child can unwind; escalate if it ignores us.
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        for _ in 0..20 {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    info!("Config process exited with {status}");
+                    return;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(err) => {
+                    warn!("Failed to wait for config process {pid}: {err}");
+                    return;
+                }
+            }
+        }
+        warn!("Config process {pid} did not exit after SIGTERM; sending SIGKILL");
+        if let Err(err) = child.kill() {
+            warn!("Failed to SIGKILL config process {pid}: {err}");
+        }
+        match child.wait() {
+            Ok(status) => info!("Config process exited with {status}"),
+            Err(err) => warn!("Failed to reap config process {pid}: {err}"),
+        }
     }
 
     fn handle_completion(&mut self, completion: Completion) {
@@ -181,12 +227,23 @@ impl DbusState {
             }
             OpKind::Timeout | OpKind::Cancel => {}
             OpKind::Waitid => {
-                if let Some(mut child) = self.config_child.take() {
-                    match child.try_wait() {
-                        Ok(Some(status)) => info!("Config process exited with {status}"),
-                        Ok(None) => info!("Config process waitid fired but process still running"),
-                        Err(err) => warn!("Failed to reap config process: {err}"),
+                let Some(expected_pid) = self.config_child_pid else {
+                    return;
+                };
+                let Some(child) = self.config_child.as_mut() else {
+                    return;
+                };
+                if child.id() != expected_pid {
+                    return;
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        info!("Config process exited with {status}");
+                        self.config_child = None;
+                        self.config_child_pid = None;
                     }
+                    Ok(None) => info!("Config process waitid fired but process still running"),
+                    Err(err) => warn!("Failed to reap config process: {err}"),
                 }
             }
             other => {
@@ -202,6 +259,7 @@ impl DbusState {
     fn handle_message(&mut self, message: DbusMessage) -> anyhow::Result<()> {
         match message {
             DbusMessage::Shutdown => {
+                self.kill_config_child();
                 self.shutting_down = true;
             }
             DbusMessage::SetOutputs(outputs) => {
@@ -234,10 +292,17 @@ impl DbusState {
                 *self.wayland_display.lock().unwrap() = Some(wayland_display);
             }
             DbusMessage::Spawn { command, args } => {
-                if let Some(child) =
-                    spawn_process(&command, &args, &self.wayland_display, &Default::default())
-                {
+                // Only one config process should be live; replace any previous child.
+                self.kill_config_child();
+                if let Some(child) = spawn_process_with_options(
+                    &command,
+                    &args,
+                    &self.wayland_display,
+                    &Default::default(),
+                    true,
+                ) {
                     let pid = child.id();
+                    self.config_child_pid = Some(pid);
                     self.config_child = Some(child);
                     if let Err(err) = self.event_loop.submit_waitid(pid, CONFIG_CHILD_WAITID_ID) {
                         warn!("Failed to submit waitid SQE for config process: {err}");

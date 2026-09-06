@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::BufWriter,
+    os::unix::process::CommandExt,
     process::Command,
     sync::{
         Arc, Condvar, Mutex,
@@ -449,7 +450,18 @@ pub(crate) fn spawn_process(
     wayland_display: &Arc<Mutex<Option<String>>>,
     extra_env: &Arc<Mutex<HashMap<String, String>>>,
 ) -> Option<std::process::Child> {
-    info!("Starting program: {command} {args:?}");
+    spawn_process_with_options(command, args, wayland_display, extra_env, false)
+}
+
+/// Spawn a process, optionally asking the kernel to signal it when this process dies.
+pub(crate) fn spawn_process_with_options(
+    command: &str,
+    args: &[String],
+    wayland_display: &Arc<Mutex<Option<String>>>,
+    extra_env: &Arc<Mutex<HashMap<String, String>>>,
+    die_with_parent: bool,
+) -> Option<std::process::Child> {
+    info!("Starting program: {command} {args:?} (die_with_parent={die_with_parent})");
     let mut cmd = Command::new(command);
     cmd.args(args).envs(extra_env.lock().unwrap().iter());
     if let Some(wayland_display) = wayland_display.lock().unwrap().as_ref() {
@@ -459,6 +471,21 @@ pub(crate) fn spawn_process(
         warn!(
             "Spawning `{command}` without WAYLAND_DISPLAY; client may connect to the wrong compositor"
         );
+    }
+    if die_with_parent {
+        // Ensure the child dies if the compositor exits unexpectedly (including SIGKILL).
+        // Must run in the child before exec; check getppid for the fork/prctl race.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() == 1 {
+                    libc::raise(libc::SIGTERM);
+                }
+                Ok(())
+            });
+        }
     }
     match cmd.spawn() {
         Ok(child) => Some(child),

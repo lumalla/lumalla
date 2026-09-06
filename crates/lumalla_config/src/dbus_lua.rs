@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use lumalla_ipc::{
-    DrmDeviceInfo, KeyBindingInfo, LayoutOutputInfo, LayoutSpacesInfo, ModsInfo, OutputConfigInfo,
-    OutputInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo,
+    BUS_NAME, DrmDeviceInfo, KeyBindingInfo, LayoutOutputInfo, LayoutSpacesInfo, ModsInfo,
+    OutputConfigInfo, OutputInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo,
 };
 use lumalla_shared::{CallbackRef, Mods, Output, geometry_field_to_dbus};
 use mlua::{
@@ -19,6 +19,8 @@ use mlua::{
     Table as LuaTable, Value as LuaValue,
 };
 use zbus::blocking::Connection;
+use zbus::blocking::fdo::DBusProxy;
+use zbus::names::BusName;
 
 use crate::{args::Args, callback::CallbackState};
 
@@ -32,7 +34,9 @@ fn dbus_result<T>(result: zbus::fdo::Result<T>) -> LuaResult<T> {
 #[derive(Clone)]
 pub struct DbusConfigClient {
     pub(crate) proxy: Arc<WindowManagerProxy<'static>>,
-    _connection: &'static Connection,
+    connection: &'static Connection,
+    /// Unique name of the compositor that owned [`BUS_NAME`] at connect time.
+    pub(crate) compositor_unique_name: String,
 }
 
 impl DbusConfigClient {
@@ -41,11 +45,23 @@ impl DbusConfigClient {
         let connection = Box::leak(Box::new(
             Connection::session().context("Failed to connect to session bus")?,
         ));
+        let bus_name = BusName::try_from(BUS_NAME).context("Invalid compositor bus name")?;
+        let dbus_proxy =
+            DBusProxy::new(connection).context("Failed to create org.freedesktop.DBus proxy")?;
+        let compositor_unique_name = dbus_proxy
+            .get_name_owner(bus_name)
+            .with_context(|| format!("Compositor bus name `{BUS_NAME}` is not owned"))?
+            .to_string();
         let proxy = WindowManagerProxy::new(connection).context("Failed to create D-Bus proxy")?;
         Ok(Self {
             proxy: Arc::new(proxy),
-            _connection: connection,
+            connection,
+            compositor_unique_name,
         })
+    }
+
+    pub(crate) fn connection(&self) -> &'static Connection {
+        self.connection
     }
 }
 

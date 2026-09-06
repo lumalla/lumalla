@@ -9,10 +9,12 @@ use std::time::Duration;
 
 use anyhow::Context;
 use log::{error, info, warn};
-use lumalla_ipc::{DrmDeviceInfo, OutputInfo, signals};
+use lumalla_ipc::{BUS_NAME, DrmDeviceInfo, OutputInfo, signals};
 use lumalla_shared::{CallbackRef, Output};
 use mlua::Lua;
 use zbus::Message;
+use zbus::blocking::fdo::DBusProxy;
+use zbus::names::{BusName, OwnedUniqueName};
 
 use crate::args::Args;
 use crate::callback::CallbackState;
@@ -21,6 +23,12 @@ use crate::dbus_lua::{
     ConfigOutput, DbusConfigClient, load_config_files, outputs_from_infos, register_dbus_module,
     reload_config_file, set_default_keymaps, watch_config_files,
 };
+
+enum RunEvent {
+    Signal(Message),
+    /// Compositor bus name was lost or claimed by a different unique name.
+    CompositorGone,
+}
 
 /// Runs configuration against a compositor exposed on the session D-Bus.
 pub struct ExternalConfig {
@@ -89,11 +97,13 @@ impl ExternalConfig {
 
     /// Wait for compositor events and dispatch Lua callbacks.
     pub fn run(&mut self) -> anyhow::Result<()> {
+        let (event_tx, event_rx) = mpsc::channel();
+
         // Multiplex all interface signals on one stream. Polling separate blocking
         // SignalIterators in sequence hangs after the first idle stream (e.g. Ready),
         // so key bindings would only fire once.
         let proxy = self.client.proxy.clone();
-        let (signal_tx, signal_rx) = mpsc::channel();
+        let signal_tx = event_tx.clone();
         std::thread::Builder::new()
             .name(String::from("lumalla-config-signals"))
             .spawn(move || {
@@ -105,14 +115,26 @@ impl ExternalConfig {
                     }
                 };
                 while let Some(message) = signals.next() {
-                    if signal_tx.send(message).is_err() {
+                    if signal_tx.send(RunEvent::Signal(message)).is_err() {
                         break;
                     }
                 }
             })
             .context("Unable to spawn config signal thread")?;
 
-        info!("External config connected to compositor");
+        let expected_owner = self.client.compositor_unique_name.clone();
+        let connection = self.client.connection();
+        std::thread::Builder::new()
+            .name(String::from("lumalla-config-nameowner"))
+            .spawn(move || {
+                watch_compositor_name_owner(connection, &expected_owner, event_tx);
+            })
+            .context("Unable to spawn compositor name-owner watch thread")?;
+
+        info!(
+            "External config connected to compositor owner {}",
+            self.client.compositor_unique_name
+        );
 
         // Ready may have been emitted before we subscribed; pick it up via is_ready.
         if self.client.proxy.is_ready().unwrap_or(false) {
@@ -132,15 +154,30 @@ impl ExternalConfig {
                 }
             }
 
-            match signal_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(message) => {
+            match event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(RunEvent::Signal(message)) => {
                     if let Err(err) = self.handle_signal(message) {
                         warn!("Error while handling compositor signal: {err:#}");
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(RunEvent::CompositorGone) => {
+                    info!("Compositor D-Bus name `{BUS_NAME}` lost or replaced; exiting");
+                    self.shutting_down = true;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !compositor_owner_matches(
+                        self.client.connection(),
+                        &self.client.compositor_unique_name,
+                    ) {
+                        info!(
+                            "Compositor D-Bus name `{BUS_NAME}` no longer owned by {}; exiting",
+                            self.client.compositor_unique_name
+                        );
+                        self.shutting_down = true;
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    anyhow::bail!("Compositor signal thread disconnected");
+                    anyhow::bail!("Compositor event threads disconnected");
                 }
             }
         }
@@ -230,5 +267,56 @@ impl ExternalConfig {
                 .run_callback::<Vec<ConfigOutput>, ()>(on_connector_change, outputs)?;
         }
         Ok(())
+    }
+}
+
+fn compositor_owner_matches(connection: &zbus::blocking::Connection, expected_owner: &str) -> bool {
+    let Ok(dbus_proxy) = DBusProxy::new(connection) else {
+        return false;
+    };
+    let Ok(bus_name) = BusName::try_from(BUS_NAME) else {
+        return false;
+    };
+    match dbus_proxy.get_name_owner(bus_name) {
+        Ok(owner) => owner.as_str() == expected_owner,
+        Err(_) => false,
+    }
+}
+
+fn watch_compositor_name_owner(
+    connection: &'static zbus::blocking::Connection,
+    expected_owner: &str,
+    event_tx: mpsc::Sender<RunEvent>,
+) {
+    let Ok(dbus_proxy) = DBusProxy::new(connection) else {
+        let _ = event_tx.send(RunEvent::CompositorGone);
+        return;
+    };
+    let Ok(mut changes) = dbus_proxy.receive_name_owner_changed() else {
+        let _ = event_tx.send(RunEvent::CompositorGone);
+        return;
+    };
+
+    let expected_owner = match OwnedUniqueName::try_from(expected_owner) {
+        Ok(name) => name,
+        Err(_) => {
+            let _ = event_tx.send(RunEvent::CompositorGone);
+            return;
+        }
+    };
+
+    while let Some(signal) = changes.next() {
+        let Ok(args) = signal.args() else {
+            continue;
+        };
+        if args.name().as_str() != BUS_NAME {
+            continue;
+        }
+        let new_owner = args.new_owner().as_ref().map(|name| name.as_str());
+        let still_ours = new_owner == Some(expected_owner.as_str());
+        if !still_ours {
+            let _ = event_tx.send(RunEvent::CompositorGone);
+            break;
+        }
     }
 }
