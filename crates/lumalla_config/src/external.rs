@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use log::{error, info, warn};
-use lumalla_ipc::OutputInfo;
+use lumalla_ipc::{DrmDeviceInfo, OutputInfo, signals};
 use lumalla_shared::{CallbackRef, Output};
 use mlua::Lua;
+use zbus::Message;
 
 use crate::args::Args;
 use crate::callback::CallbackState;
@@ -88,11 +89,28 @@ impl ExternalConfig {
 
     /// Wait for compositor events and dispatch Lua callbacks.
     pub fn run(&mut self) -> anyhow::Result<()> {
+        // Multiplex all interface signals on one stream. Polling separate blocking
+        // SignalIterators in sequence hangs after the first idle stream (e.g. Ready),
+        // so key bindings would only fire once.
         let proxy = self.client.proxy.clone();
-        let mut ready = proxy.receive_ready()?;
-        let mut output_changed = proxy.receive_output_changed()?;
-        let mut drm_devices_changed = proxy.receive_drm_devices_changed()?;
-        let mut binding_activated = proxy.receive_binding_activated()?;
+        let (signal_tx, signal_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(String::from("lumalla-config-signals"))
+            .spawn(move || {
+                let mut signals = match proxy.inner().receive_all_signals() {
+                    Ok(signals) => signals,
+                    Err(err) => {
+                        error!("Unable to subscribe to compositor signals: {err}");
+                        return;
+                    }
+                };
+                while let Some(message) = signals.next() {
+                    if signal_tx.send(message).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("Unable to spawn config signal thread")?;
 
         info!("External config connected to compositor");
 
@@ -112,28 +130,48 @@ impl ExternalConfig {
                 }
             }
 
-            if ready.next().is_some() {
-                self.handle_ready()?;
+            match signal_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(message) => {
+                    if let Err(err) = self.handle_signal(message) {
+                        warn!("Error while handling compositor signal: {err:#}");
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("Compositor signal thread disconnected");
+                }
             }
-
-            if let Some(signal) = output_changed.next() {
-                let args = signal.args()?;
-                self.handle_output_changed(args.outputs)?;
-            }
-
-            if let Some(signal) = drm_devices_changed.next() {
-                let args = signal.args()?;
-                self.handle_drm_devices_changed(args.devices)?;
-            }
-
-            if let Some(signal) = binding_activated.next() {
-                let args = signal.args()?;
-                self.handle_binding_activated(&args.binding_id)?;
-            }
-
-            std::thread::sleep(Duration::from_millis(50));
         }
 
+        Ok(())
+    }
+
+    fn handle_signal(&mut self, message: Message) -> anyhow::Result<()> {
+        let member = message
+            .header()
+            .member()
+            .map(|member| member.as_str().to_owned());
+        match member.as_deref() {
+            Some(signals::READY) => self.handle_ready()?,
+            Some(signals::OUTPUT_CHANGED) => {
+                let outputs: Vec<OutputInfo> = message.body().deserialize()?;
+                self.handle_output_changed(outputs)?;
+            }
+            Some(signals::DRM_DEVICES_CHANGED) => {
+                let devices: Vec<DrmDeviceInfo> = message.body().deserialize()?;
+                self.handle_drm_devices_changed(devices)?;
+            }
+            Some(signals::BINDING_ACTIVATED) => {
+                let binding_id: String = message.body().deserialize()?;
+                self.handle_binding_activated(&binding_id)?;
+            }
+            Some(other) => {
+                warn!("Ignoring unknown compositor signal: {other}");
+            }
+            None => {
+                warn!("Ignoring compositor signal without a member name");
+            }
+        }
         Ok(())
     }
 
@@ -172,8 +210,13 @@ impl ExternalConfig {
             warn!("Ignoring binding activation with invalid id: {binding_id}");
             return Ok(());
         };
-        self.callback_state
-            .run_callback::<(), ()>(CallbackRef { callback_id }, ())?;
+        if let Err(err) = self
+            .callback_state
+            .run_callback::<(), ()>(CallbackRef { callback_id }, ())
+        {
+            // Keep the config process alive so later key bindings still work.
+            warn!("Key binding callback {binding_id} failed: {err:#}");
+        }
         Ok(())
     }
 
