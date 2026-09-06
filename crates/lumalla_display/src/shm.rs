@@ -7,6 +7,7 @@ use std::{
 };
 
 use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, fstat, mmap, munmap, stat};
+use log::error;
 use lumalla_wayland_protocol::{
     ClientId, ObjectId,
     protocols::wayland::{WL_SHM_FORMAT_ARGB8888, WL_SHM_FORMAT_XRGB8888},
@@ -423,6 +424,11 @@ fn ensure_file_size(fd: &OwnedFd, size: usize) -> Result<()> {
 fn map_region(fd: RawFd, size: usize) -> Result<*mut c_void> {
     let address = unsafe { mmap(std::ptr::null_mut(), size, PROT_READ, MAP_SHARED, fd, 0) };
     if address == MAP_FAILED {
+        let errno = std::io::Error::last_os_error();
+        error!(
+            "wl_shm mmap failed: fd={fd} size={size} errno={} ({errno})",
+            errno.raw_os_error().unwrap_or(0),
+        );
         return Err(ShmError::new(
             ShmErrorKind::InvalidFd,
             "Unable to map shared-memory file descriptor",
