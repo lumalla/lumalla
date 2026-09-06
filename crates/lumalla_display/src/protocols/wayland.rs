@@ -1443,12 +1443,18 @@ impl WlSurface for DisplayState {
             return;
         }
 
-        let xdg_outcome = crate::protocols::xdg_shell::apply_xdg_surface_commit_with_buffer(
+        let xdg_outcome = match crate::protocols::xdg_shell::apply_xdg_surface_commit_with_buffer(
             self,
             ctx.client_id,
             object_id,
             pending_attachment.map(|buffer| buffer.is_some()),
-        );
+        ) {
+            Ok(outcome) => outcome,
+            Err((error_object, error)) => {
+                crate::protocols::xdg_shell::report_commit_error(ctx, error_object, error);
+                return;
+            }
+        };
         let result = match self.surface_manager.commit(ctx.client_id, object_id) {
             Ok(result) => result,
             Err(error) => {

@@ -845,10 +845,10 @@ pub(crate) fn apply_xdg_surface_commit_with_buffer(
     client_id: lumalla_wayland_protocol::ClientId,
     surface_id: ObjectId,
     buffer: Option<bool>,
-) -> crate::xdg::CommitOutcome {
+) -> Result<crate::xdg::CommitOutcome, (ObjectId, XdgError)> {
     let outcome = state
         .xdg_manager
-        .on_wl_surface_commit_with_buffer(client_id, surface_id, buffer);
+        .on_wl_surface_commit_with_buffer(client_id, surface_id, buffer)?;
 
     if let Some(geometry) = outcome.window_geometry {
         let _ = state
@@ -875,7 +875,7 @@ pub(crate) fn apply_xdg_surface_commit_with_buffer(
     let _ = state
         .surface_manager
         .set_xdg_map_ready(client_id, surface_id, ready);
-    outcome
+    Ok(outcome)
 }
 
 pub(crate) fn emit_xdg_commit_events(

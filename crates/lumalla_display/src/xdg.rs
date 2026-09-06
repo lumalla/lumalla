@@ -136,13 +136,21 @@ struct ToplevelState {
     title: String,
     app_id: String,
     parent: Option<ObjectId>,
+    /// Committed min size; updated from pending on wl_surface.commit.
     min_size: (i32, i32),
+    /// Committed max size; updated from pending on wl_surface.commit.
     max_size: (i32, i32),
+    pending_min_size: (i32, i32),
+    pending_max_size: (i32, i32),
     configure_width: i32,
     configure_height: i32,
     states: u32,
     maximized_requested: bool,
     restore_size: Option<(i32, i32)>,
+}
+
+fn toplevel_size_pair_invalid(min: (i32, i32), max: (i32, i32)) -> bool {
+    (max.0 > 0 && min.0 > max.0) || (max.1 > 0 && min.1 > max.1)
 }
 
 #[derive(Debug)]
@@ -496,6 +504,8 @@ impl XdgManager {
                 parent: None,
                 min_size: (0, 0),
                 max_size: (0, 0),
+                pending_min_size: (0, 0),
+                pending_max_size: (0, 0),
                 configure_width,
                 configure_height,
                 states: 0,
@@ -854,12 +864,9 @@ impl XdgManager {
             .toplevels
             .get_mut(&(client_id, toplevel_id))
             .ok_or(XdgError::UnknownToplevel)?;
-        if (state.max_size.0 > 0 && width > state.max_size.0)
-            || (state.max_size.1 > 0 && height > state.max_size.1)
-        {
-            return Err(XdgError::InvalidToplevelSize);
-        }
-        state.min_size = (width, height);
+        // Min/max are double-buffered; consistency is checked on commit so a
+        // client can update both in either order before wl_surface.commit.
+        state.pending_min_size = (width, height);
         Ok(())
     }
 
@@ -877,11 +884,20 @@ impl XdgManager {
             .toplevels
             .get_mut(&(client_id, toplevel_id))
             .ok_or(XdgError::UnknownToplevel)?;
-        if (width > 0 && width < state.min_size.0) || (height > 0 && height < state.min_size.1) {
-            return Err(XdgError::InvalidToplevelSize);
-        }
-        state.max_size = (width, height);
+        state.pending_max_size = (width, height);
         Ok(())
+    }
+
+    /// Committed min/max size for a toplevel, if any.
+    #[cfg(test)]
+    fn toplevel_size_hints(
+        &self,
+        client_id: ClientId,
+        toplevel_id: ObjectId,
+    ) -> Option<((i32, i32), (i32, i32))> {
+        self.toplevels
+            .get(&(client_id, toplevel_id))
+            .map(|state| (state.min_size, state.max_size))
     }
 
     pub fn create_popup(
@@ -1376,25 +1392,43 @@ impl XdgManager {
         &mut self,
         client_id: ClientId,
         wl_surface: ObjectId,
-    ) -> CommitOutcome {
+    ) -> Result<CommitOutcome, (ObjectId, XdgError)> {
         self.on_wl_surface_commit_with_buffer(client_id, wl_surface, None)
     }
 
     /// Apply xdg double-buffered state. `buffer` is `Some(true)` for a non-null
     /// attachment, `Some(false)` for a null attachment, and `None` when the
     /// caller cannot distinguish the attachment state.
+    ///
+    /// On failure, returns the protocol object that should receive the error
+    /// (for example the xdg_toplevel for an invalid pending size pair).
     pub fn on_wl_surface_commit_with_buffer(
         &mut self,
         client_id: ClientId,
         wl_surface: ObjectId,
         buffer: Option<bool>,
-    ) -> CommitOutcome {
+    ) -> Result<CommitOutcome, (ObjectId, XdgError)> {
         let Some(xdg_id) = self.surface_to_xdg.get(&(client_id, wl_surface)).copied() else {
-            return CommitOutcome::default();
+            return Ok(CommitOutcome::default());
         };
         let mut outcome = CommitOutcome::default();
+        let role = self
+            .xdg_surfaces
+            .get(&(client_id, xdg_id))
+            .and_then(|surface| surface.role);
+        if let Some(XdgRole::Toplevel(toplevel_id)) = role {
+            let state = self
+                .toplevels
+                .get_mut(&(client_id, toplevel_id))
+                .ok_or((toplevel_id, XdgError::UnknownToplevel))?;
+            if toplevel_size_pair_invalid(state.pending_min_size, state.pending_max_size) {
+                return Err((toplevel_id, XdgError::InvalidToplevelSize));
+            }
+            state.min_size = state.pending_min_size;
+            state.max_size = state.pending_max_size;
+        }
         let Some(surface) = self.xdg_surfaces.get_mut(&(client_id, xdg_id)) else {
-            return outcome;
+            return Ok(outcome);
         };
         if let Some(geometry) = surface.pending_window_geometry.take() {
             surface.current_window_geometry = Some(geometry);
@@ -1431,7 +1465,7 @@ impl XdgManager {
             // The caller must emit this role payload followed by xdg_surface.configure.
             outcome.initial_configure = self.configure_snapshot(client_id, xdg_id).ok();
         }
-        outcome
+        Ok(outcome)
     }
 
     #[allow(dead_code)]
@@ -1759,10 +1793,11 @@ mod tests {
             .unwrap();
         let initial = manager
             .on_wl_surface_commit_with_buffer(client, wl, Some(false))
+            .unwrap()
             .initial_configure
             .unwrap();
         manager.ack_configure(client, xdg, initial.serial).unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, wl, Some(true));
+        manager.on_wl_surface_commit_with_buffer(client, wl, Some(true)).unwrap();
         assert!(manager.is_mapped_xdg_surface(client, xdg));
     }
 
@@ -1782,7 +1817,7 @@ mod tests {
             Err(XdgError::UnconfiguredBuffer)
         );
         assert!(!manager.can_map_wl_surface(client, wl));
-        let outcome = manager.on_wl_surface_commit_with_buffer(client, wl, None);
+        let outcome = manager.on_wl_surface_commit_with_buffer(client, wl, None).unwrap();
         assert!(outcome.initial_configure.is_some());
         assert!(!manager.can_map_wl_surface(client, wl));
     }
@@ -1811,6 +1846,7 @@ mod tests {
         mapped_toplevel(&mut manager, client, xdg, wl, toplevel);
         let initial = manager
             .on_wl_surface_commit_with_buffer(client, wl, Some(false))
+            .unwrap()
             .initial_configure
             .unwrap();
         assert_eq!(
@@ -1840,6 +1876,7 @@ mod tests {
         );
         let initial = manager
             .on_wl_surface_commit_with_buffer(client, wl, None)
+            .unwrap()
             .initial_configure
             .unwrap();
         assert!(matches!(
@@ -1990,6 +2027,7 @@ mod tests {
 
         let initial = manager
             .on_wl_surface_commit_with_buffer(client, wl, Some(false))
+            .unwrap()
             .initial_configure
             .unwrap();
         assert_eq!(
@@ -2003,9 +2041,69 @@ mod tests {
         );
         manager.ack_configure(client, xdg, initial.serial).unwrap();
         assert!(!manager.can_map_wl_surface(client, wl));
-        let outcome = manager.on_wl_surface_commit_with_buffer(client, wl, Some(true));
+        let outcome = manager.on_wl_surface_commit_with_buffer(client, wl, Some(true)).unwrap();
         assert_eq!(outcome.applied_configure, Some(initial));
         assert!(manager.can_map_wl_surface(client, wl));
+    }
+
+    #[test]
+    fn toplevel_size_hints_are_double_buffered_and_validated_on_commit() {
+        let client = client_id(1);
+        let (xdg, wl, top) = (object_id(2), object_id(3), object_id(4));
+        let mut manager = XdgManager::default();
+        mapped_toplevel(&mut manager, client, xdg, wl, top);
+
+        manager
+            .set_toplevel_min_size(client, top, 1280, 720)
+            .unwrap();
+        manager
+            .set_toplevel_max_size(client, top, 1280, 720)
+            .unwrap();
+        assert_eq!(
+            manager.toplevel_size_hints(client, top),
+            Some(((0, 0), (0, 0)))
+        );
+        manager
+            .on_wl_surface_commit_with_buffer(client, wl, None)
+            .unwrap();
+        assert_eq!(
+            manager.toplevel_size_hints(client, top),
+            Some(((1280, 720), (1280, 720)))
+        );
+
+        // Growing a fixed-size window: min is raised before max in the same
+        // commit cycle (xwayland-satellite / Steam ordering).
+        manager
+            .set_toplevel_min_size(client, top, 1920, 1080)
+            .unwrap();
+        manager
+            .set_toplevel_max_size(client, top, 1920, 1080)
+            .unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, wl, None)
+            .unwrap();
+        assert_eq!(
+            manager.toplevel_size_hints(client, top),
+            Some(((1920, 1080), (1920, 1080)))
+        );
+
+        manager
+            .set_toplevel_min_size(client, top, 2000, 1000)
+            .unwrap();
+        // pending max still 1920x1080 → invalid when committed
+        assert_eq!(
+            manager.on_wl_surface_commit_with_buffer(client, wl, None),
+            Err((top, XdgError::InvalidToplevelSize))
+        );
+        assert_eq!(
+            manager.toplevel_size_hints(client, top),
+            Some(((1920, 1080), (1920, 1080)))
+        );
+
+        assert_eq!(
+            manager.set_toplevel_min_size(client, top, -1, 10),
+            Err(XdgError::InvalidToplevelSize)
+        );
     }
 
     #[test]
@@ -2115,6 +2213,7 @@ mod tests {
             .unwrap();
         let initial = manager
             .on_wl_surface_commit_with_buffer(client, popup_wl, Some(false))
+            .unwrap()
             .initial_configure
             .unwrap();
         assert_eq!(
@@ -2127,7 +2226,7 @@ mod tests {
         manager
             .ack_configure(client, popup_xdg, initial.serial)
             .unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, popup_wl, Some(true));
+        manager.on_wl_surface_commit_with_buffer(client, popup_wl, Some(true)).unwrap();
 
         let (serial, repositioned, _) = manager
             .reposition_popup(client, popup, positioner, 42)
@@ -2141,7 +2240,7 @@ mod tests {
             Some(copied)
         );
         manager.ack_configure(client, popup_xdg, serial).unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, popup_wl, Some(true));
+        manager.on_wl_surface_commit_with_buffer(client, popup_wl, Some(true)).unwrap();
         assert_eq!(
             manager
                 .popups
@@ -2185,12 +2284,13 @@ mod tests {
 
         let initial = manager
             .on_wl_surface_commit_with_buffer(client, object_id(3), Some(false))
+            .unwrap()
             .initial_configure
             .unwrap();
         manager
             .ack_configure(client, object_id(2), initial.serial)
             .unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, object_id(3), Some(true));
+        manager.on_wl_surface_commit_with_buffer(client, object_id(3), Some(true)).unwrap();
         manager
             .create_popup(
                 client,
@@ -2202,12 +2302,13 @@ mod tests {
             .unwrap();
         let popup_initial = manager
             .on_wl_surface_commit_with_buffer(client, object_id(6), Some(false))
+            .unwrap()
             .initial_configure
             .unwrap();
         manager
             .ack_configure(client, object_id(5), popup_initial.serial)
             .unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true));
+        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true)).unwrap();
 
         manager
             .create_xdg_surface(client, object_id(9), object_id(10))
@@ -2309,12 +2410,13 @@ mod tests {
 
         let popup_initial = manager
             .on_wl_surface_commit_with_buffer(client, object_id(6), Some(false))
+            .unwrap()
             .initial_configure
             .unwrap();
         manager
             .ack_configure(client, object_id(5), popup_initial.serial)
             .unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true));
+        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true)).unwrap();
 
         manager.create_positioner(client, object_id(21));
         manager
@@ -2375,12 +2477,13 @@ mod tests {
             .unwrap();
         let initial = manager
             .on_wl_surface_commit_with_buffer(client, object_id(6), Some(false))
+            .unwrap()
             .initial_configure
             .unwrap();
         manager
             .ack_configure(client, object_id(5), initial.serial)
             .unwrap();
-        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true));
+        manager.on_wl_surface_commit_with_buffer(client, object_id(6), Some(true)).unwrap();
         assert_eq!(
             manager.grab_popup(client, object_id(7)),
             Err(XdgError::InvalidGrab)
