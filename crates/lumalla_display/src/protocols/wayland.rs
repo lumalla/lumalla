@@ -1754,6 +1754,8 @@ impl WlPointer for DisplayState {
     fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlPointerRelease<'_>) {
         self.pointer_constraints_manager
             .remove_pointer(ctx.client_id, object_id);
+        self.relative_pointer_manager
+            .remove_pointer(ctx.client_id, object_id);
         self.seat_manager
             .destroy_pointer(ctx.client_id, object_id, &mut self.surface_manager);
         ctx.registry.free_object(object_id, ctx.writer);
@@ -2154,6 +2156,10 @@ mod tests {
             lumalla_wayland_protocol::protocols::pointer_constraints::ZWP_POINTER_CONSTRAINTS_V1_NAME,
             1
         )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::relative_pointer::ZWP_RELATIVE_POINTER_MANAGER_V1_NAME,
+            1
+        )));
     }
 
     #[test]
@@ -2315,6 +2321,35 @@ mod tests {
         assert_eq!(
             ctx.registry.interface_index(object_id(20)),
             Some(InterfaceIndex::ZwpPointerConstraintsV1)
+        );
+    }
+
+    #[test]
+    fn registry_bind_zwp_relative_pointer_manager_registers_object() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let mut registry = Registry::new();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
+        };
+        let global_name = state
+            .globals
+            .iter()
+            .find(|(_, global)| {
+                global.interface_index == InterfaceIndex::ZwpRelativePointerManagerV1
+            })
+            .map(|(id, _)| *id)
+            .expect("zwp_relative_pointer_manager_v1 global");
+        let data = bind_data(global_name, "zwp_relative_pointer_manager_v1", 1, 20);
+        let mut fds = VecDeque::new();
+        let params = WlRegistryBind::new(&data, &mut fds);
+        WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
+        assert_eq!(
+            ctx.registry.interface_index(object_id(20)),
+            Some(InterfaceIndex::ZwpRelativePointerManagerV1)
         );
     }
 

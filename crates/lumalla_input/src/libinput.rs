@@ -125,6 +125,12 @@ pub(crate) mod bindings {
         ) -> *mut libinput_event_pointer;
         pub fn libinput_event_pointer_get_dx(event: *mut libinput_event_pointer) -> f64;
         pub fn libinput_event_pointer_get_dy(event: *mut libinput_event_pointer) -> f64;
+        pub fn libinput_event_pointer_get_dx_unaccelerated(
+            event: *mut libinput_event_pointer,
+        ) -> f64;
+        pub fn libinput_event_pointer_get_dy_unaccelerated(
+            event: *mut libinput_event_pointer,
+        ) -> f64;
         pub fn libinput_event_pointer_get_absolute_x_transformed(
             event: *mut libinput_event_pointer,
             width: u32,
@@ -350,7 +356,12 @@ const TRANSFORM_HEIGHT: u32 = 600;
 
 pub(crate) enum InputEvent {
     KeyboardKey { key: u32, state: u32 },
-    PointerMotion { dx: f64, dy: f64 },
+    PointerMotion {
+        dx: f64,
+        dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
+    },
     PointerAbsolute { x: f64, y: f64 },
     PointerButton { button: u32, pressed: bool },
     PointerAxis { axis: u32, value: f64 },
@@ -432,7 +443,18 @@ impl LibInput {
                     } else {
                         let dx = unsafe { bindings::libinput_event_pointer_get_dx(pointer) };
                         let dy = unsafe { bindings::libinput_event_pointer_get_dy(pointer) };
-                        Some(InputEvent::PointerMotion { dx, dy })
+                        let dx_unaccel = unsafe {
+                            bindings::libinput_event_pointer_get_dx_unaccelerated(pointer)
+                        };
+                        let dy_unaccel = unsafe {
+                            bindings::libinput_event_pointer_get_dy_unaccelerated(pointer)
+                        };
+                        Some(InputEvent::PointerMotion {
+                            dx,
+                            dy,
+                            dx_unaccel,
+                            dy_unaccel,
+                        })
                     }
                 }
                 bindings::LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE => {

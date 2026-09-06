@@ -933,13 +933,21 @@ impl AppData {
                     },
                 );
             }
-            SeatEvent::Pointer(PointerEvent::Motion { time_msec, dx, dy }) => {
+            SeatEvent::Pointer(PointerEvent::Motion {
+                time_msec,
+                dx,
+                dy,
+                dx_unaccel,
+                dy_unaccel,
+            }) => {
                 pointer_changed = true;
                 self.display_state.handle_pointer_motion(
                     &mut self.connected_clients,
                     time_msec,
                     dx,
                     dy,
+                    dx_unaccel,
+                    dy_unaccel,
                 );
             }
             SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {

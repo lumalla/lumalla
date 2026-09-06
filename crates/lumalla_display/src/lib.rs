@@ -15,6 +15,7 @@ use crate::{
     dmabuf::DmabufManager,
     output::OutputManager,
     pointer_constraints::PointerConstraintsManager,
+    relative_pointer::RelativePointerManager,
     seat::SeatManager,
     shm::ShmManager,
     surface::SurfaceManager,
@@ -27,6 +28,7 @@ mod dmabuf;
 mod output;
 mod pointer_constraints;
 mod protocols;
+mod relative_pointer;
 mod seat;
 mod shm;
 mod surface;
@@ -122,6 +124,7 @@ pub struct DisplayState {
     dmabuf_manager: DmabufManager,
     seat_manager: SeatManager,
     pointer_constraints_manager: PointerConstraintsManager,
+    relative_pointer_manager: RelativePointerManager,
     output_manager: OutputManager,
     data_device_manager: DataDeviceManager,
     xdg_manager: XdgManager,
@@ -143,6 +146,7 @@ impl Default for DisplayState {
             dmabuf_manager: DmabufManager::default(),
             seat_manager: SeatManager::default(),
             pointer_constraints_manager: PointerConstraintsManager::default(),
+            relative_pointer_manager: RelativePointerManager::default(),
             output_manager: OutputManager::default(),
             data_device_manager: DataDeviceManager::default(),
             xdg_manager: XdgManager::default(),
@@ -235,14 +239,19 @@ impl DisplayState {
         time_msec: u32,
         dx: f64,
         dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
     ) {
         self.seat_manager.handle_pointer_motion(
             clients,
             &self.surface_manager,
             &mut self.pointer_constraints_manager,
+            &self.relative_pointer_manager,
             time_msec,
             dx,
             dy,
+            dx_unaccel,
+            dy_unaccel,
         );
     }
 
@@ -257,6 +266,7 @@ impl DisplayState {
             clients,
             &self.surface_manager,
             &mut self.pointer_constraints_manager,
+            &self.relative_pointer_manager,
             time_msec,
             x,
             y,
@@ -472,6 +482,7 @@ impl DisplayState {
         self.surface_manager.delete_client(client_id);
         self.seat_manager.remove_client(client_id);
         self.pointer_constraints_manager.delete_client(client_id);
+        self.relative_pointer_manager.delete_client(client_id);
         self.output_manager.remove_client(client_id);
         self.data_device_manager.remove_client(client_id);
         self.xdg_manager.delete_client(client_id);
@@ -1075,6 +1086,7 @@ impl Default for Globals {
         globals.register_version(InterfaceIndex::WpPresentation, 2, [].into_iter());
         globals.register_version(InterfaceIndex::WpViewporter, 1, [].into_iter());
         globals.register_version(InterfaceIndex::ZwpPointerConstraintsV1, 1, [].into_iter());
+        globals.register_version(InterfaceIndex::ZwpRelativePointerManagerV1, 1, [].into_iter());
         globals
     }
 }

@@ -15,6 +15,7 @@ use lumalla_wayland_protocol::{
 use crate::{
     GlobalId, Globals,
     pointer_constraints::{ConstraintKind, PointerConstraintsManager},
+    relative_pointer::RelativePointerManager,
     surface::{SurfaceError, SurfaceManager},
 };
 
@@ -638,14 +639,25 @@ impl SeatManager {
         clients: &mut HashMap<ClientId, ClientConnection>,
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
+        relative_pointers: &RelativePointerManager,
         time_msec: u32,
         dx: f64,
         dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
     ) {
-        self.apply_pointer_motion(clients, surface_manager, constraints, time_msec, |seat| {
-            seat.pointer_x += dx;
-            seat.pointer_y += dy;
-        });
+        self.apply_pointer_motion(
+            clients,
+            surface_manager,
+            constraints,
+            relative_pointers,
+            time_msec,
+            Some((dx, dy, dx_unaccel, dy_unaccel)),
+            |seat| {
+                seat.pointer_x += dx;
+                seat.pointer_y += dy;
+            },
+        );
     }
 
     pub fn handle_pointer_absolute(
@@ -653,14 +665,26 @@ impl SeatManager {
         clients: &mut HashMap<ClientId, ClientConnection>,
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
+        relative_pointers: &RelativePointerManager,
         time_msec: u32,
         x: f64,
         y: f64,
     ) {
-        self.apply_pointer_motion(clients, surface_manager, constraints, time_msec, |seat| {
-            seat.pointer_x = x;
-            seat.pointer_y = y;
-        });
+        let old_x = self.pointer_x;
+        let old_y = self.pointer_y;
+        self.apply_pointer_motion(
+            clients,
+            surface_manager,
+            constraints,
+            relative_pointers,
+            time_msec,
+            // Absolute devices: relative delta is the unclipped intended motion.
+            Some((x - old_x, y - old_y, x - old_x, y - old_y)),
+            |seat| {
+                seat.pointer_x = x;
+                seat.pointer_y = y;
+            },
+        );
     }
 
     fn apply_pointer_motion(
@@ -668,7 +692,9 @@ impl SeatManager {
         clients: &mut HashMap<ClientId, ClientConnection>,
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
+        relative_pointers: &RelativePointerManager,
         time_msec: u32,
+        relative: Option<(f64, f64, f64, f64)>,
         update: impl FnOnce(&mut Self),
     ) {
         let active = constraints.active_for_seat();
@@ -698,6 +724,23 @@ impl SeatManager {
             time_msec,
             send_motion,
         );
+
+        if let Some((dx, dy, dx_unaccel, dy_unaccel)) = relative {
+            let focused: Vec<(ClientId, ObjectId)> = self
+                .pointers
+                .iter()
+                .filter_map(|p| p.focus.map(|_| (p.client_id, p.id)))
+                .collect();
+            relative_pointers.emit_relative_motion(
+                clients,
+                &focused,
+                time_msec,
+                dx,
+                dy,
+                dx_unaccel,
+                dy_unaccel,
+            );
+        }
     }
 
     /// Deliver `wl_pointer.button` to the focused pointer(s).
@@ -1484,6 +1527,7 @@ mod tests {
         use crate::pointer_constraints::{
             ConstraintKind, ConstraintLifetime, PointerConstraintsManager,
         };
+        use crate::relative_pointer::RelativePointerManager;
 
         let mut seat = SeatManager::default();
         seat.set_output_geometry(800, 600);
@@ -1505,7 +1549,17 @@ mod tests {
 
         let mut clients = HashMap::new();
         let surfaces = SurfaceManager::default();
-        seat.handle_pointer_motion(&mut clients, &surfaces, &mut constraints, 1, 40.0, 30.0);
+        seat.handle_pointer_motion(
+            &mut clients,
+            &surfaces,
+            &mut constraints,
+            &RelativePointerManager::default(),
+            1,
+            40.0,
+            30.0,
+            40.0,
+            30.0,
+        );
         assert_eq!(seat.pointer_position(), (100.0, 100.0));
     }
 
@@ -1557,7 +1611,17 @@ mod tests {
 
         let mut clients = HashMap::new();
         // Move far outside the surface; confine should clamp back into surface.
-        seat.handle_pointer_motion(&mut clients, &surfaces, &mut constraints, 1, 500.0, 500.0);
+        seat.handle_pointer_motion(
+            &mut clients,
+            &surfaces,
+            &mut constraints,
+            &crate::relative_pointer::RelativePointerManager::default(),
+            1,
+            500.0,
+            500.0,
+            500.0,
+            500.0,
+        );
         let (x, y) = seat.pointer_position();
         assert!(x >= 50.0 && x <= 149.0, "x={x}");
         assert!(y >= 50.0 && y <= 149.0, "y={y}");

@@ -102,6 +102,8 @@ pub enum PointerEvent {
         time_msec: u32,
         dx: f64,
         dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
     },
     Absolute {
         time_msec: u32,
@@ -360,12 +362,19 @@ impl InputState {
             InputEvent::KeyboardKey { key, state } => {
                 self.handle_key(key, state, synthetic, on_event);
             }
-            InputEvent::PointerMotion { dx, dy } => {
+            InputEvent::PointerMotion {
+                dx,
+                dy,
+                dx_unaccel,
+                dy_unaccel,
+            } => {
                 let time_msec = self.now_msec();
                 on_event(SeatEvent::Pointer(PointerEvent::Motion {
                     time_msec,
                     dx,
                     dy,
+                    dx_unaccel,
+                    dy_unaccel,
                 }));
             }
             InputEvent::PointerAbsolute { x, y } => {

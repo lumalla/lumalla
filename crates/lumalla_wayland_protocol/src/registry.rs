@@ -10,8 +10,9 @@ use crate::{
     client::Ctx,
     protocols::{
         LinuxDmabufV1Protocol, PointerConstraintsUnstableV1Protocol, PresentationTimeProtocol,
-        ViewporterProtocol, WaylandProtocol, WlDisplay, XdgShellProtocol, linux_dmabuf::*,
-        pointer_constraints::*, presentation_time::*, viewporter::*, wayland::*, xdg_shell::*,
+        RelativePointerUnstableV1Protocol, ViewporterProtocol, WaylandProtocol, WlDisplay,
+        XdgShellProtocol, linux_dmabuf::*, pointer_constraints::*, presentation_time::*,
+        relative_pointer::*, viewporter::*, wayland::*, xdg_shell::*,
     },
 };
 
@@ -55,6 +56,8 @@ pub enum InterfaceIndex {
     ZwpPointerConstraintsV1,
     ZwpLockedPointerV1,
     ZwpConfinedPointerV1,
+    ZwpRelativePointerManagerV1,
+    ZwpRelativePointerV1,
 }
 
 impl InterfaceIndex {
@@ -98,6 +101,8 @@ impl InterfaceIndex {
             InterfaceIndex::ZwpPointerConstraintsV1 => ZWP_POINTER_CONSTRAINTS_V1_NAME,
             InterfaceIndex::ZwpLockedPointerV1 => ZWP_LOCKED_POINTER_V1_NAME,
             InterfaceIndex::ZwpConfinedPointerV1 => ZWP_CONFINED_POINTER_V1_NAME,
+            InterfaceIndex::ZwpRelativePointerManagerV1 => ZWP_RELATIVE_POINTER_MANAGER_V1_NAME,
+            InterfaceIndex::ZwpRelativePointerV1 => ZWP_RELATIVE_POINTER_V1_NAME,
         }
     }
 
@@ -141,6 +146,8 @@ impl InterfaceIndex {
             InterfaceIndex::ZwpPointerConstraintsV1 => ZWP_POINTER_CONSTRAINTS_V1_VERSION,
             InterfaceIndex::ZwpLockedPointerV1 => ZWP_LOCKED_POINTER_V1_VERSION,
             InterfaceIndex::ZwpConfinedPointerV1 => ZWP_CONFINED_POINTER_V1_VERSION,
+            InterfaceIndex::ZwpRelativePointerManagerV1 => ZWP_RELATIVE_POINTER_MANAGER_V1_VERSION,
+            InterfaceIndex::ZwpRelativePointerV1 => ZWP_RELATIVE_POINTER_V1_VERSION,
         }
     }
 }
@@ -310,7 +317,8 @@ where
         + LinuxDmabufV1Protocol
         + PresentationTimeProtocol
         + ViewporterProtocol
-        + PointerConstraintsUnstableV1Protocol,
+        + PointerConstraintsUnstableV1Protocol
+        + RelativePointerUnstableV1Protocol,
 {
     fn handle_request(
         &mut self,
@@ -448,6 +456,19 @@ where
             }
             InterfaceIndex::ZwpConfinedPointerV1 => {
                 ZwpConfinedPointerV1::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ZwpRelativePointerManagerV1 => {
+                ZwpRelativePointerManagerV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ZwpRelativePointerV1 => {
+                ZwpRelativePointerV1::handle_request(self, ctx, header, data, fds, object.version)
             }
         }
     }
