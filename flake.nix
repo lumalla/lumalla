@@ -79,8 +79,35 @@
           ]);
           text = builtins.readFile ./mem-profiling.sh;
         };
+
+        # Compositor binary only (root crate).
+        lumalla = naersk'.buildPackage (commonBuildArgs
+          // {
+            pname = "lumalla";
+          });
+
+        # Lua config process (`lumalla_config` / `lumalla-config`).
+        lumallaConfig = naersk'.buildPackage (commonBuildArgs
+          // {
+            pname = "lumalla-config";
+            cargoBuildOptions = opts: opts ++ ["-p" "lumalla_config"];
+            cargoTestOptions = opts: opts ++ ["-p" "lumalla_config"];
+            postInstall = ''
+              if [ -e "$out/bin/lumalla_config" ] && [ ! -e "$out/bin/lumalla-config" ]; then
+                ln -s lumalla_config "$out/bin/lumalla-config"
+              fi
+            '';
+          });
+
+        # What most consumers want: compositor + config on PATH.
+        lumallaWithConfig = pkgs.symlinkJoin {
+          name = "lumalla";
+          paths = [lumalla lumallaConfig];
+        };
       in {
-        packages.default = naersk'.buildPackage commonBuildArgs;
+        packages.default = lumallaWithConfig;
+        packages.lumalla = lumalla;
+        packages.lumalla-config = lumallaConfig;
         packages.run-local = runLocal;
         packages.cpu-profiling = cpuProfiling;
         packages.mem-profiling = memProfiling;
