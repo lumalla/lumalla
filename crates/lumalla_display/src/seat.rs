@@ -14,6 +14,7 @@ use lumalla_wayland_protocol::{
 
 use crate::{
     GlobalId, Globals,
+    pointer_constraints::{ConstraintKind, PointerConstraintsManager},
     surface::{SurfaceError, SurfaceManager},
 };
 
@@ -293,6 +294,24 @@ impl SeatManager {
         (self.pointer_x, self.pointer_y)
     }
 
+    pub fn set_pointer_position(&mut self, x: f64, y: f64) {
+        self.pointer_x = x;
+        self.pointer_y = y;
+        self.clamp_pointer();
+    }
+
+    /// Focused pointer for a specific pointer object, if any.
+    pub fn pointer_focus(
+        &self,
+        client_id: ClientId,
+        pointer_id: ObjectId,
+    ) -> Option<ObjectId> {
+        self.pointers
+            .iter()
+            .find(|p| p.client_id == client_id && p.id == pointer_id)
+            .and_then(|p| p.focus)
+    }
+
     pub fn active_cursor(&self) -> Option<ActiveCursor> {
         let pointer = self
             .pointers
@@ -323,6 +342,13 @@ impl SeatManager {
         self.pointers
             .iter()
             .find_map(|pointer| pointer.focus.map(|surface| (pointer.client_id, surface)))
+    }
+
+    /// First focused pointer as `(client, surface, pointer)`.
+    pub fn focused_pointer(&self) -> Option<(ClientId, ObjectId, ObjectId)> {
+        self.pointers
+            .iter()
+            .find_map(|pointer| pointer.focus.map(|surface| (pointer.client_id, surface, pointer.id)))
     }
 
     pub fn set_cursor(
@@ -611,28 +637,67 @@ impl SeatManager {
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,
         surface_manager: &SurfaceManager,
+        constraints: &mut PointerConstraintsManager,
         time_msec: u32,
         dx: f64,
         dy: f64,
     ) {
-        self.pointer_x += dx;
-        self.pointer_y += dy;
-        self.clamp_pointer();
-        self.update_pointer_focus_and_motion(clients, surface_manager, time_msec, true);
+        self.apply_pointer_motion(clients, surface_manager, constraints, time_msec, |seat| {
+            seat.pointer_x += dx;
+            seat.pointer_y += dy;
+        });
     }
 
     pub fn handle_pointer_absolute(
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,
         surface_manager: &SurfaceManager,
+        constraints: &mut PointerConstraintsManager,
         time_msec: u32,
         x: f64,
         y: f64,
     ) {
-        self.pointer_x = x;
-        self.pointer_y = y;
-        self.clamp_pointer();
-        self.update_pointer_focus_and_motion(clients, surface_manager, time_msec, true);
+        self.apply_pointer_motion(clients, surface_manager, constraints, time_msec, |seat| {
+            seat.pointer_x = x;
+            seat.pointer_y = y;
+        });
+    }
+
+    fn apply_pointer_motion(
+        &mut self,
+        clients: &mut HashMap<ClientId, ClientConnection>,
+        surface_manager: &SurfaceManager,
+        constraints: &mut PointerConstraintsManager,
+        time_msec: u32,
+        update: impl FnOnce(&mut Self),
+    ) {
+        let active = constraints.active_for_seat();
+        let locked = active.is_some_and(|c| c.kind == ConstraintKind::Locked);
+        if !locked {
+            update(self);
+            if let Some(confine) = active.filter(|c| c.kind == ConstraintKind::Confined) {
+                if let Some((x, y)) = surface_manager.clamp_global_to_constraint(
+                    confine.client_id,
+                    confine.surface,
+                    constraints.region_for(confine.client_id, confine.object_id),
+                    self.pointer_x,
+                    self.pointer_y,
+                ) {
+                    self.pointer_x = x;
+                    self.pointer_y = y;
+                }
+            }
+            self.clamp_pointer();
+        }
+
+        let send_motion = !locked;
+        self.update_pointer_focus_and_motion(
+            clients,
+            surface_manager,
+            constraints,
+            time_msec,
+            send_motion,
+        );
     }
 
     /// Deliver `wl_pointer.button` to the focused pointer(s).
@@ -854,10 +919,15 @@ impl SeatManager {
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,
         surface_manager: &SurfaceManager,
+        constraints: &mut PointerConstraintsManager,
         time_msec: u32,
         send_motion: bool,
     ) {
-        let target = surface_manager.global_pointer_target(None, self.pointer_x, self.pointer_y);
+        let sticky = constraints.active_for_seat().map(|c| (c.client_id, c.surface));
+        let target = match sticky {
+            Some((client_id, surface)) => Some((client_id, surface)),
+            None => surface_manager.global_pointer_target(None, self.pointer_x, self.pointer_y),
+        };
 
         // Leave pointers whose focus no longer matches the target.
         let leave_list: Vec<(ClientId, ObjectId, ObjectId, u32)> = self
@@ -952,6 +1022,16 @@ impl SeatManager {
                 }
             }
         }
+
+        // Activate pending constraints now that focus/position are current.
+        let pointer_focus = self.focused_pointer();
+        constraints.try_activate(
+            clients,
+            surface_manager,
+            pointer_focus,
+            self.pointer_x,
+            self.pointer_y,
+        );
     }
 
     fn send_keymap(&self, writer: &mut Writer, keyboard_id: ObjectId) -> anyhow::Result<()> {
@@ -1069,6 +1149,7 @@ impl Serial {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         num::NonZeroU32,
         os::{
             fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -1396,5 +1477,89 @@ mod tests {
         assert_eq!(seat.active_touches.get(&7), Some(&(client_id, surface)));
         seat.handle_touch_up(&mut clients, 2, 7);
         assert!(seat.active_touches.is_empty());
+    }
+
+    #[test]
+    fn active_lock_freezes_compositor_pointer_position() {
+        use crate::pointer_constraints::{
+            ConstraintKind, ConstraintLifetime, PointerConstraintsManager,
+        };
+
+        let mut seat = SeatManager::default();
+        seat.set_output_geometry(800, 600);
+        seat.set_pointer_position(100.0, 100.0);
+
+        let mut constraints = PointerConstraintsManager::default();
+        constraints
+            .create_constraint(
+                client(1),
+                object(50),
+                ConstraintKind::Locked,
+                object(20),
+                object(10),
+                None,
+                ConstraintLifetime::Oneshot,
+            )
+            .unwrap();
+        constraints.force_active_for_test(client(1), object(50));
+
+        let mut clients = HashMap::new();
+        let surfaces = SurfaceManager::default();
+        seat.handle_pointer_motion(&mut clients, &surfaces, &mut constraints, 1, 40.0, 30.0);
+        assert_eq!(seat.pointer_position(), (100.0, 100.0));
+    }
+
+    #[test]
+    fn active_confine_clamps_pointer_into_surface_bounds() {
+        use crate::pointer_constraints::{
+            ConstraintKind, ConstraintLifetime, PointerConstraintsManager,
+        };
+
+        let mut seat = SeatManager::default();
+        let mut surfaces = SurfaceManager::default();
+        seat.set_output_geometry(800, 600);
+
+        let client_id = client(1);
+        let surface = object(20);
+        surfaces.create_surface(client_id, surface);
+        surfaces
+            .create_shell_surface(client_id, object(30), surface)
+            .unwrap();
+        surfaces
+            .set_shell_mode(client_id, object(30), ShellMode::Toplevel)
+            .unwrap();
+        surfaces
+            .attach(client_id, surface, Some(object(40)), 0, 0, 1)
+            .unwrap();
+        let _ = surfaces.commit(client_id, surface).unwrap();
+        surfaces
+            .set_committed_buffer_size(client_id, surface, 100, 100)
+            .unwrap();
+        surfaces
+            .set_surface_layout(client_id, surface, 50, 50)
+            .unwrap();
+
+        seat.set_pointer_position(60.0, 60.0);
+
+        let mut constraints = PointerConstraintsManager::default();
+        constraints
+            .create_constraint(
+                client_id,
+                object(50),
+                ConstraintKind::Confined,
+                surface,
+                object(10),
+                None,
+                ConstraintLifetime::Persistent,
+            )
+            .unwrap();
+        constraints.force_active_for_test(client_id, object(50));
+
+        let mut clients = HashMap::new();
+        // Move far outside the surface; confine should clamp back into surface.
+        seat.handle_pointer_motion(&mut clients, &surfaces, &mut constraints, 1, 500.0, 500.0);
+        let (x, y) = seat.pointer_position();
+        assert!(x >= 50.0 && x <= 149.0, "x={x}");
+        assert!(y >= 50.0 && y <= 149.0, "y={y}");
     }
 }

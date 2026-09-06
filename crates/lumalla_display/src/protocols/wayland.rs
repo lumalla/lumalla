@@ -277,6 +277,86 @@ fn commit_damage(
     (output_damage, buffer_damage, false)
 }
 
+fn apply_pointer_constraint_commit(
+    state: &mut DisplayState,
+    ctx: &mut Ctx,
+    surface_id: ObjectId,
+) {
+    let confined = state
+        .pointer_constraints_manager
+        .apply_surface_commit(ctx.client_id, surface_id);
+    for confine in confined {
+        let (px, py) = state.seat_manager.pointer_position();
+        let Some((sx, sy)) =
+            state
+                .surface_manager
+                .surface_local_coords(confine.client_id, confine.surface, px, py)
+        else {
+            continue;
+        };
+        if state.surface_manager.constraint_region_contains(
+            confine.client_id,
+            confine.surface,
+            state
+                .pointer_constraints_manager
+                .region_for(confine.client_id, confine.object_id),
+            sx as f64,
+            sy as f64,
+        ) {
+            continue;
+        }
+        let Some((gx, gy)) = state.surface_manager.clamp_global_to_constraint(
+            confine.client_id,
+            confine.surface,
+            state
+                .pointer_constraints_manager
+                .region_for(confine.client_id, confine.object_id),
+            px,
+            py,
+        ) else {
+            continue;
+        };
+        state.seat_manager.set_pointer_position(gx, gy);
+        let (nsx, nsy) = state
+            .surface_manager
+            .surface_local_coords(confine.client_id, confine.surface, gx, gy)
+            .unwrap_or((sx, sy));
+        if state
+            .seat_manager
+            .pointer_focus(confine.client_id, confine.pointer)
+            == Some(confine.surface)
+        {
+            ctx.writer
+                .wl_pointer_motion(confine.pointer)
+                .time(0)
+                .surface_x(nsx)
+                .surface_y(nsy);
+        }
+    }
+
+    activate_pending_constraints_for_writer(state, ctx);
+}
+
+fn activate_pending_constraints_for_writer(state: &mut DisplayState, ctx: &mut Ctx) {
+    let Some((focus_client, focus_surface, focus_pointer)) = state.seat_manager.focused_pointer()
+    else {
+        return;
+    };
+    if focus_client != ctx.client_id {
+        return;
+    }
+    let (pointer_x, pointer_y) = state.seat_manager.pointer_position();
+    state.pointer_constraints_manager.activate_if_ready(
+        ctx.client_id,
+        focus_surface,
+        focus_pointer,
+        pointer_x,
+        pointer_y,
+        &state.surface_manager,
+        ctx.writer,
+    );
+}
+
 fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, mut commit: SurfaceCommit) {
     let frame_callbacks = std::mem::take(&mut commit.frame_callbacks);
     let presentation_feedbacks = std::mem::take(&mut commit.presentation_feedbacks);
@@ -1301,6 +1381,11 @@ impl WlSurface for DisplayState {
             .destroy_surface(ctx.client_id, object_id)
         {
             Ok(destroyed) => {
+                self.pointer_constraints_manager.mark_surface_destroyed(
+                    ctx.writer,
+                    ctx.client_id,
+                    object_id,
+                );
                 self.seat_manager
                     .leave_keyboards_on_surface(ctx.client_id, object_id, ctx.writer);
                 self.seat_manager
@@ -1344,6 +1429,11 @@ impl WlSurface for DisplayState {
                     });
                 }
                 for child in destroyed.unmapped_descendants {
+                    self.pointer_constraints_manager.mark_surface_destroyed(
+                        ctx.writer,
+                        ctx.client_id,
+                        child,
+                    );
                     self.seat_manager
                         .leave_keyboards_on_surface(ctx.client_id, child, ctx.writer);
                     self.seat_manager
@@ -1495,6 +1585,14 @@ impl WlSurface for DisplayState {
         process_surface_commit(self, ctx, result.primary);
         for child in result.synchronized_children {
             process_surface_commit(self, ctx, child);
+        }
+        apply_pointer_constraint_commit(self, ctx, object_id);
+        for child in &result.unmapped_descendants {
+            self.pointer_constraints_manager.mark_surface_destroyed(
+                ctx.writer,
+                ctx.client_id,
+                *child,
+            );
         }
         for child in result.unmapped_descendants {
             self.seat_manager
@@ -1654,6 +1752,8 @@ impl WlPointer for DisplayState {
     }
 
     fn release(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlPointerRelease<'_>) {
+        self.pointer_constraints_manager
+            .remove_pointer(ctx.client_id, object_id);
         self.seat_manager
             .destroy_pointer(ctx.client_id, object_id, &mut self.surface_manager);
         ctx.registry.free_object(object_id, ctx.writer);
@@ -2050,6 +2150,10 @@ mod tests {
             lumalla_wayland_protocol::protocols::presentation_time::WP_PRESENTATION_NAME,
             2
         )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::pointer_constraints::ZWP_POINTER_CONSTRAINTS_V1_NAME,
+            1
+        )));
     }
 
     #[test]
@@ -2184,6 +2288,33 @@ mod tests {
         assert_eq!(
             ctx.registry.interface_index(object_id(20)),
             Some(InterfaceIndex::WpViewporter)
+        );
+    }
+
+    #[test]
+    fn registry_bind_zwp_pointer_constraints_registers_object() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let mut registry = Registry::new();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
+        };
+        let global_name = state
+            .globals
+            .iter()
+            .find(|(_, global)| global.interface_index == InterfaceIndex::ZwpPointerConstraintsV1)
+            .map(|(id, _)| *id)
+            .expect("zwp_pointer_constraints_v1 global");
+        let data = bind_data(global_name, "zwp_pointer_constraints_v1", 1, 20);
+        let mut fds = VecDeque::new();
+        let params = WlRegistryBind::new(&data, &mut fds);
+        WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
+        assert_eq!(
+            ctx.registry.interface_index(object_id(20)),
+            Some(InterfaceIndex::ZwpPointerConstraintsV1)
         );
     }
 

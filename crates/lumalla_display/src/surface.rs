@@ -1840,6 +1840,106 @@ impl SurfaceManager {
             .transpose()
     }
 
+    /// Snapshot a `wl_region` for pointer constraints (null → `None` = full input region).
+    pub(crate) fn snapshot_region(
+        &self,
+        client_id: ClientId,
+        region_id: Option<ObjectId>,
+    ) -> Result<Option<Region>, SurfaceError> {
+        self.copy_region(client_id, region_id)
+    }
+
+    /// Whether surface-local `(sx, sy)` is inside the constraint region ∩ input region.
+    pub(crate) fn constraint_region_contains(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        constraint_region: Option<&Region>,
+        sx: f64,
+        sy: f64,
+    ) -> bool {
+        let Some(surface) = self.surfaces.get(&(client_id, surface_id)) else {
+            return false;
+        };
+        let ix = sx.floor() as i32;
+        let iy = sy.floor() as i32;
+        if !self.surface_accepts_input_at(surface, ix, iy) {
+            return false;
+        }
+        match constraint_region {
+            None => true,
+            Some(region) => region.contains(ix, iy),
+        }
+    }
+
+    /// Clamp global pointer coords into constraint_region ∩ input region ∩ surface bounds.
+    pub(crate) fn clamp_global_to_constraint(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        constraint_region: Option<&Region>,
+        global_x: f64,
+        global_y: f64,
+    ) -> Option<(f64, f64)> {
+        let (origin_x, origin_y) = self.surface_origin(client_id, surface_id)?;
+        let surface = self.surfaces.get(&(client_id, surface_id))?;
+        let (sx, sy) = (
+            global_x - origin_x as f64,
+            global_y - origin_y as f64,
+        );
+
+        let size = effective_surface_size(
+            surface.buffer_size,
+            surface.current.buffer_scale,
+            surface.current.buffer_transform,
+            &surface.current.viewport,
+        );
+        let (sw, sh) = size.unwrap_or((0, 0));
+        let mut min_x = 0.0_f64;
+        let mut min_y = 0.0_f64;
+        let mut max_x = (sw.max(1) - 1) as f64;
+        let mut max_y = (sh.max(1) - 1) as f64;
+
+        if let Some(region) = constraint_region {
+            if let Some((rx, ry, rw, rh)) = region.add_bounds() {
+                min_x = min_x.max(rx as f64);
+                min_y = min_y.max(ry as f64);
+                max_x = max_x.min((rx + rw - 1) as f64);
+                max_y = max_y.min((ry + rh - 1) as f64);
+            }
+        }
+        if let Some(input) = surface.current.input_region.as_ref() {
+            if let Some((rx, ry, rw, rh)) = input.add_bounds() {
+                min_x = min_x.max(rx as f64);
+                min_y = min_y.max(ry as f64);
+                max_x = max_x.min((rx + rw - 1) as f64);
+                max_y = max_y.min((ry + rh - 1) as f64);
+            }
+        }
+        if min_x > max_x {
+            min_x = max_x;
+        }
+        if min_y > max_y {
+            min_y = max_y;
+        }
+
+        let clamped_sx = sx.clamp(min_x, max_x);
+        let clamped_sy = sy.clamp(min_y, max_y);
+        Some((origin_x as f64 + clamped_sx, origin_y as f64 + clamped_sy))
+    }
+
+    /// Global position from a surface-local cursor hint.
+    pub(crate) fn global_from_surface_local(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        sx: f64,
+        sy: f64,
+    ) -> Option<(f64, f64)> {
+        let (origin_x, origin_y) = self.surface_origin(client_id, surface_id)?;
+        Some((origin_x as f64 + sx, origin_y as f64 + sy))
+    }
+
     fn shell_state_mut(
         &mut self,
         client_id: ClientId,
@@ -2056,12 +2156,12 @@ pub struct Rectangle {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Region {
+pub(crate) struct Region {
     operations: Vec<RegionOperation>,
 }
 
 impl Region {
-    fn contains(&self, x: i32, y: i32) -> bool {
+    pub(crate) fn contains(&self, x: i32, y: i32) -> bool {
         if self.operations.is_empty() {
             return false;
         }
@@ -2081,6 +2181,26 @@ impl Region {
             }
         }
         inside
+    }
+
+    /// Axis-aligned bounding box of all Add rectangles, if any.
+    pub(crate) fn add_bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for operation in &self.operations {
+            let RegionOperation::Add(rect) = operation else {
+                continue;
+            };
+            if rect.width <= 0 || rect.height <= 0 {
+                continue;
+            }
+            let right = rect.x.saturating_add(rect.width);
+            let bottom = rect.y.saturating_add(rect.height);
+            bounds = Some(match bounds {
+                None => (rect.x, rect.y, right, bottom),
+                Some((x0, y0, x1, y1)) => (x0.min(rect.x), y0.min(rect.y), x1.max(right), y1.max(bottom)),
+            });
+        }
+        bounds.map(|(x0, y0, x1, y1)| (x0, y0, x1 - x0, y1 - y0))
     }
 }
 

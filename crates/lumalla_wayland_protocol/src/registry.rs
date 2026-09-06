@@ -9,9 +9,9 @@ use crate::{
     buffer::{MessageHeader, Writer},
     client::Ctx,
     protocols::{
-        LinuxDmabufV1Protocol, PresentationTimeProtocol, ViewporterProtocol, WaylandProtocol,
-        WlDisplay, XdgShellProtocol, linux_dmabuf::*, presentation_time::*, viewporter::*,
-        wayland::*, xdg_shell::*,
+        LinuxDmabufV1Protocol, PointerConstraintsUnstableV1Protocol, PresentationTimeProtocol,
+        ViewporterProtocol, WaylandProtocol, WlDisplay, XdgShellProtocol, linux_dmabuf::*,
+        pointer_constraints::*, presentation_time::*, viewporter::*, wayland::*, xdg_shell::*,
     },
 };
 
@@ -52,6 +52,9 @@ pub enum InterfaceIndex {
     WpPresentationFeedback,
     WpViewporter,
     WpViewport,
+    ZwpPointerConstraintsV1,
+    ZwpLockedPointerV1,
+    ZwpConfinedPointerV1,
 }
 
 impl InterfaceIndex {
@@ -92,6 +95,9 @@ impl InterfaceIndex {
             InterfaceIndex::WpPresentationFeedback => WP_PRESENTATION_FEEDBACK_NAME,
             InterfaceIndex::WpViewporter => WP_VIEWPORTER_NAME,
             InterfaceIndex::WpViewport => WP_VIEWPORT_NAME,
+            InterfaceIndex::ZwpPointerConstraintsV1 => ZWP_POINTER_CONSTRAINTS_V1_NAME,
+            InterfaceIndex::ZwpLockedPointerV1 => ZWP_LOCKED_POINTER_V1_NAME,
+            InterfaceIndex::ZwpConfinedPointerV1 => ZWP_CONFINED_POINTER_V1_NAME,
         }
     }
 
@@ -132,6 +138,9 @@ impl InterfaceIndex {
             InterfaceIndex::WpPresentationFeedback => WP_PRESENTATION_FEEDBACK_VERSION,
             InterfaceIndex::WpViewporter => WP_VIEWPORTER_VERSION,
             InterfaceIndex::WpViewport => WP_VIEWPORT_VERSION,
+            InterfaceIndex::ZwpPointerConstraintsV1 => ZWP_POINTER_CONSTRAINTS_V1_VERSION,
+            InterfaceIndex::ZwpLockedPointerV1 => ZWP_LOCKED_POINTER_V1_VERSION,
+            InterfaceIndex::ZwpConfinedPointerV1 => ZWP_CONFINED_POINTER_V1_VERSION,
         }
     }
 }
@@ -300,7 +309,8 @@ where
         + XdgShellProtocol
         + LinuxDmabufV1Protocol
         + PresentationTimeProtocol
-        + ViewporterProtocol,
+        + ViewporterProtocol
+        + PointerConstraintsUnstableV1Protocol,
 {
     fn handle_request(
         &mut self,
@@ -422,6 +432,22 @@ where
             }
             InterfaceIndex::WpViewport => {
                 WpViewport::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ZwpPointerConstraintsV1 => {
+                ZwpPointerConstraintsV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ZwpLockedPointerV1 => {
+                ZwpLockedPointerV1::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ZwpConfinedPointerV1 => {
+                ZwpConfinedPointerV1::handle_request(self, ctx, header, data, fds, object.version)
             }
         }
     }

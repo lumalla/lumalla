@@ -14,6 +14,7 @@ use crate::{
     data_device::DataDeviceManager,
     dmabuf::DmabufManager,
     output::OutputManager,
+    pointer_constraints::PointerConstraintsManager,
     seat::SeatManager,
     shm::ShmManager,
     surface::SurfaceManager,
@@ -24,6 +25,7 @@ use crate::{
 mod data_device;
 mod dmabuf;
 mod output;
+mod pointer_constraints;
 mod protocols;
 mod seat;
 mod shm;
@@ -119,6 +121,7 @@ pub struct DisplayState {
     shm_manager: ShmManager,
     dmabuf_manager: DmabufManager,
     seat_manager: SeatManager,
+    pointer_constraints_manager: PointerConstraintsManager,
     output_manager: OutputManager,
     data_device_manager: DataDeviceManager,
     xdg_manager: XdgManager,
@@ -139,6 +142,7 @@ impl Default for DisplayState {
             shm_manager: ShmManager::default(),
             dmabuf_manager: DmabufManager::default(),
             seat_manager: SeatManager::default(),
+            pointer_constraints_manager: PointerConstraintsManager::default(),
             output_manager: OutputManager::default(),
             data_device_manager: DataDeviceManager::default(),
             xdg_manager: XdgManager::default(),
@@ -232,8 +236,14 @@ impl DisplayState {
         dx: f64,
         dy: f64,
     ) {
-        self.seat_manager
-            .handle_pointer_motion(clients, &self.surface_manager, time_msec, dx, dy);
+        self.seat_manager.handle_pointer_motion(
+            clients,
+            &self.surface_manager,
+            &mut self.pointer_constraints_manager,
+            time_msec,
+            dx,
+            dy,
+        );
     }
 
     pub fn handle_pointer_absolute(
@@ -243,16 +253,27 @@ impl DisplayState {
         x: f64,
         y: f64,
     ) {
-        self.seat_manager
-            .handle_pointer_absolute(clients, &self.surface_manager, time_msec, x, y);
+        self.seat_manager.handle_pointer_absolute(
+            clients,
+            &self.surface_manager,
+            &mut self.pointer_constraints_manager,
+            time_msec,
+            x,
+            y,
+        );
     }
 
     /// Recompute pointer enter/leave from current coordinates and stacking.
     ///
     /// Call after client dispatch or when mapping changes under a stationary cursor.
     pub fn refresh_pointer_focus(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
-        self.seat_manager
-            .update_pointer_focus_and_motion(clients, &self.surface_manager, 0, false);
+        self.seat_manager.update_pointer_focus_and_motion(
+            clients,
+            &self.surface_manager,
+            &mut self.pointer_constraints_manager,
+            0,
+            false,
+        );
     }
 
     pub fn set_output_geometry(&mut self, width: u32, height: u32) {
@@ -280,6 +301,7 @@ impl DisplayState {
             self.seat_manager.update_pointer_focus_and_motion(
                 clients,
                 &self.surface_manager,
+                &mut self.pointer_constraints_manager,
                 time_msec,
                 false,
             );
@@ -449,6 +471,7 @@ impl DisplayState {
         self.dmabuf_manager.delete_client(client_id);
         self.surface_manager.delete_client(client_id);
         self.seat_manager.remove_client(client_id);
+        self.pointer_constraints_manager.delete_client(client_id);
         self.output_manager.remove_client(client_id);
         self.data_device_manager.remove_client(client_id);
         self.xdg_manager.delete_client(client_id);
@@ -1051,6 +1074,7 @@ impl Default for Globals {
         globals.register_version(InterfaceIndex::ZwpLinuxDmabufV1, 4, [].into_iter());
         globals.register_version(InterfaceIndex::WpPresentation, 2, [].into_iter());
         globals.register_version(InterfaceIndex::WpViewporter, 1, [].into_iter());
+        globals.register_version(InterfaceIndex::ZwpPointerConstraintsV1, 1, [].into_iter());
         globals
     }
 }
