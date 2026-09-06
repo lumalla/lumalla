@@ -277,7 +277,48 @@ fn commit_damage(
     (output_damage, buffer_damage, false)
 }
 
-fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: SurfaceCommit) {
+fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, mut commit: SurfaceCommit) {
+    let frame_callbacks = std::mem::take(&mut commit.frame_callbacks);
+    let presentation_feedbacks = std::mem::take(&mut commit.presentation_feedbacks);
+
+    if process_surface_commit_body(state, ctx, &commit).is_err() {
+        DisplayState::abandon_commit_timing_objects(
+            ctx.writer,
+            ctx.registry,
+            frame_callbacks,
+            presentation_feedbacks,
+        );
+        return;
+    }
+
+    for callback in frame_callbacks {
+        state
+            .pending_frame_callbacks
+            .push_back(crate::PendingFrameCallback {
+                client_id: ctx.client_id,
+                surface_id: commit.surface_id,
+                callback_id: callback,
+            });
+    }
+
+    if !commit.deferred {
+        state.queue_presentation_feedbacks(
+            ctx.client_id,
+            commit.surface_id,
+            presentation_feedbacks,
+            ctx.writer,
+            ctx.registry,
+        );
+    }
+}
+
+/// Processes buffer/viewport side-effects of a surface commit.
+/// Returns `Err(())` when the commit failed after objects were already taken from pending state.
+fn process_surface_commit_body(
+    state: &mut DisplayState,
+    ctx: &mut Ctx,
+    commit: &SurfaceCommit,
+) -> Result<(), ()> {
     match commit.attached_buffer {
         Some(Some(buffer_id)) => {
             let is_cursor = state
@@ -302,7 +343,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                                     .object_id(buffer_id)
                                     .code(WL_DISPLAY_ERROR_INVALID_OBJECT)
                                     .message(&message);
-                                return;
+                                return Err(());
                             }
                         }
                     } else {
@@ -317,7 +358,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                             ),
                             Err(error) => {
                                 report_shm_error(ctx, buffer_id, &error);
-                                return;
+                                return Err(());
                             }
                         }
                     };
@@ -328,7 +369,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                     Some(height as i32),
                 ) {
                     super::viewporter::report_viewport_commit_error(ctx, viewport_id, error);
-                    return;
+                    return Err(());
                 }
                 let _ = state.surface_manager.set_committed_buffer_size(
                     ctx.client_id,
@@ -346,7 +387,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                 let output_x = commit.layout.0 + commit.offset.0;
                 let output_y = commit.layout.1 + commit.offset.1;
                 let (damage, buffer_damage, full_surface) = commit_damage(
-                    &commit,
+                    commit,
                     output_x,
                     output_y,
                     width,
@@ -413,7 +454,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                 None,
             ) {
                 super::viewporter::report_viewport_commit_error(ctx, viewport_id, error);
-                return;
+                return Err(());
             }
             let _ = state
                 .surface_manager
@@ -456,7 +497,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                 buffer_dims.map(|(_, h)| h),
             ) {
                 super::viewporter::report_viewport_commit_error(ctx, viewport_id, error);
-                return;
+                return Err(());
             }
             let visual_change = commit.viewport_changed
                 || !commit.damage.is_empty()
@@ -481,7 +522,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                             ),
                             Err(error) => {
                                 debug!("dmabuf export failed on viewport update: {error}");
-                                return;
+                                return Err(());
                             }
                         }
                     } else {
@@ -496,7 +537,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                             ),
                             Err(error) => {
                                 debug!("shm snapshot failed on viewport update: {error}");
-                                return;
+                                return Err(());
                             }
                         }
                     };
@@ -513,7 +554,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
                     (Vec::new(), Vec::new(), true)
                 } else {
                     commit_damage(
-                        &commit,
+                        commit,
                         output_x,
                         output_y,
                         width,
@@ -556,21 +597,7 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, commit: Surfa
         }
     }
 
-    for callback in commit.frame_callbacks {
-        state
-            .pending_frame_callbacks
-            .push_back((ctx.client_id, callback));
-    }
-
-    if !commit.deferred {
-        state.queue_presentation_feedbacks(
-            ctx.client_id,
-            commit.surface_id,
-            commit.presentation_feedbacks,
-            ctx.writer,
-            ctx.registry,
-        );
-    }
+    Ok(())
 }
 
 impl WlDisplay for DisplayState {
@@ -1278,9 +1305,13 @@ impl WlSurface for DisplayState {
                     .leave_keyboards_on_surface(ctx.client_id, object_id, ctx.writer);
                 self.seat_manager
                     .leave_pointers_on_surface(ctx.client_id, object_id, ctx.writer);
-                for callback in destroyed.callbacks {
-                    ctx.registry.free_object(callback, ctx.writer);
-                }
+                self.discard_frame_callbacks_for_surface(
+                    ctx.client_id,
+                    object_id,
+                    destroyed.callbacks,
+                    ctx.writer,
+                    ctx.registry,
+                );
                 self.discard_presentation_feedbacks_for_surface(
                     ctx.client_id,
                     object_id,
@@ -2284,10 +2315,13 @@ mod tests {
         );
 
         // Present-time completion: drain queued callbacks onto the same writer/registry.
-        while let Some((owner, callback)) = state.pending_frame_callbacks.pop_front() {
-            assert_eq!(owner, client_id);
-            ctx.writer.wl_callback_done(callback).callback_data(16);
-            ctx.registry.free_object(callback, ctx.writer);
+        while let Some(pending) = state.pending_frame_callbacks.pop_front() {
+            assert_eq!(pending.client_id, client_id);
+            assert_eq!(pending.surface_id, surface_id);
+            ctx.writer
+                .wl_callback_done(pending.callback_id)
+                .callback_data(16);
+            ctx.registry.free_object(pending.callback_id, ctx.writer);
         }
         assert!(ctx.registry.object_metadata(callback_id).is_none());
 
@@ -2329,6 +2363,85 @@ mod tests {
                 surface_id: unmapped,
             }] if *owner == client_id && *unmapped == surface_id
         ));
+    }
+
+    #[test]
+    fn surface_destroy_cancels_committed_frame_callbacks_without_done() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let client_id = ClientId::new(NonZeroU32::new(1).unwrap());
+        let surface_id = object_id(2);
+        let shell_id = object_id(3);
+        let pool_id = object_id(4);
+        let buffer_id = object_id(5);
+        let callback_id = object_id(6);
+        state.surface_manager.create_surface(client_id, surface_id);
+        state
+            .surface_manager
+            .create_shell_surface(client_id, shell_id, surface_id)
+            .unwrap();
+        state
+            .surface_manager
+            .set_shell_mode(client_id, shell_id, ShellMode::Toplevel)
+            .unwrap();
+        state
+            .shm_manager
+            .create_pool(client_id, pool_id, memory_file(&[1, 2, 3, 4]), 4)
+            .unwrap();
+        state
+            .shm_manager
+            .create_buffer(
+                client_id,
+                pool_id,
+                buffer_id,
+                0,
+                1,
+                1,
+                4,
+                WL_SHM_FORMAT_ARGB8888,
+            )
+            .unwrap();
+        state
+            .surface_manager
+            .attach(client_id, surface_id, Some(buffer_id), 0, 0, 1)
+            .unwrap();
+        state
+            .surface_manager
+            .add_frame_callback(client_id, surface_id, callback_id)
+            .unwrap();
+
+        let mut registry = Registry::new();
+        for (id, interface) in [
+            (surface_id, InterfaceIndex::WlSurface),
+            (shell_id, InterfaceIndex::WlShellSurface),
+            (buffer_id, InterfaceIndex::WlBuffer),
+            (callback_id, InterfaceIndex::WlCallback),
+        ] {
+            registry
+                .register_client_object_with_version(NewObjectId::new(id), interface, 1)
+                .unwrap();
+        }
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id,
+        };
+        let mut fds = VecDeque::new();
+        let commit = WlSurfaceCommit::new(&[], &mut fds);
+        WlSurface::commit(&mut state, &mut ctx, surface_id, &commit);
+
+        assert_eq!(state.pending_frame_callback_count(), 1);
+        assert!(ctx.registry.object_metadata(callback_id).is_some());
+
+        let destroy = WlSurfaceDestroy::new(&[], &mut fds);
+        WlSurface::destroy(&mut state, &mut ctx, surface_id, &destroy);
+
+        assert_eq!(state.pending_frame_callback_count(), 0);
+        assert!(
+            ctx.registry.object_metadata(callback_id).is_none(),
+            "committed frame callback must be freed on surface destroy"
+        );
     }
 
     #[test]

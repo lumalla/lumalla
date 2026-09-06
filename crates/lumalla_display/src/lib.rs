@@ -54,6 +54,13 @@ struct PendingPresentationFeedback {
     feedback_id: ObjectId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingFrameCallback {
+    pub(crate) client_id: ClientId,
+    pub(crate) surface_id: ObjectId,
+    pub(crate) callback_id: ObjectId,
+}
+
 pub struct DisplayMessage;
 
 #[derive(Debug)]
@@ -118,7 +125,7 @@ pub struct DisplayState {
     window_manager: WindowManager,
     surface_updates: VecDeque<SurfaceUpdate>,
     pending_geometry_changes: Vec<WindowGeometryChange>,
-    pending_frame_callbacks: VecDeque<(ClientId, lumalla_wayland_protocol::ObjectId)>,
+    pub(crate) pending_frame_callbacks: VecDeque<PendingFrameCallback>,
     pending_presentation_feedbacks: VecDeque<PendingPresentationFeedback>,
     /// Activation configures for clients other than the one currently writing.
     pending_activation_configures: Vec<ActivationConfigure>,
@@ -447,7 +454,7 @@ impl DisplayState {
         self.xdg_manager.delete_client(client_id);
         self.window_manager.delete_client(client_id);
         self.pending_frame_callbacks
-            .retain(|(owner, _)| *owner != client_id);
+            .retain(|pending| pending.client_id != client_id);
         self.pending_presentation_feedbacks
             .retain(|pending| pending.client_id != client_id);
         self.surface_updates.retain(|update| match update {
@@ -532,19 +539,73 @@ impl DisplayState {
         self.pending_presentation_feedbacks = remaining;
     }
 
+    /// Cancels in-flight frame callbacks for a surface, plus any still-pending object IDs
+    /// returned from surface destroy (not yet committed). Sends `delete_id` without `done`.
+    pub(crate) fn discard_frame_callbacks_for_surface(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        pending_on_surface: Vec<ObjectId>,
+        writer: &mut Writer,
+        registry: &mut Registry,
+    ) {
+        self.discard_in_flight_frame_callbacks(client_id, surface_id, writer, registry);
+        for callback_id in pending_on_surface {
+            registry.free_object(callback_id, writer);
+        }
+    }
+
+    fn discard_in_flight_frame_callbacks(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        writer: &mut Writer,
+        registry: &mut Registry,
+    ) {
+        let mut remaining = VecDeque::new();
+        while let Some(pending) = self.pending_frame_callbacks.pop_front() {
+            if pending.client_id == client_id && pending.surface_id == surface_id {
+                registry.free_object(pending.callback_id, writer);
+            } else {
+                remaining.push_back(pending);
+            }
+        }
+        self.pending_frame_callbacks = remaining;
+    }
+
+    /// Frees frame/presentation objects taken by a commit that failed before queuing.
+    pub(crate) fn abandon_commit_timing_objects(
+        writer: &mut Writer,
+        registry: &mut Registry,
+        frame_callbacks: impl IntoIterator<Item = ObjectId>,
+        presentation_feedbacks: impl IntoIterator<Item = ObjectId>,
+    ) {
+        for callback_id in frame_callbacks {
+            registry.free_object(callback_id, writer);
+        }
+        for feedback_id in presentation_feedbacks {
+            send_presentation_discarded(writer, registry, feedback_id);
+        }
+    }
+
     /// Completes deferred `wl_surface.frame` callbacks after presentation.
     pub fn complete_frame_callbacks(
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,
         time_msec: u32,
     ) {
-        while let Some((client_id, callback)) = self.pending_frame_callbacks.pop_front() {
-            let Some(client) = clients.get_mut(&client_id) else {
+        while let Some(pending) = self.pending_frame_callbacks.pop_front() {
+            let Some(client) = clients.get_mut(&pending.client_id) else {
                 continue;
             };
             let (registry, writer) = client.registry_and_writer_mut();
-            writer.wl_callback_done(callback).callback_data(time_msec);
-            registry.free_object(callback, writer);
+            if registry.interface_index(pending.callback_id) != Some(InterfaceIndex::WlCallback) {
+                continue;
+            }
+            writer
+                .wl_callback_done(pending.callback_id)
+                .callback_data(time_msec);
+            registry.free_object(pending.callback_id, writer);
         }
     }
 
