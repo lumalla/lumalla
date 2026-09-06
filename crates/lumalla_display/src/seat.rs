@@ -275,9 +275,12 @@ impl SeatManager {
         self.serial.next_serial()
     }
 
-    /// Whether `serial` was recently issued by this seat (for popup grab validation).
-    pub fn is_valid_serial(&self, serial: u32) -> bool {
-        self.serial.is_valid(serial)
+    /// Whether `serial` is acceptable for an `xdg_popup.grab` request.
+    ///
+    /// Prefers serials from button / key / touch events, but also accepts other
+    /// recently issued seat serials (e.g. pointer enter) for toolkit quirks.
+    pub fn is_valid_grab_serial(&self, serial: u32) -> bool {
+        self.serial.is_valid_grab(serial)
     }
 
     pub fn set_output_geometry(&mut self, width: u32, height: u32) {
@@ -568,7 +571,8 @@ impl SeatManager {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
             };
-            let serial = self.serial.next_serial();
+            // Key events may start an xdg_popup grab; retain these serials.
+            let serial = self.serial.next_grab_serial();
             client
                 .writer_mut()
                 .wl_keyboard_key(keyboard_id)
@@ -631,29 +635,19 @@ impl SeatManager {
         self.update_pointer_focus_and_motion(clients, surface_manager, time_msec, true);
     }
 
+    /// Deliver `wl_pointer.button` to the focused pointer(s).
+    ///
+    /// Pointer and keyboard focus policy (including popup-aware focus and grab
+    /// dismissal) is owned by [`crate::DisplayState::handle_pointer_button`] so
+    /// focus changes happen once with the final target.
     pub fn handle_pointer_button(
         &mut self,
         clients: &mut HashMap<ClientId, ClientConnection>,
-        surface_manager: &SurfaceManager,
+        _surface_manager: &SurfaceManager,
         time_msec: u32,
         button: u32,
         pressed: bool,
     ) {
-        if pressed {
-            // Resolve the top-most surface under the cursor before focusing; do not
-            // trust sticky pointer focus from a covered window.
-            self.update_pointer_focus_and_motion(clients, surface_manager, time_msec, false);
-            if let Some((client_id, surface)) = self
-                .pointers
-                .iter()
-                .find_map(|pointer| pointer.focus.map(|surface| (pointer.client_id, surface)))
-            {
-                if let Some(client) = clients.get_mut(&client_id) {
-                    self.focus_keyboards_on_surface(client_id, surface, client.writer_mut());
-                }
-                self.flush_pending_keyboard_leaves(clients);
-            }
-        }
         let state = if pressed {
             WL_POINTER_BUTTON_STATE_PRESSED
         } else {
@@ -669,7 +663,7 @@ impl SeatManager {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
             };
-            let serial = self.serial.next_serial();
+            let serial = self.serial.next_grab_serial();
             client
                 .writer_mut()
                 .wl_pointer_button(pointer_id)
@@ -738,7 +732,7 @@ impl SeatManager {
             let (local_x, local_y) = surface_manager
                 .surface_local_coords(client_id, surface, x, y)
                 .unwrap_or((x as f32, y as f32));
-            let serial = self.serial.next_serial();
+            let serial = self.serial.next_grab_serial();
             client
                 .writer_mut()
                 .wl_touch_down(object_id)
@@ -1030,13 +1024,21 @@ impl SeatManager {
 struct Serial {
     next_serial: u32,
     recent_serials: VecDeque<u32>,
+    /// Serials from button / key / touch events that may start an xdg_popup grab.
+    /// Kept separately so high-frequency serial consumers (modifiers, leave/enter)
+    /// cannot push a still-usable input serial out of the validation window.
+    grab_serials: VecDeque<u32>,
 }
 
 impl Serial {
+    const RECENT_CAPACITY: usize = 256;
+    const GRAB_CAPACITY: usize = 64;
+
     fn new() -> Self {
         Self {
             next_serial: 1,
             recent_serials: VecDeque::new(),
+            grab_serials: VecDeque::new(),
         }
     }
 
@@ -1044,14 +1046,23 @@ impl Serial {
         let serial = self.next_serial;
         self.next_serial = self.next_serial.wrapping_add(1);
         self.recent_serials.push_back(serial);
-        while self.recent_serials.len() > 128 {
+        while self.recent_serials.len() > Self::RECENT_CAPACITY {
             self.recent_serials.pop_front();
         }
         serial
     }
 
-    fn is_valid(&self, serial: u32) -> bool {
-        self.recent_serials.contains(&serial)
+    fn next_grab_serial(&mut self) -> u32 {
+        let serial = self.next_serial();
+        self.grab_serials.push_back(serial);
+        while self.grab_serials.len() > Self::GRAB_CAPACITY {
+            self.grab_serials.pop_front();
+        }
+        serial
+    }
+
+    fn is_valid_grab(&self, serial: u32) -> bool {
+        self.grab_serials.contains(&serial) || self.recent_serials.contains(&serial)
     }
 }
 
@@ -1110,6 +1121,26 @@ mod tests {
         seat.update_keymap(&mut clients, fake_keymap()).unwrap();
         assert_eq!(seat.keyboards.len(), 1);
         assert!(seat.keymap.is_some());
+    }
+
+    #[test]
+    fn grab_serials_survive_modifier_serial_flood() {
+        let mut serial = Serial::new();
+        let grab = serial.next_grab_serial();
+        // Modifier / leave / enter traffic must not invalidate a recent input serial.
+        for _ in 0..Serial::RECENT_CAPACITY + 8 {
+            let _ = serial.next_serial();
+        }
+        assert!(serial.is_valid_grab(grab));
+        assert!(!serial.is_valid_grab(0));
+        assert!(!serial.is_valid_grab(u32::MAX));
+    }
+
+    #[test]
+    fn recent_non_grab_serials_still_accepted_for_grab() {
+        let mut serial = Serial::new();
+        let enter = serial.next_serial();
+        assert!(serial.is_valid_grab(enter));
     }
 
     #[test]

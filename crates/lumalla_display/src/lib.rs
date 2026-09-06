@@ -263,6 +263,8 @@ impl DisplayState {
         pressed: bool,
     ) {
         if pressed {
+            // Resolve the top-most surface under the cursor before focusing; do not
+            // trust sticky pointer focus from a covered window.
             self.seat_manager.update_pointer_focus_and_motion(
                 clients,
                 &self.surface_manager,
@@ -273,6 +275,24 @@ impl DisplayState {
             if self.should_dismiss_popup_grab(click_target) {
                 self.dismiss_popup_grabs(clients);
             }
+            // Apply popup-aware keyboard focus once before the button event so
+            // clients never see a leave/enter churn on non-grabbed popups.
+            if let Some((client_id, surface)) = click_target {
+                let focus_surface = self.keyboard_focus_for_pointer_target(client_id, surface);
+                if let Some(client) = clients.get_mut(&client_id) {
+                    self.seat_manager.focus_keyboards_on_surface(
+                        client_id,
+                        focus_surface,
+                        client.writer_mut(),
+                    );
+                }
+                self.seat_manager.flush_pending_keyboard_leaves(clients);
+                self.on_surface_focused(client_id, focus_surface);
+                if let Some(client) = clients.get_mut(&client_id) {
+                    self.apply_activation(client_id, focus_surface, client.writer_mut());
+                }
+                self.flush_pending_activation_configures(clients);
+            }
         }
         self.seat_manager.handle_pointer_button(
             clients,
@@ -281,30 +301,36 @@ impl DisplayState {
             button,
             pressed,
         );
-        if pressed && let Some((client_id, surface)) = self.seat_manager.focused_keyboard_surface()
-        {
-            let focus_surface = match self.xdg_manager.popup_info_for_wl(client_id, surface) {
-                Some(popup) if !popup.grabbed => self
-                    .xdg_manager
-                    .popup_parent_wl(client_id, popup.popup_id)
-                    .unwrap_or(surface),
-                _ => surface,
-            };
-            if focus_surface != surface
-                && let Some(client) = clients.get_mut(&client_id)
-            {
-                self.seat_manager.focus_keyboards_on_surface(
-                    client_id,
-                    focus_surface,
-                    client.writer_mut(),
-                );
+    }
+
+    /// Keyboard focus target for a pointer hit, accounting for xdg popups.
+    ///
+    /// Non-grabbed popups (tooltips, some dropdowns) keep parent focus so a click
+    /// does not briefly steal keyboard focus and trigger toolkit dismiss logic.
+    fn keyboard_focus_for_pointer_target(
+        &self,
+        client_id: ClientId,
+        surface: ObjectId,
+    ) -> ObjectId {
+        let mut current = surface;
+        for _ in 0..32 {
+            match self.xdg_manager.popup_info_for_wl(client_id, current) {
+                Some(popup) if !popup.grabbed => {
+                    let Some(parent) = self
+                        .xdg_manager
+                        .popup_parent_wl(client_id, popup.popup_id)
+                    else {
+                        break;
+                    };
+                    if parent == current {
+                        break;
+                    }
+                    current = parent;
+                }
+                _ => break,
             }
-            self.on_surface_focused(client_id, focus_surface);
-            if let Some(client) = clients.get_mut(&client_id) {
-                self.apply_activation(client_id, focus_surface, client.writer_mut());
-            }
-            self.flush_pending_activation_configures(clients);
         }
+        current
     }
 
     pub fn handle_pointer_axis(

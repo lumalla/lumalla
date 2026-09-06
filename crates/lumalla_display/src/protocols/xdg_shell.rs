@@ -794,10 +794,14 @@ impl XdgPopup for DisplayState {
             report_xdg_error(ctx, object_id, XdgError::InvalidGrab);
             return;
         }
-        if !self.seat_manager.is_valid_serial(params.serial()) {
-            // Deny without a protocol error: dismiss the popup immediately.
-            ctx.writer.xdg_popup_popup_done(object_id);
-            return;
+        // Protocol allows denying a grab (which dismisses the popup). Rejecting
+        // unknown serials breaks toolkits that work on compositors which never
+        // validate (wlroots). Prefer allowing the grab and only warn.
+        if !self.seat_manager.is_valid_grab_serial(params.serial()) {
+            log::warn!(
+                "xdg_popup.grab serial {} was not issued by this seat; allowing grab anyway",
+                params.serial()
+            );
         }
         if let Err(error) = self.xdg_manager.grab_popup(ctx.client_id, object_id) {
             report_xdg_error(ctx, object_id, error);
