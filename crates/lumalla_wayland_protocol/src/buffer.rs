@@ -100,6 +100,11 @@ impl Reader {
             iov_base: usable.as_mut_ptr().cast(),
             iov_len: usable.len(),
         };
+        // io_uring RecvMsg often leaves msg_controllen at the full buffer size
+        // instead of the bytes actually written. Zero the control buffer so
+        // CMSG_NXTHDR does not walk uninitialized memory and treat leftover
+        // process FD numbers (e.g. dmabufs) as SCM_RIGHTS.
+        self.cmsg_buffer.fill(0);
         self.recv_msghdr = msghdr {
             msg_name: ptr::null_mut(),
             msg_namelen: 0,
@@ -134,6 +139,11 @@ impl Reader {
                 unsafe {
                     let mut cmsg = CMSG_FIRSTHDR(msghdr);
                     while !cmsg.is_null() {
+                        // Trailing padding when msg_controllen is the full buffer
+                        // size: stop instead of interpreting zeros/garbage as FDs.
+                        if (*cmsg).cmsg_len < mem::size_of::<cmsghdr>() {
+                            break;
+                        }
                         if (*cmsg).cmsg_level == SOL_SOCKET && (*cmsg).cmsg_type == SCM_RIGHTS {
                             if (*cmsg).cmsg_len < CMSG_LEN(0) as usize {
                                 error!("Received malformed Wayland ancillary data");
@@ -141,6 +151,12 @@ impl Reader {
                             }
                             let data_ptr = CMSG_DATA(cmsg) as *const RawFd;
                             let data_len = (*cmsg).cmsg_len - CMSG_LEN(0) as usize;
+                            if data_len % mem::size_of::<RawFd>() != 0 {
+                                error!(
+                                    "Received SCM_RIGHTS payload is not a multiple of fd size ({data_len} bytes)"
+                                );
+                                return ReadResult::EndOfStream;
+                            }
                             let fd_count = data_len / mem::size_of::<RawFd>();
 
                             let fds = slice::from_raw_parts(data_ptr, fd_count);
@@ -989,5 +1005,42 @@ mod tests {
         reader.bytes_in_buffer = BUFFER_SIZE;
         assert!(reader.recv_buffer_full());
         assert!(reader.prepare_recv_msghdr().is_none());
+    }
+
+    #[test]
+    fn prepare_recv_msghdr_zeros_cmsg_buffer() {
+        let socket = UnixStream::pair().unwrap();
+        let mut reader = Reader::new(socket.0.as_raw_fd());
+        reader.cmsg_buffer.fill(0xA5A5_A5A5_A5A5_A5A5);
+        assert!(reader.prepare_recv_msghdr().is_some());
+        assert!(reader.cmsg_buffer.iter().all(|&word| word == 0));
+    }
+
+    #[test]
+    fn reader_ignores_zero_padding_when_controllen_inflated() {
+        let socket = UnixStream::pair().unwrap();
+        let mut reader = Reader::new(socket.0.as_raw_fd());
+        assert!(reader.prepare_recv_msghdr().is_some());
+
+        let real_fd =
+            unsafe { libc::memfd_create(c"lumalla-cmsg-real".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(real_fd >= 0);
+
+        unsafe {
+            let msg = &mut reader.recv_msghdr;
+            // Mimic io_uring leaving msg_controllen at the full buffer size.
+            msg.msg_controllen = mem::size_of_val(reader.cmsg_buffer.as_ref());
+            let cmsg = CMSG_FIRSTHDR(msg);
+            assert!(!cmsg.is_null());
+            (*cmsg).cmsg_level = SOL_SOCKET;
+            (*cmsg).cmsg_type = SCM_RIGHTS;
+            (*cmsg).cmsg_len = CMSG_LEN(mem::size_of::<RawFd>() as u32) as _;
+            ptr::write(CMSG_DATA(cmsg) as *mut RawFd, real_fd);
+            // Remainder stays zeroed (as after prepare_recv_msghdr).
+        }
+
+        assert_eq!(reader.apply_recv_result(8), ReadResult::ReadData);
+        assert_eq!(reader.fds.len(), 1);
+        assert_eq!(reader.fds[0].as_raw_fd(), real_fd);
     }
 }
