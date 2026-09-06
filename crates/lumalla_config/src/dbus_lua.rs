@@ -185,7 +185,7 @@ fn init_dbus_keymap(
     module.set(
         "map_key",
         lua.create_function(move |_, keymap: ConfigKeymap| {
-            let callback = callback_state.register_callback(keymap.callback);
+            let callback = callback_state.register_keymap_callback(keymap.callback);
             dbus_result(client.proxy.map_key(KeyBindingInfo {
                 binding_id: callback.callback_id.to_string(),
                 key: keymap.key,
@@ -659,7 +659,7 @@ pub(crate) fn set_default_keymaps(
     ];
 
     for (mods, key_name, callback) in default_keymaps {
-        let callback_ref = callback_state.register_callback(callback);
+        let callback_ref = callback_state.register_keymap_callback(callback);
         client
             .proxy
             .map_key(KeyBindingInfo {
@@ -1045,7 +1045,18 @@ pub(crate) fn watch_config_files(
     Ok(())
 }
 
-pub(crate) fn reload_config_file(lua: &Lua, path: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn reload_config_file(
+    lua: &Lua,
+    client: &DbusConfigClient,
+    callback_state: &CallbackState,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    client
+        .proxy
+        .clear_keymaps()
+        .context("Failed to clear keymaps before config reload")?;
+    callback_state.forget_keymap_callbacks();
+    set_default_keymaps(lua, client, callback_state)?;
     exec_config_file(lua, path)
 }
 

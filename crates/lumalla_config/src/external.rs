@@ -125,7 +125,9 @@ impl ExternalConfig {
             }
 
             while let Ok(path) = self.reload_receiver.try_recv() {
-                if let Err(err) = reload_config_file(&self.lua, &path) {
+                if let Err(err) =
+                    reload_config_file(&self.lua, &self.client, &self.callback_state, &path)
+                {
                     warn!("Unable to reload config from {}: {err}", path.display());
                 }
             }

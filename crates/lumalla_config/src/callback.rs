@@ -1,5 +1,9 @@
 //! Module responsible for handling and managing lua callbacks.
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use anyhow::bail;
 use lumalla_shared::CallbackRef;
@@ -19,6 +23,7 @@ impl Default for CallbackState {
 
 struct CallbackStateInner {
     callbacks: HashMap<CallbackRef, LuaFunction>,
+    keymap_callbacks: HashSet<CallbackRef>,
     callback_counter: usize,
 }
 
@@ -28,6 +33,7 @@ impl CallbackState {
         Self {
             inner: Rc::new(RefCell::new(CallbackStateInner {
                 callbacks: HashMap::new(),
+                keymap_callbacks: HashSet::new(),
                 callback_counter: 1,
             })),
         }
@@ -54,6 +60,36 @@ impl CallbackState {
         inner.callback_counter += 1;
         inner.callbacks.insert(callback_ref, callback);
         callback_ref
+    }
+
+    /// Register a keymap callback that can be forgotten on config reload.
+    ///
+    /// # Example
+    /// ```
+    /// # use lumalla_config::CallbackState;
+    /// # let callback_state = CallbackState::new();
+    /// # let lua = mlua::Lua::new();
+    /// let callback = lua.create_function(|_, ()| Ok(())).expect("Failed to create callback");
+    /// let callback_ref = callback_state.register_keymap_callback(callback);
+    /// callback_state.forget_keymap_callbacks();
+    /// assert!(callback_state.run_callback::<(), ()>(callback_ref, ()).is_err());
+    /// ```
+    pub fn register_keymap_callback(&self, callback: LuaFunction) -> CallbackRef {
+        let callback_ref = self.register_callback(callback);
+        self.inner
+            .borrow_mut()
+            .keymap_callbacks
+            .insert(callback_ref);
+        callback_ref
+    }
+
+    /// Forget every callback previously registered via [`Self::register_keymap_callback`].
+    pub fn forget_keymap_callbacks(&self) {
+        let mut inner = self.inner.borrow_mut();
+        let keymap_callbacks = std::mem::take(&mut inner.keymap_callbacks);
+        for callback_ref in keymap_callbacks {
+            inner.callbacks.remove(&callback_ref);
+        }
     }
 
     /// Run a callback with the given callback reference. It propagates any errors that occur during
