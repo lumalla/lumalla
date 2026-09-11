@@ -25,7 +25,6 @@ pub enum XdgError {
     InvalidParent,
     InvalidPositioner,
     InvalidPositionerInput,
-    InvalidWindowGeometry,
     InvalidToplevelSize,
     InvalidGrab,
     InvalidSerial,
@@ -1290,15 +1289,21 @@ impl XdgManager {
         width: i32,
         height: i32,
     ) -> Result<(), XdgError> {
-        if width <= 0 || height <= 0 {
-            return Err(XdgError::InvalidWindowGeometry);
-        }
         let surface = self
             .xdg_surfaces
             .get_mut(&(client_id, xdg_surface_id))
             .ok_or(XdgError::UnknownXdgSurface)?;
         if !surface.role_alive {
             return Err(XdgError::NotConstructed);
+        }
+        // Protocol requires width/height > 0, but some clients (notably via
+        // Xwayland) send empty geometry. Disconnecting them is worse than
+        // ignoring the request; mutter does the same.
+        if width <= 0 || height <= 0 {
+            log::warn!(
+                "xdg_surface.set_window_geometry with invalid size {width}x{height}+{x}+{y}; ignoring"
+            );
+            return Ok(());
         }
         surface.pending_window_geometry = Some(WindowGeometry {
             x,
@@ -2049,6 +2054,50 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.applied_configure, Some(initial));
         assert!(manager.can_map_wl_surface(client, wl));
+    }
+
+    #[test]
+    fn invalid_window_geometry_size_is_ignored() {
+        let client = client_id(1);
+        let (xdg, wl, top) = (object_id(2), object_id(3), object_id(4));
+        let mut manager = XdgManager::default();
+        mapped_toplevel(&mut manager, client, xdg, wl, top);
+        manager
+            .set_window_geometry(client, xdg, 1, 2, 100, 80)
+            .unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, wl, None)
+            .unwrap();
+        assert_eq!(
+            manager.current_window_geometry(client, xdg).unwrap(),
+            Some(WindowGeometry {
+                x: 1,
+                y: 2,
+                width: 100,
+                height: 80
+            })
+        );
+
+        // Empty / negative sizes must not disconnect the client or clear the
+        // previously committed geometry.
+        manager
+            .set_window_geometry(client, xdg, 0, 0, 0, 0)
+            .unwrap();
+        manager
+            .set_window_geometry(client, xdg, 3, 4, -10, 20)
+            .unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, wl, None)
+            .unwrap();
+        assert_eq!(
+            manager.current_window_geometry(client, xdg).unwrap(),
+            Some(WindowGeometry {
+                x: 1,
+                y: 2,
+                width: 100,
+                height: 80
+            })
+        );
     }
 
     #[test]

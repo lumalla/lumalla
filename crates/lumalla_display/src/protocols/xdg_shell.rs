@@ -83,10 +83,6 @@ fn report_xdg_error(ctx: &mut Ctx, object_id: ObjectId, error: XdgError) {
             XDG_POSITIONER_ERROR_INVALID_INPUT,
             "Invalid positioner input",
         ),
-        XdgError::InvalidWindowGeometry => (
-            XDG_SURFACE_ERROR_INVALID_SIZE,
-            "Invalid window geometry size",
-        ),
         XdgError::InvalidToplevelSize => (XDG_TOPLEVEL_ERROR_INVALID_SIZE, "Invalid toplevel size"),
         XdgError::InvalidGrab => (XDG_POPUP_ERROR_INVALID_GRAB, "Invalid popup grab"),
         XdgError::UnknownPositioner => (
