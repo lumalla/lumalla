@@ -25,7 +25,6 @@ pub enum XdgError {
     InvalidParent,
     InvalidPositioner,
     InvalidPositionerInput,
-    InvalidToplevelSize,
     InvalidGrab,
     InvalidSerial,
     UnconfiguredBuffer,
@@ -856,13 +855,18 @@ impl XdgManager {
         width: i32,
         height: i32,
     ) -> Result<(), XdgError> {
-        if width < 0 || height < 0 {
-            return Err(XdgError::InvalidToplevelSize);
-        }
         let state = self
             .toplevels
             .get_mut(&(client_id, toplevel_id))
             .ok_or(XdgError::UnknownToplevel)?;
+        // Protocol forbids negatives, but some clients (Xwayland size hints)
+        // send them. Ignoring avoids a fatal disconnect.
+        if width < 0 || height < 0 {
+            log::warn!(
+                "xdg_toplevel.set_min_size with invalid size {width}x{height}; ignoring"
+            );
+            return Ok(());
+        }
         // Min/max are double-buffered; consistency is checked on commit so a
         // client can update both in either order before wl_surface.commit.
         state.pending_min_size = (width, height);
@@ -876,13 +880,16 @@ impl XdgManager {
         width: i32,
         height: i32,
     ) -> Result<(), XdgError> {
-        if width < 0 || height < 0 {
-            return Err(XdgError::InvalidToplevelSize);
-        }
         let state = self
             .toplevels
             .get_mut(&(client_id, toplevel_id))
             .ok_or(XdgError::UnknownToplevel)?;
+        if width < 0 || height < 0 {
+            log::warn!(
+                "xdg_toplevel.set_max_size with invalid size {width}x{height}; ignoring"
+            );
+            return Ok(());
+        }
         state.pending_max_size = (width, height);
         Ok(())
     }
@@ -1404,8 +1411,7 @@ impl XdgManager {
     /// attachment, `Some(false)` for a null attachment, and `None` when the
     /// caller cannot distinguish the attachment state.
     ///
-    /// On failure, returns the protocol object that should receive the error
-    /// (for example the xdg_toplevel for an invalid pending size pair).
+    /// On failure, returns the protocol object that should receive the error.
     pub fn on_wl_surface_commit_with_buffer(
         &mut self,
         client_id: ClientId,
@@ -1425,11 +1431,22 @@ impl XdgManager {
                 .toplevels
                 .get_mut(&(client_id, toplevel_id))
                 .ok_or((toplevel_id, XdgError::UnknownToplevel))?;
+            // Protocol forbids min > max, but buggy clients still do it.
+            // Keep the previous committed hints instead of disconnecting.
             if toplevel_size_pair_invalid(state.pending_min_size, state.pending_max_size) {
-                return Err((toplevel_id, XdgError::InvalidToplevelSize));
+                log::warn!(
+                    "xdg_toplevel pending size hints min {}x{} max {}x{} are inconsistent; ignoring",
+                    state.pending_min_size.0,
+                    state.pending_min_size.1,
+                    state.pending_max_size.0,
+                    state.pending_max_size.1
+                );
+                state.pending_min_size = state.min_size;
+                state.pending_max_size = state.max_size;
+            } else {
+                state.min_size = state.pending_min_size;
+                state.max_size = state.pending_max_size;
             }
-            state.min_size = state.pending_min_size;
-            state.max_size = state.pending_max_size;
         }
         let Some(surface) = self.xdg_surfaces.get_mut(&(client_id, xdg_id)) else {
             return Ok(outcome);
@@ -2144,19 +2161,31 @@ mod tests {
         manager
             .set_toplevel_min_size(client, top, 2000, 1000)
             .unwrap();
-        // pending max still 1920x1080 → invalid when committed
-        assert_eq!(
-            manager.on_wl_surface_commit_with_buffer(client, wl, None),
-            Err((top, XdgError::InvalidToplevelSize))
-        );
+        // pending max still 1920x1080 → inconsistent; keep previous hints
+        manager
+            .on_wl_surface_commit_with_buffer(client, wl, None)
+            .unwrap();
         assert_eq!(
             manager.toplevel_size_hints(client, top),
             Some(((1920, 1080), (1920, 1080)))
         );
 
+        // Negatives are ignored; a later valid update still applies.
+        manager
+            .set_toplevel_min_size(client, top, -1, 10)
+            .unwrap();
+        manager
+            .set_toplevel_min_size(client, top, 800, 600)
+            .unwrap();
+        manager
+            .set_toplevel_max_size(client, top, 0, 0)
+            .unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, wl, None)
+            .unwrap();
         assert_eq!(
-            manager.set_toplevel_min_size(client, top, -1, 10),
-            Err(XdgError::InvalidToplevelSize)
+            manager.toplevel_size_hints(client, top),
+            Some(((800, 600), (0, 0)))
         );
     }
 
