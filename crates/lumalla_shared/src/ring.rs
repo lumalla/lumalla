@@ -3,6 +3,7 @@
 use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -327,6 +328,17 @@ impl EventLoop {
         Ok(())
     }
 
+    /// Submit a timeout request. The deadline needs to be pinned for at least until the request is
+    /// finished.
+    pub fn submit_timeout(&mut self, deadline: Pin<&Timespec>, id: u64) -> io::Result<()> {
+        let entry = opcode::Timeout::new(deadline.get_ref() as *const Timespec)
+            .flags(TimeoutFlags::ETIME_SUCCESS)
+            .build()
+            .user_data(encode_user_data(OpKind::Timeout, id));
+        self.push(entry)?;
+        Ok(())
+    }
+
     /// Absolute timeout from a monotonic timespec (sec, nsec).
     pub fn set_absolute_timeout_timespec(&mut self, sec: u64, nsec: u32) -> io::Result<()> {
         if self.timeout_armed && self.timeout_deadline == Some((sec, nsec)) {
@@ -420,7 +432,6 @@ impl EventLoop {
     /// `Timeout` with `-ECANCELED`) are ignored so callers that refresh an
     /// absolute timeout every lap do not busy-spin on `TimeoutRemove`.
     pub fn wait(&mut self, out: &mut Vec<Completion>) -> io::Result<()> {
-        out.clear();
         loop {
             if out.is_empty() {
                 self.drain_completions(out);

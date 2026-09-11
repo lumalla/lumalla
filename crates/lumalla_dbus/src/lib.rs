@@ -6,13 +6,14 @@ mod iface;
 
 use std::{
     collections::HashMap,
+    io,
     process::Child,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
         mpsc,
     },
-    thread::{self, JoinHandle},
+    thread::{self},
 };
 
 use anyhow::Context;
@@ -101,6 +102,15 @@ impl DbusService {
     /// Notify config clients that the compositor is ready.
     pub fn emit_ready(&self) -> anyhow::Result<()> {
         emit_signal(&self.connection, signals::READY, &())
+    }
+
+    /// Set `WAYLAND_DISPLAY` used for processes spawned over D-Bus.
+    ///
+    /// Applied immediately (not via the D-Bus thread channel) so config spawns
+    /// cannot race an unset value.
+    pub fn set_wayland_display(&self, wayland_display: String) {
+        info!("Setting WAYLAND_DISPLAY for D-Bus spawns to {wayland_display}");
+        *self.wayland_display.lock().unwrap() = Some(wayland_display);
     }
 }
 
@@ -339,15 +349,20 @@ impl DbusState {
 }
 
 /// Run the D-Bus message loop on a dedicated thread.
+/// Returns the tread id of the newly created thread.
 pub fn run_thread(
     comms: Comms,
     event_loop: EventLoop,
     channel: mpsc::Receiver<DbusMessage>,
     service: DbusService,
-) -> anyhow::Result<JoinHandle<()>> {
+) -> io::Result<i32> {
+    let thread_id = Arc::new(AtomicI32::new(0));
+    let thread_id_for_thread = thread_id.clone();
     thread::Builder::new()
         .name(String::from("dbus"))
         .spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+            thread_id_for_thread.store(tid, Ordering::Release);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut state = DbusState::new(event_loop, channel, service);
                 state.run().context("D-Bus thread exited with an error")
@@ -358,8 +373,14 @@ pub fn run_thread(
                 Err(ref err) => error!("D-Bus thread panicked: {err:?}"),
             }
             comms.main(MainMessage::Shutdown);
-        })
-        .context("Unable to spawn D-Bus thread")
+        })?;
+    loop {
+        let tid = thread_id.load(Ordering::Acquire);
+        if tid != 0 {
+            return Ok(tid);
+        }
+        std::hint::spin_loop();
+    }
 }
 
 #[cfg(test)]

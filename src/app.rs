@@ -2,15 +2,16 @@ use std::{
     collections::HashMap,
     io,
     num::NonZeroU32,
-    os::fd::RawFd,
+    os::fd::{FromRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
     pin::Pin,
     sync::mpsc::Receiver,
-    thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::Context;
+use io_uring::types::Timespec;
+use libc::PIDFD_THREAD;
 use log::{debug, error, info, warn};
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::{
@@ -25,17 +26,18 @@ use lumalla_renderer::{
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
-    OpKind, encode_user_data, message_loop_with_channel, monotonic_deadline_after,
-    ring::MESSAGE_CHANNEL_TOKEN,
+    OpKind, encode_user_data, message_loop_with_channel, ring::MESSAGE_CHANNEL_TOKEN,
 };
 
 use crate::args::Args;
 
-pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1000);
+pub static SHUTDOWN_TIMEOUT_TIMESPEC: Timespec = Timespec::new().sec(1);
 pub const LIBSEAT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 1;
 pub const LIBINPUT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 2;
 pub const UDEV_DRM_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 3;
 pub const WAYLAND_ACCEPT_ID: u64 = MESSAGE_CHANNEL_TOKEN + 4;
+pub const DBUS_THREAD_FINISHED_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 5;
+pub const SHUTDOWN_TIMEOUT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 6;
 /// DRM primary-node fds use this high token range to avoid Wayland client tokens.
 pub const DRM_DEVICE_TOKEN_BASE: u64 = 1 << 16;
 
@@ -47,12 +49,13 @@ struct DrmDeviceRegistration {
 /// Represents the data for the main app thread
 struct AppData {
     comms: Comms,
-    dbus_join_handle: JoinHandle<()>,
+    _dbus_thread_completion_fd: OwnedFd,
     // `seat_state` must outlive `input_state`; fields drop in reverse declaration order.
     seat_state: Pin<Box<SeatState>>,
     input_state: InputState,
     shutting_down: bool,
-    shutdown_timeout_at: Option<Instant>,
+    shutdown_now: bool,
+    dbus_thread_finished: bool,
     wayland: Wayland,
     connected_clients: HashMap<ClientId, ClientConnection>,
     display_state: DisplayState,
@@ -66,7 +69,7 @@ struct AppData {
 impl AppData {
     fn new(
         comms: Comms,
-        dbus_join_handle: JoinHandle<()>,
+        _dbus_thread_completion_fd: OwnedFd,
         seat_state: Pin<Box<SeatState>>,
         input_state: InputState,
         wayland: Wayland,
@@ -75,11 +78,12 @@ impl AppData {
     ) -> Self {
         Self {
             comms,
-            dbus_join_handle,
+            _dbus_thread_completion_fd,
             seat_state,
             input_state,
             shutting_down: false,
-            shutdown_timeout_at: None,
+            shutdown_now: false,
+            dbus_thread_finished: false,
             wayland,
             connected_clients: HashMap::new(),
             display_state,
@@ -97,63 +101,12 @@ impl AppData {
         main_channel: Receiver<MainMessage>,
     ) -> anyhow::Result<()> {
         let mut completions = Vec::with_capacity(64);
-        // Last Instant we armed on the uring timeout; re-arm only when it changes
-        // so a stable present deadline does not churn TimeoutRemove every lap.
-        let mut armed_wake_at: Option<Instant> = None;
-        loop {
-            let now = Instant::now();
-            let (shutdown_now, shutdown_wake_at) = self.check_for_shutdown();
-            if shutdown_now {
-                break;
-            }
-
-            let scene_dirty = self.renderer_state.scene_dirty();
-            let pending_callbacks = self.pending_present_work();
-            let flip_idle = self.renderer_state.flip_idle();
-            let render_wake_at =
-                self.render_scheduler
-                    .next_wake_at(now, scene_dirty, pending_callbacks, flip_idle);
-            let wake_at = match (shutdown_wake_at, render_wake_at) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-
+        while !self.shutdown_now {
             self.ensure_pending_io(event_loop);
-
-            if wake_at.is_some_and(|at| at <= now) {
-                // Work is due now: never arm a zero/past uring timeout.
-                if armed_wake_at.take().is_some() {
-                    event_loop.clear_timeout()?;
-                }
-                if let Err(err) = event_loop.submit_and_drain(&mut completions) {
-                    warn!("Unable to drain event loop: {err}");
-                }
-            } else {
-                match wake_at {
-                    Some(at) => {
-                        if armed_wake_at != Some(at) {
-                            let remaining = at.saturating_duration_since(now);
-                            // Only future deadlines reach this branch.
-                            debug_assert!(!remaining.is_zero());
-                            let (sec, nsec) = monotonic_deadline_after(remaining)?;
-                            event_loop.set_absolute_timeout_timespec(sec, nsec)?;
-                            armed_wake_at = Some(at);
-                        }
-                    }
-                    None => {
-                        if armed_wake_at.take().is_some() {
-                            event_loop.clear_timeout()?;
-                        }
-                    }
-                }
-
-                if let Err(err) = event_loop.wait(&mut completions) {
-                    warn!("Unable to wait on event loop: {err}");
-                }
+            if let Err(err) = event_loop.wait(&mut completions) {
+                warn!("Unable to wait on event loop: {err}");
             }
-
+            let now = Instant::now();
             for completion in completions.drain(..) {
                 if let Err(err) = self.handle_completion(event_loop, &main_channel, completion, now)
                 {
@@ -183,14 +136,16 @@ impl AppData {
         event_loop: &mut EventLoop,
         main_channel: &Receiver<MainMessage>,
         completion: Completion,
-        now: Instant,
+        _now: Instant,
     ) -> anyhow::Result<()> {
         match completion.kind {
             OpKind::Wake => {
-                self.handle_channel_messages(main_channel, event_loop, now)?;
+                self.handle_channel_messages(main_channel, event_loop)?;
                 event_loop.rearm_waker()?;
             }
-            OpKind::Timeout => {}
+            OpKind::Timeout => {
+                self.handle_timeout(completion);
+            }
             OpKind::Cancel => {}
             OpKind::Accept => {
                 if completion.result >= 0 {
@@ -238,6 +193,12 @@ impl AppData {
         }
 
         match token {
+            DBUS_THREAD_FINISHED_TOKEN => {
+                self.dbus_thread_finished = true;
+                if self.shutting_down {
+                    self.shutdown_now = true;
+                }
+            }
             LIBSEAT_TOKEN => {
                 if let Err(err) = self.seat_state.dispatch() {
                     error!("Unable to dispatch seat events: {err}");
@@ -609,7 +570,6 @@ impl AppData {
         &mut self,
         main_channel: &Receiver<MainMessage>,
         event_loop: &mut EventLoop,
-        now: Instant,
     ) -> anyhow::Result<()> {
         while let Ok(msg) = main_channel.try_recv() {
             match msg {
@@ -787,7 +747,7 @@ impl AppData {
                 }
                 MainMessage::Shutdown => {
                     if !self.shutting_down {
-                        self.init_shutdown(now);
+                        self.init_shutdown(event_loop);
                     }
                 }
                 MainMessage::InjectInput(input) => {
@@ -1334,6 +1294,13 @@ impl AppData {
         Ok(())
     }
 
+    fn handle_timeout(&mut self, completion: Completion) {
+        if completion.id == SHUTDOWN_TIMEOUT_TOKEN {
+            info!("Shutdown timeout reached. Shutting down now");
+            self.shutdown_now = true;
+        }
+    }
+
     fn maybe_complete_frame_callbacks(&mut self, status: PresentStatus) {
         if !status.idle || self.display_state.pending_frame_callback_count() == 0 {
             return;
@@ -1386,30 +1353,19 @@ impl AppData {
         Ok(())
     }
 
-    fn init_shutdown(&mut self, now: Instant) {
+    fn init_shutdown(&mut self, event_loop: &mut EventLoop) {
         self.shutting_down = true;
         self.comms.dbus(DbusMessage::Shutdown);
-        self.shutdown_timeout_at = Some(now + SHUTDOWN_TIMEOUT);
-    }
-
-    fn check_for_shutdown(&mut self) -> (bool, Option<Instant>) {
-        if !self.shutting_down {
-            return (false, None);
+        if self.dbus_thread_finished {
+            self.shutdown_now = true;
+            return;
         }
-        let shutdown_wake_at = if let Some(timeout) = self.shutdown_timeout_at {
-            let now = Instant::now();
-            if now >= timeout {
-                info!("Shutdown timeout reached. Shutting down now");
-                return (true, None);
-            }
-            Some(timeout)
-        } else {
-            None
-        };
-        if !self.dbus_join_handle.is_finished() {
-            return (false, shutdown_wake_at);
+        if let Err(err) =
+            event_loop.submit_timeout(Pin::new(&SHUTDOWN_TIMEOUT_TIMESPEC), SHUTDOWN_TIMEOUT_TOKEN)
+        {
+            error!("Unable to schedule shutdown timeout: {err}. Shutting down now",);
+            self.shutdown_now = true;
         }
-        (true, shutdown_wake_at)
     }
 
     fn pending_present_work(&self) -> bool {
@@ -1433,8 +1389,9 @@ pub(crate) fn run_app(
     let wayland = init_and_register_wayland_display(args.socket_path, &mut main_event_loop)?;
     let mut renderer_state = init_and_register_renderer_state(&mut main_event_loop)?;
     let display_state = init_display_state(&input_state, &mut renderer_state);
-    let dbus_join_handle = start_dbus_service(
+    let dbus_thread_completion_fd = start_dbus_service(
         comms.clone(),
+        &mut main_event_loop,
         dbus_event_loop,
         dbus_channel,
         &mut renderer_state,
@@ -1444,7 +1401,7 @@ pub(crate) fn run_app(
     )?;
     let mut data = AppData::new(
         comms,
-        dbus_join_handle,
+        dbus_thread_completion_fd,
         seat_state,
         input_state,
         wayland,
@@ -1506,14 +1463,13 @@ fn init_and_register_wayland_display(
     Ok(wayland)
 }
 
-fn set_wayland_display(comms: &Comms, wayland_socket_path: &Path) -> anyhow::Result<()> {
+fn set_wayland_display(service: &DbusService, wayland_socket_path: &Path) {
     let wayland_display = wayland_socket_path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    comms.dbus(DbusMessage::SetWaylandDisplay(wayland_display));
-    Ok(())
+    service.set_wayland_display(wayland_display);
 }
 
 fn init_display_state(
@@ -1570,25 +1526,39 @@ fn init_and_register_input_state(
 
 fn start_dbus_service(
     comms: Comms,
+    main_event_loop: &mut EventLoop,
     dbus_event_loop: EventLoop,
     dbus_channel: Receiver<DbusMessage>,
     renderer_state: &mut RendererState,
     wayland: &Wayland,
     config_command: Option<String>,
     config_args: Option<Vec<String>>,
-) -> anyhow::Result<JoinHandle<()>> {
+) -> anyhow::Result<OwnedFd> {
     let dbus_service =
         DbusService::register(comms.clone()).context("Failed to register D-Bus service")?;
+    // Set before any Spawn so D-Bus method spawns never see an unset display.
+    set_wayland_display(&dbus_service, wayland.socket_path());
     comms.dbus(DbusMessage::SetDrmDevices(
         renderer_state.drm_device_states(),
     ));
-    set_wayland_display(&comms, wayland.socket_path())?;
     if let Some(config_command) = config_command {
         comms.dbus(DbusMessage::Spawn {
             command: config_command,
             args: config_args.unwrap_or_default(),
         });
     }
-    run_dbus_thread(comms, dbus_event_loop, dbus_channel, dbus_service)
-        .context("Unable to run D-Bus thread")
+    let dbus_thread_id = run_dbus_thread(comms, dbus_event_loop, dbus_channel, dbus_service)?;
+    let thread_complete_fd =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, dbus_thread_id, PIDFD_THREAD) } as RawFd;
+    if thread_complete_fd < 0 {
+        return Err(io::Error::last_os_error()).context("Unable to open thread completion fd")?;
+    }
+    main_event_loop
+        .submit_poll(
+            thread_complete_fd,
+            Interest::READABLE,
+            DBUS_THREAD_FINISHED_TOKEN,
+        )
+        .context("Unable to poll dbus thread completion pid")?;
+    Ok(unsafe { OwnedFd::from_raw_fd(thread_complete_fd) })
 }
