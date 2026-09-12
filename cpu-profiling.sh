@@ -46,7 +46,7 @@ echo "Recording CPU profile for scenario '${scenario}' to ${perf_data}"
 status=0
 perf record --no-inherit --mmap-pages=32 -F 99 -g --call-graph fp -o "$perf_data" -- \
   ./target/profiling/lumalla \
-  -- ./target/profiling/lumalla-config \
+  -- ./target/profiling/lumalla_config \
   --config "$config" \
   "$@" || status=$?
 

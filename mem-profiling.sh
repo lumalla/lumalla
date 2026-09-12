@@ -42,7 +42,7 @@ echo "Recording memory profile for scenario '${scenario}' to ${heap_output}"
 status=0
 heaptrack -o "$heap_output" \
   ./target/profiling/lumalla \
-  -- ./target/profiling/lumalla-config \
+  -- ./target/profiling/lumalla_config \
   --config "$config" \
   "$@" || status=$?
 
