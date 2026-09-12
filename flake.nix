@@ -63,6 +63,18 @@
           text = builtins.readFile ./run-local.sh;
         };
 
+        repl = pkgs.writeShellApplication {
+          name = "lumalla-repl";
+          runtimeInputs = [pkgs.socat];
+          text = builtins.readFile ./repl.sh;
+        };
+
+        replLocal = pkgs.writeShellApplication {
+          name = "lumalla-repl-local";
+          runtimeInputs = [pkgs.socat];
+          text = builtins.readFile ./repl-local.sh;
+        };
+
         cpuProfiling = pkgs.writeShellApplication {
           name = "lumalla-cpu-profiling";
           runtimeInputs = cargoRuntimeInputs ++ (with pkgs; [
@@ -109,12 +121,24 @@
         packages.lumalla = lumalla;
         packages.lumalla-config = lumallaConfig;
         packages.run-local = runLocal;
+        packages.lumalla-repl = repl;
+        packages.lumalla-repl-local = replLocal;
         packages.cpu-profiling = cpuProfiling;
         packages.mem-profiling = memProfiling;
 
         apps.run-local = {
           type = "app";
           program = "${runLocal}/bin/lumalla-run-local";
+        };
+
+        apps.lumalla-repl = {
+          type = "app";
+          program = "${repl}/bin/lumalla-repl";
+        };
+
+        apps.lumalla-repl-local = {
+          type = "app";
+          program = "${replLocal}/bin/lumalla-repl-local";
         };
 
         apps.cpu-profiling = {
@@ -157,6 +181,8 @@
             heaptrack
             xwayland-satellite
             runLocal
+            repl
+            replLocal
             cpuProfiling
             memProfiling
           ];

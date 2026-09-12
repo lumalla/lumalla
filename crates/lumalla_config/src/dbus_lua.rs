@@ -1084,6 +1084,252 @@ fn exec_config_file(lua: &Lua, path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Expose `require("lumalla")` as a global for REPL convenience.
+pub(crate) fn prepare_repl_env(lua: &Lua) -> anyhow::Result<()> {
+    let lumalla: LuaTable = lua
+        .load("return require('lumalla')")
+        .eval()
+        .map_err(|err| anyhow::anyhow!("Unable to preload lumalla for REPL: {err}"))?;
+    lua.globals()
+        .set("lumalla", lumalla)
+        .map_err(|err| anyhow::anyhow!("Unable to set lumalla global: {err}"))?;
+    Ok(())
+}
+
+/// Evaluate a REPL line in the config Lua VM.
+///
+/// Tries the chunk as an expression first (so `1+2` prints a value), then as a
+/// statement chunk (same as config files). Only prints when the chunk returns
+/// values — bare assignments print nothing.
+pub(crate) fn eval_repl_chunk(lua: &Lua, chunk: &str) -> Result<String, String> {
+    let trimmed = chunk.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+
+    let function = match lua.load(format!("return {trimmed}")).into_function() {
+        Ok(function) => function,
+        Err(_) => lua
+            .load(trimmed)
+            .into_function()
+            .map_err(|err| err.to_string())?,
+    };
+
+    let values: mlua::MultiValue = function.call(()).map_err(|err| err.to_string())?;
+    if values.is_empty() {
+        return Ok(String::new());
+    }
+
+    Ok(values
+        .iter()
+        .map(|value| format_lua_value(value, 0, &mut Vec::new()))
+        .collect::<Vec<_>>()
+        .join("\t"))
+}
+
+const REPL_MAX_DEPTH: usize = 8;
+const REPL_MAX_ENTRIES: usize = 64;
+
+fn format_lua_value(
+    value: &LuaValue,
+    depth: usize,
+    visited: &mut Vec<*const std::ffi::c_void>,
+) -> String {
+    match value {
+        LuaValue::Nil => String::from("nil"),
+        LuaValue::Boolean(b) => b.to_string(),
+        LuaValue::Integer(i) => i.to_string(),
+        LuaValue::Number(n) => format_lua_number(*n),
+        LuaValue::String(s) => format_lua_string(s),
+        LuaValue::Table(table) => format_lua_table(table, depth, visited),
+        LuaValue::Function(_) => String::from("<function>"),
+        LuaValue::Thread(_) => String::from("<thread>"),
+        LuaValue::UserData(_) => String::from("<userdata>"),
+        LuaValue::LightUserData(_) => String::from("<lightuserdata>"),
+        LuaValue::Error(err) => format!("<error: {err}>"),
+        _ => format!("{value:?}"),
+    }
+}
+
+fn format_lua_number(n: f64) -> String {
+    if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+        format!("{}", n as i64)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_lua_string(s: &mlua::String) -> String {
+    match s.to_str() {
+        Ok(text) => format!("\"{}\"", escape_lua_string(&text)),
+        Err(_) => format!("{:?}", s.as_bytes()),
+    }
+}
+
+fn escape_lua_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn format_lua_table(
+    table: &LuaTable,
+    depth: usize,
+    visited: &mut Vec<*const std::ffi::c_void>,
+) -> String {
+    let ptr = LuaValue::Table(table.clone()).to_pointer();
+    if visited.contains(&ptr) {
+        return String::from("{...}");
+    }
+    if depth >= REPL_MAX_DEPTH {
+        return String::from("{...}");
+    }
+
+    visited.push(ptr);
+    let mut entries = Vec::new();
+    let mut truncated = false;
+
+    let pairs = table.pairs::<LuaValue, LuaValue>();
+    for (index, pair) in pairs.enumerate() {
+        if index >= REPL_MAX_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let Ok((key, value)) = pair else {
+            truncated = true;
+            break;
+        };
+        let key_text = format_table_key(&key, depth + 1, visited);
+        let value_text = format_lua_value(&value, depth + 1, visited);
+        entries.push(format!("{key_text} = {value_text}"));
+    }
+
+    visited.pop();
+
+    if entries.is_empty() {
+        return String::from("{}");
+    }
+
+    let indent = "  ".repeat(depth + 1);
+    let closing = "  ".repeat(depth);
+    let mut out = String::from("{\n");
+    for entry in &entries {
+        out.push_str(&indent);
+        out.push_str(entry);
+        out.push(',');
+        out.push('\n');
+    }
+    if truncated {
+        out.push_str(&indent);
+        out.push_str("...");
+        out.push('\n');
+    }
+    out.push_str(&closing);
+    out.push('}');
+    out
+}
+
+fn format_table_key(
+    key: &LuaValue,
+    depth: usize,
+    visited: &mut Vec<*const std::ffi::c_void>,
+) -> String {
+    match key {
+        LuaValue::String(s) => match s.to_str() {
+            Ok(text) if is_lua_identifier(&text) => text.to_owned(),
+            Ok(text) => format!("[\"{}\"]", escape_lua_string(&text)),
+            Err(_) => format!("[{:?}]", s.as_bytes()),
+        },
+        LuaValue::Integer(i) => format!("[{i}]"),
+        LuaValue::Number(n) => format!("[{}]", format_lua_number(*n)),
+        LuaValue::Boolean(b) => format!("[{b}]"),
+        other => format!("[{}]", format_lua_value(other, depth, visited)),
+    }
+}
+
+fn is_lua_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[cfg(test)]
+mod repl_eval_tests {
+    use super::{eval_repl_chunk, format_lua_value};
+    use mlua::{Lua, Value as LuaValue};
+
+    #[test]
+    fn evaluates_expressions() {
+        let lua = Lua::new();
+        assert_eq!(eval_repl_chunk(&lua, "1 + 2").unwrap(), "3");
+        assert_eq!(eval_repl_chunk(&lua, "\"hi\"").unwrap(), "\"hi\"");
+        assert_eq!(eval_repl_chunk(&lua, "true").unwrap(), "true");
+    }
+
+    #[test]
+    fn evaluates_statements_then_reads_globals() {
+        let lua = Lua::new();
+        assert_eq!(eval_repl_chunk(&lua, "x = 40 + 2").unwrap(), "");
+        assert_eq!(eval_repl_chunk(&lua, "x").unwrap(), "42");
+    }
+
+    #[test]
+    fn evaluates_return_chunks() {
+        let lua = Lua::new();
+        assert_eq!(eval_repl_chunk(&lua, "return 7").unwrap(), "7");
+    }
+
+    #[test]
+    fn surfaces_lua_errors() {
+        let lua = Lua::new();
+        let err = eval_repl_chunk(&lua, "error('boom')").unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn formats_nil() {
+        assert_eq!(format_lua_value(&LuaValue::Nil, 0, &mut Vec::new()), "nil");
+    }
+
+    #[test]
+    fn pretty_prints_tables() {
+        let lua = Lua::new();
+        let out = eval_repl_chunk(&lua, "{ name = \"a\", n = 1, nested = { ok = true } }").unwrap();
+        assert!(out.contains("name = \"a\""), "{out}");
+        assert!(out.contains("n = 1"), "{out}");
+        assert!(out.contains("ok = true"), "{out}");
+    }
+
+    #[test]
+    fn pretty_prints_array_keys() {
+        let lua = Lua::new();
+        let out = eval_repl_chunk(&lua, "{ \"x\", \"y\" }").unwrap();
+        assert!(out.contains("[1] = \"x\""), "{out}");
+        assert!(out.contains("[2] = \"y\""), "{out}");
+    }
+
+    #[test]
+    fn pretty_prints_cycles_without_looping() {
+        let lua = Lua::new();
+        assert_eq!(eval_repl_chunk(&lua, "t = {}; t.self = t; return t").unwrap().contains("{...}"), true);
+    }
+}
+
 pub(crate) fn outputs_from_infos(outputs: Vec<OutputInfo>) -> HashMap<String, Output> {
     outputs
         .into_iter()

@@ -20,9 +20,11 @@ use crate::args::Args;
 use crate::callback::CallbackState;
 use crate::config_watcher::ConfigWatcher;
 use crate::dbus_lua::{
-    ConfigOutput, DbusConfigClient, load_config_files, outputs_from_infos, register_dbus_module,
-    reload_config_file, set_default_keymaps, watch_config_files,
+    ConfigOutput, DbusConfigClient, eval_repl_chunk, load_config_files, outputs_from_infos,
+    prepare_repl_env, register_dbus_module, reload_config_file, set_default_keymaps,
+    watch_config_files,
 };
+use crate::repl::{ReplRequest, ReplResponse, start_repl_server};
 
 enum RunEvent {
     Signal(Message),
@@ -41,6 +43,7 @@ pub struct ExternalConfig {
     outputs: HashMap<String, Output>,
     config_watcher: ConfigWatcher,
     reload_receiver: mpsc::Receiver<PathBuf>,
+    repl_socket: Option<PathBuf>,
     shutting_down: bool,
     startup_done: bool,
 }
@@ -56,6 +59,7 @@ impl ExternalConfig {
         let on_drm_devices_change = Rc::new(RefCell::new(None));
         let (reload_tx, reload_receiver) = mpsc::channel();
         let config_watcher = ConfigWatcher::new(reload_tx)?;
+        let repl_socket = args.repl_socket_path()?;
 
         register_dbus_module(
             &lua,
@@ -76,6 +80,7 @@ impl ExternalConfig {
             outputs: HashMap::new(),
             config_watcher,
             reload_receiver,
+            repl_socket,
             shutting_down: false,
             startup_done: false,
         };
@@ -136,6 +141,15 @@ impl ExternalConfig {
             self.client.compositor_unique_name
         );
 
+        let repl_receiver = if let Some(socket_path) = self.repl_socket.clone() {
+            prepare_repl_env(&self.lua)?;
+            let (repl_tx, repl_rx) = mpsc::channel();
+            start_repl_server(socket_path, repl_tx)?;
+            Some(repl_rx)
+        } else {
+            None
+        };
+
         // Ready may have been emitted before we subscribed; pick it up via is_ready.
         if self.client.proxy.is_ready().unwrap_or(false) {
             self.handle_ready()?;
@@ -151,6 +165,12 @@ impl ExternalConfig {
                     reload_config_file(&self.lua, &self.client, &self.callback_state, &path)
                 {
                     warn!("Unable to reload config from {}: {err}", path.display());
+                }
+            }
+
+            if let Some(repl_rx) = &repl_receiver {
+                while let Ok(request) = repl_rx.try_recv() {
+                    self.handle_repl_request(request);
                 }
             }
 
@@ -183,6 +203,16 @@ impl ExternalConfig {
         }
 
         Ok(())
+    }
+
+    fn handle_repl_request(&self, request: ReplRequest) {
+        let response = match eval_repl_chunk(&self.lua, &request.chunk) {
+            Ok(text) => ReplResponse { ok: true, text },
+            Err(text) => ReplResponse { ok: false, text },
+        };
+        if request.reply.send(response).is_err() {
+            warn!("REPL client disconnected before receiving response");
+        }
     }
 
     fn handle_signal(&mut self, message: Message) -> anyhow::Result<()> {
