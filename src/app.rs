@@ -39,6 +39,7 @@ pub const UDEV_DRM_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 3;
 pub const WAYLAND_ACCEPT_ID: u64 = MESSAGE_CHANNEL_TOKEN + 4;
 pub const DBUS_THREAD_FINISHED_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 5;
 pub const SHUTDOWN_TIMEOUT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 6;
+pub const PRESENT_WAKE_TIMEOUT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 7;
 /// DRM primary-node fds use this high token range to avoid Wayland client tokens.
 pub const DRM_DEVICE_TOKEN_BASE: u64 = 1 << 16;
 
@@ -65,6 +66,10 @@ struct AppData {
     frame_clock: Instant,
     drm_device_poll: HashMap<PathBuf, DrmDeviceRegistration>,
     next_drm_device_token: usize,
+    /// Caller-owned timespec for the present-wake absolute timeout SQE.
+    present_wake_ts: Box<Timespec>,
+    present_wake_deadline: Option<(u64, u32)>,
+    present_wake_armed: bool,
 }
 
 impl AppData {
@@ -93,6 +98,9 @@ impl AppData {
             frame_clock: Instant::now(),
             drm_device_poll: HashMap::new(),
             next_drm_device_token: 0,
+            present_wake_ts: Box::new(Timespec::new()),
+            present_wake_deadline: None,
+            present_wake_armed: false,
         }
     }
 
@@ -1177,8 +1185,8 @@ impl AppData {
 
     /// Arm (or run) the next present based on [`RenderScheduler::next_wake_at`].
     ///
-    /// Future deadlines use the absolute io_uring timeout slot. Due-now work is
-    /// presented inline — never arm a past/zero timeout.
+    /// Future deadlines use an absolute io_uring timeout owned by this app.
+    /// Due-now work is presented inline — never arm a past/zero timeout.
     fn arm_present_wake(&mut self, event_loop: &mut EventLoop) -> io::Result<()> {
         let now = Instant::now();
         let wake_at = self.render_scheduler.next_wake_at(
@@ -1188,9 +1196,9 @@ impl AppData {
             self.renderer_state.flip_idle(),
         );
         match wake_at {
-            None => event_loop.clear_timeout(),
+            None => self.clear_present_wake(event_loop),
             Some(at) if at <= now => {
-                event_loop.clear_timeout()?;
+                self.clear_present_wake(event_loop)?;
                 self.tick_render_scheduler(event_loop);
                 // After present, a flip is usually in flight (`None`). If a
                 // future deadline remains, arm it without re-entering due-now.
@@ -1205,7 +1213,7 @@ impl AppData {
                     Some(at) if at > now => {
                         let remaining = at.saturating_duration_since(now);
                         let (sec, nsec) = monotonic_deadline_after(remaining)?;
-                        event_loop.set_absolute_timeout_timespec(sec, nsec)
+                        self.set_present_wake(event_loop, sec, nsec)
                     }
                     _ => Ok(()),
                 }
@@ -1214,9 +1222,43 @@ impl AppData {
                 let remaining = at.saturating_duration_since(now);
                 debug_assert!(!remaining.is_zero());
                 let (sec, nsec) = monotonic_deadline_after(remaining)?;
-                event_loop.set_absolute_timeout_timespec(sec, nsec)
+                self.set_present_wake(event_loop, sec, nsec)
             }
         }
+    }
+
+    fn clear_present_wake(&mut self, event_loop: &mut EventLoop) -> io::Result<()> {
+        if !self.present_wake_armed {
+            self.present_wake_deadline = None;
+            return Ok(());
+        }
+        event_loop.cancel_timeout(PRESENT_WAKE_TIMEOUT_TOKEN)?;
+        self.present_wake_armed = false;
+        self.present_wake_deadline = None;
+        Ok(())
+    }
+
+    fn set_present_wake(
+        &mut self,
+        event_loop: &mut EventLoop,
+        sec: u64,
+        nsec: u32,
+    ) -> io::Result<()> {
+        if self.present_wake_armed && self.present_wake_deadline == Some((sec, nsec)) {
+            return Ok(());
+        }
+        if self.present_wake_armed {
+            event_loop.cancel_timeout(PRESENT_WAKE_TIMEOUT_TOKEN)?;
+            self.present_wake_armed = false;
+        }
+        *self.present_wake_ts = Timespec::new().sec(sec).nsec(nsec);
+        event_loop.submit_timeout_absolute(
+            Pin::new(self.present_wake_ts.as_ref()),
+            PRESENT_WAKE_TIMEOUT_TOKEN,
+        )?;
+        self.present_wake_armed = true;
+        self.present_wake_deadline = Some((sec, nsec));
+        Ok(())
     }
 
     fn mark_present_dirty(&mut self, event_loop: &mut EventLoop) {
@@ -1308,14 +1350,21 @@ impl AppData {
     }
 
     fn handle_timeout(&mut self, event_loop: &mut EventLoop, completion: Completion) {
-        if completion.id == SHUTDOWN_TIMEOUT_TOKEN {
-            info!("Shutdown timeout reached. Shutting down now");
-            self.shutdown_now = true;
-            return;
-        }
-        // Absolute present-wake timeout (id is EventLoop timeout_generation).
-        if let Err(err) = self.arm_present_wake(event_loop) {
-            warn!("Unable to handle present wake timeout: {err}");
+        match completion.id {
+            SHUTDOWN_TIMEOUT_TOKEN if self.shutting_down => {
+                info!("Shutdown timeout reached. Shutting down now");
+                self.shutdown_now = true;
+            }
+            PRESENT_WAKE_TIMEOUT_TOKEN => {
+                self.present_wake_armed = false;
+                self.present_wake_deadline = None;
+                if let Err(err) = self.arm_present_wake(event_loop) {
+                    warn!("Unable to handle present wake timeout: {err}");
+                }
+            }
+            other => {
+                warn!("Ignoring unexpected timeout completion id={other}");
+            }
         }
     }
 
@@ -1382,6 +1431,11 @@ impl AppData {
         if self.dbus_thread_finished {
             self.shutdown_now = true;
             return;
+        }
+        // Drop any present-wake absolute timeout so it cannot race with the
+        // one-shot shutdown timeout below.
+        if let Err(err) = self.clear_present_wake(event_loop) {
+            warn!("Unable to clear present wake before shutdown timeout: {err}");
         }
         if let Err(err) =
             event_loop.submit_timeout(Pin::new(&SHUTDOWN_TIMEOUT_TIMESPEC), SHUTDOWN_TIMEOUT_TOKEN)

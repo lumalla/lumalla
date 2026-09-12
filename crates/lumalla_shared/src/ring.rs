@@ -117,12 +117,6 @@ impl Interest {
 pub struct EventLoop {
     ring: IoUring,
     inflight: u32,
-    /// Stable storage for the absolute timeout timespec while the SQE is in flight.
-    timeout_ts: Box<Timespec>,
-    timeout_armed: bool,
-    timeout_generation: u64,
-    /// Last absolute deadline submitted (`None` if cleared / never armed).
-    timeout_deadline: Option<(u64, u32)>,
     waker_fd: OwnedFd,
     /// Buffer for the permanent eventfd Read SQE.
     waker_buf: Box<u64>,
@@ -141,10 +135,6 @@ impl EventLoop {
         let mut loop_ = Self {
             ring,
             inflight: 0,
-            timeout_ts: Box::new(Timespec::new()),
-            timeout_armed: false,
-            timeout_generation: 0,
-            timeout_deadline: None,
             waker_fd,
             waker_buf: Box::new(0),
             waker_armed: false,
@@ -322,69 +312,36 @@ impl EventLoop {
         self.push(entry)
     }
 
-    /// Arm or replace an absolute CLOCK_MONOTONIC timeout.
-    ///
-    /// `Some(duration)` is interpreted as a deadline `duration` from now.
-    pub fn set_absolute_timeout(&mut self, deadline: Option<Duration>) -> io::Result<()> {
-        let Some(deadline) = deadline else {
-            return self.clear_timeout_deadline();
-        };
-        let (abs_sec, abs_nsec) = monotonic_deadline_after(deadline)?;
-        self.set_absolute_timeout_timespec(abs_sec, abs_nsec)
-    }
-
-    fn clear_timeout_deadline(&mut self) -> io::Result<()> {
-        if self.timeout_armed {
-            let old = encode_user_data(OpKind::Timeout, self.timeout_generation);
-            let entry = opcode::TimeoutRemove::new(old)
-                .build()
-                .user_data(encode_user_data(OpKind::Cancel, self.timeout_generation));
-            self.push(entry)?;
-            self.timeout_armed = false;
-        }
-        self.timeout_deadline = None;
-        Ok(())
-    }
-
-    /// Submit a timeout request. The deadline needs to be pinned for at least until the request is
-    /// finished.
+    /// Submit a relative timeout. Caller must keep `deadline` valid until the CQE.
     pub fn submit_timeout(&mut self, deadline: Pin<&Timespec>, id: u64) -> io::Result<()> {
         let entry = opcode::Timeout::new(deadline.get_ref() as *const Timespec)
             .flags(TimeoutFlags::ETIME_SUCCESS)
             .build()
             .user_data(encode_user_data(OpKind::Timeout, id));
-        self.push(entry)?;
-        Ok(())
+        self.push(entry)
     }
 
-    /// Absolute timeout from a monotonic timespec (sec, nsec).
-    pub fn set_absolute_timeout_timespec(&mut self, sec: u64, nsec: u32) -> io::Result<()> {
-        if self.timeout_armed && self.timeout_deadline == Some((sec, nsec)) {
-            return Ok(());
-        }
-        if self.timeout_armed {
-            let old = encode_user_data(OpKind::Timeout, self.timeout_generation);
-            let entry = opcode::TimeoutRemove::new(old)
-                .build()
-                .user_data(encode_user_data(OpKind::Cancel, self.timeout_generation));
-            self.push(entry)?;
-            self.timeout_armed = false;
-        }
-        self.timeout_generation = self.timeout_generation.wrapping_add(1);
-        *self.timeout_ts = Timespec::new().sec(sec).nsec(nsec);
-        let ts = self.timeout_ts.as_ref() as *const Timespec;
-        let entry = opcode::Timeout::new(ts)
+    /// Submit an absolute CLOCK_MONOTONIC timeout. Caller must keep `deadline`
+    /// valid until the CQE.
+    pub fn submit_timeout_absolute(
+        &mut self,
+        deadline: Pin<&Timespec>,
+        id: u64,
+    ) -> io::Result<()> {
+        let entry = opcode::Timeout::new(deadline.get_ref() as *const Timespec)
             .flags(TimeoutFlags::ABS)
             .build()
-            .user_data(encode_user_data(OpKind::Timeout, self.timeout_generation));
-        self.push(entry)?;
-        self.timeout_armed = true;
-        self.timeout_deadline = Some((sec, nsec));
-        Ok(())
+            .user_data(encode_user_data(OpKind::Timeout, id));
+        self.push(entry)
     }
 
-    pub fn clear_timeout(&mut self) -> io::Result<()> {
-        self.clear_timeout_deadline()
+    /// Cancel an in-flight timeout previously submitted with `id`.
+    pub fn cancel_timeout(&mut self, id: u64) -> io::Result<()> {
+        let target = encode_user_data(OpKind::Timeout, id);
+        let entry = opcode::TimeoutRemove::new(target)
+            .build()
+            .user_data(encode_user_data(OpKind::Cancel, id));
+        self.push(entry)
     }
 
     /// Submit pending SQEs and wait for at least one CQE.
@@ -424,12 +381,6 @@ impl EventLoop {
                 OpKind::Wake => {
                     self.waker_armed = false;
                 }
-                OpKind::Timeout => {
-                    if id == self.timeout_generation {
-                        self.timeout_armed = false;
-                        self.timeout_deadline = None;
-                    }
-                }
                 OpKind::Accept => {
                     // Multishot accept stays armed while `IORING_CQE_F_MORE` is set.
                     if !cqueue::more(flags) {
@@ -450,8 +401,8 @@ impl EventLoop {
     /// Wait until at least one meaningful CQE is available, then drain all.
     ///
     /// Completions from replacing/canceling in-flight ops (`Cancel`, and
-    /// `Timeout` with `-ECANCELED`) are ignored so callers that refresh an
-    /// absolute timeout every lap do not busy-spin on `TimeoutRemove`.
+    /// `Timeout` with `-ECANCELED`) are ignored so callers that refresh a
+    /// timeout every lap do not busy-spin on `TimeoutRemove`.
     pub fn wait(&mut self, out: &mut Vec<Completion>) -> io::Result<()> {
         loop {
             if out.is_empty() {
@@ -584,7 +535,10 @@ mod tests {
         let mut loop_ = EventLoop::new(32).unwrap();
         // Arm a far-future timeout so something is in flight besides the waker.
         let (sec, nsec) = monotonic_deadline_after(Duration::from_secs(3600)).unwrap();
-        loop_.set_absolute_timeout_timespec(sec, nsec).unwrap();
+        let ts = Box::new(Timespec::new().sec(sec).nsec(nsec));
+        loop_
+            .submit_timeout_absolute(Pin::new(ts.as_ref()), 42)
+            .unwrap();
         assert!(loop_.inflight() >= 2);
         loop_.shutdown_drain().unwrap();
         assert_eq!(loop_.inflight(), 0);
@@ -594,15 +548,17 @@ mod tests {
     fn absolute_timeout_fires() {
         let mut loop_ = EventLoop::new(32).unwrap();
         let (sec, nsec) = monotonic_deadline_after(Duration::from_millis(30)).unwrap();
-        loop_.set_absolute_timeout_timespec(sec, nsec).unwrap();
+        let ts = Box::new(Timespec::new().sec(sec).nsec(nsec));
+        loop_
+            .submit_timeout_absolute(Pin::new(ts.as_ref()), 42)
+            .unwrap();
         let mut completions = Vec::new();
         loop_.wait(&mut completions).unwrap();
         // May get wake or timeout; keep waiting until timeout if needed.
         for _ in 0..10 {
-            if completions
-                .iter()
-                .any(|c| c.kind == OpKind::Timeout && c.result == -libc::ETIME)
-            {
+            if completions.iter().any(|c| {
+                c.kind == OpKind::Timeout && c.id == 42 && c.result == -libc::ETIME
+            }) {
                 return;
             }
             completions.clear();
@@ -624,11 +580,16 @@ mod tests {
 
         let started = Instant::now();
         let mut completions = Vec::new();
+        let mut ts = Box::new(Timespec::new());
         loop {
             // Same pattern that previously spun the D-Bus thread: refresh an
             // absolute timeout every lap, then wait.
             let (sec, nsec) = monotonic_deadline_after(Duration::from_secs(3600)).unwrap();
-            loop_.set_absolute_timeout_timespec(sec, nsec).unwrap();
+            loop_.cancel_timeout(42).unwrap();
+            *ts = Timespec::new().sec(sec).nsec(nsec);
+            loop_
+                .submit_timeout_absolute(Pin::new(ts.as_ref()), 42)
+                .unwrap();
             loop_.wait(&mut completions).unwrap();
             if completions
                 .iter()
