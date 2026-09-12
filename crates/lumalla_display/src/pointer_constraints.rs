@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 
 use lumalla_wayland_protocol::{
-    ClientConnection, ClientId, ObjectId,
+    ClientId, ObjectId,
     protocols::pointer_constraints::{
         ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT,
     },
 };
 
-use crate::surface::{Region, SurfaceManager};
+use crate::{
+    ConnectedClients,
+    surface::{Region, SurfaceManager},
+};
 
 type ResourceKey = (ClientId, ObjectId);
 
@@ -208,7 +211,7 @@ impl PointerConstraintsManager {
     /// Try to activate pending constraints when pointer focus/position allows it.
     pub fn try_activate(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
         pointer_focus: Option<(ClientId, ObjectId, ObjectId)>,
         pointer_x: f64,
@@ -295,7 +298,7 @@ impl PointerConstraintsManager {
     #[allow(dead_code)]
     pub fn deactivate(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         client_id: ClientId,
         object_id: ObjectId,
         send_event: bool,

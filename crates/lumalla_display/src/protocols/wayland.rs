@@ -2007,7 +2007,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::OutputInfo;
+    use crate::{ConnectedClients, OutputInfo};
 
     fn object_id(id: u32) -> ObjectId {
         ObjectId::new(NonZeroU32::new(id).unwrap())
@@ -2166,7 +2166,7 @@ mod tests {
     fn add_output_advertises_wl_output_global() {
         let mut state = display_state();
         state
-            .add_output(OutputInfo::default(), [].into_iter())
+            .add_output(OutputInfo::default(), &mut ConnectedClients::new())
             .unwrap();
         let globals: Vec<_> = state
             .globals
@@ -2189,7 +2189,7 @@ mod tests {
                     height: 1080,
                     ..OutputInfo::default()
                 },
-                [].into_iter(),
+                &mut ConnectedClients::new(),
             )
             .unwrap();
         state
@@ -2199,7 +2199,7 @@ mod tests {
                     is_virtual: true,
                     ..OutputInfo::default()
                 },
-                [].into_iter(),
+                &mut ConnectedClients::new(),
             )
             .unwrap();
         assert_eq!(state.outputs().count(), 2);
@@ -2210,14 +2210,20 @@ mod tests {
                         name: "HDMI-A-1".to_owned(),
                         ..OutputInfo::default()
                     },
-                    [].into_iter(),
+                    &mut ConnectedClients::new(),
                 )
                 .is_err()
         );
-        state.remove_output("VIRTUAL-1", [].into_iter()).unwrap();
+        state
+            .remove_output("VIRTUAL-1", &mut ConnectedClients::new())
+            .unwrap();
         let names: Vec<_> = state.outputs().map(|output| output.name.as_str()).collect();
         assert_eq!(names, ["HDMI-A-1"]);
-        assert!(state.remove_output("VIRTUAL-1", [].into_iter()).is_err());
+        assert!(
+            state
+                .remove_output("VIRTUAL-1", &mut ConnectedClients::new())
+                .is_err()
+        );
     }
 
     #[test]

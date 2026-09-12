@@ -200,7 +200,7 @@ impl EventLoop {
         Ok(())
     }
 
-    /// Submit an accept SQE. `addr`/`addrlen` may be null for anonymous accepts.
+    /// Submit a one-shot accept SQE. `addr`/`addrlen` may be null for anonymous accepts.
     pub fn submit_accept(
         &mut self,
         listen_fd: RawFd,
@@ -218,6 +218,24 @@ impl EventLoop {
         self.push(entry)?;
         self.accepting = true;
         Ok(())
+    }
+
+    /// Submit a multishot accept SQE (stays armed across CQEs with `IORING_CQE_F_MORE`).
+    pub fn submit_accept_multi(&mut self, listen_fd: RawFd, id: u64) -> io::Result<()> {
+        if self.accepting {
+            return Ok(());
+        }
+        let entry = opcode::AcceptMulti::new(Fd(listen_fd))
+            .flags(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
+            .build()
+            .user_data(encode_user_data(OpKind::Accept, id));
+        self.push(entry)?;
+        self.accepting = true;
+        Ok(())
+    }
+
+    pub fn accepting(&self) -> bool {
+        self.accepting
     }
 
     pub fn mark_accept_done(&mut self) {
@@ -413,7 +431,10 @@ impl EventLoop {
                     }
                 }
                 OpKind::Accept => {
-                    self.accepting = false;
+                    // Multishot accept stays armed while `IORING_CQE_F_MORE` is set.
+                    if !cqueue::more(flags) {
+                        self.accepting = false;
+                    }
                 }
                 _ => {}
             }
@@ -626,5 +647,62 @@ mod tests {
             started.elapsed() >= Duration::from_millis(50),
             "returned too quickly; likely busy-spinning on TimeoutRemove"
         );
+    }
+
+    #[test]
+    fn accept_multi_stays_armed_across_more_completions() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::path::PathBuf;
+
+        let dir = std::env::temp_dir();
+        let path = PathBuf::from(format!(
+            "{}/lumalla-accept-multi-{}",
+            dir.display(),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let mut loop_ = EventLoop::new(32).unwrap();
+        loop_
+            .submit_accept_multi(listener.as_raw_fd(), 7)
+            .unwrap();
+        assert!(loop_.accepting());
+
+        let _client = UnixStream::connect(&path).unwrap();
+        let mut completions = Vec::new();
+        loop_.wait(&mut completions).unwrap();
+        let accept = completions
+            .iter()
+            .find(|c| c.kind == OpKind::Accept && c.result >= 0)
+            .expect("expected accept completion");
+        assert!(
+            accept.more(),
+            "multishot accept should report MORE: {accept:?}"
+        );
+        assert!(
+            loop_.accepting(),
+            "accepting should stay true while MORE is set"
+        );
+
+        // Terminate the multishot request; bookkeeping must clear accepting.
+        let poll_ud = encode_user_data(OpKind::Accept, 7);
+        loop_.cancel_user_data(poll_ud).unwrap();
+        completions.clear();
+        for _ in 0..10 {
+            loop_.wait(&mut completions).unwrap();
+            if !loop_.accepting() {
+                break;
+            }
+            completions.clear();
+        }
+        assert!(
+            !loop_.accepting(),
+            "accepting should clear when multishot terminates"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

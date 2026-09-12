@@ -23,6 +23,7 @@ use crate::{
     xdg::{ActivationConfigure, XdgManager},
 };
 
+mod clients;
 mod data_device;
 mod dmabuf;
 mod output;
@@ -35,6 +36,7 @@ mod surface;
 mod window_manager;
 mod xdg;
 
+pub use clients::ConnectedClients;
 pub use dmabuf::ExportedDmabuf;
 pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland, buffer::ReadResult};
 pub use output::OutputInfo;
@@ -168,7 +170,7 @@ impl DisplayState {
     /// Replace the keymap and re-advertise it to all existing `wl_keyboard` objects.
     pub fn update_keyboard_keymap(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         keymap: lumalla_shared::KeymapMemfd,
     ) -> anyhow::Result<()> {
         self.seat_manager.update_keymap(clients, keymap)
@@ -183,7 +185,7 @@ impl DisplayState {
         &mut self,
         formats: Vec<(u32, u64)>,
         device_path: Option<&std::path::Path>,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) {
         self.dmabuf_manager
             .set_supported_formats(formats, device_path);
@@ -192,14 +194,14 @@ impl DisplayState {
 
     pub fn flush_pending_keyboard_leaves(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) {
         self.seat_manager.flush_pending_keyboard_leaves(clients);
     }
 
     pub fn flush_pending_activation_configures(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) {
         let pending = std::mem::take(&mut self.pending_activation_configures);
         for configure in pending {
@@ -216,7 +218,7 @@ impl DisplayState {
 
     pub fn handle_keyboard_key(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         key: u32,
         pressed: bool,
@@ -227,7 +229,7 @@ impl DisplayState {
 
     pub fn handle_keyboard_modifiers(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         modifiers: seat::KeyboardModifiers,
     ) {
         self.seat_manager.handle_modifiers(clients, modifiers);
@@ -235,7 +237,7 @@ impl DisplayState {
 
     pub fn handle_pointer_motion(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         dx: f64,
         dy: f64,
@@ -257,7 +259,7 @@ impl DisplayState {
 
     pub fn handle_pointer_absolute(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         x: f64,
         y: f64,
@@ -276,7 +278,7 @@ impl DisplayState {
     /// Recompute pointer enter/leave from current coordinates and stacking.
     ///
     /// Call after client dispatch or when mapping changes under a stationary cursor.
-    pub fn refresh_pointer_focus(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
+    pub fn refresh_pointer_focus(&mut self, clients: &mut ConnectedClients) {
         self.seat_manager.update_pointer_focus_and_motion(
             clients,
             &self.surface_manager,
@@ -300,7 +302,7 @@ impl DisplayState {
 
     pub fn handle_pointer_button(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         button: u32,
         pressed: bool,
@@ -377,7 +379,7 @@ impl DisplayState {
 
     pub fn handle_pointer_axis(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         axis: u32,
         value: f32,
@@ -388,7 +390,7 @@ impl DisplayState {
 
     pub fn handle_touch_down(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         touch_id: i32,
         x: f64,
@@ -406,7 +408,7 @@ impl DisplayState {
 
     pub fn handle_touch_up(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         touch_id: i32,
     ) {
@@ -416,7 +418,7 @@ impl DisplayState {
 
     pub fn handle_touch_motion(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         touch_id: i32,
         x: f64,
@@ -432,11 +434,11 @@ impl DisplayState {
         );
     }
 
-    pub fn handle_touch_frame(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
+    pub fn handle_touch_frame(&mut self, clients: &mut ConnectedClients) {
         self.seat_manager.handle_touch_frame(clients);
     }
 
-    pub fn handle_touch_cancel(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
+    pub fn handle_touch_cancel(&mut self, clients: &mut ConnectedClients) {
         self.seat_manager.handle_touch_cancel(clients);
     }
 
@@ -444,7 +446,7 @@ impl DisplayState {
     pub fn drag_motion(
         &mut self,
         client_id: ClientId,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         x: f64,
         y: f64,
@@ -467,7 +469,7 @@ impl DisplayState {
     pub fn drag_drop(
         &mut self,
         client_id: ClientId,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) {
         let Some(client) = clients.get_mut(&client_id) else {
             return;
@@ -625,7 +627,7 @@ impl DisplayState {
     /// Completes deferred `wl_surface.frame` callbacks after presentation.
     pub fn complete_frame_callbacks(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
     ) {
         while let Some(pending) = self.pending_frame_callbacks.pop_front() {
@@ -646,7 +648,7 @@ impl DisplayState {
     /// Completes pending `wp_presentation_feedback` objects after a DRM page-flip.
     pub fn complete_presentation_feedbacks(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         flip: PresentationFlipInfo,
     ) {
         let flags = WP_PRESENTATION_FEEDBACK_KIND_VSYNC
@@ -683,42 +685,42 @@ impl DisplayState {
     pub fn update_primary_output(
         &mut self,
         info: OutputInfo,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) {
         if let Some(global_id) = self.output_manager.primary_global_id() {
             self.output_manager.update_output(global_id, info, clients);
         }
     }
 
-    pub fn add_output<'connection>(
+    pub fn add_output(
         &mut self,
         info: OutputInfo,
-        client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
+        clients: &mut ConnectedClients,
     ) -> anyhow::Result<GlobalId> {
         self.output_manager
-            .add_output(info, &mut self.globals, client_connections)
+            .add_output(info, &mut self.globals, clients.values_mut())
     }
 
-    pub fn remove_output<'connection>(
+    pub fn remove_output(
         &mut self,
         name: &str,
-        client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
+        clients: &mut ConnectedClients,
     ) -> anyhow::Result<()> {
         self.output_manager
-            .remove_output(name, &mut self.globals, client_connections)
+            .remove_output(name, &mut self.globals, clients.values_mut())
     }
 
     pub fn outputs(&self) -> impl Iterator<Item = &OutputInfo> {
         self.output_manager.outputs()
     }
 
-    pub fn activate_main_seat<'connection>(
+    pub fn activate_main_seat(
         &mut self,
         seat_name: String,
-        client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
+        clients: &mut ConnectedClients,
     ) -> anyhow::Result<()> {
         self.seat_manager
-            .add_main_seat(seat_name, &mut self.globals, client_connections)?;
+            .add_main_seat(seat_name, &mut self.globals, clients.values_mut())?;
         Ok(())
     }
 
@@ -727,7 +729,7 @@ impl DisplayState {
         id: Option<u32>,
         geometry: WindowGeometryUpdate,
         user_initiated: bool,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) -> Result<Vec<RendererLayoutSync>, WindowError> {
         let changes = self.window_manager.set_window(
             id,
@@ -746,7 +748,7 @@ impl DisplayState {
         &mut self,
         id: Option<u32>,
         raise: bool,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) -> Result<bool, WindowError> {
         let (client_id, wl_surface) = self.window_manager.resolve_surface(id)?;
         if let Some(client) = clients.get_mut(&client_id) {
@@ -819,7 +821,7 @@ impl DisplayState {
 
     pub fn drain_pending_geometry(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) -> Vec<RendererLayoutSync> {
         if self.pending_geometry_changes.is_empty() {
             return Vec::new();
@@ -937,7 +939,7 @@ impl DisplayState {
             })
     }
 
-    fn dismiss_popup_grabs(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
+    fn dismiss_popup_grabs(&mut self, clients: &mut ConnectedClients) {
         let parent_focus =
             self.xdg_manager
                 .bottom_popup_grab()
@@ -967,7 +969,7 @@ impl DisplayState {
 
     pub(crate) fn flush_pending_window_configures(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) {
         let pending = self.window_manager.take_pending_configures();
         for configure in pending {
@@ -999,7 +1001,7 @@ impl DisplayState {
     fn apply_geometry_changes(
         &mut self,
         changes: Vec<WindowGeometryChange>,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) -> Vec<RendererLayoutSync> {
         let mut renderer_syncs = Vec::new();
         for change in changes {

@@ -169,10 +169,11 @@ impl ClientConnection {
         Some(msg)
     }
 
-    /// Returns whether the caller should re-submit SendMsg.
+    /// Returns whether the caller should re-submit SendMsg (same or next chunk).
     pub fn complete_send(&mut self, result: i32) -> anyhow::Result<bool> {
         let more = self.writer.apply_send_result(result)?;
-        self.send_in_flight = more;
+        // SQE finished; clear so prepare_send can re-arm when more output remains.
+        self.send_in_flight = false;
         Ok(more)
     }
 

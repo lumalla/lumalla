@@ -13,7 +13,7 @@ use lumalla_wayland_protocol::{
 };
 
 use crate::{
-    GlobalId, Globals,
+    ConnectedClients, GlobalId, Globals,
     pointer_constraints::{ConstraintKind, PointerConstraintsManager},
     relative_pointer::RelativePointerManager,
     surface::{SurfaceError, SurfaceManager},
@@ -112,7 +112,7 @@ impl SeatManager {
     /// Replace the keymap and send `wl_keyboard.keymap` + modifiers to every keyboard.
     pub fn update_keymap(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         keymap: KeymapMemfd,
     ) -> anyhow::Result<()> {
         self.keymap = Some(keymap);
@@ -560,7 +560,7 @@ impl SeatManager {
     /// Deliver queued `wl_keyboard.leave` events to other clients.
     pub fn flush_pending_keyboard_leaves(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) {
         let pending = std::mem::take(&mut self.pending_keyboard_leaves);
         for (client_id, keyboard_id, surface) in pending {
@@ -578,7 +578,7 @@ impl SeatManager {
 
     pub fn handle_key(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         key: u32,
         pressed: bool,
@@ -612,7 +612,7 @@ impl SeatManager {
 
     pub fn handle_modifiers(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         modifiers: KeyboardModifiers,
     ) {
         self.modifiers = modifiers;
@@ -636,7 +636,7 @@ impl SeatManager {
 
     pub fn handle_pointer_motion(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
         relative_pointers: &RelativePointerManager,
@@ -662,7 +662,7 @@ impl SeatManager {
 
     pub fn handle_pointer_absolute(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
         relative_pointers: &RelativePointerManager,
@@ -689,7 +689,7 @@ impl SeatManager {
 
     fn apply_pointer_motion(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
         relative_pointers: &RelativePointerManager,
@@ -750,7 +750,7 @@ impl SeatManager {
     /// focus changes happen once with the final target.
     pub fn handle_pointer_button(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         _surface_manager: &SurfaceManager,
         time_msec: u32,
         button: u32,
@@ -787,7 +787,7 @@ impl SeatManager {
 
     pub fn handle_pointer_axis(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         axis: u32,
         value: f32,
@@ -816,7 +816,7 @@ impl SeatManager {
 
     pub fn handle_touch_down(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
         time_msec: u32,
         touch_id: i32,
@@ -855,7 +855,7 @@ impl SeatManager {
 
     pub fn handle_touch_up(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         time_msec: u32,
         touch_id: i32,
     ) {
@@ -884,7 +884,7 @@ impl SeatManager {
 
     pub fn handle_touch_motion(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
         time_msec: u32,
         touch_id: i32,
@@ -917,7 +917,7 @@ impl SeatManager {
         }
     }
 
-    pub fn handle_touch_frame(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
+    pub fn handle_touch_frame(&mut self, clients: &mut ConnectedClients) {
         let client_ids: HashSet<ClientId> = self.touches.iter().map(|t| t.client_id).collect();
         for client_id in client_ids {
             let touches: Vec<ObjectId> = self
@@ -935,7 +935,7 @@ impl SeatManager {
         }
     }
 
-    pub fn handle_touch_cancel(&mut self, clients: &mut HashMap<ClientId, ClientConnection>) {
+    pub fn handle_touch_cancel(&mut self, clients: &mut ConnectedClients) {
         let client_ids: HashSet<ClientId> = self
             .active_touches
             .values()
@@ -960,7 +960,7 @@ impl SeatManager {
 
     pub fn update_pointer_focus_and_motion(
         &mut self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
         time_msec: u32,
@@ -1240,7 +1240,7 @@ mod tests {
             .unwrap();
         assert_eq!(seat.keyboards.len(), 1);
 
-        let mut clients = HashMap::new();
+        let mut clients = ConnectedClients::new();
         // No live client connection — update should still replace the stored keymap.
         seat.update_keymap(&mut clients, fake_keymap()).unwrap();
         assert_eq!(seat.keyboards.len(), 1);
@@ -1491,7 +1491,7 @@ mod tests {
     fn touch_down_up_tracks_active_points() {
         let mut seat = SeatManager::default();
         let mut surfaces = SurfaceManager::default();
-        let mut clients = HashMap::new();
+        let mut clients = ConnectedClients::new();
         let (receiver, sender) = UnixStream::pair().unwrap();
         let client_id = client(1);
         let surface = object(20);
@@ -1547,7 +1547,7 @@ mod tests {
             .unwrap();
         constraints.force_active_for_test(client(1), object(50));
 
-        let mut clients = HashMap::new();
+        let mut clients = ConnectedClients::new();
         let surfaces = SurfaceManager::default();
         seat.handle_pointer_motion(
             &mut clients,
@@ -1609,7 +1609,7 @@ mod tests {
             .unwrap();
         constraints.force_active_for_test(client_id, object(50));
 
-        let mut clients = HashMap::new();
+        let mut clients = ConnectedClients::new();
         // Move far outside the surface; confine should clamp back into surface.
         seat.handle_pointer_motion(
             &mut clients,

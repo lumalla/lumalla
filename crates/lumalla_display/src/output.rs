@@ -11,7 +11,7 @@ use lumalla_wayland_protocol::{
     registry::InterfaceIndex,
 };
 
-use crate::{GlobalId, Globals};
+use crate::{ConnectedClients, GlobalId, Globals};
 
 #[derive(Debug, Clone)]
 pub struct OutputInfo {
@@ -212,7 +212,7 @@ impl OutputManager {
         &mut self,
         global_id: GlobalId,
         info: OutputInfo,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
     ) -> bool {
         if !self.outputs.contains_key(&global_id) {
             return false;

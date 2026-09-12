@@ -15,7 +15,7 @@ use libc::PIDFD_THREAD;
 use log::{debug, error, info, warn};
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::{
-    ClientConnection, ClientId, DisplayState, KeyboardModifiers, OutputInfo, PresentationFlipInfo,
+    ClientId, ConnectedClients, DisplayState, KeyboardModifiers, OutputInfo, PresentationFlipInfo,
     ReadResult, SurfaceUpdate, Wayland, create_wayland_display,
 };
 use lumalla_input::{BTN_LEFT, InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
@@ -26,7 +26,8 @@ use lumalla_renderer::{
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
-    OpKind, encode_user_data, message_loop_with_channel, ring::MESSAGE_CHANNEL_TOKEN,
+    OpKind, encode_user_data, message_loop_with_channel, monotonic_deadline_after,
+    ring::MESSAGE_CHANNEL_TOKEN,
 };
 
 use crate::args::Args;
@@ -57,7 +58,7 @@ struct AppData {
     shutdown_now: bool,
     dbus_thread_finished: bool,
     wayland: Wayland,
-    connected_clients: HashMap<ClientId, ClientConnection>,
+    clients: ConnectedClients,
     display_state: DisplayState,
     renderer_state: RendererState,
     render_scheduler: RenderScheduler,
@@ -85,7 +86,7 @@ impl AppData {
             shutdown_now: false,
             dbus_thread_finished: false,
             wayland,
-            connected_clients: HashMap::new(),
+            clients: ConnectedClients::new(),
             display_state,
             renderer_state,
             render_scheduler: RenderScheduler::default(),
@@ -102,7 +103,6 @@ impl AppData {
     ) -> anyhow::Result<()> {
         let mut completions = Vec::with_capacity(64);
         while !self.shutdown_now {
-            self.ensure_pending_io(event_loop);
             if let Err(err) = event_loop.wait(&mut completions) {
                 warn!("Unable to wait on event loop: {err}");
             }
@@ -113,8 +113,6 @@ impl AppData {
                     error!("Unable to handle completion: {err:#}");
                 }
             }
-
-            self.tick_render_scheduler();
         }
 
         if let Err(err) = event_loop.shutdown_drain() {
@@ -144,19 +142,11 @@ impl AppData {
                 event_loop.rearm_waker()?;
             }
             OpKind::Timeout => {
-                self.handle_timeout(completion);
+                self.handle_timeout(event_loop, completion);
             }
             OpKind::Cancel => {}
             OpKind::Accept => {
-                if completion.result >= 0 {
-                    if let Some(client) = self.wayland.client_from_accepted_fd(completion.result) {
-                        let client_id = client.client_id();
-                        info!("New client connected with id {:?}", client_id);
-                        self.connected_clients.insert(client_id, client);
-                    }
-                } else if completion.result != -libc::EAGAIN {
-                    warn!("Wayland accept failed: {}", completion.result);
-                }
+                self.handle_accept(event_loop, completion);
             }
             OpKind::Recv => {
                 self.handle_client_recv(event_loop, completion.id, completion.result)?;
@@ -213,6 +203,7 @@ impl AppData {
                     for event in events {
                         pointer_changed |= self.handle_seat_event(event);
                     }
+                    self.flush_client_sends(event_loop);
                     if pointer_changed {
                         if let Err(err) = self.renderer_state.update_pointer_position(
                             self.display_state.pointer_position().0.round() as i32,
@@ -220,7 +211,7 @@ impl AppData {
                         ) {
                             error!("Unable to update pointer position: {err:#}");
                         } else if self.renderer_state.scene_dirty() {
-                            self.render_scheduler.mark_dirty(Instant::now());
+                            self.mark_present_dirty(event_loop);
                         }
                     }
                 }
@@ -247,7 +238,7 @@ impl AppData {
                             if let Err(err) = configure_dmabuf_formats(
                                 &mut self.display_state,
                                 &mut self.renderer_state,
-                                &mut self.connected_clients,
+                                &mut self.clients,
                             ) {
                                 warn!(
                                     "Unable to refresh GPU dmabuf formats after DRM reconcile: {err:#}"
@@ -255,8 +246,9 @@ impl AppData {
                             }
                         }
                         self.sync_wayland_output_from_drm();
-                        self.render_scheduler.request_immediate();
+                        self.flush_client_sends(event_loop);
                         self.renderer_state.mark_scene_dirty();
+                        self.request_present_immediate(event_loop);
                     }
                     self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                         self.renderer_state.drm_device_states(),
@@ -273,7 +265,7 @@ impl AppData {
                     .values()
                     .any(|registration| registration.token == token) =>
             {
-                self.handle_drm_device_events()?;
+                self.handle_drm_device_events(event_loop)?;
             }
             other => {
                 debug!("Unexpected poll token: {other}");
@@ -339,7 +331,7 @@ impl AppData {
             NonZeroU32::new(client_id_raw as u32)
                 .ok_or_else(|| anyhow::anyhow!("Invalid client id {client_id_raw}"))?,
         );
-        let Some(client) = self.connected_clients.get_mut(&client_id) else {
+        let Some(client) = self.clients.get_mut(&client_id) else {
             debug!("Recv completion for unknown client {:?}", client_id);
             return Ok(());
         };
@@ -355,7 +347,9 @@ impl AppData {
             ReadResult::EndOfStream => {
                 self.begin_client_disconnect(event_loop, client_id);
             }
-            ReadResult::NoMoreData => {}
+            ReadResult::NoMoreData => {
+                self.arm_client_recv(event_loop, client_id);
+            }
             ReadResult::ReadData => {
                 if let Err(err) = client.dispatch_pending(&mut self.display_state) {
                     error!(
@@ -371,22 +365,24 @@ impl AppData {
                     self.begin_client_disconnect(event_loop, client_id);
                 } else {
                     self.display_state
-                        .flush_pending_keyboard_leaves(&mut self.connected_clients);
+                        .flush_pending_keyboard_leaves(&mut self.clients);
                     self.display_state
-                        .flush_pending_activation_configures(&mut self.connected_clients);
-                    self.submit_committed_frames();
+                        .flush_pending_activation_configures(&mut self.clients);
+                    self.submit_committed_frames(event_loop);
                     // Mapping / get_pointer can change who should own the cursor
                     // without a motion event; sync enter/leave now.
                     self.display_state
-                        .refresh_pointer_focus(&mut self.connected_clients);
+                        .refresh_pointer_focus(&mut self.clients);
                     let layout_syncs = self
                         .display_state
-                        .drain_pending_geometry(&mut self.connected_clients);
-                    self.apply_renderer_layout_syncs(&layout_syncs);
+                        .drain_pending_geometry(&mut self.clients);
+                    self.apply_renderer_layout_syncs(event_loop, &layout_syncs);
                     if !layout_syncs.is_empty() {
                         self.sync_windows_to_dbus();
                     }
-                    self.sync_pointer_cursor();
+                    self.sync_pointer_cursor(event_loop);
+                    self.flush_client_sends(event_loop);
+                    self.arm_client_recv(event_loop, client_id);
                 }
             }
         }
@@ -403,7 +399,7 @@ impl AppData {
             NonZeroU32::new(client_id_raw as u32)
                 .ok_or_else(|| anyhow::anyhow!("Invalid client id {client_id_raw}"))?,
         );
-        let Some(client) = self.connected_clients.get_mut(&client_id) else {
+        let Some(client) = self.clients.get_mut(&client_id) else {
             debug!("Send completion for unknown client {:?}", client_id);
             return Ok(());
         };
@@ -422,6 +418,8 @@ impl AppData {
                         client_id
                     );
                     self.begin_client_disconnect(event_loop, client_id);
+                } else {
+                    self.arm_client_send(event_loop, client_id);
                 }
             }
             Err(err) => {
@@ -433,7 +431,7 @@ impl AppData {
     }
 
     fn begin_client_disconnect(&mut self, event_loop: &mut EventLoop, client_id: ClientId) {
-        let Some(client) = self.connected_clients.get_mut(&client_id) else {
+        let Some(client) = self.clients.get_mut(&client_id) else {
             return;
         };
         if client.closing {
@@ -458,111 +456,58 @@ impl AppData {
         if let Err(err) = self.renderer_state.remove_client_frames(client_id.get()) {
             error!("Unable to clear frames for disconnected client: {err:#}");
         } else if self.renderer_state.scene_dirty() {
-            self.render_scheduler.mark_dirty(Instant::now());
+            self.mark_present_dirty(event_loop);
         }
         self.sync_windows_to_dbus();
         self.try_finalize_client(client_id);
     }
 
     fn try_finalize_client(&mut self, client_id: ClientId) {
-        let should_remove = self
-            .connected_clients
-            .get(&client_id)
-            .is_some_and(|client| {
-                client.closing && !client.recv_in_flight() && !client.send_in_flight()
-            });
+        let should_remove = self.clients.get(&client_id).is_some_and(|client| {
+            client.closing && !client.recv_in_flight() && !client.send_in_flight()
+        });
         if should_remove {
-            self.connected_clients.remove(&client_id);
+            self.clients.remove(client_id);
         }
     }
 
-    fn ensure_pending_io(&mut self, event_loop: &mut EventLoop) {
-        // Seat/input/udev/DRM use multishot POLL_ADD (armed once at register / hotplug).
-        if let Err(err) = event_loop.submit_accept(
-            self.wayland.as_raw_fd(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            WAYLAND_ACCEPT_ID,
-        ) {
-            // Retry next lap; do not tear down the compositor for a transient SQ push failure.
-            warn!("Unable to submit Wayland accept: {err}");
+    fn handle_accept(&mut self, event_loop: &mut EventLoop, completion: Completion) {
+        if completion.result >= 0 {
+            if let Some(client) = self.wayland.client_from_accepted_fd(completion.result) {
+                let client_id = client.client_id();
+                info!("New client connected with id {:?}", client_id);
+                self.clients.insert(client);
+                self.arm_client_recv(event_loop, client_id);
+            }
+        } else if completion.result != -libc::EAGAIN && completion.result != -libc::ECANCELED {
+            warn!("Wayland accept failed: {}", completion.result);
         }
 
-        self.ensure_client_io(event_loop);
+        if !completion.more() && !self.shutting_down {
+            if let Err(err) = event_loop.submit_accept_multi(self.wayland.as_raw_fd(), WAYLAND_ACCEPT_ID)
+            {
+                warn!("Unable to re-arm Wayland accept: {err}");
+            }
+        }
     }
 
-    fn ensure_client_io(&mut self, event_loop: &mut EventLoop) {
-        let client_ids: Vec<ClientId> = self.connected_clients.keys().copied().collect();
-        let mut disconnect = Vec::new();
-        for client_id in client_ids {
-            let id = client_id.get() as u64;
-            let (fd, closing, needs_recv, needs_send, should_disconnect, recv_buffer_full) = {
-                let Some(client) = self.connected_clients.get_mut(&client_id) else {
-                    continue;
-                };
-                (
-                    client.as_raw_fd(),
-                    client.closing,
-                    !client.recv_in_flight(),
-                    !client.send_in_flight() && client.has_pending_output(),
-                    client.should_disconnect(),
-                    client.recv_buffer_full(),
-                )
-            };
-            if closing {
-                continue;
-            }
-            if should_disconnect {
-                error!(
-                    "Client {:?} entered fatal Wayland write/protocol state; disconnecting",
-                    client_id
-                );
-                disconnect.push(client_id);
-                continue;
-            }
-            if needs_recv && recv_buffer_full {
-                error!(
-                    "Client {:?} filled the Wayland receive buffer; disconnecting",
-                    client_id
-                );
-                disconnect.push(client_id);
-                continue;
-            }
-            if needs_recv {
-                if let Some(client) = self.connected_clients.get_mut(&client_id) {
-                    if let Some(msg) = client.prepare_recv() {
-                        let submit_result = unsafe { event_loop.submit_recvmsg(fd, msg, id) };
-                        if let Err(err) = submit_result {
-                            client.cancel_prepared_recv();
-                            error!(
-                                "Unable to submit recv for client {:?}: {err}; disconnecting",
-                                client_id
-                            );
-                            disconnect.push(client_id);
-                            continue;
-                        }
-                    }
-                }
-            }
-            if needs_send {
-                if let Some(client) = self.connected_clients.get_mut(&client_id) {
-                    if let Some(msg) = client.prepare_send() {
-                        let submit_result = unsafe { event_loop.submit_sendmsg(fd, msg, id) };
-                        if let Err(err) = submit_result {
-                            client.cancel_prepared_send();
-                            error!(
-                                "Unable to submit send for client {:?}: {err}; disconnecting",
-                                client_id
-                            );
-                            disconnect.push(client_id);
-                            continue;
-                        }
-                    }
-                }
-            }
+    fn arm_client_recv(&mut self, event_loop: &mut EventLoop, client_id: ClientId) {
+        if let Err(id) = self.clients.arm_recv(event_loop, client_id) {
+            self.begin_client_disconnect(event_loop, id);
         }
-        for client_id in disconnect {
-            self.begin_client_disconnect(event_loop, client_id);
+    }
+
+    fn arm_client_send(&mut self, event_loop: &mut EventLoop, client_id: ClientId) {
+        if let Err(id) = self.clients.arm_send(event_loop, client_id) {
+            self.begin_client_disconnect(event_loop, id);
+        }
+    }
+
+    /// After DisplayState (or other) writes that may enqueue Wayland events.
+    fn flush_client_sends(&mut self, event_loop: &mut EventLoop) {
+        self.clients.note_possible_output();
+        for id in self.clients.arm_pending_sends(event_loop) {
+            self.begin_client_disconnect(event_loop, id);
         }
     }
 
@@ -590,7 +535,7 @@ impl AppData {
                         }
                         if let Err(err) = self
                             .display_state
-                            .activate_main_seat(seat_name, self.connected_clients.values_mut())
+                            .activate_main_seat(seat_name, &mut self.clients)
                         {
                             error!("Unable to activate Wayland seat: {err}");
                         }
@@ -610,7 +555,7 @@ impl AppData {
                         if let Err(err) = configure_dmabuf_formats(
                             &mut self.display_state,
                             &mut self.renderer_state,
-                            &mut self.connected_clients,
+                            &mut self.clients,
                         ) {
                             warn!(
                                 "Unable to refresh GPU dmabuf formats after DRM activate: {err:#}"
@@ -620,8 +565,8 @@ impl AppData {
                         self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                             self.renderer_state.drm_device_states(),
                         ));
-                        self.render_scheduler.request_immediate();
                         self.renderer_state.mark_scene_dirty();
+                        self.request_present_immediate(event_loop);
                     } else {
                         info!("Skipping DRM activate (no session backend for device opens)");
                         self.sync_primary_output_geometry();
@@ -677,7 +622,7 @@ impl AppData {
                                     });
                                 if let Err(err) = self
                                     .display_state
-                                    .update_keyboard_keymap(&mut self.connected_clients, keymap)
+                                    .update_keyboard_keymap(&mut self.clients, keymap)
                                 {
                                     error!("Unable to advertise updated XKB keymap: {err:#}");
                                 }
@@ -692,7 +637,7 @@ impl AppData {
                     if let Err(err) = self.renderer_state.set_render_device(path) {
                         error!("Unable to set render device: {err:#}");
                     } else {
-                        self.render_scheduler.request_immediate();
+                        self.request_present_immediate(event_loop);
                     }
                     self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                         self.renderer_state.drm_device_states(),
@@ -702,7 +647,7 @@ impl AppData {
                     if let Err(err) = self.renderer_state.set_output_configs(configs) {
                         error!("Unable to set output configs: {err:#}");
                     } else {
-                        self.render_scheduler.request_immediate();
+                        self.request_present_immediate(event_loop);
                     }
                     self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
                         self.renderer_state.drm_device_states(),
@@ -723,12 +668,12 @@ impl AppData {
                             error!("Unable to register virtual output {name}: {err:#}");
                         } else {
                             self.sync_primary_output_geometry();
-                            self.render_scheduler.request_immediate();
+                            self.request_present_immediate(event_loop);
                         }
                     }
                     if let Err(err) = self.display_state.add_output(
                         lumalla_display::OutputInfo::from(&output),
-                        self.connected_clients.values_mut(),
+                        &mut self.clients,
                     ) {
                         error!("Unable to add output {name}: {err:#}");
                     }
@@ -738,7 +683,7 @@ impl AppData {
                     self.renderer_state.remove_virtual_output(&name);
                     if let Err(err) = self
                         .display_state
-                        .remove_output(&name, self.connected_clients.values_mut())
+                        .remove_output(&name, &mut self.clients)
                     {
                         error!("Unable to remove output {name}: {err:#}");
                     }
@@ -751,7 +696,7 @@ impl AppData {
                     }
                 }
                 MainMessage::InjectInput(input) => {
-                    if let Err(err) = self.inject_input(input) {
+                    if let Err(err) = self.inject_input(event_loop, input) {
                         error!("Unable to inject input: {err:#}");
                     }
                 }
@@ -783,12 +728,12 @@ impl AppData {
                         id,
                         geometry,
                         user_initiated,
-                        &mut self.connected_clients,
+                        &mut self.clients,
                     ) {
                         Ok(layout_syncs) => {
-                            self.apply_renderer_layout_syncs(&layout_syncs);
+                            self.apply_renderer_layout_syncs(event_loop, &layout_syncs);
                             self.sync_windows_to_dbus();
-                            self.render_scheduler.request_immediate();
+                            self.request_present_immediate(event_loop);
                         }
                         Err(err) => error!("Unable to set window geometry: {err}"),
                     }
@@ -796,14 +741,14 @@ impl AppData {
                 MainMessage::FocusWindow { id, raise } => {
                     match self
                         .display_state
-                        .focus_window(id, raise, &mut self.connected_clients)
+                        .focus_window(id, raise, &mut self.clients)
                     {
                         Ok(raised) => {
                             if raised {
                                 self.sync_renderer_scene();
                             }
                             self.sync_windows_to_dbus();
-                            self.render_scheduler.request_immediate();
+                            self.request_present_immediate(event_loop);
                         }
                         Err(err) => error!("Unable to focus window: {err}"),
                     }
@@ -811,7 +756,7 @@ impl AppData {
                 MainMessage::RaiseWindow { id } => match self.display_state.raise_window(id) {
                     Ok(()) => {
                         self.sync_renderer_scene();
-                        self.render_scheduler.request_immediate();
+                        self.request_present_immediate(event_loop);
                     }
                     Err(err) => error!("Unable to raise window: {err}"),
                 },
@@ -823,10 +768,15 @@ impl AppData {
                 }
             }
         }
+        self.flush_client_sends(event_loop);
         Ok(())
     }
 
-    fn inject_input(&mut self, input: InjectedInput) -> anyhow::Result<()> {
+    fn inject_input(
+        &mut self,
+        event_loop: &mut EventLoop,
+        input: InjectedInput,
+    ) -> anyhow::Result<()> {
         let mut events = Vec::new();
         let result = match input {
             InjectedInput::Key { name } => self
@@ -854,6 +804,7 @@ impl AppData {
         for event in events {
             pointer_changed |= self.handle_seat_event(event);
         }
+        self.flush_client_sends(event_loop);
         if pointer_changed {
             if let Err(err) = self.renderer_state.update_pointer_position(
                 self.display_state.pointer_position().0.round() as i32,
@@ -861,7 +812,7 @@ impl AppData {
             ) {
                 error!("Unable to update pointer position after input injection: {err:#}");
             } else if self.renderer_state.scene_dirty() {
-                self.render_scheduler.mark_dirty(Instant::now());
+                self.mark_present_dirty(event_loop);
             }
         }
         result
@@ -876,7 +827,7 @@ impl AppData {
                 pressed,
             }) => {
                 self.display_state.handle_keyboard_key(
-                    &mut self.connected_clients,
+                    &mut self.clients,
                     time_msec,
                     key,
                     pressed,
@@ -884,7 +835,7 @@ impl AppData {
             }
             SeatEvent::Keyboard(KeyboardEvent::Modifiers(modifiers)) => {
                 self.display_state.handle_keyboard_modifiers(
-                    &mut self.connected_clients,
+                    &mut self.clients,
                     KeyboardModifiers {
                         depressed: modifiers.depressed,
                         latched: modifiers.latched,
@@ -902,7 +853,7 @@ impl AppData {
             }) => {
                 pointer_changed = true;
                 self.display_state.handle_pointer_motion(
-                    &mut self.connected_clients,
+                    &mut self.clients,
                     time_msec,
                     dx,
                     dy,
@@ -913,7 +864,7 @@ impl AppData {
             SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {
                 pointer_changed = true;
                 self.display_state.handle_pointer_absolute(
-                    &mut self.connected_clients,
+                    &mut self.clients,
                     time_msec,
                     x,
                     y,
@@ -925,7 +876,7 @@ impl AppData {
                 pressed,
             }) => {
                 self.display_state.handle_pointer_button(
-                    &mut self.connected_clients,
+                    &mut self.clients,
                     time_msec,
                     button,
                     pressed,
@@ -937,7 +888,7 @@ impl AppData {
                 value,
             }) => {
                 self.display_state.handle_pointer_axis(
-                    &mut self.connected_clients,
+                    &mut self.clients,
                     time_msec,
                     axis,
                     value,
@@ -950,7 +901,7 @@ impl AppData {
                 y,
             }) => {
                 self.display_state.handle_touch_down(
-                    &mut self.connected_clients,
+                    &mut self.clients,
                     time_msec,
                     id,
                     x,
@@ -959,7 +910,7 @@ impl AppData {
             }
             SeatEvent::Touch(TouchEvent::Up { time_msec, id }) => {
                 self.display_state
-                    .handle_touch_up(&mut self.connected_clients, time_msec, id);
+                    .handle_touch_up(&mut self.clients, time_msec, id);
             }
             SeatEvent::Touch(TouchEvent::Motion {
                 time_msec,
@@ -968,7 +919,7 @@ impl AppData {
                 y,
             }) => {
                 self.display_state.handle_touch_motion(
-                    &mut self.connected_clients,
+                    &mut self.clients,
                     time_msec,
                     id,
                     x,
@@ -977,11 +928,11 @@ impl AppData {
             }
             SeatEvent::Touch(TouchEvent::Frame) => {
                 self.display_state
-                    .handle_touch_frame(&mut self.connected_clients);
+                    .handle_touch_frame(&mut self.clients);
             }
             SeatEvent::Touch(TouchEvent::Cancel) => {
                 self.display_state
-                    .handle_touch_cancel(&mut self.connected_clients);
+                    .handle_touch_cancel(&mut self.clients);
             }
         }
         pointer_changed
@@ -1039,10 +990,10 @@ impl AppData {
             is_virtual: false,
         };
         self.display_state
-            .update_primary_output(info, &mut self.connected_clients);
+            .update_primary_output(info, &mut self.clients);
     }
 
-    fn sync_pointer_cursor(&mut self) {
+    fn sync_pointer_cursor(&mut self, event_loop: &mut EventLoop) {
         if let Some(active) = self.display_state.active_cursor() {
             let key = (active.client_id.get(), active.surface_id.get());
             if self.renderer_state.cursor_surface_key() == Some(key) {
@@ -1052,20 +1003,21 @@ impl AppData {
                 {
                     error!("Unable to update cursor hotspot: {err:#}");
                 } else if self.renderer_state.scene_dirty() {
-                    self.render_scheduler.mark_dirty(Instant::now());
+                    self.mark_present_dirty(event_loop);
                 }
             }
         } else if self.renderer_state.cursor_surface_key().is_some() {
             if let Err(err) = self.renderer_state.clear_cursor_frame() {
                 error!("Unable to clear client cursor frame: {err:#}");
             } else if self.renderer_state.scene_dirty() {
-                self.render_scheduler.mark_dirty(Instant::now());
+                self.mark_present_dirty(event_loop);
             }
         }
     }
 
     fn apply_renderer_layout_syncs(
         &mut self,
+        event_loop: &mut EventLoop,
         layout_syncs: &[lumalla_display::RendererLayoutSync],
     ) {
         for sync in layout_syncs {
@@ -1080,7 +1032,7 @@ impl AppData {
         }
         self.sync_renderer_scene();
         if !layout_syncs.is_empty() && self.renderer_state.scene_dirty() {
-            self.render_scheduler.mark_dirty(Instant::now());
+            self.mark_present_dirty(event_loop);
         }
     }
 
@@ -1106,7 +1058,7 @@ impl AppData {
         self.renderer_state.sync_surface_scene(&scene);
     }
 
-    fn submit_committed_frames(&mut self) {
+    fn submit_committed_frames(&mut self, event_loop: &mut EventLoop) {
         let updates: Vec<_> = self.display_state.take_surface_updates().collect();
         let had_updates = !updates.is_empty();
         for update in updates {
@@ -1219,11 +1171,69 @@ impl AppData {
             || self.display_state.pending_frame_callback_count() > 0
             || self.display_state.pending_presentation_feedback_count() > 0
         {
-            self.render_scheduler.mark_dirty(Instant::now());
+            self.mark_present_dirty(event_loop);
         }
     }
 
-    fn tick_render_scheduler(&mut self) {
+    /// Arm (or run) the next present based on [`RenderScheduler::next_wake_at`].
+    ///
+    /// Future deadlines use the absolute io_uring timeout slot. Due-now work is
+    /// presented inline — never arm a past/zero timeout.
+    fn arm_present_wake(&mut self, event_loop: &mut EventLoop) -> io::Result<()> {
+        let now = Instant::now();
+        let wake_at = self.render_scheduler.next_wake_at(
+            now,
+            self.renderer_state.scene_dirty(),
+            self.pending_present_work(),
+            self.renderer_state.flip_idle(),
+        );
+        match wake_at {
+            None => event_loop.clear_timeout(),
+            Some(at) if at <= now => {
+                event_loop.clear_timeout()?;
+                self.tick_render_scheduler(event_loop);
+                // After present, a flip is usually in flight (`None`). If a
+                // future deadline remains, arm it without re-entering due-now.
+                let now = Instant::now();
+                let wake_at = self.render_scheduler.next_wake_at(
+                    now,
+                    self.renderer_state.scene_dirty(),
+                    self.pending_present_work(),
+                    self.renderer_state.flip_idle(),
+                );
+                match wake_at {
+                    Some(at) if at > now => {
+                        let remaining = at.saturating_duration_since(now);
+                        let (sec, nsec) = monotonic_deadline_after(remaining)?;
+                        event_loop.set_absolute_timeout_timespec(sec, nsec)
+                    }
+                    _ => Ok(()),
+                }
+            }
+            Some(at) => {
+                let remaining = at.saturating_duration_since(now);
+                debug_assert!(!remaining.is_zero());
+                let (sec, nsec) = monotonic_deadline_after(remaining)?;
+                event_loop.set_absolute_timeout_timespec(sec, nsec)
+            }
+        }
+    }
+
+    fn mark_present_dirty(&mut self, event_loop: &mut EventLoop) {
+        self.render_scheduler.mark_dirty(Instant::now());
+        if let Err(err) = self.arm_present_wake(event_loop) {
+            warn!("Unable to arm present wake: {err}");
+        }
+    }
+
+    fn request_present_immediate(&mut self, event_loop: &mut EventLoop) {
+        self.render_scheduler.request_immediate();
+        if let Err(err) = self.arm_present_wake(event_loop) {
+            warn!("Unable to arm present wake: {err}");
+        }
+    }
+
+    fn tick_render_scheduler(&mut self, event_loop: &mut EventLoop) {
         if !self.seat_state.is_enabled() || self.renderer_state.presents_halted() {
             return;
         }
@@ -1250,7 +1260,7 @@ impl AppData {
                             .on_present_finished(timings.render_duration);
                     }
                 }
-                self.maybe_complete_frame_callbacks(outcome.status);
+                self.maybe_complete_frame_callbacks(event_loop, outcome.status);
             }
             Err(err) => {
                 self.render_scheduler.on_present_started(now);
@@ -1259,7 +1269,7 @@ impl AppData {
         }
     }
 
-    fn handle_drm_device_events(&mut self) -> anyhow::Result<()> {
+    fn handle_drm_device_events(&mut self, event_loop: &mut EventLoop) -> anyhow::Result<()> {
         match self.renderer_state.dispatch_page_flips() {
             Ok(outcome) => {
                 let now = Instant::now();
@@ -1271,7 +1281,7 @@ impl AppData {
                         .min(u128::from(u32::MAX)) as u32;
                     if let Some(flip) = outcome.completed.last() {
                         self.display_state.complete_presentation_feedbacks(
-                            &mut self.connected_clients,
+                            &mut self.clients,
                             PresentationFlipInfo {
                                 tv_sec: flip.tv_sec,
                                 tv_usec: flip.tv_usec,
@@ -1286,22 +1296,34 @@ impl AppData {
                         self.pending_present_work(),
                     );
                 }
-                self.maybe_complete_frame_callbacks(outcome.status);
-                self.tick_render_scheduler();
+                self.maybe_complete_frame_callbacks(event_loop, outcome.status);
+                self.flush_client_sends(event_loop);
+                if let Err(err) = self.arm_present_wake(event_loop) {
+                    warn!("Unable to arm present wake after page flip: {err}");
+                }
             }
             Err(err) => error!("Unable to dispatch DRM page-flip events: {err:#}"),
         }
         Ok(())
     }
 
-    fn handle_timeout(&mut self, completion: Completion) {
+    fn handle_timeout(&mut self, event_loop: &mut EventLoop, completion: Completion) {
         if completion.id == SHUTDOWN_TIMEOUT_TOKEN {
             info!("Shutdown timeout reached. Shutting down now");
             self.shutdown_now = true;
+            return;
+        }
+        // Absolute present-wake timeout (id is EventLoop timeout_generation).
+        if let Err(err) = self.arm_present_wake(event_loop) {
+            warn!("Unable to handle present wake timeout: {err}");
         }
     }
 
-    fn maybe_complete_frame_callbacks(&mut self, status: PresentStatus) {
+    fn maybe_complete_frame_callbacks(
+        &mut self,
+        event_loop: &mut EventLoop,
+        status: PresentStatus,
+    ) {
         if !status.idle || self.display_state.pending_frame_callback_count() == 0 {
             return;
         }
@@ -1312,7 +1334,8 @@ impl AppData {
             .min(u128::from(u32::MAX)) as u32;
         let time_msec = time_msec.max(1);
         self.display_state
-            .complete_frame_callbacks(&mut self.connected_clients, time_msec);
+            .complete_frame_callbacks(&mut self.clients, time_msec);
+        self.flush_client_sends(event_loop);
     }
 
     fn sync_drm_device_poll(&mut self, event_loop: &mut EventLoop) -> io::Result<()> {
@@ -1428,10 +1451,7 @@ fn init_and_register_renderer_state(
 fn configure_dmabuf_formats(
     display_state: &mut DisplayState,
     renderer_state: &mut RendererState,
-    clients: &mut std::collections::HashMap<
-        lumalla_display::ClientId,
-        lumalla_display::ClientConnection,
-    >,
+    clients: &mut ConnectedClients,
 ) -> anyhow::Result<()> {
     let formats = renderer_state.supported_dmabuf_formats()?;
     let device_path = renderer_state.dmabuf_feedback_device_path();
@@ -1453,12 +1473,7 @@ fn init_and_register_wayland_display(
         wayland.socket_path()
     );
     main_event_loop
-        .submit_accept(
-            wayland.as_raw_fd(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            WAYLAND_ACCEPT_ID,
-        )
+        .submit_accept_multi(wayland.as_raw_fd(), WAYLAND_ACCEPT_ID)
         .context("Unable to listen on wayland display socket")?;
     Ok(wayland)
 }
@@ -1490,7 +1505,7 @@ fn init_display_state(
         }
         Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
     }
-    let mut no_clients = HashMap::new();
+    let mut no_clients = ConnectedClients::new();
     if let Err(err) = configure_dmabuf_formats(&mut display_state, renderer_state, &mut no_clients)
     {
         warn!("Unable to query GPU dmabuf formats; using linear defaults: {err:#}");

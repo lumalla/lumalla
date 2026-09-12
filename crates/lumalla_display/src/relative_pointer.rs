@@ -1,7 +1,8 @@
+use crate::ConnectedClients;
 use std::collections::HashMap;
 
 use lumalla_wayland_protocol::{
-    ClientConnection, ClientId, ObjectId,
+    ClientId, ObjectId,
     buffer::Writer,
 };
 
@@ -47,7 +48,7 @@ impl RelativePointerManager {
     /// Emit `relative_motion` for every relative pointer whose `wl_pointer` currently has focus.
     pub fn emit_relative_motion(
         &self,
-        clients: &mut HashMap<ClientId, ClientConnection>,
+        clients: &mut ConnectedClients,
         focused_pointers: &[(ClientId, ObjectId)],
         time_msec: u32,
         dx: f64,
