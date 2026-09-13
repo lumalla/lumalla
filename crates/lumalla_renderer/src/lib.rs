@@ -13,6 +13,7 @@ pub mod drm;
 pub mod vulkan;
 
 mod default_cursor;
+mod present_control;
 mod scanout_pool;
 mod scene_backing;
 pub mod scheduler;
@@ -22,8 +23,13 @@ use crate::drm::{
     atomic_modeset, atomic_page_flip, atomic_set_plane_fb, dispatch_drm_events,
     resolve_connected_output,
 };
+use crate::present_control::{NamedFlipDispatchOutcome, OutputPresentControl};
 use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
 use crate::scene_backing::DamageRect;
+pub use crate::present_control::{
+    CompletedFlipEffect, FlipSideEffects, PRESENT_WAKE_TOKEN_BASE, PRESENT_WAKE_TOKEN_COUNT,
+    PresentTickResult, is_present_wake_token,
+};
 pub use crate::scene_backing::{
     CompositeMode, DamageRect as OutputDamageRect, UploadRect, buffer_damage_to_upload_rect,
     clip_buffer_damage_list, clip_damage_list, cursor_damage_rects, cursor_damage_rects_default,
@@ -295,6 +301,12 @@ pub struct RendererState {
     /// Virtual outputs registered from config (`add_output` with `virtual = true`).
     virtual_outputs: HashMap<String, VirtualOutput>,
     scanouts: HashMap<String, OutputScanout>,
+    /// Per-output schedule + present-wake timeout state.
+    output_presents: HashMap<String, OutputPresentControl>,
+    next_present_wake_token: u64,
+    free_present_wake_tokens: Vec<u64>,
+    /// Cached modeset-resolved present targets; invalidated on hotplug/config.
+    cached_present_targets: Option<Vec<PresentTarget>>,
     /// Heap-stable queue pointer passed to DRM as page-flip `user_data`.
     flip_events: Box<FlipEventQueue>,
     /// Mapped surfaces in paint order (back to front).
@@ -325,6 +337,10 @@ impl RendererState {
             output_configs: HashMap::new(),
             virtual_outputs: HashMap::new(),
             scanouts: HashMap::new(),
+            output_presents: HashMap::new(),
+            next_present_wake_token: 0,
+            free_present_wake_tokens: Vec::new(),
+            cached_present_targets: None,
             flip_events: Box::new(FlipEventQueue::new()),
             surface_frames: HashMap::new(),
             surface_order: Vec::new(),
@@ -425,6 +441,7 @@ impl RendererState {
                 refresh_mhz,
             },
         );
+        self.invalidate_present_targets();
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -433,6 +450,7 @@ impl RendererState {
     pub fn remove_virtual_output(&mut self, name: &str) {
         if self.virtual_outputs.remove(name).is_some() {
             info!("Removed virtual output {name}");
+            self.invalidate_present_targets();
             if let Some(scanout) = self.scanouts.remove(name) {
                 self.release_output_scanout(scanout);
             }
@@ -455,7 +473,11 @@ impl RendererState {
 
     /// Drain pending udev DRM events; update device paths and/or connectors.
     pub fn dispatch(&mut self) -> anyhow::Result<DrmDispatchResult> {
-        self.drm_devices.dispatch()
+        let result = self.drm_devices.dispatch()?;
+        if result.changed() {
+            self.invalidate_present_targets();
+        }
+        Ok(result)
     }
 
     /// Opened DRM primary-node paths and fds for event-loop registration.
@@ -469,6 +491,15 @@ impl RendererState {
 
     /// Drain DRM page-flip events, retire buffers, and schedule queued flips.
     pub fn dispatch_page_flips(&mut self) -> anyhow::Result<FlipDispatchOutcome> {
+        let named = self.dispatch_page_flips_named()?;
+        Ok(FlipDispatchOutcome {
+            status: named.status,
+            completed: named.completed.into_iter().map(|(_, flip)| flip).collect(),
+        })
+    }
+
+    /// Drain DRM page-flip events and attribute each completion to an output name.
+    pub(crate) fn dispatch_page_flips_named(&mut self) -> anyhow::Result<NamedFlipDispatchOutcome> {
         let fds: Vec<RawFd> = self
             .drm_devices
             .opened()
@@ -479,12 +510,16 @@ impl RendererState {
             dispatch_drm_events(fd)?;
         }
         let completed = self.flip_events.drain();
-        for flip in &completed {
-            self.retire_page_flip(flip.crtc_id)?;
+        let mut named = Vec::with_capacity(completed.len());
+        for flip in completed {
+            let crtc_id = flip.crtc_id;
+            if let Some(name) = self.retire_page_flip(crtc_id)? {
+                named.push((name, flip));
+            }
         }
-        Ok(FlipDispatchOutcome {
+        Ok(NamedFlipDispatchOutcome {
             status: self.present_status(),
-            completed,
+            completed: named,
         })
     }
 
@@ -830,6 +865,7 @@ impl RendererState {
             return Ok(());
         }
         self.drm_devices.activate(seat)?;
+        self.invalidate_present_targets();
         if self.present_halted.take().is_some() {
             info!("Resuming presents after DRM activate");
         }
@@ -840,6 +876,7 @@ impl RendererState {
     pub fn deactivate_drm(&mut self, seat: &SeatState) {
         self.drain_scanouts();
         let _ = self.flip_events.drain();
+        self.invalidate_present_targets();
         if seat.can_open_devices() {
             self.drm_devices.deactivate(seat);
         }
@@ -866,6 +903,7 @@ impl RendererState {
         }
         self.drain_scanouts();
         let _ = self.flip_events.drain();
+        self.invalidate_present_targets();
         self.drm_devices.reconcile(seat)
     }
 
@@ -899,6 +937,7 @@ impl RendererState {
     pub fn set_render_device(&mut self, path: Option<PathBuf>) -> anyhow::Result<()> {
         info!("Render device config: {path:?}");
         self.render_device = path;
+        self.invalidate_present_targets();
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -912,11 +951,15 @@ impl RendererState {
             );
             self.output_configs.insert(config.name.clone(), config);
         }
+        self.invalidate_present_targets();
         self.mark_dirty_if_active();
         Ok(())
     }
 
     /// Run a present pass when `force` is set or the scene is dirty.
+    ///
+    /// Presents every presentable output (legacy bulk path). Prefer
+    /// [`Self::present_named`] / [`Self::arm_presents`] for per-output pacing.
     pub fn present(&mut self, color: [f32; 4], force: bool) -> anyhow::Result<PresentOutcome> {
         if self.present_halted.is_some() {
             return Ok(PresentOutcome {
@@ -933,6 +976,9 @@ impl RendererState {
             });
         }
         self.scene_dirty = false;
+        for control in self.output_presents.values_mut() {
+            control.content_dirty = false;
+        }
         let started = Instant::now();
         let status = self.present_enabled_outputs(color)?;
         Ok(PresentOutcome {
@@ -942,6 +988,160 @@ impl RendererState {
                 render_duration: started.elapsed(),
             }),
         })
+    }
+
+    /// Present a single named output when `force` is set or that output is content-dirty.
+    pub fn present_named(
+        &mut self,
+        name: &str,
+        color: [f32; 4],
+        force: bool,
+    ) -> anyhow::Result<PresentOutcome> {
+        if self.present_halted.is_some() {
+            return Ok(PresentOutcome {
+                presented: false,
+                status: self.present_status(),
+                timings: None,
+            });
+        }
+        let content_dirty = self
+            .output_presents
+            .get(name)
+            .is_some_and(|c| c.content_dirty);
+        if !force && !content_dirty && !self.scene_dirty {
+            return Ok(PresentOutcome {
+                presented: false,
+                status: self.present_status(),
+                timings: None,
+            });
+        }
+        let started = Instant::now();
+        let presented = self.present_one_named(name, color)?;
+        Ok(PresentOutcome {
+            presented,
+            status: self.present_status(),
+            timings: presented.then_some(FrameTimings {
+                render_duration: started.elapsed(),
+            }),
+        })
+    }
+
+    /// Returns whether GPU/DRM work was submitted for `name`.
+    fn present_one_named(&mut self, name: &str, color: [f32; 4]) -> anyhow::Result<bool> {
+        if self.present_halted.is_some() {
+            return Ok(false);
+        }
+        if !self.ensure_vulkan_ready()? {
+            return Ok(false);
+        }
+
+        self.ensure_present_targets_cached();
+        let Some(target) = self
+            .cached_present_targets
+            .as_ref()
+            .and_then(|targets| targets.iter().find(|t| t.name == name).cloned())
+        else {
+            warn!("No present target named {name}");
+            return Ok(false);
+        };
+
+        // Preserve global damage until every content-dirty output has presented.
+        let other_dirty = self
+            .output_presents
+            .iter()
+            .any(|(n, c)| n != name && c.content_dirty);
+        let damage_snapshot = if other_dirty {
+            Some((
+                self.pending_damage.clone(),
+                self.pending_surface_buffer_damage.clone(),
+                self.pending_full_redraw,
+                self.pending_pointer_damage,
+                self.cursor_buffer_dirty,
+                self.dirty_surface_keys.clone(),
+            ))
+        } else {
+            None
+        };
+        if other_dirty {
+            // Each selectively presented output needs a full redraw of its scanout.
+            self.pending_full_redraw = true;
+        }
+
+        let mut presented = false;
+        match self.present_one_output(&target, color) {
+            Ok(()) => {
+                presented = true;
+                if let Some(scanout) = self.scanouts.get(&target.name) {
+                    if let Some(physical) = scanout.physical.as_ref() {
+                        debug!(
+                            "Presented {} on {} (CRTC {}, {}x{}@{}Hz)",
+                            physical.output.connector_name,
+                            physical.drm_path.display(),
+                            physical.output.crtc_id,
+                            physical.output.mode.width(),
+                            physical.output.mode.height(),
+                            physical.output.mode.refresh_hz()
+                        );
+                    } else {
+                        debug!(
+                            "Presented virtual output {} ({}x{})",
+                            target.name, target.width, target.height
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                if let Some(physical) = target.physical.as_ref() {
+                    error!(
+                        "Failed to present {} on {}: {err:#}",
+                        target.name,
+                        physical.drm_path.display()
+                    );
+                } else {
+                    error!("Failed to present virtual output {}: {err:#}", target.name);
+                }
+                if is_unrecoverable_present_error(&err) {
+                    self.halt_presents(&err);
+                }
+            }
+        }
+
+        if let Some((
+            pending_damage,
+            pending_surface_buffer_damage,
+            pending_full_redraw,
+            pending_pointer_damage,
+            cursor_buffer_dirty,
+            dirty_surface_keys,
+        )) = damage_snapshot
+        {
+            self.pending_damage = pending_damage;
+            self.pending_surface_buffer_damage = pending_surface_buffer_damage;
+            self.pending_full_redraw = pending_full_redraw || self.pending_full_redraw;
+            self.pending_pointer_damage = pending_pointer_damage || self.pending_pointer_damage;
+            self.cursor_buffer_dirty = cursor_buffer_dirty || self.cursor_buffer_dirty;
+            self.dirty_surface_keys.extend(dirty_surface_keys);
+        }
+
+        // Drop scanouts for outputs that are no longer presentable (cached names).
+        let keep: HashSet<String> = self
+            .cached_present_targets
+            .as_ref()
+            .map(|targets| targets.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default();
+        let stale: Vec<String> = self
+            .scanouts
+            .keys()
+            .filter(|n| !keep.contains(*n))
+            .cloned()
+            .collect();
+        for stale_name in stale {
+            if let Some(scanout) = self.scanouts.remove(&stale_name) {
+                self.release_output_scanout(scanout);
+            }
+        }
+
+        Ok(presented)
     }
 
     /// Present a solid clear on every enabled connected or virtual output.
@@ -961,6 +1161,7 @@ impl RendererState {
             return Ok(self.present_status());
         }
 
+        self.ensure_present_targets_cached();
         let targets = self.collect_present_targets();
         if targets.is_empty() {
             warn!("No enabled connected or virtual outputs to present");
@@ -1026,7 +1227,26 @@ impl RendererState {
         Ok(self.present_status())
     }
 
+    fn invalidate_present_targets(&mut self) {
+        self.cached_present_targets = None;
+    }
+
+    fn ensure_present_targets_cached(&mut self) {
+        if self.cached_present_targets.is_some() {
+            return;
+        }
+        self.cached_present_targets = Some(self.resolve_present_targets());
+    }
+
+    /// Returns cached present targets when available, otherwise resolves once.
     fn collect_present_targets(&self) -> Vec<PresentTarget> {
+        if let Some(cached) = &self.cached_present_targets {
+            return cached.clone();
+        }
+        self.resolve_present_targets()
+    }
+
+    fn resolve_present_targets(&self) -> Vec<PresentTarget> {
         let mut targets = Vec::new();
 
         for (drm_path, device) in self.drm_devices.opened() {
@@ -1495,7 +1715,7 @@ impl RendererState {
         pending.wait(vulkan.device(), vulkan.graphics_command_pool())
     }
 
-    fn retire_page_flip(&mut self, crtc_id: u32) -> anyhow::Result<()> {
+    fn retire_page_flip(&mut self, crtc_id: u32) -> anyhow::Result<Option<String>> {
         let Some(connector_name) = self.scanouts.iter().find_map(|(name, scanout)| {
             scanout
                 .physical
@@ -1504,7 +1724,7 @@ impl RendererState {
                 .then(|| name.clone())
         }) else {
             warn!("Ignoring page-flip completion for unknown CRTC {crtc_id}");
-            return Ok(());
+            return Ok(None);
         };
 
         let queued = {
@@ -1514,7 +1734,7 @@ impl RendererState {
                 .context("Missing scanout during flip retirement")?;
             let Some(new_current) = scanout.pending.take() else {
                 warn!("Page-flip completion without pending buffer on {connector_name}");
-                return Ok(());
+                return Ok(Some(connector_name));
             };
             let old = std::mem::replace(&mut scanout.current, new_current);
             let queued = scanout.queued.take();
@@ -1526,7 +1746,7 @@ impl RendererState {
         if let Some(queued) = queued {
             self.schedule_or_queue_flip(&connector_name, queued)?;
         }
-        Ok(())
+        Ok(Some(connector_name))
     }
 
     fn wait_for_connector_flip(&mut self, connector_name: &str) -> anyhow::Result<()> {
@@ -1559,7 +1779,7 @@ impl RendererState {
                 continue;
             }
             for flip in completed {
-                self.retire_page_flip(flip.crtc_id)?;
+                let _ = self.retire_page_flip(flip.crtc_id)?;
             }
         }
 
@@ -1748,11 +1968,13 @@ fn blit_bgra_to_rgba(
     Ok(())
 }
 
+#[derive(Clone)]
 struct PhysicalPresent {
     drm_path: PathBuf,
     output: ConnectedOutput,
 }
 
+#[derive(Clone)]
 struct PresentTarget {
     name: String,
     width: u32,

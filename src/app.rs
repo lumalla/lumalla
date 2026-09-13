@@ -20,14 +20,13 @@ use lumalla_display::{
 };
 use lumalla_input::{BTN_LEFT, InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
 use lumalla_renderer::{
-    CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RenderScheduler, RendererState,
-    SOLID_CLEAR_COLOR, SurfaceFrame,
+    CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RendererState, SurfaceFrame,
+    is_present_wake_token,
 };
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
-    OpKind, encode_user_data, message_loop_with_channel, monotonic_deadline_after,
-    ring::MESSAGE_CHANNEL_TOKEN,
+    OpKind, encode_user_data, message_loop_with_channel, ring::MESSAGE_CHANNEL_TOKEN,
 };
 
 use crate::args::Args;
@@ -39,7 +38,6 @@ pub const UDEV_DRM_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 3;
 pub const WAYLAND_ACCEPT_ID: u64 = MESSAGE_CHANNEL_TOKEN + 4;
 pub const DBUS_THREAD_FINISHED_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 5;
 pub const SHUTDOWN_TIMEOUT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 6;
-pub const PRESENT_WAKE_TIMEOUT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 7;
 /// DRM primary-node fds use this high token range to avoid Wayland client tokens.
 pub const DRM_DEVICE_TOKEN_BASE: u64 = 1 << 16;
 
@@ -62,14 +60,9 @@ struct AppData {
     clients: ConnectedClients,
     display_state: DisplayState,
     renderer_state: RendererState,
-    render_scheduler: RenderScheduler,
     frame_clock: Instant,
     drm_device_poll: HashMap<PathBuf, DrmDeviceRegistration>,
     next_drm_device_token: usize,
-    /// Caller-owned timespec for the present-wake absolute timeout SQE.
-    present_wake_ts: Box<Timespec>,
-    present_wake_deadline: Option<(u64, u32)>,
-    present_wake_armed: bool,
 }
 
 impl AppData {
@@ -94,13 +87,9 @@ impl AppData {
             clients: ConnectedClients::new(),
             display_state,
             renderer_state,
-            render_scheduler: RenderScheduler::default(),
             frame_clock: Instant::now(),
             drm_device_poll: HashMap::new(),
             next_drm_device_token: 0,
-            present_wake_ts: Box::new(Timespec::new()),
-            present_wake_deadline: None,
-            present_wake_armed: false,
         }
     }
 
@@ -959,14 +948,13 @@ impl AppData {
         self.sync_primary_output_geometry();
     }
 
-    /// Apply primary present-target geometry to input transform, display layout, and refresh.
+    /// Apply primary present-target geometry to input transform and display layout.
     fn sync_primary_output_geometry(&mut self) {
         let Some((name, width, height, refresh_mhz)) =
             self.renderer_state.primary_output_geometry()
         else {
             return;
         };
-        self.render_scheduler.set_refresh_rate(refresh_mhz);
         let width_u = width.max(1) as u32;
         let height_u = height.max(1) as u32;
         self.input_state.set_output_geometry(width_u, height_u);
@@ -1183,168 +1171,53 @@ impl AppData {
         }
     }
 
-    /// Arm (or run) the next present based on [`RenderScheduler::next_wake_at`].
-    ///
-    /// Future deadlines use an absolute io_uring timeout owned by this app.
-    /// Due-now work is presented inline — never arm a past/zero timeout.
-    fn arm_present_wake(&mut self, event_loop: &mut EventLoop) -> io::Result<()> {
-        let now = Instant::now();
-        let wake_at = self.render_scheduler.next_wake_at(
-            now,
-            self.renderer_state.scene_dirty(),
-            self.pending_present_work(),
-            self.renderer_state.flip_idle(),
-        );
-        match wake_at {
-            None => self.clear_present_wake(event_loop),
-            Some(at) if at <= now => {
-                self.clear_present_wake(event_loop)?;
-                self.tick_render_scheduler(event_loop);
-                // After present, a flip is usually in flight (`None`). If a
-                // future deadline remains, arm it without re-entering due-now.
-                let now = Instant::now();
-                let wake_at = self.render_scheduler.next_wake_at(
-                    now,
-                    self.renderer_state.scene_dirty(),
-                    self.pending_present_work(),
-                    self.renderer_state.flip_idle(),
-                );
-                match wake_at {
-                    Some(at) if at > now => {
-                        let remaining = at.saturating_duration_since(now);
-                        let (sec, nsec) = monotonic_deadline_after(remaining)?;
-                        self.set_present_wake(event_loop, sec, nsec)
-                    }
-                    _ => Ok(()),
-                }
-            }
-            Some(at) => {
-                let remaining = at.saturating_duration_since(now);
-                debug_assert!(!remaining.is_zero());
-                let (sec, nsec) = monotonic_deadline_after(remaining)?;
-                self.set_present_wake(event_loop, sec, nsec)
-            }
-        }
-    }
-
-    fn clear_present_wake(&mut self, event_loop: &mut EventLoop) -> io::Result<()> {
-        if !self.present_wake_armed {
-            self.present_wake_deadline = None;
-            return Ok(());
-        }
-        event_loop.cancel_timeout(PRESENT_WAKE_TIMEOUT_TOKEN)?;
-        self.present_wake_armed = false;
-        self.present_wake_deadline = None;
-        Ok(())
-    }
-
-    fn set_present_wake(
-        &mut self,
-        event_loop: &mut EventLoop,
-        sec: u64,
-        nsec: u32,
-    ) -> io::Result<()> {
-        if self.present_wake_armed && self.present_wake_deadline == Some((sec, nsec)) {
-            return Ok(());
-        }
-        if self.present_wake_armed {
-            event_loop.cancel_timeout(PRESENT_WAKE_TIMEOUT_TOKEN)?;
-            self.present_wake_armed = false;
-        }
-        *self.present_wake_ts = Timespec::new().sec(sec).nsec(nsec);
-        event_loop.submit_timeout_absolute(
-            Pin::new(self.present_wake_ts.as_ref()),
-            PRESENT_WAKE_TIMEOUT_TOKEN,
-        )?;
-        self.present_wake_armed = true;
-        self.present_wake_deadline = Some((sec, nsec));
-        Ok(())
-    }
-
+    /// Mark all outputs dirty and arm their present wakes.
     fn mark_present_dirty(&mut self, event_loop: &mut EventLoop) {
-        self.render_scheduler.mark_dirty(Instant::now());
-        if let Err(err) = self.arm_present_wake(event_loop) {
-            warn!("Unable to arm present wake: {err}");
-        }
+        self.renderer_state.mark_dirty(Instant::now());
+        self.arm_presents(event_loop);
     }
 
+    /// Request an immediate present on all outputs and arm their wakes.
     fn request_present_immediate(&mut self, event_loop: &mut EventLoop) {
-        self.render_scheduler.request_immediate();
-        if let Err(err) = self.arm_present_wake(event_loop) {
-            warn!("Unable to arm present wake: {err}");
-        }
+        self.renderer_state.request_immediate();
+        self.arm_presents(event_loop);
     }
 
-    fn tick_render_scheduler(&mut self, event_loop: &mut EventLoop) {
-        if !self.seat_state.is_enabled() || self.renderer_state.presents_halted() {
-            return;
-        }
-
-        let now = Instant::now();
-        let scene_dirty = self.renderer_state.scene_dirty();
-        let pending_callbacks = self.pending_present_work();
-        let flip_idle = self.renderer_state.flip_idle();
-
-        if !self
-            .render_scheduler
-            .should_present(now, scene_dirty, pending_callbacks, flip_idle)
-        {
-            return;
-        }
-
-        let force = pending_callbacks && !scene_dirty;
-        match self.renderer_state.present(SOLID_CLEAR_COLOR, force) {
-            Ok(outcome) => {
-                if outcome.presented {
-                    self.render_scheduler.on_present_started(now);
-                    if let Some(timings) = outcome.timings {
-                        self.render_scheduler
-                            .on_present_finished(timings.render_duration);
-                    }
-                }
-                self.maybe_complete_frame_callbacks(event_loop, outcome.status);
+    fn arm_presents(&mut self, event_loop: &mut EventLoop) {
+        match self.renderer_state.arm_presents(
+            event_loop,
+            self.pending_present_work(),
+            self.seat_state.is_enabled(),
+        ) {
+            Ok(result) => {
+                self.maybe_complete_frame_callbacks(event_loop, result.status);
             }
-            Err(err) => {
-                self.render_scheduler.on_present_started(now);
-                error!("Unable to present outputs: {err:#}");
-            }
+            Err(err) => warn!("Unable to arm present wakes: {err}"),
         }
     }
 
     fn handle_drm_device_events(&mut self, event_loop: &mut EventLoop) -> anyhow::Result<()> {
-        match self.renderer_state.dispatch_page_flips() {
-            Ok(outcome) => {
-                let now = Instant::now();
-                if !outcome.completed.is_empty() {
-                    let refresh_ns = self
-                        .render_scheduler
-                        .frame_period()
-                        .as_nanos()
-                        .min(u128::from(u32::MAX)) as u32;
-                    if let Some(flip) = outcome.completed.last() {
-                        self.display_state.complete_presentation_feedbacks(
-                            &mut self.clients,
-                            PresentationFlipInfo {
-                                tv_sec: flip.tv_sec,
-                                tv_usec: flip.tv_usec,
-                                sequence: flip.sequence,
-                                refresh_ns,
-                            },
-                        );
-                    }
-                    self.render_scheduler.after_flip(
-                        now,
-                        self.renderer_state.scene_dirty(),
-                        self.pending_present_work(),
+        match self.renderer_state.on_drm_events(
+            event_loop,
+            self.pending_present_work(),
+            self.seat_state.is_enabled(),
+        ) {
+            Ok(effects) => {
+                for completed in &effects.completed {
+                    self.display_state.complete_presentation_feedbacks(
+                        &mut self.clients,
+                        PresentationFlipInfo {
+                            tv_sec: completed.flip.tv_sec,
+                            tv_usec: completed.flip.tv_usec,
+                            sequence: completed.flip.sequence,
+                            refresh_ns: completed.refresh_ns,
+                        },
                     );
                 }
-                self.maybe_complete_frame_callbacks(event_loop, outcome.status);
+                self.maybe_complete_frame_callbacks(event_loop, effects.status);
                 self.flush_client_sends(event_loop);
-                if let Err(err) = self.arm_present_wake(event_loop) {
-                    warn!("Unable to arm present wake after page flip: {err}");
-                }
             }
-            Err(err) => error!("Unable to dispatch DRM page-flip events: {err:#}"),
+            Err(err) => error!("Unable to handle DRM device events: {err}"),
         }
         Ok(())
     }
@@ -1355,11 +1228,17 @@ impl AppData {
                 info!("Shutdown timeout reached. Shutting down now");
                 self.shutdown_now = true;
             }
-            PRESENT_WAKE_TIMEOUT_TOKEN => {
-                self.present_wake_armed = false;
-                self.present_wake_deadline = None;
-                if let Err(err) = self.arm_present_wake(event_loop) {
-                    warn!("Unable to handle present wake timeout: {err}");
+            token if is_present_wake_token(token) => {
+                match self.renderer_state.on_present_timeout(
+                    event_loop,
+                    token,
+                    self.pending_present_work(),
+                    self.seat_state.is_enabled(),
+                ) {
+                    Ok(result) => {
+                        self.maybe_complete_frame_callbacks(event_loop, result.status);
+                    }
+                    Err(err) => warn!("Unable to handle present wake timeout: {err}"),
                 }
             }
             other => {
@@ -1432,10 +1311,10 @@ impl AppData {
             self.shutdown_now = true;
             return;
         }
-        // Drop any present-wake absolute timeout so it cannot race with the
+        // Drop any present-wake absolute timeouts so they cannot race with the
         // one-shot shutdown timeout below.
-        if let Err(err) = self.clear_present_wake(event_loop) {
-            warn!("Unable to clear present wake before shutdown timeout: {err}");
+        if let Err(err) = self.renderer_state.clear_all_present_wakes(event_loop) {
+            warn!("Unable to clear present wakes before shutdown timeout: {err}");
         }
         if let Err(err) =
             event_loop.submit_timeout(Pin::new(&SHUTDOWN_TIMEOUT_TIMESPEC), SHUTDOWN_TIMEOUT_TOKEN)

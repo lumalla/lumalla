@@ -858,6 +858,7 @@ dependencies = [
  "ash",
  "bytemuck",
  "gpu-allocator",
+ "io-uring",
  "libc",
  "log",
  "lumalla_seat",

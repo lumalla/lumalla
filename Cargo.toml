@@ -56,3 +56,4 @@ signal-hook = { workspace = true }
 inherits = "release"
 debug = true
 strip = "none"
+debug-assertions = true

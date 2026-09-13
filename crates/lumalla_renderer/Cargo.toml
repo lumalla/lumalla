@@ -12,6 +12,7 @@ lumalla_shared = { path = "../lumalla_shared" }
 lumalla_seat = { path = "../lumalla_seat" }
 anyhow = { workspace = true }
 log = { workspace = true }
+io-uring = { workspace = true }
 ash = "0.38"
 gpu-allocator = "0.28"
 libc = "0.2"

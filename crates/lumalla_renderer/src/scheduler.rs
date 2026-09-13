@@ -185,7 +185,11 @@ impl RenderScheduler {
     }
 
     fn lead_time(&self) -> Duration {
-        self.estimated_render + self.estimated_flip_margin
+        // Keep lead under one frame so a slow present cannot collapse pacing to
+        // "due now" on every mark_dirty (cursor-move death spiral).
+        let lead = self.estimated_render + self.estimated_flip_margin;
+        let max_lead = self.frame_period.mul_f32(0.75);
+        lead.min(max_lead).max(Duration::from_millis(1))
     }
 
     fn schedule_next_present(&mut self, now: Instant) {
@@ -293,5 +297,23 @@ mod tests {
         scheduler.next_present_at = Some(now + Duration::from_millis(10));
         let wake = scheduler.next_wake_at(now, true, false, true);
         assert_eq!(wake, Some(now + Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn lead_time_clamped_below_frame_period() {
+        let mut scheduler = RenderScheduler::default();
+        // Drive EMA very high so unclamped lead would exceed one frame.
+        for _ in 0..40 {
+            scheduler.on_present_finished(Duration::from_millis(50));
+        }
+        let now = Instant::now();
+        scheduler.on_flip_completed(now);
+        scheduler.mark_dirty(now);
+        let wake = scheduler.next_wake_at(now, true, false, true).unwrap();
+        assert!(
+            wake > now,
+            "oversized render estimate must not collapse wake to now"
+        );
+        assert!(wake <= now + scheduler.frame_period());
     }
 }
