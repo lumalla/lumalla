@@ -165,6 +165,8 @@ pub struct InputState {
     keymaps: Vec<KeyBinding>,
     /// Keycodes whose press was consumed; matching releases are also withheld from clients.
     suppressed_keys: HashSet<u32>,
+    /// Modifier keycodes currently held and already forwarded to clients.
+    forwarded_modifiers: HashSet<u32>,
     start: Instant,
 }
 
@@ -179,6 +181,7 @@ impl InputState {
             mods: Mods::default(),
             keymaps: Vec::new(),
             suppressed_keys: HashSet::new(),
+            forwarded_modifiers: HashSet::new(),
             start: Instant::now(),
         })
     }
@@ -212,6 +215,7 @@ impl InputState {
     pub fn disable_seat(&mut self) -> anyhow::Result<()> {
         self.mods = Mods::default();
         self.suppressed_keys.clear();
+        self.forwarded_modifiers.clear();
         self.xkb.reset()?;
         self.libinput.suspend()?;
         self.dispatch(|_| {})
@@ -506,8 +510,39 @@ impl InputState {
                 key,
                 pressed,
             }));
+            if is_modifier_key(key) {
+                if pressed {
+                    self.forwarded_modifiers.insert(key);
+                } else {
+                    self.forwarded_modifiers.remove(&key);
+                }
+            }
         }
-        if mods_changed {
+
+        // Consumed chords already delivered modifier presses to the client. Release
+        // those modifiers client-side so they cannot combine into app shortcuts
+        // (e.g. wezterm Alt+1) around the focus change.
+        if consumed && pressed && !self.forwarded_modifiers.is_empty() {
+            let forwarded: Vec<u32> = self.forwarded_modifiers.drain().collect();
+            for &mod_key in &forwarded {
+                self.suppressed_keys.insert(mod_key);
+                on_event(SeatEvent::Keyboard(KeyboardEvent::Key {
+                    time_msec,
+                    key: mod_key,
+                    pressed: false,
+                }));
+                self.xkb.update_key(mod_key, false);
+            }
+            let client_modifiers = self.xkb.modifiers();
+            for &mod_key in &forwarded {
+                // Restore physical held state for further binding matches.
+                self.xkb.update_key(mod_key, true);
+            }
+            debug!("xkb modifiers (client after consume): {client_modifiers:?}");
+            on_event(SeatEvent::Keyboard(KeyboardEvent::Modifiers(
+                client_modifiers,
+            )));
+        } else if mods_changed {
             let modifiers = self.xkb.modifiers();
             debug!("xkb modifiers: {modifiers:?}");
             on_event(SeatEvent::Keyboard(KeyboardEvent::Modifiers(modifiers)));
@@ -527,17 +562,49 @@ fn mods_for_binding_match(key: u32, mods: Mods) -> Mods {
     match_mods
 }
 
+/// True when every modifier required by `binding` is present in `pressed`.
+///
+/// Extra pressed modifiers are allowed (i3/sway-style subset match).
+fn mods_is_subset(binding: Mods, pressed: Mods) -> bool {
+    (!binding.ctrl || pressed.ctrl)
+        && (!binding.alt || pressed.alt)
+        && (!binding.shift || pressed.shift)
+        && (!binding.logo || pressed.logo)
+}
+
+fn mod_count(mods: Mods) -> u32 {
+    u32::from(mods.ctrl) + u32::from(mods.alt) + u32::from(mods.shift) + u32::from(mods.logo)
+}
+
+/// Select bindings for this key event.
+///
+/// Matching is subset-based (`binding.mods ⊆ pressed mods`). When several
+/// bindings match, more-specific ones (higher modifier count) run first.
+/// Registration order breaks ties. The first `consume: true` binding stops
+/// further activations.
 fn select_binding_activations(
     keymaps: &[KeyBinding],
     key: u32,
     match_mods: Mods,
     on_release: bool,
 ) -> Vec<(String, bool)> {
+    let mut matched: Vec<(usize, &KeyBinding)> = keymaps
+        .iter()
+        .enumerate()
+        .filter(|(_, binding)| {
+            binding.key == key
+                && binding.on_release == on_release
+                && mods_is_subset(binding.mods, match_mods)
+        })
+        .collect();
+    matched.sort_by(|(index_a, a), (index_b, b)| {
+        mod_count(b.mods)
+            .cmp(&mod_count(a.mods))
+            .then_with(|| index_a.cmp(index_b))
+    });
+
     let mut activations = Vec::new();
-    for binding in keymaps {
-        if binding.key != key || binding.mods != match_mods || binding.on_release != on_release {
-            continue;
-        }
+    for (_, binding) in matched {
         activations.push((binding.binding_id.clone(), binding.consume));
         if binding.consume {
             break;
@@ -660,6 +727,69 @@ mod tests {
             activations,
             vec![("first".into(), false), ("second".into(), true),]
         );
+    }
+
+    #[test]
+    fn select_binding_activations_prefers_more_modifiers() {
+        let bindings = [
+            KeyBinding {
+                key: 30, // KEY_A
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                binding_id: "shift-a".into(),
+                on_release: false,
+                consume: true,
+            },
+            KeyBinding {
+                key: 30,
+                mods: Mods {
+                    shift: true,
+                    alt: true,
+                    ..Default::default()
+                },
+                binding_id: "shift-alt-a".into(),
+                on_release: false,
+                consume: true,
+            },
+        ];
+        let activations = select_binding_activations(
+            &bindings,
+            30,
+            Mods {
+                shift: true,
+                alt: true,
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(activations, vec![("shift-alt-a".into(), true)]);
+    }
+
+    #[test]
+    fn select_binding_activations_subset_match_without_more_specific() {
+        let bindings = [KeyBinding {
+            key: 30,
+            mods: Mods {
+                shift: true,
+                ..Default::default()
+            },
+            binding_id: "shift-a".into(),
+            on_release: false,
+            consume: true,
+        }];
+        let activations = select_binding_activations(
+            &bindings,
+            30,
+            Mods {
+                shift: true,
+                alt: true,
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(activations, vec![("shift-a".into(), true)]);
     }
 
     #[test]

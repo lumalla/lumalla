@@ -757,11 +757,18 @@ impl FromLua for ConfigKeymap {
                 });
             }
         };
+        // `suppress` is accepted as an alias for `consume`.
+        let consume = table
+            .get::<Option<bool>>("consume")
+            .ok()
+            .flatten()
+            .or_else(|| table.get::<Option<bool>>("suppress").ok().flatten())
+            .unwrap_or(true);
         Ok(Self {
             key: table.get("key")?,
             mods,
             on_release,
-            consume: table.get("consume").unwrap_or(true),
+            consume,
             callback: table.get("callback")?,
         })
     }
