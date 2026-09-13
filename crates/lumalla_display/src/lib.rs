@@ -40,7 +40,7 @@ pub use clients::ConnectedClients;
 pub use dmabuf::ExportedDmabuf;
 pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland, buffer::ReadResult};
 pub use output::OutputInfo;
-pub use seat::{ActiveCursor, KeyboardModifiers};
+pub use seat::{ActiveCursor, KeyboardModifiers, PointerCursor};
 pub use surface::{Rectangle, SceneSurface};
 pub use window_manager::{WindowError, WindowGeometryChange};
 
@@ -294,6 +294,10 @@ impl DisplayState {
 
     pub fn pointer_position(&self) -> (f64, f64) {
         self.seat_manager.pointer_position()
+    }
+
+    pub fn pointer_cursor(&self) -> PointerCursor {
+        self.seat_manager.pointer_cursor()
     }
 
     pub fn active_cursor(&self) -> Option<ActiveCursor> {

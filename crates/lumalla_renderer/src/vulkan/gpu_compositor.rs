@@ -12,7 +12,7 @@ use lumalla_shared::BufferTransform;
 
 use crate::default_cursor::default_cursor_frame;
 use crate::scene_backing::{CompositeMode, DamageRect, UploadRect, buffer_damage_to_upload_rect};
-use crate::{CursorFrame, DmabufAttachment, SurfaceFrame};
+use crate::{CursorDraw, CursorFrame, DmabufAttachment, SurfaceFrame};
 
 const WL_SHM_FORMAT_XRGB8888: u32 = 1;
 
@@ -284,10 +284,10 @@ impl SurfaceTextureCache {
         vulkan: &mut VulkanContext,
         compositor: &GpuCompositor,
         batch: &mut GpuWorkBatch,
-        cursor: Option<&CursorFrame>,
+        cursor: CursorDraw<'_>,
     ) -> anyhow::Result<()> {
         match cursor {
-            Some(frame) => {
+            CursorDraw::Client(frame) => {
                 let key = (frame.owner_id, frame.surface_id);
                 if let Some(dmabuf) = frame.dmabuf.as_ref() {
                     let surface = cursor_surface_view(frame);
@@ -307,7 +307,7 @@ impl SurfaceTextureCache {
                     )
                 }
             }
-            None => {
+            CursorDraw::Default => {
                 let default = default_cursor_frame();
                 self.sync_shm_pixels(
                     vulkan,
@@ -322,6 +322,7 @@ impl SurfaceTextureCache {
                     default.format,
                 )
             }
+            CursorDraw::Hidden => Ok(()),
         }
     }
 
@@ -650,7 +651,7 @@ impl SurfaceTextureCache {
         compositor: &GpuCompositor,
         batch: &mut GpuWorkBatch,
         layers: &[&SurfaceFrame],
-        cursor: Option<&CursorFrame>,
+        cursor: CursorDraw<'_>,
         composite_mode: &CompositeMode,
         dirty_surfaces: &HashSet<(u32, u32)>,
         surface_buffer_damage: &HashMap<(u32, u32), DamageRect>,
@@ -959,7 +960,7 @@ pub fn composite_to_scanout(
     clear_color: [f32; 4],
     composite_mode: CompositeMode,
     layers: &[&SurfaceFrame],
-    cursor: Option<&CursorFrame>,
+    cursor: CursorDraw<'_>,
     pointer_x: i32,
     pointer_y: i32,
 ) -> anyhow::Result<()> {
@@ -1097,61 +1098,38 @@ fn draw_cursor_layer(
     device: &Device,
     recorder: &mut CommandBufferRecorder<'_>,
     cache: &SurfaceTextureCache,
-    cursor: Option<&CursorFrame>,
+    cursor: CursorDraw<'_>,
     pointer_x: i32,
     pointer_y: i32,
     output_width: u32,
     output_height: u32,
     clip: Option<&vk::Rect2D>,
 ) {
-    let cursor_key = cursor
-        .map(|c| (c.owner_id, c.surface_id))
-        .unwrap_or(CURSOR_TEXTURE_KEY);
+    let (cursor_key, cursor_frame) = match cursor {
+        CursorDraw::Client(frame) => ((frame.owner_id, frame.surface_id), frame),
+        CursorDraw::Default => (CURSOR_TEXTURE_KEY, default_cursor_frame()),
+        CursorDraw::Hidden => return,
+    };
     let Some(texture) = cache.texture(cursor_key) else {
         return;
     };
-    match cursor {
-        Some(cursor_frame) => {
-            let dest = cursor_dest_rect(cursor_frame, pointer_x, pointer_y);
-            if dest[2] > 0.0
-                && dest[3] > 0.0
-                && clip.is_none_or(|clip| dest_intersects_clip(dest, clip))
-            {
-                compositor.draw_layer(
-                    device,
-                    recorder,
-                    texture,
-                    dest,
-                    [0.0, 0.0, 1.0, 1.0],
-                    output_width,
-                    output_height,
-                    cursor_frame.format == WL_SHM_FORMAT_XRGB8888,
-                    BufferTransform::from_raw(cursor_frame.buffer_transform).unwrap_or_default(),
-                    clip,
-                );
-            }
-        }
-        None => {
-            let default = default_cursor_frame();
-            let dest = cursor_dest_rect(default, pointer_x, pointer_y);
-            if dest[2] > 0.0
-                && dest[3] > 0.0
-                && clip.is_none_or(|clip| dest_intersects_clip(dest, clip))
-            {
-                compositor.draw_layer(
-                    device,
-                    recorder,
-                    texture,
-                    dest,
-                    [0.0, 0.0, 1.0, 1.0],
-                    output_width,
-                    output_height,
-                    default.format == WL_SHM_FORMAT_XRGB8888,
-                    BufferTransform::from_raw(default.buffer_transform).unwrap_or_default(),
-                    clip,
-                );
-            }
-        }
+    let dest = cursor_dest_rect(cursor_frame, pointer_x, pointer_y);
+    if dest[2] > 0.0
+        && dest[3] > 0.0
+        && clip.is_none_or(|clip| dest_intersects_clip(dest, clip))
+    {
+        compositor.draw_layer(
+            device,
+            recorder,
+            texture,
+            dest,
+            [0.0, 0.0, 1.0, 1.0],
+            output_width,
+            output_height,
+            cursor_frame.format == WL_SHM_FORMAT_XRGB8888,
+            BufferTransform::from_raw(cursor_frame.buffer_transform).unwrap_or_default(),
+            clip,
+        );
     }
 }
 

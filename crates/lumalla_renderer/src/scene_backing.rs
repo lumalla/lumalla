@@ -4,7 +4,7 @@ use anyhow::Context;
 use lumalla_shared::BufferTransform;
 
 use crate::default_cursor::default_cursor_frame;
-use crate::{CursorFrame, SurfaceFrame};
+use crate::{CursorDraw, CursorFrame, SurfaceFrame};
 
 const WL_SHM_FORMAT_ARGB8888: u32 = 0;
 const WL_SHM_FORMAT_XRGB8888: u32 = 1;
@@ -87,7 +87,7 @@ pub fn prepare_composite(
     pending_damage: &[DamageRect],
     force_full: bool,
     frames: &[&SurfaceFrame],
-    cursor: Option<&CursorFrame>,
+    cursor: CursorDraw<'_>,
     pointer_x: i32,
     pointer_y: i32,
 ) -> anyhow::Result<CompositeMode> {
@@ -213,7 +213,7 @@ pub fn prepare_gpu_composite(
 
 fn composite_scene_full(
     frames: &[&SurfaceFrame],
-    cursor: Option<&CursorFrame>,
+    cursor: CursorDraw<'_>,
     pointer_x: i32,
     pointer_y: i32,
     output_width: u32,
@@ -222,7 +222,7 @@ fn composite_scene_full(
 ) -> anyhow::Result<Vec<u8>> {
     let mut upload = composite_surface_full(frames, output_width, output_height, clear)?;
     match cursor {
-        Some(client) => composite_cursor_into(
+        CursorDraw::Client(client) => composite_cursor_into(
             &mut upload,
             output_width as usize,
             output_height as usize,
@@ -230,7 +230,7 @@ fn composite_scene_full(
             pointer_x,
             pointer_y,
         )?,
-        None => composite_cursor_into(
+        CursorDraw::Default => composite_cursor_into(
             &mut upload,
             output_width as usize,
             output_height as usize,
@@ -238,6 +238,7 @@ fn composite_scene_full(
             pointer_x,
             pointer_y,
         )?,
+        CursorDraw::Hidden => {}
     }
     Ok(upload)
 }
@@ -249,7 +250,7 @@ fn composite_region(
     damage: DamageRect,
     clear: [f32; 4],
     frames: &[&SurfaceFrame],
-    cursor: Option<&CursorFrame>,
+    cursor: CursorDraw<'_>,
     pointer_x: i32,
     pointer_y: i32,
 ) -> anyhow::Result<()> {
@@ -293,7 +294,7 @@ fn composite_region(
         height: damage.height,
     };
     match cursor {
-        Some(client) => composite_cursor_in_rect(
+        CursorDraw::Client(client) => composite_cursor_in_rect(
             pixels,
             width,
             height,
@@ -302,7 +303,7 @@ fn composite_region(
             pointer_y,
             cursor_rect,
         )?,
-        None => composite_cursor_in_rect(
+        CursorDraw::Default => composite_cursor_in_rect(
             pixels,
             width,
             height,
@@ -311,6 +312,7 @@ fn composite_region(
             pointer_y,
             cursor_rect,
         )?,
+        CursorDraw::Hidden => {}
     }
     Ok(())
 }
@@ -777,7 +779,7 @@ mod tests {
             }],
             false,
             &[&frame],
-            None,
+            CursorDraw::Default,
             5,
             0,
         )
@@ -1004,7 +1006,7 @@ mod tests {
                 }],
                 false,
                 &[&frame],
-                None,
+                CursorDraw::Default,
                 100,
                 100,
             )

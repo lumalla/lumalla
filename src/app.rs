@@ -15,8 +15,8 @@ use libc::PIDFD_THREAD;
 use log::{debug, error, info, warn};
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::{
-    ClientId, ConnectedClients, DisplayState, KeyboardModifiers, OutputInfo, PresentationFlipInfo,
-    ReadResult, SurfaceUpdate, Wayland, create_wayland_display,
+    ClientId, ConnectedClients, DisplayState, KeyboardModifiers, OutputInfo, PointerCursor,
+    PresentationFlipInfo, ReadResult, SurfaceUpdate, Wayland, create_wayland_display,
 };
 use lumalla_input::{BTN_LEFT, InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
 use lumalla_renderer::{
@@ -990,23 +990,33 @@ impl AppData {
     }
 
     fn sync_pointer_cursor(&mut self, event_loop: &mut EventLoop) {
-        if let Some(active) = self.display_state.active_cursor() {
-            let key = (active.client_id.get(), active.surface_id.get());
-            if self.renderer_state.cursor_surface_key() == Some(key) {
-                if let Err(err) = self
-                    .renderer_state
-                    .update_cursor_hotspot(active.hotspot_x, active.hotspot_y)
-                {
-                    error!("Unable to update cursor hotspot: {err:#}");
+        match self.display_state.pointer_cursor() {
+            PointerCursor::Surface(active) => {
+                let key = (active.client_id.get(), active.surface_id.get());
+                if self.renderer_state.cursor_surface_key() == Some(key) {
+                    if let Err(err) = self
+                        .renderer_state
+                        .update_cursor_hotspot(active.hotspot_x, active.hotspot_y)
+                    {
+                        error!("Unable to update cursor hotspot: {err:#}");
+                    } else if self.renderer_state.scene_dirty() {
+                        self.mark_present_dirty(event_loop);
+                    }
+                }
+            }
+            PointerCursor::Hidden => {
+                if let Err(err) = self.renderer_state.hide_cursor() {
+                    error!("Unable to hide pointer cursor: {err:#}");
                 } else if self.renderer_state.scene_dirty() {
                     self.mark_present_dirty(event_loop);
                 }
             }
-        } else if self.renderer_state.cursor_surface_key().is_some() {
-            if let Err(err) = self.renderer_state.clear_cursor_frame() {
-                error!("Unable to clear client cursor frame: {err:#}");
-            } else if self.renderer_state.scene_dirty() {
-                self.mark_present_dirty(event_loop);
+            PointerCursor::Default => {
+                if let Err(err) = self.renderer_state.clear_cursor_frame() {
+                    error!("Unable to restore default cursor: {err:#}");
+                } else if self.renderer_state.scene_dirty() {
+                    self.mark_present_dirty(event_loop);
+                }
             }
         }
     }

@@ -28,6 +28,43 @@ pub struct ActiveCursor {
     pub hotspot_y: i32,
 }
 
+/// What the compositor should draw for the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerCursor {
+    /// No focused pointer, or client has not set a cursor yet.
+    Default,
+    /// Client called `wl_pointer.set_cursor` with a null surface.
+    Hidden,
+    /// Client assigned a cursor surface.
+    Surface(ActiveCursor),
+}
+
+/// Per-pointer cursor assignment from `wl_pointer.set_cursor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatPointerCursor {
+    /// Client has not called set_cursor since this pointer was created.
+    Unset,
+    /// Client explicitly hid the cursor (null surface).
+    Hidden,
+    Surface(ObjectId),
+}
+
+impl SeatPointerCursor {
+    fn from_set_cursor(surface: Option<ObjectId>) -> Self {
+        match surface {
+            None => Self::Hidden,
+            Some(surface) => Self::Surface(surface),
+        }
+    }
+
+    fn surface_id(self) -> Option<ObjectId> {
+        match self {
+            Self::Surface(surface) => Some(surface),
+            Self::Unset | Self::Hidden => None,
+        }
+    }
+}
+
 pub struct SeatManager {
     has_main_seat: bool,
     known_seats: HashSet<String>,
@@ -70,7 +107,7 @@ struct SeatPointer {
     id: ObjectId,
     version: u32,
     focus: Option<ObjectId>,
-    cursor_surface: Option<ObjectId>,
+    cursor: SeatPointerCursor,
     hotspot: (i32, i32),
     enter_serial: Option<u32>,
 }
@@ -227,7 +264,7 @@ impl SeatManager {
             id: pointer_id,
             version,
             focus: focus_surface,
-            cursor_surface: None,
+            cursor: SeatPointerCursor::Unset,
             hotspot: (0, 0),
             enter_serial,
         });
@@ -244,7 +281,7 @@ impl SeatManager {
             .iter()
             .find(|p| p.client_id == client_id && p.id == pointer_id)
         {
-            if let Some(cursor) = pointer.cursor_surface {
+            if let Some(cursor) = pointer.cursor.surface_id() {
                 let _ = surface_manager.clear_cursor_role(client_id, cursor);
             }
         }
@@ -313,17 +350,27 @@ impl SeatManager {
             .and_then(|p| p.focus)
     }
 
+    pub fn pointer_cursor(&self) -> PointerCursor {
+        let Some(pointer) = self.pointers.iter().find(|p| p.focus.is_some()) else {
+            return PointerCursor::Default;
+        };
+        match pointer.cursor {
+            SeatPointerCursor::Unset => PointerCursor::Default,
+            SeatPointerCursor::Hidden => PointerCursor::Hidden,
+            SeatPointerCursor::Surface(surface_id) => PointerCursor::Surface(ActiveCursor {
+                client_id: pointer.client_id,
+                surface_id,
+                hotspot_x: pointer.hotspot.0,
+                hotspot_y: pointer.hotspot.1,
+            }),
+        }
+    }
+
     pub fn active_cursor(&self) -> Option<ActiveCursor> {
-        let pointer = self
-            .pointers
-            .iter()
-            .find(|p| p.focus.is_some() && p.cursor_surface.is_some())?;
-        Some(ActiveCursor {
-            client_id: pointer.client_id,
-            surface_id: pointer.cursor_surface?,
-            hotspot_x: pointer.hotspot.0,
-            hotspot_y: pointer.hotspot.1,
-        })
+        match self.pointer_cursor() {
+            PointerCursor::Surface(cursor) => Some(cursor),
+            PointerCursor::Default | PointerCursor::Hidden => None,
+        }
     }
 
     pub fn pointer_focus_for_client(&self, client_id: ClientId) -> Option<ObjectId> {
@@ -374,8 +421,9 @@ impl SeatManager {
             return Ok(());
         }
 
-        let previous_cursor = self.pointers[pointer_index].cursor_surface;
-        if previous_cursor == surface {
+        let previous_cursor = self.pointers[pointer_index].cursor;
+        let new_cursor = SeatPointerCursor::from_set_cursor(surface);
+        if previous_cursor == new_cursor {
             self.pointers[pointer_index].hotspot = (hotspot_x, hotspot_y);
             return Ok(());
         }
@@ -384,7 +432,7 @@ impl SeatManager {
             // ObjectIds are per-client namespaces: only compare within the same client.
             let owned_by_other = self.pointers.iter().any(|p| {
                 p.client_id == client_id
-                    && p.cursor_surface == Some(new_surface)
+                    && p.cursor.surface_id() == Some(new_surface)
                     && p.id != pointer_id
             });
             if owned_by_other {
@@ -404,16 +452,16 @@ impl SeatManager {
             }
         }
 
-        if let Some(old) = previous_cursor {
+        if let Some(old) = previous_cursor.surface_id() {
             let still_used = self.pointers.iter().enumerate().any(|(idx, p)| {
-                idx != pointer_index && p.client_id == client_id && p.cursor_surface == Some(old)
+                idx != pointer_index && p.client_id == client_id && p.cursor.surface_id() == Some(old)
             });
             if !still_used {
                 let _ = surface_manager.clear_cursor_role(client_id, old);
             }
         }
 
-        self.pointers[pointer_index].cursor_surface = surface;
+        self.pointers[pointer_index].cursor = new_cursor;
         self.pointers[pointer_index].hotspot = (hotspot_x, hotspot_y);
         Ok(())
     }
@@ -1004,7 +1052,7 @@ impl SeatManager {
             {
                 pointer.focus = None;
                 pointer.enter_serial = None;
-                // Keep cursor_surface so a later set_cursor with the same surface
+                // Keep cursor so a later set_cursor with the same surface
                 // can no-op; ObjectIds are only compared within a client.
             }
         }
@@ -1361,8 +1409,66 @@ mod tests {
         )
         .unwrap();
         assert!(surfaces.surface_role_is_cursor(client_id, cursor));
-        assert_eq!(seat.pointers[0].cursor_surface, Some(cursor));
+        assert_eq!(
+            seat.pointers[0].cursor,
+            SeatPointerCursor::Surface(cursor)
+        );
+        assert_eq!(
+            seat.pointer_cursor(),
+            PointerCursor::Surface(ActiveCursor {
+                client_id,
+                surface_id: cursor,
+                hotspot_x: 1,
+                hotspot_y: 2,
+            })
+        );
         assert_eq!(seat.pointers[0].hotspot, (1, 2));
+    }
+
+    #[test]
+    fn set_cursor_null_hides_pointer_image() {
+        let mut seat = SeatManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let (_keep, mut writer) = writer();
+        let client_id = client(1);
+        let pointer = object(10);
+        let surface = object(20);
+        let cursor = object(21);
+
+        surfaces.create_surface(client_id, surface);
+        surfaces.create_surface(client_id, cursor);
+        surfaces
+            .create_shell_surface(client_id, object(30), surface)
+            .unwrap();
+        surfaces
+            .set_shell_mode(client_id, object(30), ShellMode::Toplevel)
+            .unwrap();
+        surfaces
+            .attach(client_id, surface, Some(object(40)), 0, 0, 1)
+            .unwrap();
+        let _ = surfaces.commit(client_id, surface).unwrap();
+
+        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces);
+        let enter_serial = seat.pointers[0].enter_serial.unwrap();
+        assert_eq!(seat.pointer_cursor(), PointerCursor::Default);
+
+        seat.set_cursor(
+            client_id,
+            pointer,
+            enter_serial,
+            Some(cursor),
+            0,
+            0,
+            &mut surfaces,
+        )
+        .unwrap();
+        seat.set_cursor(client_id, pointer, enter_serial, None, 0, 0, &mut surfaces)
+            .unwrap();
+
+        assert_eq!(seat.pointers[0].cursor, SeatPointerCursor::Hidden);
+        assert_eq!(seat.pointer_cursor(), PointerCursor::Hidden);
+        assert!(seat.active_cursor().is_none());
+        assert!(!surfaces.surface_role_is_cursor(client_id, cursor));
     }
 
     #[test]

@@ -223,6 +223,54 @@ pub struct CursorFrame {
     pub dmabuf: Option<DmabufAttachment>,
 }
 
+/// What to composite for the pointer image.
+#[derive(Debug)]
+pub enum CursorState {
+    /// Compositor theme / built-in default cursor.
+    Default,
+    /// Client explicitly hid the cursor; draw nothing.
+    Hidden,
+    /// Client-provided cursor buffer.
+    Client(CursorFrame),
+}
+
+impl CursorState {
+    pub fn as_client(&self) -> Option<&CursorFrame> {
+        match self {
+            Self::Client(frame) => Some(frame),
+            Self::Default | Self::Hidden => None,
+        }
+    }
+
+    pub fn as_client_mut(&mut self) -> Option<&mut CursorFrame> {
+        match self {
+            Self::Client(frame) => Some(frame),
+            Self::Default | Self::Hidden => None,
+        }
+    }
+
+    pub fn surface_key(&self) -> Option<(u32, u32)> {
+        self.as_client()
+            .map(|cursor| (cursor.owner_id, cursor.surface_id))
+    }
+
+    pub fn draw_ref(&self) -> CursorDraw<'_> {
+        match self {
+            Self::Default => CursorDraw::Default,
+            Self::Hidden => CursorDraw::Hidden,
+            Self::Client(frame) => CursorDraw::Client(frame),
+        }
+    }
+}
+
+/// Borrowed cursor draw intent passed into compositors.
+#[derive(Debug, Clone, Copy)]
+pub enum CursorDraw<'a> {
+    Default,
+    Hidden,
+    Client(&'a CursorFrame),
+}
+
 impl CursorFrame {
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -312,7 +360,7 @@ pub struct RendererState {
     /// Mapped surfaces in paint order (back to front).
     surface_frames: HashMap<(u32, u32), SurfaceFrame>,
     surface_order: Vec<(u32, u32)>,
-    cursor_frame: Option<CursorFrame>,
+    cursor_state: CursorState,
     pointer_x: i32,
     pointer_y: i32,
     scene_dirty: bool,
@@ -344,7 +392,7 @@ impl RendererState {
             flip_events: Box::new(FlipEventQueue::new()),
             surface_frames: HashMap::new(),
             surface_order: Vec::new(),
-            cursor_frame: None,
+            cursor_state: CursorState::Default,
             pointer_x: 0,
             pointer_y: 0,
             scene_dirty: false,
@@ -371,25 +419,21 @@ impl RendererState {
 
     fn note_pointer_damage(&mut self, new_x: i32, new_y: i32) {
         let old = (self.pointer_x, self.pointer_y);
-        let damage = match self.cursor_frame.as_ref() {
-            Some(cursor) => cursor_damage_rects(cursor, old, (new_x, new_y)),
-            None => cursor_damage_rects_default(old, (new_x, new_y)),
+        let damage = match self.cursor_state.draw_ref() {
+            CursorDraw::Client(cursor) => cursor_damage_rects(cursor, old, (new_x, new_y)),
+            CursorDraw::Default => cursor_damage_rects_default(old, (new_x, new_y)),
+            CursorDraw::Hidden => Vec::new(),
         };
         self.pending_damage.extend(damage);
         self.pending_pointer_damage = true;
     }
 
     fn note_cursor_redraw(&mut self) {
-        let rect = match self.cursor_frame.as_ref() {
-            Some(cursor) => cursor_damage_rects(
-                cursor,
-                (self.pointer_x, self.pointer_y),
-                (self.pointer_x, self.pointer_y),
-            ),
-            None => cursor_damage_rects_default(
-                (self.pointer_x, self.pointer_y),
-                (self.pointer_x, self.pointer_y),
-            ),
+        let pointer = (self.pointer_x, self.pointer_y);
+        let rect = match self.cursor_state.draw_ref() {
+            CursorDraw::Client(cursor) => cursor_damage_rects(cursor, pointer, pointer),
+            CursorDraw::Default => cursor_damage_rects_default(pointer, pointer),
+            CursorDraw::Hidden => Vec::new(),
         };
         self.pending_damage.extend(rect);
         self.pending_pointer_damage = true;
@@ -640,11 +684,11 @@ impl RendererState {
         self.pending_surface_buffer_damage
             .retain(|(owner, _), _| *owner != owner_id);
         let cursor_removed = self
-            .cursor_frame
-            .as_ref()
+            .cursor_state
+            .as_client()
             .is_some_and(|cursor| cursor.owner_id == owner_id);
         if cursor_removed {
-            self.cursor_frame = None;
+            self.cursor_state = CursorState::Default;
         }
         if self.surface_frames.len() != before || cursor_removed {
             self.pending_full_redraw = true;
@@ -655,26 +699,37 @@ impl RendererState {
     }
 
     pub fn cursor_surface_key(&self) -> Option<(u32, u32)> {
-        self.cursor_frame
-            .as_ref()
-            .map(|cursor| (cursor.owner_id, cursor.surface_id))
+        self.cursor_state.surface_key()
     }
 
     pub fn set_cursor_frame(&mut self, frame: CursorFrame) -> anyhow::Result<()> {
         frame.validate()?;
-        self.cursor_frame = Some(frame);
+        self.cursor_state = CursorState::Client(frame);
         self.cursor_buffer_dirty = true;
         self.note_cursor_redraw();
         self.mark_dirty_if_active();
         Ok(())
     }
 
+    /// Restore the compositor default cursor (not an explicit client hide).
     pub fn clear_cursor_frame(&mut self) -> anyhow::Result<()> {
-        if self.cursor_frame.is_none() {
+        if matches!(self.cursor_state, CursorState::Default) {
             return Ok(());
         }
         self.note_cursor_redraw();
-        self.cursor_frame = None;
+        self.cursor_state = CursorState::Default;
+        self.note_cursor_redraw();
+        self.mark_dirty_if_active();
+        Ok(())
+    }
+
+    /// Hide the pointer image entirely (client called set_cursor with null).
+    pub fn hide_cursor(&mut self) -> anyhow::Result<()> {
+        if matches!(self.cursor_state, CursorState::Hidden) {
+            return Ok(());
+        }
+        self.note_cursor_redraw();
+        self.cursor_state = CursorState::Hidden;
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -691,7 +746,7 @@ impl RendererState {
     }
 
     pub fn update_cursor_hotspot(&mut self, hotspot_x: i32, hotspot_y: i32) -> anyhow::Result<()> {
-        let Some(cursor) = self.cursor_frame.as_ref() else {
+        let Some(cursor) = self.cursor_state.as_client() else {
             return Ok(());
         };
         if cursor.hotspot_x == hotspot_x && cursor.hotspot_y == hotspot_y {
@@ -721,7 +776,7 @@ impl RendererState {
             .extend(damage_for(old_hotspot.0, old_hotspot.1));
         self.pending_damage.extend(damage_for(hotspot_x, hotspot_y));
         self.pending_pointer_damage = true;
-        if let Some(cursor) = self.cursor_frame.as_mut() {
+        if let Some(cursor) = self.cursor_state.as_client_mut() {
             cursor.hotspot_x = hotspot_x;
             cursor.hotspot_y = hotspot_y;
         }
@@ -1501,7 +1556,7 @@ impl RendererState {
             .iter()
             .filter_map(|key| self.surface_frames.get(key))
             .collect();
-        let cursor = self.cursor_frame.as_ref();
+        let cursor = self.cursor_state.draw_ref();
         let pointer_x = self.pointer_x;
         let pointer_y = self.pointer_y;
 
