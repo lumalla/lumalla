@@ -3,7 +3,7 @@
 use zbus::{interface, object_server::SignalEmitter};
 
 use crate::types::{
-    DrmDeviceInfo, KeyBindingInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowInfo,
+    DrmDeviceInfo, KeyBindingInfo, OutputConfigInfo, OutputInfo, ViewInfo, WindowInfo,
     WindowRuleInfo, XkbInfo, ZoneInfo,
 };
 
@@ -32,14 +32,17 @@ pub trait WindowManagerHandler: Send + Sync {
     /// Remove a logical Wayland output by name.
     fn remove_output(&mut self, name: &str) -> zbus::fdo::Result<()>;
 
+    /// Append a view to a named output (replaces an existing view with the same name).
+    fn add_view(&mut self, output: &str, view: ViewInfo) -> zbus::fdo::Result<()>;
+
+    /// Remove a view from a named output by view name.
+    fn remove_view(&mut self, output: &str, view: &str) -> zbus::fdo::Result<()>;
+
     /// Add or replace a zone by name.
     fn add_zone(&mut self, zone: ZoneInfo) -> zbus::fdo::Result<()>;
 
     /// Remove a zone by name.
     fn remove_zone(&mut self, name: &str) -> zbus::fdo::Result<()>;
-
-    /// Replace workspace layout.
-    fn set_layout(&mut self, spaces: LayoutSpacesInfo) -> zbus::fdo::Result<()>;
 
     /// Add a window placement rule.
     fn add_window_rule(&mut self, rule: WindowRuleInfo) -> zbus::fdo::Result<()>;
@@ -212,16 +215,20 @@ impl WindowManager {
         self.handler.remove_output(name)
     }
 
+    fn add_view(&mut self, output: &str, view: ViewInfo) -> zbus::fdo::Result<()> {
+        self.handler.add_view(output, view)
+    }
+
+    fn remove_view(&mut self, output: &str, view: &str) -> zbus::fdo::Result<()> {
+        self.handler.remove_view(output, view)
+    }
+
     fn add_zone(&mut self, zone: ZoneInfo) -> zbus::fdo::Result<()> {
         self.handler.add_zone(zone)
     }
 
     fn remove_zone(&mut self, name: &str) -> zbus::fdo::Result<()> {
         self.handler.remove_zone(name)
-    }
-
-    fn set_layout(&mut self, spaces: LayoutSpacesInfo) -> zbus::fdo::Result<()> {
-        self.handler.set_layout(spaces)
     }
 
     fn add_window_rule(&mut self, rule: WindowRuleInfo) -> zbus::fdo::Result<()> {

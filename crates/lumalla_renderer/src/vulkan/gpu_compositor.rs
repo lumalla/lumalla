@@ -8,7 +8,7 @@ use std::ptr;
 
 use anyhow::Context;
 use ash::vk;
-use lumalla_shared::BufferTransform;
+use lumalla_shared::{BufferTransform, View};
 
 use crate::default_cursor::default_cursor_frame;
 use crate::scene_backing::{CompositeMode, DamageRect, UploadRect, buffer_damage_to_upload_rect};
@@ -959,6 +959,7 @@ pub fn composite_to_scanout(
     output_height: u32,
     clear_color: [f32; 4],
     composite_mode: CompositeMode,
+    views: &[View],
     layers: &[&SurfaceFrame],
     cursor: CursorDraw<'_>,
     pointer_x: i32,
@@ -986,21 +987,13 @@ pub fn composite_to_scanout(
 
         match composite_mode {
             CompositeMode::Full => {
-                draw_scene_layers(
+                draw_views(
                     compositor,
                     device,
                     &mut recorder,
                     cache,
+                    views,
                     layers,
-                    output_width,
-                    output_height,
-                    None,
-                );
-                draw_cursor_layer(
-                    compositor,
-                    device,
-                    &mut recorder,
-                    cache,
                     cursor,
                     pointer_x,
                     pointer_y,
@@ -1015,21 +1008,13 @@ pub fn composite_to_scanout(
                     // ClearAttachments is clipped by the dynamic scissor.
                     recorder.set_scissor(&clip);
                     recorder.clear_color_rects(clear_color, &[clip]);
-                    draw_scene_layers(
+                    draw_views(
                         compositor,
                         device,
                         &mut recorder,
                         cache,
+                        views,
                         layers,
-                        output_width,
-                        output_height,
-                        Some(&clip),
-                    );
-                    draw_cursor_layer(
-                        compositor,
-                        device,
-                        &mut recorder,
-                        cache,
                         cursor,
                         pointer_x,
                         pointer_y,
@@ -1054,11 +1039,64 @@ pub fn composite_to_scanout(
     Ok(())
 }
 
+fn draw_views(
+    compositor: &GpuCompositor,
+    device: &Device,
+    recorder: &mut CommandBufferRecorder<'_>,
+    cache: &SurfaceTextureCache,
+    views: &[View],
+    layers: &[&SurfaceFrame],
+    cursor: CursorDraw<'_>,
+    pointer_x: i32,
+    pointer_y: i32,
+    output_width: u32,
+    output_height: u32,
+    outer_clip: Option<&vk::Rect2D>,
+) {
+    for view in views {
+        let Some(view_clip) = view_dest_clip(view, output_width, output_height) else {
+            continue;
+        };
+        let clip = match outer_clip {
+            Some(outer) => match intersect_vk_rects(outer, &view_clip) {
+                Some(combined) => combined,
+                None => continue,
+            },
+            None => view_clip,
+        };
+        draw_scene_layers(
+            compositor,
+            device,
+            recorder,
+            cache,
+            view,
+            layers,
+            output_width,
+            output_height,
+            Some(&clip),
+        );
+        draw_cursor_layer(
+            compositor,
+            device,
+            recorder,
+            cache,
+            view,
+            cursor,
+            pointer_x,
+            pointer_y,
+            output_width,
+            output_height,
+            Some(&clip),
+        );
+    }
+}
+
 fn draw_scene_layers(
     compositor: &GpuCompositor,
     device: &Device,
     recorder: &mut CommandBufferRecorder<'_>,
     cache: &SurfaceTextureCache,
+    view: &View,
     layers: &[&SurfaceFrame],
     output_width: u32,
     output_height: u32,
@@ -1069,7 +1107,7 @@ fn draw_scene_layers(
         let Some(texture) = cache.texture(key) else {
             continue;
         };
-        let dest = surface_dest_rect(frame);
+        let dest = map_rect_through_view(view, surface_dest_rect(frame));
         if dest[2] <= 0.0 || dest[3] <= 0.0 {
             continue;
         }
@@ -1098,6 +1136,7 @@ fn draw_cursor_layer(
     device: &Device,
     recorder: &mut CommandBufferRecorder<'_>,
     cache: &SurfaceTextureCache,
+    view: &View,
     cursor: CursorDraw<'_>,
     pointer_x: i32,
     pointer_y: i32,
@@ -1113,7 +1152,7 @@ fn draw_cursor_layer(
     let Some(texture) = cache.texture(cursor_key) else {
         return;
     };
-    let dest = cursor_dest_rect(cursor_frame, pointer_x, pointer_y);
+    let dest = map_rect_through_view(view, cursor_dest_rect(cursor_frame, pointer_x, pointer_y));
     if dest[2] > 0.0
         && dest[3] > 0.0
         && clip.is_none_or(|clip| dest_intersects_clip(dest, clip))
@@ -1131,6 +1170,76 @@ fn draw_cursor_layer(
             clip,
         );
     }
+}
+
+/// Map a rectangle from global compositor space through a view into output-local pixels.
+pub fn map_rect_through_view(view: &View, rect: [f32; 4]) -> [f32; 4] {
+    let (sx, sy, sw, sh) = view.source;
+    let (dx, dy, dw, dh) = view.dest;
+    if sw <= 0 || sh <= 0 {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    let scale_x = dw as f32 / sw as f32;
+    let scale_y = dh as f32 / sh as f32;
+    [
+        dx as f32 + (rect[0] - sx as f32) * scale_x,
+        dy as f32 + (rect[1] - sy as f32) * scale_y,
+        rect[2] * scale_x,
+        rect[3] * scale_y,
+    ]
+}
+
+fn view_dest_clip(view: &View, output_width: u32, output_height: u32) -> Option<vk::Rect2D> {
+    let (dx, dy, dw, dh) = view.dest;
+    if dw <= 0 || dh <= 0 {
+        return None;
+    }
+    let x0 = dx.max(0) as u32;
+    let y0 = dy.max(0) as u32;
+    let x1 = (dx + dw).max(0) as u32;
+    let y1 = (dy + dh).max(0) as u32;
+    let x0 = x0.min(output_width);
+    let y0 = y0.min(output_height);
+    let x1 = x1.min(output_width);
+    let y1 = y1.min(output_height);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    Some(vk::Rect2D {
+        offset: vk::Offset2D {
+            x: x0 as i32,
+            y: y0 as i32,
+        },
+        extent: vk::Extent2D {
+            width: x1 - x0,
+            height: y1 - y0,
+        },
+    })
+}
+
+fn intersect_vk_rects(a: &vk::Rect2D, b: &vk::Rect2D) -> Option<vk::Rect2D> {
+    let ax0 = a.offset.x;
+    let ay0 = a.offset.y;
+    let ax1 = a.offset.x + a.extent.width as i32;
+    let ay1 = a.offset.y + a.extent.height as i32;
+    let bx0 = b.offset.x;
+    let by0 = b.offset.y;
+    let bx1 = b.offset.x + b.extent.width as i32;
+    let by1 = b.offset.y + b.extent.height as i32;
+    let x0 = ax0.max(bx0);
+    let y0 = ay0.max(by0);
+    let x1 = ax1.min(bx1);
+    let y1 = ay1.min(by1);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    Some(vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    })
 }
 
 fn surface_dest_rect(frame: &SurfaceFrame) -> [f32; 4] {

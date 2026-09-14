@@ -28,7 +28,7 @@ function M.enable_virtual_output(opts)
 	if existing[name] then
 		return
 	end
-	lum.add_output({
+	lum.add_output_with_view({
 		name = name,
 		description = opts.description or DEFAULT_VIRTUAL.description,
 		x = opts.x or DEFAULT_VIRTUAL.x,
@@ -108,7 +108,7 @@ function M.enable_all_drm_outputs(devices)
 		local refresh_mhz = mode and (mode.refresh_hz * 1000) or 60000
 
 		if not existing[connector.name] and width > 0 and height > 0 then
-			lum.add_output({
+			lum.add_output_with_view({
 				name = connector.name,
 				description = connector.connector_type .. " " .. connector.name,
 				x = x,

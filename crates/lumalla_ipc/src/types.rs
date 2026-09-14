@@ -1,7 +1,5 @@
 //! D-Bus serializable types.
 
-use std::collections::HashMap;
-
 use lumalla_shared::{
     CompositionStrategy, DrmConnector, DrmDeviceState, DrmMode, Mods, Output, WindowRule,
     WindowState, Zone,
@@ -135,6 +133,60 @@ impl From<OutputConfigInfo> for lumalla_shared::OutputConfig {
     }
 }
 
+/// A view mapping global compositor space onto an output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct ViewInfo {
+    /// Unique name within the owning output.
+    pub name: String,
+    /// Source X in global compositor space.
+    pub source_x: i32,
+    /// Source Y in global compositor space.
+    pub source_y: i32,
+    /// Source width in global compositor space.
+    pub source_width: i32,
+    /// Source height in global compositor space.
+    pub source_height: i32,
+    /// Destination X in output-local coordinates.
+    pub dest_x: i32,
+    /// Destination Y in output-local coordinates.
+    pub dest_y: i32,
+    /// Destination width in output-local coordinates.
+    pub dest_width: i32,
+    /// Destination height in output-local coordinates.
+    pub dest_height: i32,
+}
+
+impl From<&lumalla_shared::View> for ViewInfo {
+    fn from(view: &lumalla_shared::View) -> Self {
+        Self {
+            name: view.name.clone(),
+            source_x: view.source.0,
+            source_y: view.source.1,
+            source_width: view.source.2,
+            source_height: view.source.3,
+            dest_x: view.dest.0,
+            dest_y: view.dest.1,
+            dest_width: view.dest.2,
+            dest_height: view.dest.3,
+        }
+    }
+}
+
+impl From<ViewInfo> for lumalla_shared::View {
+    fn from(info: ViewInfo) -> Self {
+        Self {
+            name: info.name,
+            source: (
+                info.source_x,
+                info.source_y,
+                info.source_width,
+                info.source_height,
+            ),
+            dest: (info.dest_x, info.dest_y, info.dest_width, info.dest_height),
+        }
+    }
+}
+
 /// Output state exposed over D-Bus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct OutputInfo {
@@ -142,9 +194,9 @@ pub struct OutputInfo {
     pub name: String,
     /// Human-readable description.
     pub description: String,
-    /// X position in the global layout.
+    /// X position in the global layout (from the first view's source origin).
     pub x: i32,
-    /// Y position in the global layout.
+    /// Y position in the global layout (from the first view's source origin).
     pub y: i32,
     /// Width in pixels.
     pub width: i32,
@@ -160,15 +212,18 @@ pub struct OutputInfo {
     pub physical_height_mm: i32,
     /// Whether this is a config-created virtual output (no DRM connector).
     pub is_virtual: bool,
+    /// Views composited onto this output (paint order: later draws on top).
+    pub views: Vec<ViewInfo>,
 }
 
 impl From<&Output> for OutputInfo {
     fn from(output: &Output) -> Self {
+        let (x, y) = output.location();
         Self {
             name: output.name.clone(),
             description: output.description.clone(),
-            x: output.location.0,
-            y: output.location.1,
+            x,
+            y,
             width: output.size.0,
             height: output.size.1,
             scale: output.scale,
@@ -176,6 +231,7 @@ impl From<&Output> for OutputInfo {
             physical_width_mm: output.physical_width_mm,
             physical_height_mm: output.physical_height_mm,
             is_virtual: output.is_virtual,
+            views: output.views.iter().map(ViewInfo::from).collect(),
         }
     }
 }
@@ -191,7 +247,7 @@ impl From<&OutputInfo> for Output {
         Self {
             name: info.name.clone(),
             description: info.description.clone(),
-            location: (info.x, info.y),
+            views: info.views.iter().cloned().map(Into::into).collect(),
             size: (info.width, info.height),
             scale: info.scale,
             refresh_mhz: info.refresh_mhz,
@@ -383,17 +439,6 @@ impl From<WindowState> for WindowInfo {
     }
 }
 
-/// Output placement within a layout space.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
-pub struct LayoutOutputInfo {
-    /// Output name.
-    pub name: String,
-    /// X position.
-    pub x: i32,
-    /// Y position.
-    pub y: i32,
-}
-
 /// A registered key binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct KeyBindingInfo {
@@ -450,6 +495,3 @@ impl From<XkbInfo> for lumalla_shared::XkbConfig {
         }
     }
 }
-
-/// Layout spaces keyed by name.
-pub type LayoutSpacesInfo = HashMap<String, Vec<LayoutOutputInfo>>;

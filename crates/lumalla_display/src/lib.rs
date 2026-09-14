@@ -714,6 +714,26 @@ impl DisplayState {
             .remove_output(name, &mut self.globals, clients.values_mut())
     }
 
+    pub fn add_view(
+        &mut self,
+        output_name: &str,
+        view: lumalla_shared::View,
+        clients: &mut ConnectedClients,
+    ) -> anyhow::Result<()> {
+        self.output_manager
+            .add_view(output_name, view, clients)
+    }
+
+    pub fn remove_view(
+        &mut self,
+        output_name: &str,
+        view_name: &str,
+        clients: &mut ConnectedClients,
+    ) -> anyhow::Result<()> {
+        self.output_manager
+            .remove_view(output_name, view_name, clients)
+    }
+
     pub fn outputs(&self) -> impl Iterator<Item = &OutputInfo> {
         self.output_manager.outputs()
     }

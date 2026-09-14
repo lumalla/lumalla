@@ -673,11 +673,15 @@ impl AppData {
                         &mut self.clients,
                     ) {
                         error!("Unable to add output {name}: {err:#}");
+                    } else {
+                        self.renderer_state
+                            .set_output_views(&name, output.views.clone());
                     }
                     self.emit_outputs_changed();
                 }
                 MainMessage::RemoveOutput { name } => {
                     self.renderer_state.remove_virtual_output(&name);
+                    self.renderer_state.clear_output_views(&name);
                     if let Err(err) = self
                         .display_state
                         .remove_output(&name, &mut self.clients)
@@ -686,6 +690,32 @@ impl AppData {
                     }
                     self.sync_primary_output_geometry();
                     self.emit_outputs_changed();
+                }
+                MainMessage::AddView { output, view } => {
+                    if let Err(err) =
+                        self.display_state
+                            .add_view(&output, view.clone(), &mut self.clients)
+                    {
+                        error!("Unable to add view {output}/{}: {err:#}", view.name);
+                    } else {
+                        self.renderer_state
+                            .set_output_views(&output, self.views_for_output(&output));
+                        self.request_present_immediate(event_loop);
+                        self.emit_outputs_changed();
+                    }
+                }
+                MainMessage::RemoveView { output, view } => {
+                    if let Err(err) =
+                        self.display_state
+                            .remove_view(&output, &view, &mut self.clients)
+                    {
+                        error!("Unable to remove view {output}/{view}: {err:#}");
+                    } else {
+                        self.renderer_state
+                            .set_output_views(&output, self.views_for_output(&output));
+                        self.request_present_immediate(event_loop);
+                        self.emit_outputs_changed();
+                    }
                 }
                 MainMessage::AddZone(zone) => {
                     self.display_state.add_zone(zone);
@@ -973,6 +1003,14 @@ impl AppData {
         self.comms.dbus(DbusMessage::EmitOutputChanged(outputs));
     }
 
+    fn views_for_output(&self, name: &str) -> Vec<lumalla_shared::View> {
+        self.display_state
+            .outputs()
+            .find(|output| output.name == name)
+            .map(|output| output.views.clone())
+            .unwrap_or_default()
+    }
+
     fn sync_wayland_output_from_drm(&mut self) {
         self.sync_primary_output_geometry();
     }
@@ -991,21 +1029,30 @@ impl AppData {
 
         // Only rewrite the primary Wayland output when it already exists and is physical
         // (DRM hotplug sync). Virtual outputs are owned entirely by config `add_output`.
-        let is_virtual_primary = self
-            .display_state
-            .outputs()
-            .find(|o| o.name == name)
-            .map(|o| o.is_virtual)
-            .unwrap_or(true);
+        let existing = self.display_state.outputs().find(|o| o.name == name);
+        let is_virtual_primary = existing.map(|o| o.is_virtual).unwrap_or(true);
         if is_virtual_primary {
             return;
         }
 
+        let old_size = existing
+            .map(|o| (o.width, o.height))
+            .unwrap_or((width, height));
+        let mut views = existing
+            .map(|o| o.views.clone())
+            .unwrap_or_default();
+        for view in &mut views {
+            view.resize_for_output_mode(old_size, (width, height));
+        }
+        let (x, y) = views
+            .first()
+            .map(|view| (view.source.0, view.source.1))
+            .unwrap_or((0, 0));
         let info = OutputInfo {
             name: name.clone(),
             description: format!("Lumalla output {name}"),
-            x: 0,
-            y: 0,
+            x,
+            y,
             physical_width_mm: 300,
             physical_height_mm: 200,
             width,
@@ -1013,9 +1060,12 @@ impl AppData {
             refresh_mhz,
             scale: 1,
             is_virtual: false,
+            views: views.clone(),
         };
         self.display_state
             .update_primary_output(info, &mut self.clients);
+        self.renderer_state.set_output_views(&name, views);
+        self.emit_outputs_changed();
     }
 
     fn sync_pointer_cursor(&mut self, event_loop: &mut EventLoop) {

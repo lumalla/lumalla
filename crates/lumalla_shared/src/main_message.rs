@@ -1,6 +1,7 @@
 use crate::Mods;
 use crate::Output;
 use crate::OutputConfig;
+use crate::View;
 use crate::WindowGeometryUpdate;
 use crate::WindowRule;
 use crate::XkbConfig;
@@ -75,6 +76,20 @@ pub enum MainMessage {
     RemoveOutput {
         /// Output name previously passed to [`Self::AddOutput`].
         name: String,
+    },
+    /// Append a view to a named output (replaces an existing view with the same name).
+    AddView {
+        /// Output that owns the view.
+        output: String,
+        /// View to add or replace.
+        view: View,
+    },
+    /// Remove a view from a named output by view name.
+    RemoveView {
+        /// Output that owns the view.
+        output: String,
+        /// View name previously passed to [`Self::AddView`].
+        view: String,
     },
     /// Add or replace a zone by name.
     AddZone(Zone),

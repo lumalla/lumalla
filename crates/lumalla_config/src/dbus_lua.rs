@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use lumalla_ipc::{
-    BUS_NAME, DrmDeviceInfo, KeyBindingInfo, LayoutOutputInfo, LayoutSpacesInfo, ModsInfo,
-    OutputConfigInfo, OutputInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo, ZoneInfo,
+    BUS_NAME, DrmDeviceInfo, KeyBindingInfo, ModsInfo, OutputConfigInfo, OutputInfo, ViewInfo,
+    WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo, ZoneInfo,
 };
 use lumalla_shared::{CallbackRef, Mods, Output, geometry_field_to_dbus};
 use mlua::{
@@ -216,32 +216,6 @@ fn init_dbus_keymap(
 }
 
 fn init_dbus_output(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> LuaResult<()> {
-    let layout_client = client.clone();
-    module.set(
-        "set_layout",
-        lua.create_function(move |_, layout: ConfigLayout| {
-            let spaces: LayoutSpacesInfo = layout
-                .spaces
-                .into_iter()
-                .map(|(name, outputs)| {
-                    (
-                        name,
-                        outputs
-                            .into_iter()
-                            .map(|output| LayoutOutputInfo {
-                                name: output.name,
-                                x: output.x,
-                                y: output.y,
-                            })
-                            .collect(),
-                    )
-                })
-                .collect();
-            dbus_result(layout_client.proxy.set_layout(spaces))?;
-            Ok(())
-        })?,
-    )?;
-
     let get_client = client.clone();
     module.set(
         "get_outputs",
@@ -262,8 +236,8 @@ fn init_dbus_output(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
             dbus_result(add_client.proxy.add_output(OutputInfo {
                 name: output.name,
                 description: output.description,
-                x: output.x,
-                y: output.y,
+                x: 0,
+                y: 0,
                 width: output.width,
                 height: output.height,
                 scale: output.scale,
@@ -271,7 +245,80 @@ fn init_dbus_output(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
                 physical_width_mm: output.physical_width_mm,
                 physical_height_mm: output.physical_height_mm,
                 is_virtual: output.is_virtual,
+                views: Vec::new(),
             }))?;
+            Ok(())
+        })?,
+    )?;
+
+    let add_view_client = client.clone();
+    module.set(
+        "add_view",
+        lua.create_function(move |_, (output, view): (String, ConfigView)| {
+            dbus_result(add_view_client.proxy.add_view(
+                &output,
+                ViewInfo {
+                    name: view.name,
+                    source_x: view.source_x,
+                    source_y: view.source_y,
+                    source_width: view.source_width,
+                    source_height: view.source_height,
+                    dest_x: view.dest_x,
+                    dest_y: view.dest_y,
+                    dest_width: view.dest_width,
+                    dest_height: view.dest_height,
+                },
+            ))?;
+            Ok(())
+        })?,
+    )?;
+
+    let remove_view_client = client.clone();
+    module.set(
+        "remove_view",
+        lua.create_function(move |_, (output, view): (String, String)| {
+            dbus_result(remove_view_client.proxy.remove_view(&output, &view))?;
+            Ok(())
+        })?,
+    )?;
+
+    let helper_client = client.clone();
+    module.set(
+        "add_output_with_view",
+        lua.create_function(move |_, output: ConfigOutput| {
+            let name = output.name.clone();
+            let x = output.x;
+            let y = output.y;
+            let width = output.width;
+            let height = output.height;
+            dbus_result(helper_client.proxy.add_output(OutputInfo {
+                name: output.name,
+                description: output.description,
+                x: 0,
+                y: 0,
+                width,
+                height,
+                scale: output.scale,
+                refresh_mhz: output.refresh_mhz,
+                physical_width_mm: output.physical_width_mm,
+                physical_height_mm: output.physical_height_mm,
+                is_virtual: output.is_virtual,
+                views: Vec::new(),
+            }))?;
+            dbus_result(helper_client.proxy.add_view(
+                &name,
+                ViewInfo {
+                    name: "main".to_owned(),
+                    source_x: x,
+                    source_y: y,
+                    source_width: width,
+                    source_height: height,
+                    dest_x: 0,
+                    dest_y: 0,
+                    dest_width: width,
+                    dest_height: height,
+                },
+            ))?;
             Ok(())
         })?,
     )?;
@@ -827,25 +874,70 @@ impl FromLua for ConfigKeymap {
     }
 }
 
-struct ConfigLayout {
-    spaces: HashMap<String, Vec<ConfigOutput>>,
+struct ConfigView {
+    name: String,
+    source_x: i32,
+    source_y: i32,
+    source_width: i32,
+    source_height: i32,
+    dest_x: i32,
+    dest_y: i32,
+    dest_width: i32,
+    dest_height: i32,
 }
 
-impl FromLua for ConfigLayout {
+impl FromLua for ConfigView {
     fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
         let table = value
             .as_table()
             .ok_or_else(|| LuaError::FromLuaConversionError {
-                from: "LuaConfigLayout",
-                to: String::from("ConfigLayout"),
-                message: Some(String::from("Expected a Lua table for the ConfigLayout")),
+                from: "LuaConfigView",
+                to: String::from("ConfigView"),
+                message: Some(String::from("Expected a Lua table for the ConfigView")),
             })?;
-        let mut spaces = HashMap::new();
-        for pair in table.pairs() {
-            let (space_name, config_outputs) = pair?;
-            spaces.insert(space_name, config_outputs);
-        }
-        Ok(Self { spaces })
+        let source = table.get::<Option<LuaTable>>("source")?;
+        let dest = table.get::<Option<LuaTable>>("dest")?;
+        let (source_x, source_y, source_width, source_height) = if let Some(source) = source {
+            (
+                source.get("x")?,
+                source.get("y")?,
+                source.get("width")?,
+                source.get("height")?,
+            )
+        } else {
+            (
+                table.get("source_x")?,
+                table.get("source_y")?,
+                table.get("source_width")?,
+                table.get("source_height")?,
+            )
+        };
+        let (dest_x, dest_y, dest_width, dest_height) = if let Some(dest) = dest {
+            (
+                dest.get("x")?,
+                dest.get("y")?,
+                dest.get("width")?,
+                dest.get("height")?,
+            )
+        } else {
+            (
+                table.get("dest_x")?,
+                table.get("dest_y")?,
+                table.get("dest_width")?,
+                table.get("dest_height")?,
+            )
+        };
+        Ok(Self {
+            name: table.get("name")?,
+            source_x,
+            source_y,
+            source_width,
+            source_height,
+            dest_x,
+            dest_y,
+            dest_width,
+            dest_height,
+        })
     }
 }
 
@@ -865,11 +957,12 @@ pub(crate) struct ConfigOutput {
 
 impl From<&Output> for ConfigOutput {
     fn from(value: &Output) -> Self {
+        let (x, y) = value.location();
         Self {
             name: value.name.clone(),
             description: value.description.clone(),
-            x: value.location.0,
-            y: value.location.1,
+            x,
+            y,
             width: value.size.0,
             height: value.size.1,
             scale: value.scale,
@@ -896,8 +989,8 @@ impl FromLua for ConfigOutput {
                 .get::<Option<String>>("description")
                 .unwrap_or(None)
                 .unwrap_or_default(),
-            x: table.get("x")?,
-            y: table.get("y")?,
+            x: table.get("x").unwrap_or(0),
+            y: table.get("y").unwrap_or(0),
             width: table.get("width")?,
             height: table.get("height")?,
             scale: table.get("scale").unwrap_or(1),

@@ -17,12 +17,12 @@ use lumalla_input::evdev_keycode_from_name_with_xkb;
 use lumalla_ipc::{
     INTERFACE_NAME, KeyBindingInfo, OBJECT_PATH, WindowManagerHandler,
     types::{
-        DrmDeviceInfo, LayoutSpacesInfo, OutputConfigInfo, OutputInfo, WindowInfo, WindowRuleInfo,
-        XkbInfo, ZoneInfo,
+        DrmDeviceInfo, OutputConfigInfo, OutputInfo, ViewInfo, WindowInfo, WindowRuleInfo, XkbInfo,
+        ZoneInfo,
     },
 };
 use lumalla_shared::{
-    CapturedImage, Comms, InjectedInput, MainMessage, Mods, Output, WindowGeometryUpdate,
+    CapturedImage, Comms, InjectedInput, MainMessage, Mods, Output, View, WindowGeometryUpdate,
     WindowState, XkbConfig, geometry_field_from_dbus,
 };
 use std::path::PathBuf;
@@ -90,7 +90,10 @@ impl WindowManagerHandler for CompositorHandler {
     }
 
     fn add_output(&mut self, info: OutputInfo) -> zbus::fdo::Result<()> {
-        let output = Output::from(&info);
+        let mut output = Output::from(&info);
+        // Location is derived from views; add_output does not auto-create views.
+        output.views.clear();
+        let info = OutputInfo::from(&output);
         {
             let mut lookup = self.state.output_lookup.lock().unwrap();
             if lookup.contains_key(&output.name) {
@@ -126,6 +129,59 @@ impl WindowManagerHandler for CompositorHandler {
         Ok(())
     }
 
+    fn add_view(&mut self, output: &str, view: ViewInfo) -> zbus::fdo::Result<()> {
+        let view: View = view.into();
+        {
+            let mut lookup = self.state.output_lookup.lock().unwrap();
+            let Some(owned) = lookup.get_mut(output) else {
+                return Err(zbus::fdo::Error::Failed(format!("Unknown output: {output}")));
+            };
+            if let Some(existing) = owned.views.iter_mut().find(|v| v.name == view.name) {
+                *existing = view.clone();
+            } else {
+                owned.views.push(view.clone());
+            }
+            let updated = OutputInfo::from(&*owned);
+            let mut outputs = self.state.outputs.lock().unwrap();
+            if let Some(slot) = outputs.iter_mut().find(|o| o.name == output) {
+                *slot = updated;
+            }
+        }
+        info!("Add view over D-Bus: {output}/{}", view.name);
+        self.state.comms.main(MainMessage::AddView {
+            output: output.to_owned(),
+            view,
+        });
+        Ok(())
+    }
+
+    fn remove_view(&mut self, output: &str, view: &str) -> zbus::fdo::Result<()> {
+        {
+            let mut lookup = self.state.output_lookup.lock().unwrap();
+            let Some(owned) = lookup.get_mut(output) else {
+                return Err(zbus::fdo::Error::Failed(format!("Unknown output: {output}")));
+            };
+            let before = owned.views.len();
+            owned.views.retain(|v| v.name != view);
+            if owned.views.len() == before {
+                return Err(zbus::fdo::Error::Failed(format!(
+                    "Unknown view: {output}/{view}"
+                )));
+            }
+            let updated = OutputInfo::from(&*owned);
+            let mut outputs = self.state.outputs.lock().unwrap();
+            if let Some(slot) = outputs.iter_mut().find(|o| o.name == output) {
+                *slot = updated;
+            }
+        }
+        info!("Remove view over D-Bus: {output}/{view}");
+        self.state.comms.main(MainMessage::RemoveView {
+            output: output.to_owned(),
+            view: view.to_owned(),
+        });
+        Ok(())
+    }
+
     fn add_zone(&mut self, zone: ZoneInfo) -> zbus::fdo::Result<()> {
         info!("Add zone over D-Bus: {}", zone.name);
         self.state.comms.main(MainMessage::AddZone(zone.into()));
@@ -137,34 +193,6 @@ impl WindowManagerHandler for CompositorHandler {
         self.state.comms.main(MainMessage::RemoveZone {
             name: name.to_owned(),
         });
-        Ok(())
-    }
-
-    fn set_layout(&mut self, spaces: LayoutSpacesInfo) -> zbus::fdo::Result<()> {
-        let _outputs = self.state.output_lookup.lock().unwrap();
-        let _ = spaces;
-        // self.state.comms.display(DisplayMessage::SetLayout {
-        //     spaces: spaces
-        //         .into_iter()
-        //         .map(|(name, layout_outputs)| {
-        //             (
-        //                 name,
-        //                 layout_outputs
-        //                     .into_iter()
-        //                     .filter_map(|layout_output| {
-        //                         let Some(output) = outputs.get(&layout_output.name) else {
-        //                             warn!("Output not found: {}", layout_output.name);
-        //                             return None;
-        //                         };
-        //                         let mut output = output.clone();
-        //                         output.set_location(layout_output.x, layout_output.y);
-        //                         Some(output)
-        //                     })
-        //                     .collect(),
-        //             )
-        //         })
-        //         .collect(),
-        // });
         Ok(())
     }
 

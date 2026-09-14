@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, bail};
+use lumalla_shared::View;
 use lumalla_wayland_protocol::{
     ClientConnection, ClientId, ObjectId,
     buffer::Writer,
@@ -26,6 +27,7 @@ pub struct OutputInfo {
     pub refresh_mhz: i32,
     pub scale: i32,
     pub is_virtual: bool,
+    pub views: Vec<View>,
 }
 
 impl Default for OutputInfo {
@@ -42,7 +44,21 @@ impl Default for OutputInfo {
             refresh_mhz: 60_000,
             scale: 1,
             is_virtual: true,
+            views: Vec::new(),
         }
+    }
+}
+
+impl OutputInfo {
+    /// Sync advertised `x`/`y` from the first view's source origin.
+    pub fn sync_location_from_views(&mut self) {
+        let (x, y) = self
+            .views
+            .first()
+            .map(|view| (view.source.0, view.source.1))
+            .unwrap_or((0, 0));
+        self.x = x;
+        self.y = y;
     }
 }
 
@@ -51,7 +67,7 @@ impl From<&OutputInfo> for lumalla_shared::Output {
         Self {
             name: info.name.clone(),
             description: info.description.clone(),
-            location: (info.x, info.y),
+            views: info.views.clone(),
             size: (info.width, info.height),
             scale: info.scale,
             refresh_mhz: info.refresh_mhz,
@@ -64,11 +80,12 @@ impl From<&OutputInfo> for lumalla_shared::Output {
 
 impl From<&lumalla_shared::Output> for OutputInfo {
     fn from(output: &lumalla_shared::Output) -> Self {
+        let (x, y) = output.location();
         Self {
             name: output.name.clone(),
             description: output.description.clone(),
-            x: output.location.0,
-            y: output.location.1,
+            x,
+            y,
             physical_width_mm: output.physical_width_mm,
             physical_height_mm: output.physical_height_mm,
             width: output.size.0,
@@ -76,6 +93,7 @@ impl From<&lumalla_shared::Output> for OutputInfo {
             refresh_mhz: output.refresh_mhz,
             scale: output.scale,
             is_virtual: output.is_virtual,
+            views: output.views.clone(),
         }
     }
 }
@@ -93,13 +111,14 @@ pub struct OutputManager {
 impl OutputManager {
     pub fn add_output<'connection>(
         &mut self,
-        info: OutputInfo,
+        mut info: OutputInfo,
         globals: &mut Globals,
         client_connections: impl Iterator<Item = &'connection mut ClientConnection>,
     ) -> anyhow::Result<GlobalId> {
         if self.by_name.contains_key(&info.name) {
             bail!("Output already exists: {}", info.name);
         }
+        info.sync_location_from_views();
         let name = info.name.clone();
         let id = globals.register_version(InterfaceIndex::WlOutput, 4, client_connections);
         self.outputs.insert(id, info);
@@ -135,6 +154,56 @@ impl OutputManager {
             }
         }
         globals.unregister(global_id, client_connections);
+        Ok(())
+    }
+
+    pub fn add_view(
+        &mut self,
+        output_name: &str,
+        view: View,
+        clients: &mut ConnectedClients,
+    ) -> anyhow::Result<()> {
+        let global_id = *self
+            .by_name
+            .get(output_name)
+            .with_context(|| format!("Unknown output: {output_name}"))?;
+        let info = self
+            .outputs
+            .get_mut(&global_id)
+            .with_context(|| format!("Unknown output: {output_name}"))?;
+        if let Some(existing) = info.views.iter_mut().find(|v| v.name == view.name) {
+            *existing = view;
+        } else {
+            info.views.push(view);
+        }
+        info.sync_location_from_views();
+        let info = info.clone();
+        self.update_output(global_id, info, clients);
+        Ok(())
+    }
+
+    pub fn remove_view(
+        &mut self,
+        output_name: &str,
+        view_name: &str,
+        clients: &mut ConnectedClients,
+    ) -> anyhow::Result<()> {
+        let global_id = *self
+            .by_name
+            .get(output_name)
+            .with_context(|| format!("Unknown output: {output_name}"))?;
+        let info = self
+            .outputs
+            .get_mut(&global_id)
+            .with_context(|| format!("Unknown output: {output_name}"))?;
+        let before = info.views.len();
+        info.views.retain(|v| v.name != view_name);
+        if info.views.len() == before {
+            bail!("Unknown view: {output_name}/{view_name}");
+        }
+        info.sync_location_from_views();
+        let info = info.clone();
+        self.update_output(global_id, info, clients);
         Ok(())
     }
 
@@ -211,12 +280,13 @@ impl OutputManager {
     pub fn update_output(
         &mut self,
         global_id: GlobalId,
-        info: OutputInfo,
+        mut info: OutputInfo,
         clients: &mut ConnectedClients,
     ) -> bool {
         if !self.outputs.contains_key(&global_id) {
             return false;
         }
+        info.sync_location_from_views();
         self.outputs.insert(global_id, info.clone());
         for ((client_id, object_id), bound_global) in &self.bindings {
             if *bound_global != global_id {
@@ -321,6 +391,7 @@ mod tests {
             refresh_mhz: 60_000,
             scale: 1,
             is_virtual: false,
+            views: Vec::new(),
         };
         let virtual_output = OutputInfo {
             name: "VIRTUAL-1".to_owned(),
@@ -334,6 +405,7 @@ mod tests {
             refresh_mhz: 60_000,
             scale: 1,
             is_virtual: true,
+            views: Vec::new(),
         };
         let physical_id = manager
             .add_output(physical, &mut globals, [].into_iter())
@@ -377,6 +449,11 @@ mod tests {
                     refresh_mhz: 60_000,
                     scale: 2,
                     is_virtual: false,
+                    views: vec![View {
+                        name: "main".to_owned(),
+                        source: (10, 20, 1920, 1080),
+                        dest: (0, 0, 1920, 1080),
+                    }],
                 },
                 &mut globals,
                 [].into_iter(),
@@ -408,6 +485,8 @@ mod tests {
             u32::from_ne_bytes(w[0..4].try_into().unwrap()) == 10
                 && u16::from_ne_bytes(w[4..6].try_into().unwrap()) == 2
         }));
+        assert_eq!(manager.get_by_name("HDMI-A-1").unwrap().x, 10);
+        assert_eq!(manager.get_by_name("HDMI-A-1").unwrap().y, 20);
     }
 
     #[test]
@@ -435,5 +514,38 @@ mod tests {
                 .remove_output("VIRTUAL-1", &mut globals, [].into_iter())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn add_view_updates_location_from_first_view() {
+        let mut globals = Globals::default();
+        let mut manager = OutputManager::default();
+        let mut clients = ConnectedClients::new();
+        manager
+            .add_output(
+                OutputInfo {
+                    name: "VIRTUAL-1".to_owned(),
+                    ..OutputInfo::default()
+                },
+                &mut globals,
+                [].into_iter(),
+            )
+            .unwrap();
+        assert_eq!(manager.get_by_name("VIRTUAL-1").unwrap().x, 0);
+        manager
+            .add_view(
+                "VIRTUAL-1",
+                View {
+                    name: "main".to_owned(),
+                    source: (100, 200, 800, 600),
+                    dest: (0, 0, 800, 600),
+                },
+                &mut clients,
+            )
+            .unwrap();
+        let output = manager.get_by_name("VIRTUAL-1").unwrap();
+        assert_eq!(output.x, 100);
+        assert_eq!(output.y, 200);
+        assert_eq!(output.views.len(), 1);
     }
 }

@@ -7,7 +7,7 @@ use anyhow::Context;
 use ash::vk;
 use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
-use lumalla_shared::{BufferTransform, CapturedImage, DrmDeviceState, Output, OutputConfig};
+use lumalla_shared::{BufferTransform, CapturedImage, DrmDeviceState, Output, OutputConfig, View};
 
 pub mod drm;
 pub mod vulkan;
@@ -38,7 +38,8 @@ pub use crate::scene_backing::{
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
     DmaBufImage, GpuCompositor, GpuWorkBatch, SurfaceTextureCache, VulkanContext,
-    composite_to_scanout, copy_scanout_frame, download_bgra_region, vulkan_to_drm_fourcc,
+    composite_to_scanout, copy_scanout_frame, download_bgra_region, map_rect_through_view,
+    vulkan_to_drm_fourcc,
 };
 
 struct GpuRenderResources {
@@ -348,6 +349,8 @@ pub struct RendererState {
     output_configs: HashMap<String, OutputConfig>,
     /// Virtual outputs registered from config (`add_output` with `virtual = true`).
     virtual_outputs: HashMap<String, VirtualOutput>,
+    /// Views keyed by output name; empty means the output presents clear color only.
+    output_views: HashMap<String, Vec<View>>,
     scanouts: HashMap<String, OutputScanout>,
     /// Per-output schedule + present-wake timeout state.
     output_presents: HashMap<String, OutputPresentControl>,
@@ -384,6 +387,7 @@ impl RendererState {
             render_device: None,
             output_configs: HashMap::new(),
             virtual_outputs: HashMap::new(),
+            output_views: HashMap::new(),
             scanouts: HashMap::new(),
             output_presents: HashMap::new(),
             next_present_wake_token: 0,
@@ -494,10 +498,30 @@ impl RendererState {
     pub fn remove_virtual_output(&mut self, name: &str) {
         if self.virtual_outputs.remove(name).is_some() {
             info!("Removed virtual output {name}");
+            self.output_views.remove(name);
             self.invalidate_present_targets();
             if let Some(scanout) = self.scanouts.remove(name) {
                 self.release_output_scanout(scanout);
             }
+        }
+    }
+
+    /// Replace the view list used when compositing `output`.
+    pub fn set_output_views(&mut self, output: &str, views: Vec<View>) {
+        if views.is_empty() {
+            self.output_views.remove(output);
+        } else {
+            self.output_views.insert(output.to_owned(), views);
+        }
+        self.pending_full_redraw = true;
+        self.mark_dirty_if_active();
+    }
+
+    /// Drop views for an output (blank presents until new views are set).
+    pub fn clear_output_views(&mut self, output: &str) {
+        if self.output_views.remove(output).is_some() {
+            self.pending_full_redraw = true;
+            self.mark_dirty_if_active();
         }
     }
 
@@ -802,7 +826,7 @@ impl RendererState {
     /// Capture a rectangular region of the displayed scanouts as RGBA8 pixels.
     ///
     /// `x`/`y`/`width`/`height` are in global compositor (logical) space. `outputs`
-    /// supplies layout for mapping that space onto DRM scanout buffers.
+    /// supplies views for mapping that space onto scanout buffers.
     pub fn capture_region(
         &mut self,
         x: i32,
@@ -819,7 +843,7 @@ impl RendererState {
 
         let regions: Vec<CaptureRegion> = outputs
             .iter()
-            .filter_map(|output| CaptureRegion::intersect(output, x, y, width, height))
+            .flat_map(|output| CaptureRegion::from_output_views(output, x, y, width, height))
             .collect();
 
         for region in regions {
@@ -839,15 +863,6 @@ impl RendererState {
                 pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
             }
 
-            let fb_x = ((region.ix0 - region.ox) * region.scale) as u32;
-            let fb_y = ((region.iy0 - region.oy) * region.scale) as u32;
-            let fb_w = ((region.ix1 - region.ix0) * region.scale) as u32;
-            let fb_h = ((region.iy1 - region.iy0) * region.scale) as u32;
-            let logical_w = (region.ix1 - region.ix0) as u32;
-            let logical_h = (region.iy1 - region.iy0) as u32;
-            let dest_x = (region.ix0 - x) as u32;
-            let dest_y = (region.iy0 - y) as u32;
-
             let vulkan = self
                 .vulkan
                 .as_ref()
@@ -857,12 +872,27 @@ impl RendererState {
                 .get(&region.name)
                 .context("scanout disappeared during capture")?;
             let format = scanout.current.dma_image.format();
-            let bgra =
-                download_bgra_region(vulkan, &scanout.current.dma_image, fb_x, fb_y, fb_w, fb_h)?;
+            let bgra = download_bgra_region(
+                vulkan,
+                &scanout.current.dma_image,
+                region.fb_x,
+                region.fb_y,
+                region.fb_w,
+                region.fb_h,
+            )?;
 
             blit_bgra_to_rgba(
-                &bgra, fb_w, fb_h, format, &mut rgba, dest_w, dest_h, dest_x, dest_y, logical_w,
-                logical_h,
+                &bgra,
+                region.fb_w,
+                region.fb_h,
+                format,
+                &mut rgba,
+                dest_w,
+                dest_h,
+                region.dest_x,
+                region.dest_y,
+                region.logical_w,
+                region.logical_h,
             )?;
             covered = true;
         }
@@ -1548,8 +1578,19 @@ impl RendererState {
         self.pending_pointer_damage = false;
         self.cursor_buffer_dirty = false;
 
-        let mut composite_mode =
-            prepare_gpu_composite(width, height, &_pending_damage, force_full, buffer.fresh);
+        let views = self
+            .output_views
+            .get(&target.name)
+            .cloned()
+            .unwrap_or_default();
+        // View transforms invalidate global-space partial damage; force a full redraw.
+        let mut composite_mode = prepare_gpu_composite(
+            width,
+            height,
+            &_pending_damage,
+            force_full || !views.is_empty(),
+            buffer.fresh,
+        );
 
         let layers: Vec<&SurfaceFrame> = self
             .surface_order
@@ -1644,6 +1685,7 @@ impl RendererState {
                     height,
                     color,
                     composite_mode,
+                    &views,
                     &layers,
                     cursor,
                     pointer_x,
@@ -1924,41 +1966,67 @@ impl RendererState {
 
 struct CaptureRegion {
     name: String,
-    ox: i32,
-    oy: i32,
-    scale: i32,
-    ix0: i32,
-    iy0: i32,
-    ix1: i32,
-    iy1: i32,
+    fb_x: u32,
+    fb_y: u32,
+    fb_w: u32,
+    fb_h: u32,
+    dest_x: u32,
+    dest_y: u32,
+    logical_w: u32,
+    logical_h: u32,
 }
 
 impl CaptureRegion {
-    fn intersect(output: &Output, x: i32, y: i32, width: i32, height: i32) -> Option<Self> {
-        let ox = output.location.0;
-        let oy = output.location.1;
-        let ow = output.size.0;
-        let oh = output.size.1;
-        if ow <= 0 || oh <= 0 {
-            return None;
+    fn from_output_views(
+        output: &Output,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Vec<Self> {
+        let scale = output.scale.max(1);
+        let mut regions = Vec::new();
+        for view in &output.views {
+            let (sx, sy, sw, sh) = view.source;
+            if sw <= 0 || sh <= 0 {
+                continue;
+            }
+            let ix0 = x.max(sx);
+            let iy0 = y.max(sy);
+            let ix1 = (x + width).min(sx + sw);
+            let iy1 = (y + height).min(sy + sh);
+            if ix0 >= ix1 || iy0 >= iy1 {
+                continue;
+            }
+            let mapped = map_rect_through_view(
+                view,
+                [
+                    ix0 as f32,
+                    iy0 as f32,
+                    (ix1 - ix0) as f32,
+                    (iy1 - iy0) as f32,
+                ],
+            );
+            if mapped[2] <= 0.0 || mapped[3] <= 0.0 {
+                continue;
+            }
+            let fb_x = (mapped[0] * scale as f32).round().max(0.0) as u32;
+            let fb_y = (mapped[1] * scale as f32).round().max(0.0) as u32;
+            let fb_w = (mapped[2] * scale as f32).round().max(1.0) as u32;
+            let fb_h = (mapped[3] * scale as f32).round().max(1.0) as u32;
+            regions.push(Self {
+                name: output.name.clone(),
+                fb_x,
+                fb_y,
+                fb_w,
+                fb_h,
+                dest_x: (ix0 - x) as u32,
+                dest_y: (iy0 - y) as u32,
+                logical_w: (ix1 - ix0) as u32,
+                logical_h: (iy1 - iy0) as u32,
+            });
         }
-        let ix0 = x.max(ox);
-        let iy0 = y.max(oy);
-        let ix1 = (x + width).min(ox + ow);
-        let iy1 = (y + height).min(oy + oh);
-        if ix0 >= ix1 || iy0 >= iy1 {
-            return None;
-        }
-        Some(Self {
-            name: output.name.clone(),
-            ox,
-            oy,
-            scale: output.scale.max(1),
-            ix0,
-            iy0,
-            ix1,
-            iy1,
-        })
+        regions
     }
 }
 
