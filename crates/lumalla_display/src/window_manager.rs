@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use lumalla_shared::{WindowGeometryUpdate, WindowRule, WindowState};
+use lumalla_shared::{WindowGeometryUpdate, WindowRule, WindowState, Zone};
 use lumalla_wayland_protocol::{ClientId, ObjectId};
 
 use crate::surface::SurfaceManager;
@@ -28,6 +28,7 @@ struct ManagedWindow {
     xdg_surface: ObjectId,
     app_id: String,
     title: String,
+    zone: Option<String>,
     user_placed: UserPlaced,
 }
 
@@ -51,10 +52,11 @@ pub struct WindowGeometryChange {
     pub size: Option<(i32, i32)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowError {
     UnknownWindow(u32),
     NoFocusedWindow,
+    UnknownZone(String),
 }
 
 impl std::fmt::Display for WindowError {
@@ -62,6 +64,7 @@ impl std::fmt::Display for WindowError {
         match self {
             Self::UnknownWindow(id) => write!(f, "unknown window id {id}"),
             Self::NoFocusedWindow => write!(f, "no focused window"),
+            Self::UnknownZone(name) => write!(f, "unknown zone {name}"),
         }
     }
 }
@@ -76,10 +79,37 @@ pub struct WindowManager {
     by_toplevel: HashMap<(ClientId, ObjectId), u32>,
     focused_id: Option<u32>,
     rules: Vec<WindowRule>,
+    zones: Vec<Zone>,
     pending_configures: Vec<PendingConfigure>,
 }
 
 impl WindowManager {
+    pub fn add_zone(&mut self, zone: Zone) {
+        if zone.default {
+            for existing in &mut self.zones {
+                existing.default = false;
+            }
+        }
+        if let Some(existing) = self.zones.iter_mut().find(|z| z.name == zone.name) {
+            *existing = zone;
+        } else {
+            self.zones.push(zone);
+        }
+        self.ensure_default_zone();
+    }
+
+    pub fn remove_zone(&mut self, name: &str) -> bool {
+        let Some(index) = self.zones.iter().position(|zone| zone.name == name) else {
+            return false;
+        };
+        let was_default = self.zones[index].default;
+        self.zones.remove(index);
+        if was_default {
+            self.ensure_default_zone();
+        }
+        true
+    }
+
     pub fn register_toplevel(
         &mut self,
         client_id: ClientId,
@@ -90,8 +120,20 @@ impl WindowManager {
     ) -> (i32, i32) {
         self.next_id = self.next_id.saturating_add(1).max(1);
         let id = self.next_id;
-        let (x, y) = self.next_cascade_position();
-        let (width, height) = (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+
+        let (zone_name, x, y, width, height) = if let Some(zone) = self.default_zone() {
+            let (x, y, width, height) = zone.place();
+            (Some(zone.name.clone()), x, y, width, height)
+        } else {
+            let (x, y) = self.next_cascade_position();
+            (
+                None,
+                x,
+                y,
+                DEFAULT_WINDOW_WIDTH,
+                DEFAULT_WINDOW_HEIGHT,
+            )
+        };
 
         let _ = surface_manager.set_surface_layout(client_id, wl_surface, x, y);
 
@@ -105,6 +147,7 @@ impl WindowManager {
                 xdg_surface,
                 app_id: String::new(),
                 title: String::new(),
+                zone: zone_name,
                 user_placed: UserPlaced::default(),
             },
         );
@@ -169,11 +212,23 @@ impl WindowManager {
             window.app_id = app_id.clone();
         }
 
-        let update = self.matching_rule_geometry(&app_id);
-        if update.is_empty() {
+        let Some(rule) = self.matching_rule(&app_id).cloned() else {
             return Vec::new();
+        };
+
+        let mut changes = Vec::new();
+        if let Some(zone_name) = rule.zone.as_deref()
+            && let Ok(zone_changes) =
+                self.assign_window_to_zone(id, zone_name, false, surface_manager, xdg_manager)
+        {
+            changes.extend(zone_changes);
         }
-        self.apply_update(id, update, false, surface_manager, xdg_manager)
+
+        let geometry = rule.geometry();
+        if !geometry.is_empty() {
+            changes.extend(self.apply_update(id, geometry, false, surface_manager, xdg_manager));
+        }
+        changes
     }
 
     pub fn set_focus_from_surface(&mut self, client_id: ClientId, wl_surface: ObjectId) {
@@ -206,16 +261,31 @@ impl WindowManager {
         if update.is_empty() {
             return Ok(Vec::new());
         }
-        let target = match id {
-            Some(id) if id != 0 => {
-                if !self.windows.contains_key(&id) {
-                    return Err(WindowError::UnknownWindow(id));
-                }
-                id
-            }
-            _ => self.focused_id.ok_or(WindowError::NoFocusedWindow)?,
-        };
+        let target = self.resolve_window_id(id)?;
         Ok(self.apply_update(target, update, user_initiated, surface_manager, xdg_manager))
+    }
+
+    pub fn add_window_to_zone(
+        &mut self,
+        id: Option<u32>,
+        zone_name: &str,
+        surface_manager: &SurfaceManager,
+        xdg_manager: &mut XdgManager,
+    ) -> Result<Vec<WindowGeometryChange>, WindowError> {
+        let target = self.resolve_window_id(id)?;
+        self.assign_window_to_zone(target, zone_name, true, surface_manager, xdg_manager)
+    }
+
+    pub fn remove_window_from_zone(&mut self, id: Option<u32>) -> Result<(), WindowError> {
+        let target = self.resolve_window_id(id)?;
+        if let Some(window) = self.windows.get_mut(&target) {
+            window.zone = None;
+        }
+        Ok(())
+    }
+
+    pub fn window_zone(&self, id: u32) -> Option<&str> {
+        self.windows.get(&id).and_then(|window| window.zone.as_deref())
     }
 
     pub fn take_pending_configures(&mut self) -> Vec<PendingConfigure> {
@@ -242,20 +312,56 @@ impl WindowManager {
 
     /// Resolve a window id to its Wayland surface. `None` / `0` → focused window.
     pub fn resolve_surface(&self, id: Option<u32>) -> Result<(ClientId, ObjectId), WindowError> {
-        let target = match id {
-            Some(id) if id != 0 => {
-                if !self.windows.contains_key(&id) {
-                    return Err(WindowError::UnknownWindow(id));
-                }
-                id
-            }
-            _ => self.focused_id.ok_or(WindowError::NoFocusedWindow)?,
-        };
+        let target = self.resolve_window_id(id)?;
         let window = self
             .windows
             .get(&target)
             .ok_or(WindowError::UnknownWindow(target))?;
         Ok((window.client_id, window.wl_surface))
+    }
+
+    fn assign_window_to_zone(
+        &mut self,
+        id: u32,
+        zone_name: &str,
+        user_initiated: bool,
+        surface_manager: &SurfaceManager,
+        xdg_manager: &mut XdgManager,
+    ) -> Result<Vec<WindowGeometryChange>, WindowError> {
+        let zone = self
+            .zones
+            .iter()
+            .find(|zone| zone.name == zone_name)
+            .cloned()
+            .ok_or_else(|| WindowError::UnknownZone(zone_name.to_owned()))?;
+        if let Some(window) = self.windows.get_mut(&id) {
+            window.zone = Some(zone.name.clone());
+        }
+        let (x, y, width, height) = zone.place();
+        Ok(self.apply_update(
+            id,
+            WindowGeometryUpdate {
+                x: Some(x),
+                y: Some(y),
+                width: Some(width),
+                height: Some(height),
+            },
+            user_initiated,
+            surface_manager,
+            xdg_manager,
+        ))
+    }
+
+    fn resolve_window_id(&self, id: Option<u32>) -> Result<u32, WindowError> {
+        match id {
+            Some(id) if id != 0 => {
+                if !self.windows.contains_key(&id) {
+                    return Err(WindowError::UnknownWindow(id));
+                }
+                Ok(id)
+            }
+            _ => self.focused_id.ok_or(WindowError::NoFocusedWindow),
+        }
     }
 
     fn apply_update(
@@ -367,13 +473,30 @@ impl WindowManager {
         }]
     }
 
+    fn matching_rule(&self, app_id: &str) -> Option<&WindowRule> {
+        self.rules.iter().find(|rule| rule.app_id == app_id)
+    }
+
     fn matching_rule_geometry(&self, app_id: &str) -> WindowGeometryUpdate {
-        for rule in &self.rules {
-            if rule.app_id == app_id {
-                return rule.geometry();
-            }
+        self.matching_rule(app_id)
+            .map(WindowRule::geometry)
+            .unwrap_or_default()
+    }
+
+    fn default_zone(&self) -> Option<&Zone> {
+        self.zones
+            .iter()
+            .find(|zone| zone.default)
+            .or_else(|| self.zones.first())
+    }
+
+    fn ensure_default_zone(&mut self) {
+        if self.zones.is_empty() {
+            return;
         }
-        WindowGeometryUpdate::default()
+        if !self.zones.iter().any(|zone| zone.default) {
+            self.zones[0].default = true;
+        }
     }
 
     fn next_cascade_position(&mut self) -> (i32, i32) {
@@ -409,13 +532,55 @@ impl WindowManager {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::*;
+    use lumalla_shared::CompositionStrategy;
+
+    fn client(id: u32) -> ClientId {
+        ClientId::new(NonZeroU32::new(id).unwrap())
+    }
+
+    fn object(id: u32) -> ObjectId {
+        ObjectId::new(NonZeroU32::new(id).unwrap())
+    }
+
+    fn free_zone(name: &str, x: i32, y: i32, default: bool, w: i32, h: i32) -> Zone {
+        Zone::new(
+            name.to_owned(),
+            x,
+            y,
+            default,
+            CompositionStrategy::Free {
+                default_width: w,
+                default_height: h,
+            },
+        )
+    }
+
+    fn register_with_surface(
+        wm: &mut WindowManager,
+        surfaces: &mut SurfaceManager,
+        xdg: &mut XdgManager,
+    ) -> (i32, i32) {
+        let c = client(1);
+        let wl = object(12);
+        let xdg_surface = object(11);
+        let toplevel = object(10);
+        surfaces.create_surface(c, wl);
+        xdg.create_xdg_surface(c, xdg_surface, wl).unwrap();
+        let (width, height) = wm.register_toplevel(c, toplevel, xdg_surface, wl, surfaces);
+        xdg.create_toplevel(c, toplevel, xdg_surface, width, height)
+            .unwrap();
+        (width, height)
+    }
 
     #[test]
     fn per_field_rule_merge_keeps_unspecified_fields() {
         let mut wm = WindowManager::default();
         wm.add_rule(WindowRule {
             app_id: String::from("app"),
+            zone: None,
             x: None,
             y: None,
             width: Some(640),
@@ -426,5 +591,93 @@ mod tests {
         assert_eq!(geometry.height, Some(480));
         assert!(geometry.x.is_none());
         assert!(geometry.y.is_none());
+    }
+
+    #[test]
+    fn add_and_remove_zone_promotes_default() {
+        let mut wm = WindowManager::default();
+        wm.add_zone(free_zone("a", 0, 0, true, 800, 600));
+        wm.add_zone(free_zone("b", 100, 100, false, 640, 480));
+        assert!(wm.remove_zone("a"));
+        assert_eq!(wm.default_zone().map(|z| z.name.as_str()), Some("b"));
+        assert!(wm.default_zone().unwrap().default);
+    }
+
+    #[test]
+    fn register_toplevel_uses_default_zone() {
+        let mut wm = WindowManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let mut xdg = XdgManager::default();
+        wm.add_zone(free_zone("main", 40, 50, true, 900, 700));
+
+        let (width, height) = register_with_surface(&mut wm, &mut surfaces, &mut xdg);
+        assert_eq!((width, height), (900, 700));
+        assert_eq!(
+            surfaces.surface_layout(client(1), object(12)),
+            Some((40, 50))
+        );
+        assert_eq!(wm.window_zone(1), Some("main"));
+    }
+
+    #[test]
+    fn register_toplevel_falls_back_to_cascade_without_zones() {
+        let mut wm = WindowManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let mut xdg = XdgManager::default();
+        let (width, height) = register_with_surface(&mut wm, &mut surfaces, &mut xdg);
+        assert_eq!(
+            (width, height),
+            (DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+        );
+        assert_eq!(surfaces.surface_layout(client(1), object(12)), Some((0, 0)));
+        assert_eq!(wm.window_zone(1), None);
+    }
+
+    #[test]
+    fn add_and_remove_window_zone_membership() {
+        let mut wm = WindowManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let mut xdg = XdgManager::default();
+        wm.add_zone(free_zone("main", 10, 20, true, 400, 300));
+        wm.add_zone(free_zone("side", 500, 0, false, 200, 200));
+
+        let _ = register_with_surface(&mut wm, &mut surfaces, &mut xdg);
+        wm.focused_id = Some(1);
+
+        let changes = wm
+            .add_window_to_zone(None, "side", &surfaces, &mut xdg)
+            .unwrap();
+        assert_eq!(wm.window_zone(1), Some("side"));
+        assert_eq!(changes[0].position, Some((500, 0)));
+        assert_eq!(changes[0].size, Some((200, 200)));
+
+        wm.remove_window_from_zone(None).unwrap();
+        assert_eq!(wm.window_zone(1), None);
+    }
+
+    #[test]
+    fn rule_with_zone_and_geometry_overlay() {
+        let mut wm = WindowManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let mut xdg = XdgManager::default();
+        wm.add_zone(free_zone("main", 10, 20, true, 400, 300));
+        wm.add_rule(WindowRule {
+            app_id: String::from("app"),
+            zone: Some(String::from("main")),
+            x: None,
+            y: None,
+            width: Some(640),
+            height: None,
+        });
+
+        let _ = register_with_surface(&mut wm, &mut surfaces, &mut xdg);
+        wm.windows.get_mut(&1).unwrap().zone = None;
+        let _ = surfaces.set_surface_layout(client(1), object(12), 0, 0);
+
+        let changes =
+            wm.on_app_id_set(client(1), object(10), String::from("app"), &surfaces, &mut xdg);
+        assert_eq!(wm.window_zone(1), Some("main"));
+        assert!(changes.iter().any(|c| c.position == Some((10, 20))));
+        assert!(changes.iter().any(|c| c.size == Some((640, 300))));
     }
 }

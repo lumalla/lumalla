@@ -32,8 +32,11 @@ pub trait WindowManagerHandler: Send + Sync {
     /// Remove a logical Wayland output by name.
     fn remove_output(&mut self, name: &str) -> zbus::fdo::Result<()>;
 
-    /// Replace zone definitions.
-    fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()>;
+    /// Add or replace a zone by name.
+    fn add_zone(&mut self, zone: ZoneInfo) -> zbus::fdo::Result<()>;
+
+    /// Remove a zone by name.
+    fn remove_zone(&mut self, name: &str) -> zbus::fdo::Result<()>;
 
     /// Replace workspace layout.
     fn set_layout(&mut self, spaces: LayoutSpacesInfo) -> zbus::fdo::Result<()>;
@@ -60,6 +63,12 @@ pub trait WindowManagerHandler: Send + Sync {
         width: i32,
         height: i32,
     ) -> zbus::fdo::Result<()>;
+
+    /// Assign a window to a zone. Pass `id = 0` to target the focused window.
+    fn add_window_to_zone(&mut self, id: u32, zone: &str) -> zbus::fdo::Result<()>;
+
+    /// Clear a window's zone membership. Pass `id = 0` to target the focused window.
+    fn remove_window_from_zone(&mut self, id: u32) -> zbus::fdo::Result<()>;
 
     /// Focus a window. Pass `id = 0` to target the focused window.
     /// When `raise` is true, also raise the window after focusing.
@@ -203,8 +212,12 @@ impl WindowManager {
         self.handler.remove_output(name)
     }
 
-    fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()> {
-        self.handler.set_zones(zones)
+    fn add_zone(&mut self, zone: ZoneInfo) -> zbus::fdo::Result<()> {
+        self.handler.add_zone(zone)
+    }
+
+    fn remove_zone(&mut self, name: &str) -> zbus::fdo::Result<()> {
+        self.handler.remove_zone(name)
     }
 
     fn set_layout(&mut self, spaces: LayoutSpacesInfo) -> zbus::fdo::Result<()> {
@@ -236,6 +249,14 @@ impl WindowManager {
         height: i32,
     ) -> zbus::fdo::Result<()> {
         self.handler.set_window(id, x, y, width, height)
+    }
+
+    fn add_window_to_zone(&mut self, id: u32, zone: &str) -> zbus::fdo::Result<()> {
+        self.handler.add_window_to_zone(id, zone)
+    }
+
+    fn remove_window_from_zone(&mut self, id: u32) -> zbus::fdo::Result<()> {
+        self.handler.remove_window_from_zone(id)
     }
 
     fn focus_window(&mut self, id: u32, raise: bool) -> zbus::fdo::Result<()> {

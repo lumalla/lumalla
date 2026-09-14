@@ -3,6 +3,8 @@
 pub struct WindowRule {
     /// Application id to match (`xdg_toplevel.app_id`).
     pub app_id: String,
+    /// Optional zone to join when the app id is set.
+    pub zone: Option<String>,
     /// Default x position.
     pub x: Option<i32>,
     /// Default y position.

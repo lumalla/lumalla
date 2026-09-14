@@ -4,6 +4,7 @@ use crate::OutputConfig;
 use crate::WindowGeometryUpdate;
 use crate::WindowRule;
 use crate::XkbConfig;
+use crate::Zone;
 use std::path::PathBuf;
 
 /// Synthetic input requested by profiling or automation configs.
@@ -74,6 +75,27 @@ pub enum MainMessage {
     RemoveOutput {
         /// Output name previously passed to [`Self::AddOutput`].
         name: String,
+    },
+    /// Add or replace a zone by name.
+    AddZone(Zone),
+    /// Remove a zone by name.
+    RemoveZone {
+        /// Zone name previously passed to [`Self::AddZone`].
+        name: String,
+    },
+    /// Assign a window to a zone and apply its composition strategy.
+    /// `window == None` targets the focused window.
+    AddWindowToZone {
+        /// Window id, or `None` for the focused window.
+        window: Option<u32>,
+        /// Zone name.
+        zone: String,
+    },
+    /// Clear a window's zone membership without changing geometry.
+    /// `window == None` targets the focused window.
+    RemoveWindowFromZone {
+        /// Window id, or `None` for the focused window.
+        window: Option<u32>,
     },
     /// Inject synthetic keyboard or pointer input.
     InjectInput(InjectedInput),

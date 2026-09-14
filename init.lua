@@ -23,6 +23,16 @@ local function enable_virtual_output()
 	})
 end
 
+lum.add_zone({
+	name = "main",
+	x = 0,
+	y = 0,
+	default = true,
+	composition = "free",
+	default_width = 800,
+	default_height = 600,
+})
+
 lum.on_startup(function()
 	enable_virtual_output()
 	lum.spawn({ command = "wezterm", args = { "start", "--always-new-process" } })
@@ -33,6 +43,11 @@ lum.on_startup(function()
 	-- 	args = { "DISPLAY=:12", "steam" },
 	-- })
 end)
+
+lum.add_window_rule({
+	app_id = "org.wezfurlong.wezterm",
+	zone = "main",
+})
 
 lum.add_window_rule({
 	app_id = "io.github.Qalculate.qalculate-qt",

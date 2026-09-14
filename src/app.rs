@@ -687,6 +687,35 @@ impl AppData {
                     self.sync_primary_output_geometry();
                     self.emit_outputs_changed();
                 }
+                MainMessage::AddZone(zone) => {
+                    self.display_state.add_zone(zone);
+                }
+                MainMessage::RemoveZone { name } => {
+                    if !self.display_state.remove_zone(&name) {
+                        error!("Unable to remove unknown zone {name}");
+                    }
+                }
+                MainMessage::AddWindowToZone { window, zone } => {
+                    match self
+                        .display_state
+                        .add_window_to_zone(window, &zone, &mut self.clients)
+                    {
+                        Ok(layout_syncs) => {
+                            self.apply_renderer_layout_syncs(event_loop, &layout_syncs);
+                            self.sync_windows_to_dbus();
+                            self.request_present_immediate(event_loop);
+                        }
+                        Err(err) => error!("Unable to add window to zone {zone}: {err}"),
+                    }
+                }
+                MainMessage::RemoveWindowFromZone { window } => {
+                    match self.display_state.remove_window_from_zone(window) {
+                        Ok(()) => {
+                            self.sync_windows_to_dbus();
+                        }
+                        Err(err) => error!("Unable to remove window from zone: {err}"),
+                    }
+                }
                 MainMessage::Shutdown => {
                     if !self.shutting_down {
                         self.init_shutdown(event_loop);

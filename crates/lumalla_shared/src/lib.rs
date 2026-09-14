@@ -37,4 +37,4 @@ pub use window_geometry::{
 pub use window_rule::WindowRule;
 pub use window_state::WindowState;
 pub use xkb_config::XkbConfig;
-pub use zone::Zone;
+pub use zone::{CompositionStrategy, Zone};

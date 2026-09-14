@@ -794,6 +794,33 @@ impl DisplayState {
         self.window_manager.clear_rules();
     }
 
+    pub fn add_zone(&mut self, zone: lumalla_shared::Zone) {
+        self.window_manager.add_zone(zone);
+    }
+
+    pub fn remove_zone(&mut self, name: &str) -> bool {
+        self.window_manager.remove_zone(name)
+    }
+
+    pub fn add_window_to_zone(
+        &mut self,
+        id: Option<u32>,
+        zone: &str,
+        clients: &mut ConnectedClients,
+    ) -> Result<Vec<RendererLayoutSync>, WindowError> {
+        let changes = self.window_manager.add_window_to_zone(
+            id,
+            zone,
+            &self.surface_manager,
+            &mut self.xdg_manager,
+        )?;
+        Ok(self.apply_geometry_changes(changes, clients))
+    }
+
+    pub fn remove_window_from_zone(&mut self, id: Option<u32>) -> Result<(), WindowError> {
+        self.window_manager.remove_window_from_zone(id)
+    }
+
     pub fn window_states(&self) -> Vec<WindowState> {
         self.window_manager
             .window_states(&self.surface_manager, &self.xdg_manager)

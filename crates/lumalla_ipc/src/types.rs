@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 
 use lumalla_shared::{
-    DrmConnector, DrmDeviceState, DrmMode, Mods, Output, WindowRule, WindowState, Zone,
+    CompositionStrategy, DrmConnector, DrmDeviceState, DrmMode, Mods, Output, WindowRule,
+    WindowState, Zone,
 };
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
@@ -236,46 +237,58 @@ impl From<ModsInfo> for Mods {
     }
 }
 
-/// Zone geometry exposed over D-Bus.
+/// Zone definition exposed over D-Bus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct ZoneInfo {
     /// Zone name.
     pub name: String,
-    /// X position.
+    /// Anchor X position.
     pub x: i32,
-    /// Y position.
+    /// Anchor Y position.
     pub y: i32,
-    /// Width in pixels.
-    pub width: i32,
-    /// Height in pixels.
-    pub height: i32,
     /// Whether this is the default zone.
     pub default: bool,
+    /// Composition strategy name (`"free"`).
+    pub composition: String,
+    /// Default window width for the `free` strategy.
+    pub default_width: i32,
+    /// Default window height for the `free` strategy.
+    pub default_height: i32,
 }
 
 impl From<Zone> for ZoneInfo {
     fn from(zone: Zone) -> Self {
+        let (composition, default_width, default_height) = match zone.composition {
+            CompositionStrategy::Free {
+                default_width,
+                default_height,
+            } => (String::from("free"), default_width, default_height),
+        };
         Self {
             name: zone.name,
-            x: zone.geometry.0,
-            y: zone.geometry.1,
-            width: zone.geometry.2,
-            height: zone.geometry.3,
+            x: zone.anchor.0,
+            y: zone.anchor.1,
             default: zone.default,
+            composition,
+            default_width,
+            default_height,
         }
     }
 }
 
 impl From<ZoneInfo> for Zone {
     fn from(zone: ZoneInfo) -> Self {
-        Self::new(
-            zone.name,
-            zone.x,
-            zone.y,
-            zone.width,
-            zone.height,
-            zone.default,
-        )
+        let composition = match zone.composition.as_str() {
+            "free" | "" => CompositionStrategy::Free {
+                default_width: zone.default_width,
+                default_height: zone.default_height,
+            },
+            _ => CompositionStrategy::Free {
+                default_width: zone.default_width,
+                default_height: zone.default_height,
+            },
+        };
+        Zone::new(zone.name, zone.x, zone.y, zone.default, composition)
     }
 }
 
@@ -284,6 +297,8 @@ impl From<ZoneInfo> for Zone {
 pub struct WindowRuleInfo {
     /// Application id to match.
     pub app_id: String,
+    /// Zone name to join (`""` = unset).
+    pub zone: String,
     /// Default x position (`WINDOW_GEOMETRY_UNSET` = unset).
     pub x: i32,
     /// Default y position (`WINDOW_GEOMETRY_UNSET` = unset).
@@ -299,6 +314,7 @@ impl From<WindowRule> for WindowRuleInfo {
         use lumalla_shared::geometry_field_to_dbus;
         Self {
             app_id: rule.app_id,
+            zone: rule.zone.unwrap_or_default(),
             x: geometry_field_to_dbus(rule.x),
             y: geometry_field_to_dbus(rule.y),
             width: geometry_field_to_dbus(rule.width),
@@ -312,6 +328,11 @@ impl From<WindowRuleInfo> for WindowRule {
         use lumalla_shared::geometry_field_from_dbus;
         Self {
             app_id: rule.app_id,
+            zone: if rule.zone.is_empty() {
+                None
+            } else {
+                Some(rule.zone)
+            },
             x: geometry_field_from_dbus(rule.x),
             y: geometry_field_from_dbus(rule.y),
             width: geometry_field_from_dbus(rule.width),

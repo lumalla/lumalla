@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use lumalla_ipc::{
     BUS_NAME, DrmDeviceInfo, KeyBindingInfo, LayoutOutputInfo, LayoutSpacesInfo, ModsInfo,
-    OutputConfigInfo, OutputInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo,
+    OutputConfigInfo, OutputInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo, ZoneInfo,
 };
 use lumalla_shared::{CallbackRef, Mods, Output, geometry_field_to_dbus};
 use mlua::{
@@ -480,6 +480,58 @@ fn init_dbus_window(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
         })?,
     )?;
 
+    let add_zone_client = client.clone();
+    module.set(
+        "add_zone",
+        lua.create_function(move |_, zone: ConfigZone| {
+            dbus_result(add_zone_client.proxy.add_zone(ZoneInfo {
+                name: zone.name,
+                x: zone.x,
+                y: zone.y,
+                default: zone.default,
+                composition: zone.composition,
+                default_width: zone.default_width,
+                default_height: zone.default_height,
+            }))?;
+            Ok(())
+        })?,
+    )?;
+
+    let remove_zone_client = client.clone();
+    module.set(
+        "remove_zone",
+        lua.create_function(move |_, name: String| {
+            dbus_result(remove_zone_client.proxy.remove_zone(&name))?;
+            Ok(())
+        })?,
+    )?;
+
+    let add_to_zone_client = client.clone();
+    module.set(
+        "add_window_to_zone",
+        lua.create_function(move |_, args: ConfigWindowZone| {
+            dbus_result(
+                add_to_zone_client
+                    .proxy
+                    .add_window_to_zone(args.id.unwrap_or(0), &args.zone),
+            )?;
+            Ok(())
+        })?,
+    )?;
+
+    let remove_from_zone_client = client.clone();
+    module.set(
+        "remove_window_from_zone",
+        lua.create_function(move |_, window: ConfigWindowId| {
+            dbus_result(
+                remove_from_zone_client
+                    .proxy
+                    .remove_window_from_zone(window.id.unwrap_or(0)),
+            )?;
+            Ok(())
+        })?,
+    )?;
+
     let focus_win_client = client.clone();
     module.set(
         "focus_window",
@@ -530,6 +582,7 @@ fn init_dbus_window(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
         lua.create_function(move |_, window_rule: ConfigWindowRule| {
             dbus_result(rules_client.proxy.add_window_rule(WindowRuleInfo {
                 app_id: window_rule.app_id,
+                zone: window_rule.zone.unwrap_or_default(),
                 x: geometry_field_to_dbus(window_rule.x),
                 y: geometry_field_to_dbus(window_rule.y),
                 width: geometry_field_to_dbus(window_rule.width),
@@ -1014,6 +1067,7 @@ impl IntoLua for ConfigWindow {
 
 struct ConfigWindowRule {
     app_id: String,
+    zone: Option<String>,
     x: Option<i32>,
     y: Option<i32>,
     width: Option<i32>,
@@ -1033,10 +1087,88 @@ impl FromLua for ConfigWindowRule {
             })?;
         Ok(Self {
             app_id: table.get("app_id")?,
+            zone: table.get("zone").unwrap_or(None),
             x: table.get("x").unwrap_or(None),
             y: table.get("y").unwrap_or(None),
             width: table.get("width").unwrap_or(None),
             height: table.get("height").unwrap_or(None),
+        })
+    }
+}
+
+struct ConfigZone {
+    name: String,
+    x: i32,
+    y: i32,
+    default: bool,
+    composition: String,
+    default_width: i32,
+    default_height: i32,
+}
+
+impl FromLua for ConfigZone {
+    fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaZone",
+                to: String::from("ConfigZone"),
+                message: Some(String::from("Expected a Lua table for the zone")),
+            })?;
+        Ok(Self {
+            name: table.get("name")?,
+            x: table.get("x").unwrap_or(0),
+            y: table.get("y").unwrap_or(0),
+            default: table.get("default").unwrap_or(false),
+            composition: table
+                .get("composition")
+                .unwrap_or_else(|_| String::from("free")),
+            default_width: table.get("default_width").unwrap_or(800),
+            default_height: table.get("default_height").unwrap_or(600),
+        })
+    }
+}
+
+struct ConfigWindowZone {
+    id: Option<u32>,
+    zone: String,
+}
+
+impl FromLua for ConfigWindowZone {
+    fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaWindowZone",
+                to: String::from("ConfigWindowZone"),
+                message: Some(String::from(
+                    "Expected a Lua table for add_window_to_zone",
+                )),
+            })?;
+        Ok(Self {
+            id: table.get("id").unwrap_or(None),
+            zone: table.get("zone")?,
+        })
+    }
+}
+
+struct ConfigWindowId {
+    id: Option<u32>,
+}
+
+impl FromLua for ConfigWindowId {
+    fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaWindowId",
+                to: String::from("ConfigWindowId"),
+                message: Some(String::from(
+                    "Expected a Lua table for remove_window_from_zone",
+                )),
+            })?;
+        Ok(Self {
+            id: table.get("id").unwrap_or(None),
         })
     }
 }

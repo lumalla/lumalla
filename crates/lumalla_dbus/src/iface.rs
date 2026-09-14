@@ -126,11 +126,17 @@ impl WindowManagerHandler for CompositorHandler {
         Ok(())
     }
 
-    fn set_zones(&mut self, zones: Vec<ZoneInfo>) -> zbus::fdo::Result<()> {
-        let _ = zones;
-        // self.state.comms.display(DisplayMessage::SetZones(
-        //     zones.into_iter().map(Into::into).collect(),
-        // ));
+    fn add_zone(&mut self, zone: ZoneInfo) -> zbus::fdo::Result<()> {
+        info!("Add zone over D-Bus: {}", zone.name);
+        self.state.comms.main(MainMessage::AddZone(zone.into()));
+        Ok(())
+    }
+
+    fn remove_zone(&mut self, name: &str) -> zbus::fdo::Result<()> {
+        info!("Remove zone over D-Bus: {name}");
+        self.state.comms.main(MainMessage::RemoveZone {
+            name: name.to_owned(),
+        });
         Ok(())
     }
 
@@ -215,6 +221,23 @@ impl WindowManagerHandler for CompositorHandler {
             },
             user_initiated: true,
         });
+        Ok(())
+    }
+
+    fn add_window_to_zone(&mut self, id: u32, zone: &str) -> zbus::fdo::Result<()> {
+        self.state.comms.main(MainMessage::AddWindowToZone {
+            window: if id == 0 { None } else { Some(id) },
+            zone: zone.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn remove_window_from_zone(&mut self, id: u32) -> zbus::fdo::Result<()> {
+        self.state
+            .comms
+            .main(MainMessage::RemoveWindowFromZone {
+                window: if id == 0 { None } else { Some(id) },
+            });
         Ok(())
     }
 
