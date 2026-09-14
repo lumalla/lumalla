@@ -10,6 +10,8 @@ include = ["src/**/*", "LICENSE-*"]
 [dependencies]
 lumalla_shared = { path = "../lumalla_shared" }
 lumalla_wayland_protocol = { path = "../lumalla_wayland_protocol" }
+allocator-api2 = { workspace = true }
+stumpalo = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 libc = { workspace = true }

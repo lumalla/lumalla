@@ -8,6 +8,7 @@ use std::{
 use log::error;
 use lumalla_shared::EventLoop;
 use lumalla_wayland_protocol::{ClientConnection, ClientId};
+use stumpalo::Arena;
 
 /// Collection of connected Wayland clients with recv/send arming helpers.
 ///
@@ -164,9 +165,14 @@ impl ConnectedClients {
     /// / [`Self::note_possible_output`] / [`Self::note_client_output`].
     ///
     /// Returns client ids that must be disconnected.
-    pub fn arm_pending_sends(&mut self, event_loop: &mut EventLoop) -> Vec<ClientId> {
-        let pending: Vec<ClientId> = self.pending_send.drain().collect();
-        let mut disconnect = Vec::new();
+    pub fn arm_pending_sends<'a>(
+        &mut self,
+        event_loop: &mut EventLoop,
+        arena: &'a Arena,
+    ) -> allocator_api2::vec::Vec<ClientId, &'a Arena> {
+        let mut pending = allocator_api2::vec::Vec::new_in(arena);
+        pending.extend(self.pending_send.drain());
+        let mut disconnect = allocator_api2::vec::Vec::new_in(arena);
         for client_id in pending {
             if let Err(id) = self.arm_send(event_loop, client_id) {
                 disconnect.push(id);

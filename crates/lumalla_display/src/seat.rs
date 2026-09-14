@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use allocator_api2::vec::Vec as ArenaVec;
 use lumalla_shared::KeymapMemfd;
 use lumalla_wayland_protocol::{
     ClientConnection, ClientId, ObjectId,
@@ -11,6 +12,7 @@ use lumalla_wayland_protocol::{
     },
     registry::InterfaceIndex,
 };
+use stumpalo::Arena;
 
 use crate::{
     ConnectedClients, GlobalId, Globals,
@@ -630,18 +632,20 @@ impl SeatManager {
         time_msec: u32,
         key: u32,
         pressed: bool,
+        arena: &Arena,
     ) {
         let state = if pressed {
             WL_KEYBOARD_KEY_STATE_PRESSED
         } else {
             WL_KEYBOARD_KEY_STATE_RELEASED
         };
-        let focused: Vec<(ClientId, ObjectId)> = self
-            .keyboards
-            .iter()
-            .filter(|kb| kb.focus.is_some())
-            .map(|kb| (kb.client_id, kb.id))
-            .collect();
+        let mut focused = ArenaVec::new_in(arena);
+        focused.extend(
+            self.keyboards
+                .iter()
+                .filter(|kb| kb.focus.is_some())
+                .map(|kb| (kb.client_id, kb.id)),
+        );
         for (client_id, keyboard_id) in focused {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
@@ -693,6 +697,7 @@ impl SeatManager {
         dy: f64,
         dx_unaccel: f64,
         dy_unaccel: f64,
+        arena: &Arena,
     ) {
         self.apply_pointer_motion(
             clients,
@@ -705,6 +710,7 @@ impl SeatManager {
                 seat.pointer_x += dx;
                 seat.pointer_y += dy;
             },
+            arena,
         );
     }
 
@@ -717,6 +723,7 @@ impl SeatManager {
         time_msec: u32,
         x: f64,
         y: f64,
+        arena: &Arena,
     ) {
         let old_x = self.pointer_x;
         let old_y = self.pointer_y;
@@ -732,6 +739,7 @@ impl SeatManager {
                 seat.pointer_x = x;
                 seat.pointer_y = y;
             },
+            arena,
         );
     }
 
@@ -744,6 +752,7 @@ impl SeatManager {
         time_msec: u32,
         relative: Option<(f64, f64, f64, f64)>,
         update: impl FnOnce(&mut Self),
+        arena: &Arena,
     ) {
         let active = constraints.active_for_seat();
         let locked = active.is_some_and(|c| c.kind == ConstraintKind::Locked);
@@ -771,14 +780,16 @@ impl SeatManager {
             constraints,
             time_msec,
             send_motion,
+            arena,
         );
 
         if let Some((dx, dy, dx_unaccel, dy_unaccel)) = relative {
-            let focused: Vec<(ClientId, ObjectId)> = self
-                .pointers
-                .iter()
-                .filter_map(|p| p.focus.map(|_| (p.client_id, p.id)))
-                .collect();
+            let mut focused = ArenaVec::new_in(arena);
+            focused.extend(
+                self.pointers
+                    .iter()
+                    .filter_map(|p| p.focus.map(|_| (p.client_id, p.id))),
+            );
             relative_pointers.emit_relative_motion(
                 clients,
                 &focused,
@@ -803,18 +814,20 @@ impl SeatManager {
         time_msec: u32,
         button: u32,
         pressed: bool,
+        arena: &Arena,
     ) {
         let state = if pressed {
             WL_POINTER_BUTTON_STATE_PRESSED
         } else {
             WL_POINTER_BUTTON_STATE_RELEASED
         };
-        let focused: Vec<(ClientId, ObjectId, u32)> = self
-            .pointers
-            .iter()
-            .filter(|p| p.focus.is_some())
-            .map(|p| (p.client_id, p.id, p.version))
-            .collect();
+        let mut focused = ArenaVec::new_in(arena);
+        focused.extend(
+            self.pointers
+                .iter()
+                .filter(|p| p.focus.is_some())
+                .map(|p| (p.client_id, p.id, p.version)),
+        );
         for (client_id, pointer_id, version) in focused {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
@@ -839,13 +852,15 @@ impl SeatManager {
         time_msec: u32,
         axis: u32,
         value: f32,
+        arena: &Arena,
     ) {
-        let focused: Vec<(ClientId, ObjectId, u32)> = self
-            .pointers
-            .iter()
-            .filter(|p| p.focus.is_some())
-            .map(|p| (p.client_id, p.id, p.version))
-            .collect();
+        let mut focused = ArenaVec::new_in(arena);
+        focused.extend(
+            self.pointers
+                .iter()
+                .filter(|p| p.focus.is_some())
+                .map(|p| (p.client_id, p.id, p.version)),
+        );
         for (client_id, pointer_id, version) in focused {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
@@ -870,17 +885,19 @@ impl SeatManager {
         touch_id: i32,
         x: f64,
         y: f64,
+        arena: &Arena,
     ) {
         let Some((client_id, surface)) = surface_manager.global_pointer_target(None, x, y) else {
             return;
         };
         self.active_touches.insert(touch_id, (client_id, surface));
-        let touches: Vec<ObjectId> = self
-            .touches
-            .iter()
-            .filter(|t| t.client_id == client_id)
-            .map(|t| t.id)
-            .collect();
+        let mut touches = ArenaVec::new_in(arena);
+        touches.extend(
+            self.touches
+                .iter()
+                .filter(|t| t.client_id == client_id)
+                .map(|t| t.id),
+        );
         for object_id in touches {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
@@ -906,16 +923,18 @@ impl SeatManager {
         clients: &mut ConnectedClients,
         time_msec: u32,
         touch_id: i32,
+        arena: &Arena,
     ) {
         let Some((client_id, _)) = self.active_touches.remove(&touch_id) else {
             return;
         };
-        let touches: Vec<ObjectId> = self
-            .touches
-            .iter()
-            .filter(|t| t.client_id == client_id)
-            .map(|t| t.id)
-            .collect();
+        let mut touches = ArenaVec::new_in(arena);
+        touches.extend(
+            self.touches
+                .iter()
+                .filter(|t| t.client_id == client_id)
+                .map(|t| t.id),
+        );
         for object_id in touches {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
@@ -938,16 +957,18 @@ impl SeatManager {
         touch_id: i32,
         x: f64,
         y: f64,
+        arena: &Arena,
     ) {
         let Some((client_id, surface)) = self.active_touches.get(&touch_id).copied() else {
             return;
         };
-        let touches: Vec<ObjectId> = self
-            .touches
-            .iter()
-            .filter(|t| t.client_id == client_id)
-            .map(|t| t.id)
-            .collect();
+        let mut touches = ArenaVec::new_in(arena);
+        touches.extend(
+            self.touches
+                .iter()
+                .filter(|t| t.client_id == client_id)
+                .map(|t| t.id),
+        );
         let (local_x, local_y) = surface_manager
             .surface_local_coords(client_id, surface, x, y)
             .unwrap_or((x as f32, y as f32));
@@ -965,15 +986,21 @@ impl SeatManager {
         }
     }
 
-    pub fn handle_touch_frame(&mut self, clients: &mut ConnectedClients) {
-        let client_ids: HashSet<ClientId> = self.touches.iter().map(|t| t.client_id).collect();
+    pub fn handle_touch_frame(&mut self, clients: &mut ConnectedClients, arena: &Arena) {
+        let mut client_ids = ArenaVec::new_in(arena);
+        for t in &self.touches {
+            if !client_ids.contains(&t.client_id) {
+                client_ids.push(t.client_id);
+            }
+        }
         for client_id in client_ids {
-            let touches: Vec<ObjectId> = self
-                .touches
-                .iter()
-                .filter(|t| t.client_id == client_id)
-                .map(|t| t.id)
-                .collect();
+            let mut touches = ArenaVec::new_in(arena);
+            touches.extend(
+                self.touches
+                    .iter()
+                    .filter(|t| t.client_id == client_id)
+                    .map(|t| t.id),
+            );
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
             };
@@ -983,20 +1010,22 @@ impl SeatManager {
         }
     }
 
-    pub fn handle_touch_cancel(&mut self, clients: &mut ConnectedClients) {
-        let client_ids: HashSet<ClientId> = self
-            .active_touches
-            .values()
-            .map(|(client_id, _)| *client_id)
-            .collect();
+    pub fn handle_touch_cancel(&mut self, clients: &mut ConnectedClients, arena: &Arena) {
+        let mut client_ids = ArenaVec::new_in(arena);
+        for (client_id, _) in self.active_touches.values() {
+            if !client_ids.contains(client_id) {
+                client_ids.push(*client_id);
+            }
+        }
         self.active_touches.clear();
         for client_id in client_ids {
-            let touches: Vec<ObjectId> = self
-                .touches
-                .iter()
-                .filter(|t| t.client_id == client_id)
-                .map(|t| t.id)
-                .collect();
+            let mut touches = ArenaVec::new_in(arena);
+            touches.extend(
+                self.touches
+                    .iter()
+                    .filter(|t| t.client_id == client_id)
+                    .map(|t| t.id),
+            );
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
             };
@@ -1013,6 +1042,7 @@ impl SeatManager {
         constraints: &mut PointerConstraintsManager,
         time_msec: u32,
         send_motion: bool,
+        arena: &Arena,
     ) {
         let sticky = constraints.active_for_seat().map(|c| (c.client_id, c.surface));
         let target = match sticky {
@@ -1021,18 +1051,15 @@ impl SeatManager {
         };
 
         // Leave pointers whose focus no longer matches the target.
-        let leave_list: Vec<(ClientId, ObjectId, ObjectId, u32)> = self
-            .pointers
-            .iter()
-            .filter_map(|p| {
-                let focus = p.focus?;
-                let should_leave = match target {
-                    Some((client_id, surface)) => p.client_id != client_id || focus != surface,
-                    None => true,
-                };
-                should_leave.then_some((p.client_id, p.id, focus, p.version))
-            })
-            .collect();
+        let mut leave_list = ArenaVec::new_in(arena);
+        leave_list.extend(self.pointers.iter().filter_map(|p| {
+            let focus = p.focus?;
+            let should_leave = match target {
+                Some((client_id, surface)) => p.client_id != client_id || focus != surface,
+                None => true,
+            };
+            should_leave.then_some((p.client_id, p.id, focus, p.version))
+        }));
         for (client_id, pointer_id, surface, version) in leave_list {
             if let Some(client) = clients.get_mut(&client_id) {
                 let serial = self.serial.next_serial();
@@ -1070,12 +1097,13 @@ impl SeatManager {
             )
             .unwrap_or((self.pointer_x as f32, self.pointer_y as f32));
 
-        let enter_list: Vec<(ObjectId, u32, bool)> = self
-            .pointers
-            .iter()
-            .filter(|p| p.client_id == target_client)
-            .map(|p| (p.id, p.version, p.focus == Some(target_surface)))
-            .collect();
+        let mut enter_list = ArenaVec::new_in(arena);
+        enter_list.extend(
+            self.pointers
+                .iter()
+                .filter(|p| p.client_id == target_client)
+                .map(|p| (p.id, p.version, p.focus == Some(target_surface))),
+        );
 
         for (pointer_id, version, already_focused) in enter_list {
             let Some(client) = clients.get_mut(&target_client) else {
@@ -1620,11 +1648,12 @@ mod tests {
         // ClientConnection is heavy; exercise SeatManager state without a full client map.
         let _ = (receiver, sender);
         assert!(seat.active_touches.is_empty());
-        seat.handle_touch_down(&mut clients, &surfaces, 1, 7, 10.0, 20.0);
+        let arena = Arena::new();
+        seat.handle_touch_down(&mut clients, &surfaces, 1, 7, 10.0, 20.0, &arena);
         // No client connection means events are skipped after tracking insert... actually
         // insert happens before client lookup, so active_touches should be set.
         assert_eq!(seat.active_touches.get(&7), Some(&(client_id, surface)));
-        seat.handle_touch_up(&mut clients, 2, 7);
+        seat.handle_touch_up(&mut clients, 2, 7, &arena);
         assert!(seat.active_touches.is_empty());
     }
 
@@ -1655,6 +1684,7 @@ mod tests {
 
         let mut clients = ConnectedClients::new();
         let surfaces = SurfaceManager::default();
+        let arena = Arena::new();
         seat.handle_pointer_motion(
             &mut clients,
             &surfaces,
@@ -1665,6 +1695,7 @@ mod tests {
             30.0,
             40.0,
             30.0,
+            &arena,
         );
         assert_eq!(seat.pointer_position(), (100.0, 100.0));
     }
@@ -1716,6 +1747,7 @@ mod tests {
         constraints.force_active_for_test(client_id, object(50));
 
         let mut clients = ConnectedClients::new();
+        let arena = Arena::new();
         // Move far outside the surface; confine should clamp back into surface.
         seat.handle_pointer_motion(
             &mut clients,
@@ -1727,6 +1759,7 @@ mod tests {
             500.0,
             500.0,
             500.0,
+            &arena,
         );
         let (x, y) = seat.pointer_position();
         assert!(x >= 50.0 && x <= 149.0, "x={x}");

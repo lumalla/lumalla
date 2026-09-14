@@ -240,7 +240,16 @@ impl SurfaceManager {
 
     /// Complete mapped scene in back-to-front order.
     pub fn scene_surfaces(&self) -> Vec<SceneSurface> {
-        let mut scene = Vec::new();
+        let mut scene = allocator_api2::vec::Vec::new();
+        self.collect_scene_surfaces(&mut scene);
+        scene.into_iter().collect()
+    }
+
+    /// Append the mapped scene in back-to-front order into `scene`.
+    pub fn collect_scene_surfaces<A: allocator_api2::alloc::Allocator>(
+        &self,
+        scene: &mut allocator_api2::vec::Vec<SceneSurface, A>,
+    ) {
         for &(client_id, surface_id) in &self.paint_order {
             let Some(surface) = self.surfaces.get(&(client_id, surface_id)) else {
                 continue;
@@ -251,16 +260,15 @@ impl SurfaceManager {
             {
                 continue;
             }
-            self.flatten_surface_tree(client_id, surface_id, &mut scene);
+            self.flatten_surface_tree(client_id, surface_id, scene);
         }
-        scene
     }
 
-    fn flatten_surface_tree(
+    fn flatten_surface_tree<A: allocator_api2::alloc::Allocator>(
         &self,
         client_id: ClientId,
         surface_id: ObjectId,
-        scene: &mut Vec<SceneSurface>,
+        scene: &mut allocator_api2::vec::Vec<SceneSurface, A>,
     ) {
         let Some(surface) = self.surfaces.get(&(client_id, surface_id)) else {
             return;

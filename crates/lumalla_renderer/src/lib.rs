@@ -8,6 +8,7 @@ use ash::vk;
 use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::{BufferTransform, CapturedImage, DrmDeviceState, Output, OutputConfig, View};
+use stumpalo::Arena;
 
 pub mod drm;
 pub mod vulkan;
@@ -558,8 +559,11 @@ impl RendererState {
     }
 
     /// Drain DRM page-flip events, retire buffers, and schedule queued flips.
-    pub fn dispatch_page_flips(&mut self) -> anyhow::Result<FlipDispatchOutcome> {
-        let named = self.dispatch_page_flips_named()?;
+    pub fn dispatch_page_flips(
+        &mut self,
+        arena: &Arena,
+    ) -> anyhow::Result<FlipDispatchOutcome> {
+        let named = self.dispatch_page_flips_named(arena)?;
         Ok(FlipDispatchOutcome {
             status: named.status,
             completed: named.completed.into_iter().map(|(_, flip)| flip).collect(),
@@ -567,18 +571,22 @@ impl RendererState {
     }
 
     /// Drain DRM page-flip events and attribute each completion to an output name.
-    pub(crate) fn dispatch_page_flips_named(&mut self) -> anyhow::Result<NamedFlipDispatchOutcome> {
-        let fds: Vec<RawFd> = self
-            .drm_devices
-            .opened()
-            .values()
-            .map(|device| device.fd().as_raw_fd())
-            .collect();
+    pub(crate) fn dispatch_page_flips_named<'a>(
+        &mut self,
+        arena: &'a Arena,
+    ) -> anyhow::Result<NamedFlipDispatchOutcome<'a>> {
+        let mut fds = allocator_api2::vec::Vec::new_in(arena);
+        fds.extend(
+            self.drm_devices
+                .opened()
+                .values()
+                .map(|device| device.fd().as_raw_fd()),
+        );
         for fd in fds {
             dispatch_drm_events(fd)?;
         }
         let completed = self.flip_events.drain();
-        let mut named = Vec::with_capacity(completed.len());
+        let mut named = allocator_api2::vec::Vec::with_capacity_in(completed.len(), arena);
         for flip in completed {
             let crtc_id = flip.crtc_id;
             if let Some(name) = self.retire_page_flip(crtc_id)? {
@@ -647,7 +655,7 @@ impl RendererState {
 
     /// Replace cached placement and z-order from the display's authoritative
     /// back-to-front scene.
-    pub fn sync_surface_scene(&mut self, scene: &[(u32, u32, i32, i32)]) {
+    pub fn sync_surface_scene(&mut self, scene: &[(u32, u32, i32, i32)], arena: &Arena) {
         let new_order: Vec<(u32, u32)> = scene
             .iter()
             .map(|(owner, surface, _, _)| (*owner, *surface))
@@ -663,13 +671,14 @@ impl RendererState {
                 changed = true;
             }
         }
-        let visible: HashSet<(u32, u32)> = new_order.iter().copied().collect();
-        let removed: Vec<(u32, u32)> = self
-            .surface_frames
-            .keys()
-            .copied()
-            .filter(|key| !visible.contains(key))
-            .collect();
+        let mut visible = allocator_api2::vec::Vec::new_in(arena);
+        visible.extend(new_order.iter().copied());
+        let mut removed = allocator_api2::vec::Vec::new_in(arena);
+        for key in self.surface_frames.keys().copied() {
+            if !visible.contains(&key) {
+                removed.push(key);
+            }
+        }
         for key in removed {
             self.surface_frames.remove(&key);
             self.gpu.surface_textures.remove(key);
@@ -2185,7 +2194,8 @@ mod tests {
         state.set_surface_frame(first).unwrap();
         state.set_surface_frame(second).unwrap();
 
-        state.sync_surface_scene(&[(1, 3, 40, 50), (1, 2, 10, 20)]);
+        let arena = Arena::new();
+        state.sync_surface_scene(&[(1, 3, 40, 50), (1, 2, 10, 20)], &arena);
 
         assert_eq!(state.surface_order, vec![(1, 3), (1, 2)]);
         assert_eq!(
@@ -2209,7 +2219,8 @@ mod tests {
     fn authoritative_scene_sync_removes_invisible_frames() {
         let mut state = RendererState::new().unwrap();
         state.set_surface_frame(frame()).unwrap();
-        state.sync_surface_scene(&[]);
+        let arena = Arena::new();
+        state.sync_surface_scene(&[], &arena);
         assert!(state.surface_frames.is_empty());
         assert!(state.surface_order.is_empty());
     }

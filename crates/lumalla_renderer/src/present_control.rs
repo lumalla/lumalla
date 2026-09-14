@@ -1,6 +1,6 @@
 //! Per-output present wake timers and scheduling glue owned by [`RendererState`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::time::Instant;
@@ -10,6 +10,7 @@ use log::{debug, error, warn};
 use lumalla_shared::{
     EventLoop, monotonic_deadline_after,
 };
+use stumpalo::Arena;
 
 use crate::drm::CompletedPageFlip;
 use crate::scheduler::{FrameTimings, RenderScheduler};
@@ -111,8 +112,8 @@ impl RendererState {
     }
 
     /// Schedule a present on every presentable output (scene changed).
-    pub fn mark_dirty(&mut self, now: Instant) {
-        if let Err(err) = self.sync_output_present_controls(None) {
+    pub fn mark_dirty(&mut self, now: Instant, arena: &Arena) {
+        if let Err(err) = self.sync_output_present_controls(None, arena) {
             warn!("Unable to sync output present controls: {err}");
             return;
         }
@@ -126,8 +127,8 @@ impl RendererState {
     }
 
     /// Bypass vblank alignment on every presentable output.
-    pub fn request_immediate(&mut self) {
-        if let Err(err) = self.sync_output_present_controls(None) {
+    pub fn request_immediate(&mut self, arena: &Arena) {
+        if let Err(err) = self.sync_output_present_controls(None, arena) {
             warn!("Unable to sync output present controls: {err}");
             return;
         }
@@ -154,9 +155,11 @@ impl RendererState {
         event_loop: &mut EventLoop,
         pending_protocol_work: bool,
         seat_enabled: bool,
+        arena: &Arena,
     ) -> io::Result<PresentTickResult> {
-        self.sync_output_present_controls(Some(event_loop))?;
-        let names: Vec<String> = self.output_presents.keys().cloned().collect();
+        self.sync_output_present_controls(Some(event_loop), arena)?;
+        let mut names = allocator_api2::vec::Vec::new_in(arena);
+        names.extend(self.output_presents.keys().cloned());
         let mut presented_outputs = Vec::new();
         let mut last_timings = None;
 
@@ -232,8 +235,9 @@ impl RendererState {
         event_loop: &mut EventLoop,
         pending_protocol_work: bool,
         seat_enabled: bool,
+        arena: &Arena,
     ) -> io::Result<FlipSideEffects> {
-        let outcome = match self.dispatch_page_flips_named() {
+        let outcome = match self.dispatch_page_flips_named(arena) {
             Ok(outcome) => outcome,
             Err(err) => {
                 error!("Unable to dispatch DRM page-flip events: {err:#}");
@@ -245,8 +249,8 @@ impl RendererState {
         };
 
         let now = Instant::now();
-        let mut completed_effects = Vec::new();
-        let mut touched: HashSet<String> = HashSet::new();
+        let mut completed_effects = allocator_api2::vec::Vec::new_in(arena);
+        let mut touched = allocator_api2::vec::Vec::new_in(arena);
 
         for (output_name, flip) in outcome.completed {
             let refresh_ns = self
@@ -268,7 +272,9 @@ impl RendererState {
                     pending_protocol_work,
                 );
             }
-            touched.insert(output_name.clone());
+            if !touched.contains(&output_name) {
+                touched.push(output_name.clone());
+            }
             completed_effects.push(CompletedFlipEffect {
                 output_name,
                 flip,
@@ -289,7 +295,7 @@ impl RendererState {
 
         Ok(FlipSideEffects {
             status: outcome.status,
-            completed: completed_effects,
+            completed: completed_effects.into_iter().collect(),
         })
     }
 
@@ -483,17 +489,19 @@ impl RendererState {
     pub(crate) fn sync_output_present_controls(
         &mut self,
         event_loop: Option<&mut EventLoop>,
+        arena: &Arena,
     ) -> io::Result<()> {
         let desired = self.presentable_output_refresh();
 
         if let Some(event_loop) = event_loop {
-            let desired_names: HashSet<String> = desired.keys().cloned().collect();
-            let stale: Vec<String> = self
-                .output_presents
-                .keys()
-                .filter(|name| !desired_names.contains(*name))
-                .cloned()
-                .collect();
+            let mut desired_names = allocator_api2::vec::Vec::new_in(arena);
+            desired_names.extend(desired.keys().cloned());
+            let mut stale = allocator_api2::vec::Vec::new_in(arena);
+            for name in self.output_presents.keys() {
+                if !desired_names.iter().any(|desired| desired == name) {
+                    stale.push(name.clone());
+                }
+            }
             for name in stale {
                 if let Some(mut control) = self.output_presents.remove(&name) {
                     control.clear_wake(event_loop)?;
@@ -569,9 +577,9 @@ struct OutputTick {
 }
 
 /// Named flip completions from [`RendererState::dispatch_page_flips_named`].
-pub(crate) struct NamedFlipDispatchOutcome {
+pub(crate) struct NamedFlipDispatchOutcome<'a> {
     pub status: PresentStatus,
-    pub completed: Vec<(String, CompletedPageFlip)>,
+    pub completed: allocator_api2::vec::Vec<(String, CompletedPageFlip), &'a Arena>,
 }
 
 #[cfg(test)]

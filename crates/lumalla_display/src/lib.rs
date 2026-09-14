@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use lumalla_shared::{WindowGeometryUpdate, WindowRule, WindowState};
+use stumpalo::Arena;
 use lumalla_wayland_protocol::protocols::presentation_time::{
     WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK, WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION,
     WP_PRESENTATION_FEEDBACK_KIND_VSYNC,
@@ -222,9 +223,10 @@ impl DisplayState {
         time_msec: u32,
         key: u32,
         pressed: bool,
+        arena: &Arena,
     ) {
         self.seat_manager
-            .handle_key(clients, time_msec, key, pressed);
+            .handle_key(clients, time_msec, key, pressed, arena);
     }
 
     pub fn handle_keyboard_modifiers(
@@ -243,6 +245,7 @@ impl DisplayState {
         dy: f64,
         dx_unaccel: f64,
         dy_unaccel: f64,
+        arena: &Arena,
     ) {
         self.seat_manager.handle_pointer_motion(
             clients,
@@ -254,6 +257,7 @@ impl DisplayState {
             dy,
             dx_unaccel,
             dy_unaccel,
+            arena,
         );
     }
 
@@ -263,6 +267,7 @@ impl DisplayState {
         time_msec: u32,
         x: f64,
         y: f64,
+        arena: &Arena,
     ) {
         self.seat_manager.handle_pointer_absolute(
             clients,
@@ -272,19 +277,25 @@ impl DisplayState {
             time_msec,
             x,
             y,
+            arena,
         );
     }
 
     /// Recompute pointer enter/leave from current coordinates and stacking.
     ///
     /// Call after client dispatch or when mapping changes under a stationary cursor.
-    pub fn refresh_pointer_focus(&mut self, clients: &mut ConnectedClients) {
+    pub fn refresh_pointer_focus(
+        &mut self,
+        clients: &mut ConnectedClients,
+        arena: &Arena,
+    ) {
         self.seat_manager.update_pointer_focus_and_motion(
             clients,
             &self.surface_manager,
             &mut self.pointer_constraints_manager,
             0,
             false,
+            arena,
         );
     }
 
@@ -310,6 +321,7 @@ impl DisplayState {
         time_msec: u32,
         button: u32,
         pressed: bool,
+        arena: &Arena,
     ) {
         if pressed {
             // Resolve the top-most surface under the cursor before focusing; do not
@@ -320,6 +332,7 @@ impl DisplayState {
                 &mut self.pointer_constraints_manager,
                 time_msec,
                 false,
+                arena,
             );
             let click_target = self.seat_manager.focused_pointer_surface();
             if self.should_dismiss_popup_grab(click_target) {
@@ -350,6 +363,7 @@ impl DisplayState {
             time_msec,
             button,
             pressed,
+            arena,
         );
     }
 
@@ -387,9 +401,10 @@ impl DisplayState {
         time_msec: u32,
         axis: u32,
         value: f32,
+        arena: &Arena,
     ) {
         self.seat_manager
-            .handle_pointer_axis(clients, time_msec, axis, value);
+            .handle_pointer_axis(clients, time_msec, axis, value, arena);
     }
 
     pub fn handle_touch_down(
@@ -399,6 +414,7 @@ impl DisplayState {
         touch_id: i32,
         x: f64,
         y: f64,
+        arena: &Arena,
     ) {
         self.seat_manager.handle_touch_down(
             clients,
@@ -407,6 +423,7 @@ impl DisplayState {
             touch_id,
             x,
             y,
+            arena,
         );
     }
 
@@ -415,9 +432,10 @@ impl DisplayState {
         clients: &mut ConnectedClients,
         time_msec: u32,
         touch_id: i32,
+        arena: &Arena,
     ) {
         self.seat_manager
-            .handle_touch_up(clients, time_msec, touch_id);
+            .handle_touch_up(clients, time_msec, touch_id, arena);
     }
 
     pub fn handle_touch_motion(
@@ -427,6 +445,7 @@ impl DisplayState {
         touch_id: i32,
         x: f64,
         y: f64,
+        arena: &Arena,
     ) {
         self.seat_manager.handle_touch_motion(
             clients,
@@ -435,15 +454,24 @@ impl DisplayState {
             touch_id,
             x,
             y,
+            arena,
         );
     }
 
-    pub fn handle_touch_frame(&mut self, clients: &mut ConnectedClients) {
-        self.seat_manager.handle_touch_frame(clients);
+    pub fn handle_touch_frame(
+        &mut self,
+        clients: &mut ConnectedClients,
+        arena: &Arena,
+    ) {
+        self.seat_manager.handle_touch_frame(clients, arena);
     }
 
-    pub fn handle_touch_cancel(&mut self, clients: &mut ConnectedClients) {
-        self.seat_manager.handle_touch_cancel(clients);
+    pub fn handle_touch_cancel(
+        &mut self,
+        clients: &mut ConnectedClients,
+        arena: &Arena,
+    ) {
+        self.seat_manager.handle_touch_cancel(clients, arena);
     }
 
     /// Drive an active drag's motion for tests / compositor input.
@@ -514,6 +542,14 @@ impl DisplayState {
     /// Current mapped scene in authoritative back-to-front order.
     pub fn scene_surfaces(&self) -> Vec<SceneSurface> {
         self.surface_manager.scene_surfaces()
+    }
+
+    /// Append the mapped scene into `scene` using the provided allocator.
+    pub fn collect_scene_surfaces<A: allocator_api2::alloc::Allocator>(
+        &self,
+        scene: &mut allocator_api2::vec::Vec<SceneSurface, A>,
+    ) {
+        self.surface_manager.collect_scene_surfaces(scene);
     }
 
     pub fn pending_frame_callback_count(&self) -> usize {
@@ -748,13 +784,14 @@ impl DisplayState {
         Ok(())
     }
 
-    pub fn set_window(
+    pub fn set_window<'a>(
         &mut self,
         id: Option<u32>,
         geometry: WindowGeometryUpdate,
         user_initiated: bool,
         clients: &mut ConnectedClients,
-    ) -> Result<Vec<RendererLayoutSync>, WindowError> {
+        arena: &'a Arena,
+    ) -> Result<allocator_api2::vec::Vec<RendererLayoutSync, &'a Arena>, WindowError> {
         let changes = self.window_manager.set_window(
             id,
             geometry,
@@ -762,7 +799,7 @@ impl DisplayState {
             &self.surface_manager,
             &mut self.xdg_manager,
         )?;
-        Ok(self.apply_geometry_changes(changes, clients))
+        Ok(self.apply_geometry_changes(changes, clients, arena))
     }
 
     /// Give keyboard focus and xdg activation to a window.
@@ -822,19 +859,20 @@ impl DisplayState {
         self.window_manager.remove_zone(name)
     }
 
-    pub fn add_window_to_zone(
+    pub fn add_window_to_zone<'a>(
         &mut self,
         id: Option<u32>,
         zone: &str,
         clients: &mut ConnectedClients,
-    ) -> Result<Vec<RendererLayoutSync>, WindowError> {
+        arena: &'a Arena,
+    ) -> Result<allocator_api2::vec::Vec<RendererLayoutSync, &'a Arena>, WindowError> {
         let changes = self.window_manager.add_window_to_zone(
             id,
             zone,
             &self.surface_manager,
             &mut self.xdg_manager,
         )?;
-        Ok(self.apply_geometry_changes(changes, clients))
+        Ok(self.apply_geometry_changes(changes, clients, arena))
     }
 
     pub fn remove_window_from_zone(&mut self, id: Option<u32>) -> Result<(), WindowError> {
@@ -870,15 +908,16 @@ impl DisplayState {
         self.window_manager.unregister_toplevel(client_id, toplevel);
     }
 
-    pub fn drain_pending_geometry(
+    pub fn drain_pending_geometry<'a>(
         &mut self,
         clients: &mut ConnectedClients,
-    ) -> Vec<RendererLayoutSync> {
+        arena: &'a Arena,
+    ) -> allocator_api2::vec::Vec<RendererLayoutSync, &'a Arena> {
         if self.pending_geometry_changes.is_empty() {
-            return Vec::new();
+            return allocator_api2::vec::Vec::new_in(arena);
         }
         let changes = std::mem::take(&mut self.pending_geometry_changes);
-        self.apply_geometry_changes(changes, clients)
+        self.apply_geometry_changes(changes, clients, arena)
     }
 
     pub(crate) fn queue_rule_geometry_for_toplevel(
@@ -1049,12 +1088,13 @@ impl DisplayState {
         protocols::xdg_shell::write_configure_snapshot(writer, xdg_surface_id, snapshot);
     }
 
-    fn apply_geometry_changes(
+    fn apply_geometry_changes<'a>(
         &mut self,
         changes: Vec<WindowGeometryChange>,
         clients: &mut ConnectedClients,
-    ) -> Vec<RendererLayoutSync> {
-        let mut renderer_syncs = Vec::new();
+        arena: &'a Arena,
+    ) -> allocator_api2::vec::Vec<RendererLayoutSync, &'a Arena> {
+        let mut renderer_syncs = allocator_api2::vec::Vec::new_in(arena);
         for change in changes {
             if let Some((x, y)) = change.position {
                 let _ = self.surface_manager.set_surface_layout(
