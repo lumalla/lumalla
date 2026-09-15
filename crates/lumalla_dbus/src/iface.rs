@@ -36,6 +36,13 @@ pub(crate) struct PendingScreenshot {
     pub done: Condvar,
 }
 
+/// In-flight PipeWire stream start waiting for main-thread / PipeWire setup.
+pub(crate) struct PendingPipewireStream {
+    /// `None` until the main thread finishes start (or records an error).
+    pub result: Mutex<Option<Result<(u32, u32), String>>>,
+    pub done: Condvar,
+}
+
 pub(crate) struct ServiceState {
     pub comms: Comms,
     pub outputs: Arc<Mutex<Vec<OutputInfo>>>,
@@ -47,6 +54,8 @@ pub(crate) struct ServiceState {
     pub xkb_config: Arc<Mutex<XkbConfig>>,
     pub windows: Arc<Mutex<Vec<WindowState>>>,
     pub pending_screenshots: Arc<Mutex<HashMap<usize, Arc<PendingScreenshot>>>>,
+    pub pending_pipewire_streams: Arc<Mutex<HashMap<usize, Arc<PendingPipewireStream>>>>,
+    pub next_pipewire_request_id: Arc<Mutex<usize>>,
     /// Set when the compositor emits Ready (sticky for late config subscribers).
     pub ready: Arc<AtomicBool>,
 }
@@ -308,8 +317,68 @@ impl WindowManagerHandler for CompositorHandler {
         Ok(())
     }
 
-    fn start_video_stream(&mut self) -> zbus::fdo::Result<()> {
-        // self.state.comms.display(DisplayMessage::StartVideoStream);
+    fn start_pipewire_stream(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        name: &str,
+        max_fps: u32,
+    ) -> zbus::fdo::Result<(u32, u32)> {
+        if width <= 0 || height <= 0 {
+            return Err(zbus::fdo::Error::Failed(
+                "pipewire stream width and height must be positive".into(),
+            ));
+        }
+
+        let name = if name.is_empty() {
+            String::from("Lumalla")
+        } else {
+            name.to_string()
+        };
+        let max_fps = if max_fps == 0 { 30 } else { max_fps };
+
+        let request_id = {
+            let mut next = self.state.next_pipewire_request_id.lock().unwrap();
+            let id = *next;
+            *next = next.wrapping_add(1);
+            id
+        };
+        let pending = Arc::new(PendingPipewireStream {
+            result: Mutex::new(None),
+            done: Condvar::new(),
+        });
+        self.state
+            .pending_pipewire_streams
+            .lock()
+            .unwrap()
+            .insert(request_id, Arc::clone(&pending));
+
+        self.state.comms.main(MainMessage::StartPipewireStream {
+            request_id,
+            x,
+            y,
+            width,
+            height,
+            name,
+            max_fps,
+        });
+
+        let mut guard = pending.result.lock().unwrap();
+        while guard.is_none() {
+            guard = pending.done.wait(guard).unwrap();
+        }
+        match guard.take().unwrap() {
+            Ok(ids) => Ok(ids),
+            Err(err) => Err(zbus::fdo::Error::Failed(err)),
+        }
+    }
+
+    fn stop_pipewire_stream(&mut self, stream_id: u32) -> zbus::fdo::Result<()> {
+        self.state
+            .comms
+            .main(MainMessage::StopPipewireStream { stream_id });
         Ok(())
     }
 
@@ -465,6 +534,23 @@ pub(crate) fn complete_screenshot(
     {
         let mut guard = pending.result.lock().unwrap();
         *guard = Some(write_result);
+    }
+    pending.done.notify_one();
+}
+
+pub(crate) fn complete_pipewire_stream(
+    pending_streams: &Mutex<HashMap<usize, Arc<PendingPipewireStream>>>,
+    request_id: usize,
+    result: Result<(u32, u32), String>,
+) {
+    let Some(pending) = pending_streams.lock().unwrap().remove(&request_id) else {
+        error!("PipeWire stream reply for unknown request_id={request_id:#x}");
+        return;
+    };
+
+    {
+        let mut guard = pending.result.lock().unwrap();
+        *guard = Some(result);
     }
     pending.done.notify_one();
 }

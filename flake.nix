@@ -30,6 +30,7 @@
             clang
             libclang
             libdrm.dev
+            pipewire.dev
           ];
           buildInputs = with pkgs; [
             seatd
@@ -39,10 +40,11 @@
             vulkan-loader
             libdrm
             libgbm
+            pipewire
           ];
-          PKG_CONFIG_PATH = "${pkgs.seatd.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libgbm}/lib/pkgconfig";
+          PKG_CONFIG_PATH = "${pkgs.seatd.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libgbm}/lib/pkgconfig:${pkgs.pipewire.dev}/lib/pkgconfig";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
-          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.libdrm}/lib:${pkgs.libgbm}/lib:${pkgs.libinput}/lib:${pkgs.libxkbcommon}/lib:${pkgs.systemd}/lib";
+          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.libdrm}/lib:${pkgs.libgbm}/lib:${pkgs.libinput}/lib:${pkgs.libxkbcommon}/lib:${pkgs.systemd}/lib:${pkgs.pipewire}/lib";
           # libgbm/libdrm for link search; force libvulkan into NEEDED/RUNPATH so
           # ash::Entry::load() works without the flake shell's LD_LIBRARY_PATH.
           LIBRARY_PATH = "${pkgs.libgbm}/lib:${pkgs.vulkan-loader}/lib";
@@ -176,6 +178,7 @@
             clang
             libclang
             libdrm.dev
+            pipewire.dev
             perf
             hotspot
             heaptrack
@@ -195,10 +198,11 @@
             vulkan-validation-layers
             libdrm
             libgbm
+            pipewire
           ];
-          PKG_CONFIG_PATH = "${pkgs.seatd.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libgbm}/lib/pkgconfig";
+          PKG_CONFIG_PATH = "${pkgs.seatd.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libgbm}/lib/pkgconfig:${pkgs.pipewire.dev}/lib/pkgconfig";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
-          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.libdrm}/lib:${pkgs.libgbm}/lib:${pkgs.libinput}/lib:${pkgs.libxkbcommon}/lib:${pkgs.systemd}/lib";
+          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.libdrm}/lib:${pkgs.libgbm}/lib:${pkgs.libinput}/lib:${pkgs.libxkbcommon}/lib:${pkgs.systemd}/lib:${pkgs.pipewire}/lib";
           LIBRARY_PATH = "${pkgs.libgbm}/lib:${pkgs.vulkan-loader}/lib";
           RUSTFLAGS = "-L ${pkgs.libgbm}/lib -L ${pkgs.libdrm}/lib -L ${pkgs.vulkan-loader}/lib -C link-arg=-Wl,--push-state,--no-as-needed -C link-arg=-lvulkan -C link-arg=-Wl,--pop-state";
           VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";

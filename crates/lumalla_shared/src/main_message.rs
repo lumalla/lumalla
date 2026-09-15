@@ -127,6 +127,28 @@ pub enum MainMessage {
         /// Region height in compositor space.
         height: i32,
     },
+    /// Start a PipeWire video stream of a compositor region.
+    StartPipewireStream {
+        /// Correlates the reply on the D-Bus thread.
+        request_id: usize,
+        /// Left edge in compositor space.
+        x: i32,
+        /// Top edge in compositor space.
+        y: i32,
+        /// Region width in compositor space.
+        width: i32,
+        /// Region height in compositor space.
+        height: i32,
+        /// PipeWire node name.
+        name: String,
+        /// Maximum capture rate (frames per second).
+        max_fps: u32,
+    },
+    /// Stop a PipeWire video stream previously started via [`Self::StartPipewireStream`].
+    StopPipewireStream {
+        /// Stream id returned from start.
+        stream_id: u32,
+    },
     /// Update window geometry. `id == None` targets the focused window.
     SetWindow {
         /// Window id, or `None` for the focused window.

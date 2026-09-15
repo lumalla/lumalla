@@ -122,9 +122,30 @@ pub(crate) fn init_dbus_module(
 
     let c = client.clone();
     module.set(
-        "start_video_stream",
-        lua.create_function(move |_, ()| {
-            dbus_result(c.proxy.start_video_stream())?;
+        "start_pipewire_stream",
+        lua.create_function(move |lua, opts: ConfigPipewireStream| {
+            let name = opts.name.unwrap_or_default();
+            let max_fps = opts.max_fps.unwrap_or(0);
+            let (stream_id, node_id) = dbus_result(c.proxy.start_pipewire_stream(
+                opts.x,
+                opts.y,
+                opts.width,
+                opts.height,
+                &name,
+                max_fps,
+            ))?;
+            let table = lua.create_table()?;
+            table.set("id", stream_id)?;
+            table.set("node_id", node_id)?;
+            Ok(table)
+        })?,
+    )?;
+
+    let c = client.clone();
+    module.set(
+        "stop_pipewire_stream",
+        lua.create_function(move |_, stream_id: u32| {
+            dbus_result(c.proxy.stop_pipewire_stream(stream_id))?;
             Ok(())
         })?,
     )?;
@@ -1225,6 +1246,37 @@ impl FromLua for ConfigZone {
 struct ConfigWindowZone {
     id: Option<u32>,
     zone: String,
+}
+
+struct ConfigPipewireStream {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    name: Option<String>,
+    max_fps: Option<u32>,
+}
+
+impl FromLua for ConfigPipewireStream {
+    fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaPipewireStream",
+                to: String::from("ConfigPipewireStream"),
+                message: Some(String::from(
+                    "Expected a Lua table for start_pipewire_stream",
+                )),
+            })?;
+        Ok(Self {
+            x: table.get("x")?,
+            y: table.get("y")?,
+            width: table.get("width")?,
+            height: table.get("height")?,
+            name: table.get("name").unwrap_or(None),
+            max_fps: table.get("max_fps").unwrap_or(None),
+        })
+    }
 }
 
 impl FromLua for ConfigWindowZone {

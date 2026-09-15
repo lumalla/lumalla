@@ -268,3 +268,28 @@ lum.map_key({
 		lum.set_window({ width = 1200, height = 800 })
 	end,
 })
+
+--- logo+r: toggle PipeWire stream of the primary output.
+local pipewire_stream_id = nil
+lum.map_key({
+	key = "r",
+	mods = "logo",
+	callback = function()
+		if pipewire_stream_id then
+			lum.stop_pipewire_stream(pipewire_stream_id)
+			pipewire_stream_id = nil
+			return
+		end
+		local output = primary_output()
+		if not output then
+			return
+		end
+		local stream = lum.start_pipewire_stream({
+			x = output.x,
+			y = output.y,
+			width = output.width,
+			height = output.height,
+		})
+		pipewire_stream_id = stream.id
+	end,
+})

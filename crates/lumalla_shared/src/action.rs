@@ -47,8 +47,6 @@ pub enum Action {
     },
     /// Close current window
     Close,
-    /// Start pipewire video stream
-    StartVideoStream,
     /// Do nothing
     None,
 }

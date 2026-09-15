@@ -15,6 +15,7 @@ members = [
     "crates/lumalla_input",
     "crates/lumalla_ipc",
     "crates/lumalla_renderer",
+    "crates/lumalla_screencast",
     "crates/lumalla_seat",
     "crates/lumalla_shared",
     "crates/lumalla_wayland_protocol",
@@ -44,6 +45,7 @@ lumalla_dbus = { path = "./crates/lumalla_dbus", version = "^0.1.0" }
 lumalla_display = { path = "./crates/lumalla_display", version = "^0.1.0" }
 lumalla_input = { path = "./crates/lumalla_input", version = "^0.1.0" }
 lumalla_renderer = { path = "./crates/lumalla_renderer", version = "^0.1.0" }
+lumalla_screencast = { path = "./crates/lumalla_screencast", version = "^0.1.0" }
 lumalla_seat = { path = "./crates/lumalla_seat", version = "^0.1.0" }
 lumalla_shared = { path = "./crates/lumalla_shared", version = "^0.1.0" }
 allocator-api2 = { workspace = true }

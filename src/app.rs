@@ -25,6 +25,7 @@ use lumalla_renderer::{
     CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RendererState, SurfaceFrame,
     is_present_wake_token,
 };
+use lumalla_screencast::{ScreencastManager, VideoFrame};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
@@ -62,6 +63,9 @@ struct AppData {
     clients: ConnectedClients,
     display_state: DisplayState,
     renderer_state: RendererState,
+    screencast: ScreencastManager,
+    /// Prevents `push_screencast_frames` → `arm_presents` re-entrancy.
+    screencast_push_active: bool,
     frame_clock: Instant,
     drm_device_poll: HashMap<PathBuf, DrmDeviceRegistration>,
     next_drm_device_token: usize,
@@ -89,6 +93,8 @@ impl AppData {
             clients: ConnectedClients::new(),
             display_state,
             renderer_state,
+            screencast: ScreencastManager::new(),
+            screencast_push_active: false,
             frame_clock: Instant::now(),
             drm_device_poll: HashMap::new(),
             next_drm_device_token: 0,
@@ -758,6 +764,7 @@ impl AppData {
                 }
                 MainMessage::Shutdown => {
                     if !self.shutting_down {
+                        self.screencast.shutdown();
                         self.init_shutdown(event_loop);
                     }
                 }
@@ -785,6 +792,28 @@ impl AppData {
                         .map_err(|err| format!("{err:#}"));
                     self.comms
                         .dbus(DbusMessage::ScreenshotCaptured { request_id, result });
+                }
+                MainMessage::StartPipewireStream {
+                    request_id,
+                    x,
+                    y,
+                    width,
+                    height,
+                    name,
+                    max_fps,
+                } => {
+                    let result = self
+                        .screencast
+                        .start_stream(x, y, width, height, name, max_fps)
+                        .map_err(|err| format!("{err:#}"));
+                    if result.is_ok() {
+                        self.mark_present_dirty(event_loop, arena);
+                    }
+                    self.comms
+                        .dbus(DbusMessage::PipewireStreamStarted { request_id, result });
+                }
+                MainMessage::StopPipewireStream { stream_id } => {
+                    self.screencast.stop_stream(stream_id);
                 }
                 MainMessage::SetWindow {
                     id,
@@ -1301,6 +1330,9 @@ impl AppData {
         ) {
             Ok(result) => {
                 self.maybe_complete_frame_callbacks(event_loop, result.status, arena);
+                if !result.presented_outputs.is_empty() && !self.screencast_push_active {
+                    self.push_screencast_frames(event_loop, arena);
+                }
             }
             Err(err) => warn!("Unable to arm present wakes: {err}"),
         }
@@ -1357,6 +1389,9 @@ impl AppData {
                 ) {
                     Ok(result) => {
                         self.maybe_complete_frame_callbacks(event_loop, result.status, arena);
+                        if !result.presented_outputs.is_empty() && !self.screencast_push_active {
+                            self.push_screencast_frames(event_loop, arena);
+                        }
                     }
                     Err(err) => warn!("Unable to handle present wake timeout: {err}"),
                 }
@@ -1452,6 +1487,71 @@ impl AppData {
     fn pending_present_work(&self) -> bool {
         self.display_state.pending_frame_callback_count() > 0
             || self.display_state.pending_presentation_feedback_count() > 0
+            || self.screencast.has_streams()
+    }
+
+    fn push_screencast_frames(&mut self, event_loop: &mut EventLoop, arena: &Arena) {
+        if !self.screencast.has_streams() {
+            return;
+        }
+
+        let now = Instant::now();
+        let due: Vec<(u32, i32, i32, i32, i32)> = self
+            .screencast
+            .streams()
+            .values()
+            .filter(|stream| stream.due_at(now))
+            .map(|stream| {
+                (
+                    stream.id,
+                    stream.x,
+                    stream.y,
+                    stream.width,
+                    stream.height,
+                )
+            })
+            .collect();
+
+        if !due.is_empty() {
+            let mut outputs = ArenaVec::new_in(arena);
+            outputs.extend(
+                self.display_state
+                    .outputs()
+                    .map(lumalla_shared::Output::from),
+            );
+
+            for (stream_id, x, y, width, height) in due {
+                match self
+                    .renderer_state
+                    .capture_region(x, y, width, height, &outputs)
+                {
+                    Ok(image) => {
+                        let frame = VideoFrame {
+                            width: image.width,
+                            height: image.height,
+                            rgba: image.rgba,
+                        };
+                        if let Err(err) = self.screencast.push_frame(stream_id, frame) {
+                            warn!("Unable to push PipeWire frame for stream {stream_id}: {err:#}");
+                        } else if let Some(stream) =
+                            self.screencast.streams_mut().get_mut(&stream_id)
+                        {
+                            stream.last_capture = Some(now);
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Unable to capture PipeWire region for stream {stream_id}: {err:#}");
+                    }
+                }
+            }
+        }
+
+        // Keep presenting while streams are alive so fps-throttled captures continue.
+        if self.screencast.has_streams() {
+            self.screencast_push_active = true;
+            self.mark_present_dirty(event_loop, arena);
+            self.screencast_push_active = false;
+        }
     }
 }
 

@@ -17,7 +17,7 @@ use std::{
 };
 
 use anyhow::Context;
-use iface::{CompositorHandler, ServiceState, complete_screenshot, emit_signal};
+use iface::{CompositorHandler, ServiceState, complete_pipewire_stream, complete_screenshot, emit_signal};
 use log::{error, info, warn};
 use lumalla_ipc::{
     BUS_NAME, OBJECT_PATH, WindowManager, signals,
@@ -39,6 +39,7 @@ pub struct DbusService {
     wayland_display: Arc<Mutex<Option<String>>>,
     windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
     pending_screenshots: Arc<Mutex<HashMap<usize, Arc<iface::PendingScreenshot>>>>,
+    pending_pipewire_streams: Arc<Mutex<HashMap<usize, Arc<iface::PendingPipewireStream>>>>,
     ready: Arc<AtomicBool>,
 }
 
@@ -50,6 +51,7 @@ impl DbusService {
         let drm_devices = Arc::new(Mutex::new(Vec::new()));
         let wayland_display = Arc::new(Mutex::new(None));
         let pending_screenshots = Arc::new(Mutex::new(HashMap::new()));
+        let pending_pipewire_streams = Arc::new(Mutex::new(HashMap::new()));
         let ready = Arc::new(AtomicBool::new(false));
         let state = Arc::new(ServiceState {
             comms: comms.clone(),
@@ -62,6 +64,8 @@ impl DbusService {
             xkb_config: Arc::new(Mutex::new(lumalla_shared::XkbConfig::default())),
             windows: Arc::new(Mutex::new(Vec::new())),
             pending_screenshots: Arc::clone(&pending_screenshots),
+            pending_pipewire_streams: Arc::clone(&pending_pipewire_streams),
+            next_pipewire_request_id: Arc::new(Mutex::new(1)),
             ready: Arc::clone(&ready),
         });
         let connection = connection::Builder::session()
@@ -95,6 +99,7 @@ impl DbusService {
             wayland_display,
             windows: state.windows.clone(),
             pending_screenshots,
+            pending_pipewire_streams,
             ready,
         })
     }
@@ -128,6 +133,7 @@ struct DbusState {
     wayland_display: Arc<Mutex<Option<String>>>,
     windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
     pending_screenshots: Arc<Mutex<HashMap<usize, Arc<iface::PendingScreenshot>>>>,
+    pending_pipewire_streams: Arc<Mutex<HashMap<usize, Arc<iface::PendingPipewireStream>>>>,
     ready: Arc<AtomicBool>,
     /// Config child process; kept alive so we can reap it via `WaitId` SQE.
     config_child: Option<Child>,
@@ -152,6 +158,7 @@ impl DbusState {
             wayland_display: service.wayland_display,
             windows: service.windows,
             pending_screenshots: service.pending_screenshots,
+            pending_pipewire_streams: service.pending_pipewire_streams,
             ready: service.ready,
             config_child: None,
             config_child_pid: None,
@@ -324,6 +331,9 @@ impl DbusState {
             }
             DbusMessage::ScreenshotCaptured { request_id, result } => {
                 complete_screenshot(&self.pending_screenshots, request_id, result);
+            }
+            DbusMessage::PipewireStreamStarted { request_id, result } => {
+                complete_pipewire_stream(&self.pending_pipewire_streams, request_id, result);
             }
         }
 

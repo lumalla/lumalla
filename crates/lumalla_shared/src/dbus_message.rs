@@ -35,4 +35,11 @@ pub enum DbusMessage {
         /// Captured pixels, or an error message.
         result: Result<CapturedImage, String>,
     },
+    /// PipeWire stream start finished on the main thread.
+    PipewireStreamStarted {
+        /// Matches the pending request id from [`crate::MainMessage::StartPipewireStream`].
+        request_id: usize,
+        /// `(stream_id, node_id)` on success.
+        result: Result<(u32, u32), String>,
+    },
 }

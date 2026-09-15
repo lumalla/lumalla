@@ -90,8 +90,22 @@ pub trait WindowManagerHandler: Send + Sync {
     /// Toggle the debug overlay.
     fn toggle_debug_ui(&mut self) -> zbus::fdo::Result<()>;
 
-    /// Start the video stream.
-    fn start_video_stream(&mut self) -> zbus::fdo::Result<()>;
+    /// Start a PipeWire video stream of a compositor region.
+    ///
+    /// Blocks until the PipeWire node is connected. Returns `(stream_id, node_id)`.
+    /// Empty `name` uses the default `"Lumalla"`. `max_fps == 0` defaults to 30.
+    fn start_pipewire_stream(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        name: &str,
+        max_fps: u32,
+    ) -> zbus::fdo::Result<(u32, u32)>;
+
+    /// Stop a PipeWire video stream. Idempotent if the stream is already gone.
+    fn stop_pipewire_stream(&mut self, stream_id: u32) -> zbus::fdo::Result<()>;
 
     /// Switch virtual terminal.
     fn vt_switch(&mut self, vt: i32) -> zbus::fdo::Result<()>;
@@ -286,8 +300,21 @@ impl WindowManager {
         self.handler.toggle_debug_ui()
     }
 
-    fn start_video_stream(&mut self) -> zbus::fdo::Result<()> {
-        self.handler.start_video_stream()
+    fn start_pipewire_stream(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        name: &str,
+        max_fps: u32,
+    ) -> zbus::fdo::Result<(u32, u32)> {
+        self.handler
+            .start_pipewire_stream(x, y, width, height, name, max_fps)
+    }
+
+    fn stop_pipewire_stream(&mut self, stream_id: u32) -> zbus::fdo::Result<()> {
+        self.handler.stop_pipewire_stream(stream_id)
     }
 
     fn vt_switch(&mut self, vt: i32) -> zbus::fdo::Result<()> {
