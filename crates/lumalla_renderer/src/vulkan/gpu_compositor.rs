@@ -1519,6 +1519,175 @@ fn write_texture_descriptor(
     }
 }
 
+/// Copies (with optional scale) a rectangular region from `src` into `dst`.
+pub fn blit_image_region(
+    vulkan: &VulkanContext,
+    batch: &mut GpuWorkBatch,
+    src: &DmaBufImage,
+    dst: &DmaBufImage,
+    src_x: u32,
+    src_y: u32,
+    src_w: u32,
+    src_h: u32,
+    dst_x: u32,
+    dst_y: u32,
+    dst_w: u32,
+    dst_h: u32,
+    dst_was_undefined: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(src_w > 0 && src_h > 0 && dst_w > 0 && dst_h > 0, "blit sizes must be positive");
+    let src_extent = src.extent();
+    let dst_extent = dst.extent();
+    anyhow::ensure!(
+        src_x.saturating_add(src_w) <= src_extent.width
+            && src_y.saturating_add(src_h) <= src_extent.height,
+        "source blit rect out of bounds"
+    );
+    anyhow::ensure!(
+        dst_x.saturating_add(dst_w) <= dst_extent.width
+            && dst_y.saturating_add(dst_h) <= dst_extent.height,
+        "destination blit rect out of bounds"
+    );
+
+    let device = vulkan.device();
+    let command_pool = vulkan.graphics_command_pool();
+    let command_buffer = command_pool.allocate_command_buffer(device)?;
+
+    let dst_old_layout = if dst_was_undefined {
+        vk::ImageLayout::UNDEFINED
+    } else {
+        vk::ImageLayout::GENERAL
+    };
+
+    let record_result = (|| -> anyhow::Result<()> {
+        let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
+        let cb = recorder.command_buffer();
+
+        let src_barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(src.image())
+            .subresource_range(color_subresource_range());
+        let dst_src_access = if dst_was_undefined {
+            vk::AccessFlags::empty()
+        } else {
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+        };
+        let dst_barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(dst_src_access)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(dst_old_layout)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst.image())
+            .subresource_range(color_subresource_range());
+        unsafe {
+            device.handle().cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[src_barrier, dst_barrier],
+            );
+        }
+
+        let regions = [vk::ImageBlit::default()
+            .src_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_offsets([
+                vk::Offset3D {
+                    x: src_x as i32,
+                    y: src_y as i32,
+                    z: 0,
+                },
+                vk::Offset3D {
+                    x: (src_x + src_w) as i32,
+                    y: (src_y + src_h) as i32,
+                    z: 1,
+                },
+            ])
+            .dst_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .dst_offsets([
+                vk::Offset3D {
+                    x: dst_x as i32,
+                    y: dst_y as i32,
+                    z: 0,
+                },
+                vk::Offset3D {
+                    x: (dst_x + dst_w) as i32,
+                    y: (dst_y + dst_h) as i32,
+                    z: 1,
+                },
+            ])];
+        unsafe {
+            device.handle().cmd_blit_image(
+                cb,
+                src.image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst.image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
+                vk::Filter::NEAREST,
+            );
+        }
+
+        let src_back = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(src.image())
+            .subresource_range(color_subresource_range());
+        let dst_back = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst.image())
+            .subresource_range(color_subresource_range());
+        unsafe {
+            device.handle().cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[src_back, dst_back],
+            );
+        }
+        recorder.end()?;
+        Ok(())
+    })();
+
+    if let Err(err) = record_result {
+        command_pool.free_command_buffers(device, &[command_buffer]);
+        return Err(err);
+    }
+    batch.push(command_buffer, None);
+    Ok(())
+}
+
 fn color_subresource_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,

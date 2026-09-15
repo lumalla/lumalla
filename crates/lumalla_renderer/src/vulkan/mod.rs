@@ -33,8 +33,8 @@ pub use dma_buf::{
 pub use download::download_bgra_region;
 pub use framebuffer::Framebuffer;
 pub use gpu_compositor::{
-    GpuCompositor, GpuWorkBatch, PendingGpuSubmit, SurfaceTextureCache, composite_to_scanout,
-    copy_scanout_frame, map_rect_through_view,
+    GpuCompositor, GpuWorkBatch, PendingGpuSubmit, SurfaceTextureCache, blit_image_region,
+    composite_to_scanout, copy_scanout_frame, map_rect_through_view,
 };
 pub use image::Image;
 pub use instance::VulkanContext;

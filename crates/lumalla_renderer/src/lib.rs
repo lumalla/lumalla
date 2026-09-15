@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -39,8 +39,8 @@ pub use crate::scene_backing::{
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
     DmaBufImage, GpuCompositor, GpuWorkBatch, SurfaceTextureCache, VulkanContext,
-    composite_to_scanout, copy_scanout_frame, download_bgra_region, map_rect_through_view,
-    vulkan_to_drm_fourcc,
+    blit_image_region, composite_to_scanout, copy_scanout_frame, download_bgra_region,
+    map_rect_through_view, vulkan_to_drm_fourcc,
 };
 
 struct GpuRenderResources {
@@ -377,6 +377,40 @@ pub struct RendererState {
     cursor_buffer_dirty: bool,
     /// When set, presents are skipped until DRM is reactivated (e.g. after VT return).
     present_halted: Option<String>,
+    /// PipeWire DMA-BUF capture buffers keyed by stream id.
+    screencast_buffers: HashMap<u32, Vec<ScreencastDmaSlot>>,
+}
+
+/// DMA-BUF handle handed to the PipeWire thread for one capture slot.
+#[derive(Debug)]
+pub struct ScreencastDmaExport {
+    /// Index into the stream's buffer pool.
+    pub index: usize,
+    /// Duplicated DMA-BUF fd (PipeWire owns this clone).
+    pub fd: OwnedFd,
+    /// Buffer width in pixels.
+    pub width: u32,
+    /// Buffer height in pixels.
+    pub height: u32,
+    /// Row stride in bytes.
+    pub stride: u32,
+    /// Byte offset into the DMA-BUF.
+    pub offset: u32,
+    /// DRM format modifier.
+    pub modifier: u64,
+}
+
+struct ScreencastDmaSlot {
+    image: DmaBufImage,
+    /// Original export fd kept alive for the image memory.
+    _export_fd: OwnedFd,
+    in_use: bool,
+}
+
+fn dup_owned_fd(fd: RawFd) -> anyhow::Result<OwnedFd> {
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    anyhow::ensure!(dup >= 0, "F_DUPFD_CLOEXEC failed: {}", std::io::Error::last_os_error());
+    Ok(unsafe { OwnedFd::from_raw_fd(dup) })
 }
 
 impl RendererState {
@@ -409,6 +443,7 @@ impl RendererState {
             dirty_surface_keys: HashSet::new(),
             cursor_buffer_dirty: false,
             present_halted: None,
+            screencast_buffers: HashMap::new(),
         })
     }
 
@@ -916,6 +951,195 @@ impl RendererState {
             height: dest_h,
             rgba,
         })
+    }
+
+    /// Allocate LINEAR exportable buffers for a PipeWire DMA-BUF stream.
+    ///
+    /// Returns one [`ScreencastDmaExport`] per buffer (duplicated fds for the PW thread).
+    /// Images stay owned by [`RendererState`] under `stream_id` until
+    /// [`Self::free_screencast_buffers`].
+    pub fn alloc_screencast_buffers(
+        &mut self,
+        stream_id: u32,
+        width: u32,
+        height: u32,
+        count: usize,
+    ) -> anyhow::Result<Vec<ScreencastDmaExport>> {
+        anyhow::ensure!(width > 0 && height > 0, "screencast buffer size must be positive");
+        anyhow::ensure!(count > 0, "screencast buffer count must be positive");
+        self.free_screencast_buffers(stream_id);
+
+        if let Some(path) = self.resolved_render_device_path() {
+            self.ensure_vulkan(Some(&path))?;
+        } else {
+            self.ensure_vulkan(None)?;
+        }
+
+        let format = vk::Format::B8G8R8A8_UNORM;
+        let mut slots = Vec::with_capacity(count);
+        let mut exports = Vec::with_capacity(count);
+        {
+            let vulkan = self
+                .vulkan
+                .as_mut()
+                .context("Vulkan is not initialized for screencast buffers")?;
+            for index in 0..count {
+                let image = DmaBufImage::allocate(
+                    vulkan.device(),
+                    vulkan.physical_device(),
+                    width,
+                    height,
+                    format,
+                )
+                .with_context(|| format!("allocate screencast buffer {index}"))?;
+                let export_fd = image
+                    .export_dma_buf()
+                    .context("export screencast DMA-BUF")?;
+                let pw_fd = dup_owned_fd(export_fd.as_raw_fd())
+                    .context("dup screencast DMA-BUF for PipeWire")?;
+                let info = ScreencastDmaExport {
+                    index,
+                    fd: pw_fd,
+                    width,
+                    height,
+                    stride: image.stride(),
+                    offset: image.offset(),
+                    modifier: image.modifier(),
+                };
+                exports.push(info);
+                slots.push(ScreencastDmaSlot {
+                    image,
+                    _export_fd: export_fd,
+                    in_use: false,
+                });
+            }
+        }
+        self.screencast_buffers.insert(stream_id, slots);
+        Ok(exports)
+    }
+
+    /// Drop capture buffers for `stream_id`.
+    pub fn free_screencast_buffers(&mut self, stream_id: u32) {
+        self.screencast_buffers.remove(&stream_id);
+    }
+
+    /// GPU-blit the compositor region into screencast buffer `index`, waiting for completion.
+    pub fn blit_region_to_screencast_buffer(
+        &mut self,
+        stream_id: u32,
+        index: usize,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        outputs: &[Output],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(width > 0 && height > 0, "capture region must be positive");
+        let regions: Vec<CaptureRegion> = outputs
+            .iter()
+            .flat_map(|output| CaptureRegion::from_output_views(output, x, y, width, height))
+            .collect();
+        anyhow::ensure!(
+            !regions.is_empty(),
+            "screencast region does not intersect any presented scanout"
+        );
+
+        // Wait for source scanout GPU work first.
+        let mut source_names = HashSet::new();
+        for region in &regions {
+            source_names.insert(region.name.clone());
+        }
+        for name in source_names {
+            if let Some(scanout) = self.scanouts.get_mut(&name) {
+                if let Some(pending) = scanout.current.gpu_pending.take() {
+                    let vulkan = self
+                        .vulkan
+                        .as_mut()
+                        .context("Vulkan missing while waiting for scanout")?;
+                    pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
+                }
+            }
+        }
+
+        let mut batch = GpuWorkBatch::new();
+        let mut first = true;
+        for region in &regions {
+            let src_ptr = {
+                let scanout = self
+                    .scanouts
+                    .get(&region.name)
+                    .with_context(|| format!("missing scanout {}", region.name))?;
+                &scanout.current.dma_image as *const DmaBufImage
+            };
+            let dst_ptr = {
+                let slots = self
+                    .screencast_buffers
+                    .get(&stream_id)
+                    .context("screencast buffers missing")?;
+                let slot = slots
+                    .get(index)
+                    .context("screencast buffer index out of range")?;
+                &slot.image as *const DmaBufImage
+            };
+            let vulkan = self
+                .vulkan
+                .as_ref()
+                .context("Vulkan missing for screencast blit")?;
+            // Safety: both images are owned by self and live for this call.
+            unsafe {
+                blit_image_region(
+                    vulkan,
+                    &mut batch,
+                    &*src_ptr,
+                    &*dst_ptr,
+                    region.fb_x,
+                    region.fb_y,
+                    region.fb_w,
+                    region.fb_h,
+                    region.dest_x,
+                    region.dest_y,
+                    region.logical_w,
+                    region.logical_h,
+                    first,
+                )?;
+            }
+            first = false;
+        }
+
+        let vulkan = self
+            .vulkan
+            .as_ref()
+            .context("Vulkan missing for screencast submit")?;
+        let pending = batch.submit(vulkan.device())?;
+        pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
+
+        if let Some(slot) = self
+            .screencast_buffers
+            .get_mut(&stream_id)
+            .and_then(|slots| slots.get_mut(index))
+        {
+            slot.in_use = true;
+        }
+        Ok(())
+    }
+
+    /// Mark a screencast buffer free for reuse after PipeWire has finished with it.
+    pub fn release_screencast_buffer(&mut self, stream_id: u32, index: usize) {
+        if let Some(slot) = self
+            .screencast_buffers
+            .get_mut(&stream_id)
+            .and_then(|slots| slots.get_mut(index))
+        {
+            slot.in_use = false;
+        }
+    }
+
+    /// Next free screencast buffer index, if any.
+    pub fn next_free_screencast_buffer(&self, stream_id: u32) -> Option<usize> {
+        self.screencast_buffers
+            .get(&stream_id)?
+            .iter()
+            .position(|slot| !slot.in_use)
     }
 
     /// DRM format/modifier pairs clients may use with linux-dmabuf.

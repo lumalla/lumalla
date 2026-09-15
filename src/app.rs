@@ -25,7 +25,7 @@ use lumalla_renderer::{
     CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RendererState, SurfaceFrame,
     is_present_wake_token,
 };
-use lumalla_screencast::{ScreencastManager, VideoFrame};
+use lumalla_screencast::{DmaBufferExport, ScreencastManager, VideoFrame};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
@@ -764,7 +764,11 @@ impl AppData {
                 }
                 MainMessage::Shutdown => {
                     if !self.shutting_down {
+                        let ids: Vec<u32> = self.screencast.streams().keys().copied().collect();
                         self.screencast.shutdown();
+                        for id in ids {
+                            self.renderer_state.free_screencast_buffers(id);
+                        }
                         self.init_shutdown(event_loop);
                     }
                 }
@@ -802,10 +806,36 @@ impl AppData {
                     name,
                     max_fps,
                 } => {
-                    let result = self
-                        .screencast
-                        .start_stream(x, y, width, height, name, max_fps)
-                        .map_err(|err| format!("{err:#}"));
+                    let stream_id = self.screencast.peek_next_stream_id();
+                    let result = (|| -> Result<(u32, u32), String> {
+                        let exports = self
+                            .renderer_state
+                            .alloc_screencast_buffers(
+                                stream_id,
+                                width as u32,
+                                height as u32,
+                                ScreencastManager::dma_buffer_count(),
+                            )
+                            .map_err(|err| format!("{err:#}"))?;
+                        let dma_exports = exports
+                            .into_iter()
+                            .map(|export| DmaBufferExport {
+                                index: export.index,
+                                fd: export.fd,
+                                width: export.width,
+                                height: export.height,
+                                stride: export.stride,
+                                offset: export.offset,
+                                modifier: export.modifier,
+                            })
+                            .collect();
+                        self.screencast
+                            .start_stream(x, y, width, height, name, max_fps, dma_exports)
+                            .map_err(|err| {
+                                self.renderer_state.free_screencast_buffers(stream_id);
+                                format!("{err:#}")
+                            })
+                    })();
                     if result.is_ok() {
                         self.mark_present_dirty(event_loop, arena);
                     }
@@ -814,6 +844,7 @@ impl AppData {
                 }
                 MainMessage::StopPipewireStream { stream_id } => {
                     self.screencast.stop_stream(stream_id);
+                    self.renderer_state.free_screencast_buffers(stream_id);
                 }
                 MainMessage::SetWindow {
                     id,
@@ -1496,11 +1527,51 @@ impl AppData {
         }
 
         let now = Instant::now();
+        let mut outputs = ArenaVec::new_in(arena);
+        outputs.extend(
+            self.display_state
+                .outputs()
+                .map(lumalla_shared::Output::from),
+        );
+
+        // DMA-BUF path: fill buffers that PipeWire has returned for a blit.
+        let pending_blits = self.screencast.take_pending_blits();
+        for (stream_id, index) in pending_blits {
+            let Some(stream) = self.screencast.streams().get(&stream_id) else {
+                continue;
+            };
+            if !stream.uses_dmabuf() {
+                continue;
+            }
+            let (x, y, width, height) = (stream.x, stream.y, stream.width, stream.height);
+            match self.renderer_state.blit_region_to_screencast_buffer(
+                stream_id, index, x, y, width, height, &outputs,
+            ) {
+                Ok(()) => {
+                    if let Err(err) = self.screencast.queue_dma_buffer(stream_id, index) {
+                        warn!("Unable to queue DMA-BUF for stream {stream_id}: {err:#}");
+                        self.renderer_state
+                            .release_screencast_buffer(stream_id, index);
+                    } else if let Some(stream) =
+                        self.screencast.streams_mut().get_mut(&stream_id)
+                    {
+                        stream.last_capture = Some(now);
+                    }
+                }
+                Err(err) => {
+                    warn!("Unable to blit PipeWire DMA region for stream {stream_id}: {err:#}");
+                    self.renderer_state
+                        .release_screencast_buffer(stream_id, index);
+                }
+            }
+        }
+
+        // MemFd path: CPU download when DMA-BUF was not negotiated.
         let due: Vec<(u32, i32, i32, i32, i32)> = self
             .screencast
             .streams()
             .values()
-            .filter(|stream| stream.due_at(now))
+            .filter(|stream| !stream.uses_dmabuf() && stream.due_at(now))
             .map(|stream| {
                 (
                     stream.id,
@@ -1512,41 +1583,32 @@ impl AppData {
             })
             .collect();
 
-        if !due.is_empty() {
-            let mut outputs = ArenaVec::new_in(arena);
-            outputs.extend(
-                self.display_state
-                    .outputs()
-                    .map(lumalla_shared::Output::from),
-            );
-
-            for (stream_id, x, y, width, height) in due {
-                match self
-                    .renderer_state
-                    .capture_region(x, y, width, height, &outputs)
-                {
-                    Ok(image) => {
-                        let frame = VideoFrame {
-                            width: image.width,
-                            height: image.height,
-                            rgba: image.rgba,
-                        };
-                        if let Err(err) = self.screencast.push_frame(stream_id, frame) {
-                            warn!("Unable to push PipeWire frame for stream {stream_id}: {err:#}");
-                        } else if let Some(stream) =
-                            self.screencast.streams_mut().get_mut(&stream_id)
-                        {
-                            stream.last_capture = Some(now);
-                        }
+        for (stream_id, x, y, width, height) in due {
+            match self
+                .renderer_state
+                .capture_region(x, y, width, height, &outputs)
+            {
+                Ok(image) => {
+                    let frame = VideoFrame {
+                        width: image.width,
+                        height: image.height,
+                        rgba: image.rgba,
+                    };
+                    if let Err(err) = self.screencast.push_memfd_frame(stream_id, frame) {
+                        warn!("Unable to push PipeWire frame for stream {stream_id}: {err:#}");
+                    } else if let Some(stream) =
+                        self.screencast.streams_mut().get_mut(&stream_id)
+                    {
+                        stream.last_capture = Some(now);
                     }
-                    Err(err) => {
-                        warn!("Unable to capture PipeWire region for stream {stream_id}: {err:#}");
-                    }
+                }
+                Err(err) => {
+                    warn!("Unable to capture PipeWire region for stream {stream_id}: {err:#}");
                 }
             }
         }
 
-        // Keep presenting while streams are alive so fps-throttled captures continue.
+        // Keep presenting while streams are alive so captures continue.
         if self.screencast.has_streams() {
             self.screencast_push_active = true;
             self.mark_present_dirty(event_loop, arena);
