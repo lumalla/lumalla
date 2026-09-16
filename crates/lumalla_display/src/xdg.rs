@@ -1133,6 +1133,12 @@ impl XdgManager {
         self.xdg_surface_wl(client_id, parent_xdg)
     }
 
+    /// wl_surface for an xdg_popup object, if known.
+    pub fn popup_wl(&self, client_id: ClientId, popup_id: ObjectId) -> Option<ObjectId> {
+        let xdg_surface = self.popups.get(&(client_id, popup_id))?.xdg_surface;
+        self.xdg_surface_wl(client_id, xdg_surface)
+    }
+
     /// Walk popup parents until a toplevel wl_surface is found.
     pub fn activation_root_wl(
         &self,

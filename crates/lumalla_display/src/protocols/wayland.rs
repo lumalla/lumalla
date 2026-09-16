@@ -539,7 +539,7 @@ fn process_surface_commit_body(
             let _ = state
                 .surface_manager
                 .clear_committed_buffer_size(ctx.client_id, commit.surface_id);
-            state.seat_manager.leave_keyboards_on_surface(
+            state.release_keyboard_focus_from_surface(
                 ctx.client_id,
                 commit.surface_id,
                 ctx.writer,
@@ -1386,8 +1386,7 @@ impl WlSurface for DisplayState {
                     ctx.client_id,
                     object_id,
                 );
-                self.seat_manager
-                    .leave_keyboards_on_surface(ctx.client_id, object_id, ctx.writer);
+                self.release_keyboard_focus_from_surface(ctx.client_id, object_id, ctx.writer);
                 self.seat_manager
                     .leave_pointers_on_surface(ctx.client_id, object_id, ctx.writer);
                 self.discard_frame_callbacks_for_surface(
@@ -1434,8 +1433,7 @@ impl WlSurface for DisplayState {
                         ctx.client_id,
                         child,
                     );
-                    self.seat_manager
-                        .leave_keyboards_on_surface(ctx.client_id, child, ctx.writer);
+                    self.release_keyboard_focus_from_surface(ctx.client_id, child, ctx.writer);
                     self.seat_manager
                         .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
                     self.surface_updates.push_back(SurfaceUpdate::Unmapped {
@@ -1595,8 +1593,7 @@ impl WlSurface for DisplayState {
             );
         }
         for child in result.unmapped_descendants {
-            self.seat_manager
-                .leave_keyboards_on_surface(ctx.client_id, child, ctx.writer);
+            self.release_keyboard_focus_from_surface(ctx.client_id, child, ctx.writer);
             self.seat_manager
                 .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
             self.surface_updates.push_back(SurfaceUpdate::Unmapped {
@@ -1866,17 +1863,19 @@ impl WlSubcompositor for DisplayState {
 
 impl WlSubsurface for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSubsurfaceDestroy<'_>) {
+        // Release keyboard before parent links are cleared by destroy_subsurface.
+        if let Some((surface_id, _)) = self
+            .surface_manager
+            .subsurface_surface_and_parent(ctx.client_id, object_id)
+        {
+            self.release_keyboard_focus_from_surface(ctx.client_id, surface_id, ctx.writer);
+        }
         match self
             .surface_manager
             .destroy_subsurface(ctx.client_id, object_id)
         {
             Ok((surface_id, was_mapped)) => {
                 if was_mapped {
-                    self.seat_manager.leave_keyboards_on_surface(
-                        ctx.client_id,
-                        surface_id,
-                        ctx.writer,
-                    );
                     self.seat_manager.leave_pointers_on_surface(
                         ctx.client_id,
                         surface_id,

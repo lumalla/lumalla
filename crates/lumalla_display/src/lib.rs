@@ -959,13 +959,22 @@ impl DisplayState {
     /// Apply keyboard/activation policy for a newly mapped surface.
     ///
     /// Non-grabbed popups keep parent focus. Grabbed popups take keyboard focus
-    /// while the parent toplevel stays activated.
+    /// while the parent toplevel stays activated. Subsurfaces never take focus —
+    /// clients (e.g. Chromium omnibox) map short-lived overlays that must not
+    /// steal keyboard enter/leave from the parent.
     pub(crate) fn focus_newly_mapped_surface(
         &mut self,
         client_id: ClientId,
         surface_id: ObjectId,
         writer: &mut Writer,
     ) {
+        if self
+            .surface_manager
+            .surface_role_is_subsurface(client_id, surface_id)
+        {
+            return;
+        }
+
         if self.surface_manager.shell_mode(client_id, surface_id) == Some(surface::ShellMode::Popup)
         {
             return;
@@ -988,6 +997,64 @@ impl DisplayState {
             .focus_keyboards_on_surface(client_id, surface_id, writer);
         self.on_surface_focused(client_id, surface_id);
         self.apply_activation(client_id, surface_id, writer);
+    }
+
+    /// Leave keyboard focus on `surface_id` if it currently has it, restoring
+    /// focus to a parent when possible (subsurface / popup child).
+    ///
+    /// Computes the restore target before leaving so parent links can still be
+    /// walked (call before clearing role/subsurface parent relationships).
+    pub(crate) fn release_keyboard_focus_from_surface(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        writer: &mut Writer,
+    ) {
+        let had_focus = self
+            .seat_manager
+            .focused_keyboard_surface()
+            .is_some_and(|(focus_client, focus_surface)| {
+                focus_client == client_id && focus_surface == surface_id
+            });
+        let restore = had_focus
+            .then(|| self.keyboard_focus_restore_target(client_id, surface_id))
+            .flatten();
+        self.seat_manager
+            .leave_keyboards_on_surface(client_id, surface_id, writer);
+        let Some(restore) = restore else {
+            return;
+        };
+        self.seat_manager
+            .focus_keyboards_on_surface(client_id, restore, writer);
+        self.on_surface_focused(client_id, restore);
+        self.apply_activation(client_id, restore, writer);
+    }
+
+    /// Prefer a still-usable parent for keyboard focus after `surface_id` unmaps.
+    fn keyboard_focus_restore_target(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Option<ObjectId> {
+        let mut current = self.surface_manager.parent_surface(client_id, surface_id)?;
+        for _ in 0..32 {
+            // Non-grabbed popups are not keyboard targets; keep walking up.
+            if let Some(popup) = self.xdg_manager.popup_info_for_wl(client_id, current) {
+                if !popup.grabbed {
+                    current = self.xdg_manager.popup_parent_wl(client_id, popup.popup_id)?;
+                    continue;
+                }
+            }
+            if self
+                .surface_manager
+                .surface_role_is_subsurface(client_id, current)
+            {
+                current = self.surface_manager.parent_surface(client_id, current)?;
+                continue;
+            }
+            return Some(current);
+        }
+        None
     }
 
     pub(crate) fn apply_activation(

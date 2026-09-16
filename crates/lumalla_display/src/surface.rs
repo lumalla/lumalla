@@ -712,6 +712,16 @@ impl SurfaceManager {
             .is_some_and(|surface| surface.role == Some(Role::Cursor))
     }
 
+    pub fn surface_role_is_subsurface(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> bool {
+        self.surfaces
+            .get(&(client_id, surface_id))
+            .is_some_and(|surface| matches!(surface.role, Some(Role::Subsurface(_))))
+    }
+
     pub fn assign_dnd_icon_role(
         &mut self,
         client_id: ClientId,
@@ -1188,6 +1198,17 @@ impl SurfaceManager {
             parent_surface.pending_below_count = Some(parent_surface.current_below_count);
         }
         Ok(())
+    }
+
+    /// `(wl_surface, parent wl_surface)` for a `wl_subsurface` object.
+    pub fn subsurface_surface_and_parent(
+        &self,
+        client_id: ClientId,
+        subsurface_id: ObjectId,
+    ) -> Option<(ObjectId, ObjectId)> {
+        self.subsurfaces
+            .get(&(client_id, subsurface_id))
+            .map(|sub| (sub.surface, sub.parent))
     }
 
     pub fn destroy_subsurface(
@@ -2546,6 +2567,28 @@ mod tests {
         manager.create_surface(client(1), object(4));
         manager.assign_cursor_role(client(1), object(4)).unwrap();
         assert!(manager.surface_role_is_cursor(client(1), object(4)));
+    }
+
+    #[test]
+    fn subsurface_role_is_detected() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(3));
+        manager
+            .create_shell_surface(client(1), object(4), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(4), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .create_subsurface(client(1), object(5), object(3), object(2))
+            .unwrap();
+        assert!(manager.surface_role_is_subsurface(client(1), object(3)));
+        assert!(!manager.surface_role_is_subsurface(client(1), object(2)));
+        assert_eq!(
+            manager.subsurface_surface_and_parent(client(1), object(5)),
+            Some((object(3), object(2)))
+        );
     }
 
     #[test]
