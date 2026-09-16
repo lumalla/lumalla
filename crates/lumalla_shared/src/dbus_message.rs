@@ -42,4 +42,11 @@ pub enum DbusMessage {
         /// `(stream_id, node_id)` on success.
         result: Result<(u32, u32), String>,
     },
+    /// Mutter ScreenCast stream is ready (or failed); emit `PipeWireStreamAdded` on success.
+    MutterScreenCastStarted {
+        /// Matches [`crate::MainMessage::StartMutterScreenCast::mutter_stream_id`].
+        mutter_stream_id: u64,
+        /// PipeWire node id on success.
+        result: Result<u32, String>,
+    },
 }

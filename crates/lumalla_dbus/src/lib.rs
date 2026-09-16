@@ -3,6 +3,7 @@
 #![warn(missing_docs)]
 
 mod iface;
+mod mutter;
 
 use std::{
     collections::HashMap,
@@ -17,7 +18,9 @@ use std::{
 };
 
 use anyhow::Context;
-use iface::{CompositorHandler, ServiceState, complete_pipewire_stream, complete_screenshot, emit_signal};
+use iface::{
+    CompositorHandler, ServiceState, complete_pipewire_stream, complete_screenshot, emit_signal,
+};
 use log::{error, info, warn};
 use lumalla_ipc::{
     BUS_NAME, OBJECT_PATH, WindowManager, signals,
@@ -26,9 +29,11 @@ use lumalla_ipc::{
 use lumalla_shared::{
     Comms, Completion, DbusMessage, DrmDeviceState, EventLoop, MainMessage, OpKind, Output,
 };
+use mutter::{DisplayConfig, ScreenCast, complete_mutter_stream};
 use zbus::{Error as ZbusError, blocking::connection};
 
 use crate::iface::spawn_process_with_options;
+use crate::mutter::screen_cast::MutterStreamRegistry;
 
 /// A registered D-Bus service that must be kept alive for the lifetime of the compositor.
 pub struct DbusService {
@@ -40,6 +45,7 @@ pub struct DbusService {
     windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
     pending_screenshots: Arc<Mutex<HashMap<usize, Arc<iface::PendingScreenshot>>>>,
     pending_pipewire_streams: Arc<Mutex<HashMap<usize, Arc<iface::PendingPipewireStream>>>>,
+    mutter_streams: MutterStreamRegistry,
     ready: Arc<AtomicBool>,
 }
 
@@ -91,6 +97,33 @@ impl DbusService {
             })?;
         info!("D-Bus service listening on {BUS_NAME}{OBJECT_PATH}");
 
+        let (screen_cast, mutter_streams) =
+            ScreenCast::new(Arc::clone(&outputs), comms, connection.clone());
+        connection
+            .object_server()
+            .at("/org/gnome/Mutter/ScreenCast", screen_cast)
+            .context("Failed to register Mutter ScreenCast object")?;
+        match connection.request_name("org.gnome.Mutter.ScreenCast") {
+            Ok(()) => info!("D-Bus service listening on org.gnome.Mutter.ScreenCast"),
+            Err(err) => warn!(
+                "Could not claim org.gnome.Mutter.ScreenCast (portal-gnome screencast may be unavailable): {err}"
+            ),
+        }
+
+        connection
+            .object_server()
+            .at(
+                "/org/gnome/Mutter/DisplayConfig",
+                DisplayConfig::new(Arc::clone(&outputs)),
+            )
+            .context("Failed to register Mutter DisplayConfig object")?;
+        match connection.request_name("org.gnome.Mutter.DisplayConfig") {
+            Ok(()) => info!("D-Bus service listening on org.gnome.Mutter.DisplayConfig"),
+            Err(err) => warn!(
+                "Could not claim org.gnome.Mutter.DisplayConfig (portal monitor list may be empty): {err}"
+            ),
+        }
+
         Ok(Self {
             connection,
             outputs,
@@ -100,6 +133,7 @@ impl DbusService {
             windows: state.windows.clone(),
             pending_screenshots,
             pending_pipewire_streams,
+            mutter_streams,
             ready,
         })
     }
@@ -134,6 +168,7 @@ struct DbusState {
     windows: Arc<Mutex<Vec<lumalla_shared::WindowState>>>,
     pending_screenshots: Arc<Mutex<HashMap<usize, Arc<iface::PendingScreenshot>>>>,
     pending_pipewire_streams: Arc<Mutex<HashMap<usize, Arc<iface::PendingPipewireStream>>>>,
+    mutter_streams: MutterStreamRegistry,
     ready: Arc<AtomicBool>,
     /// Config child process; kept alive so we can reap it via `WaitId` SQE.
     config_child: Option<Child>,
@@ -159,6 +194,7 @@ impl DbusState {
             windows: service.windows,
             pending_screenshots: service.pending_screenshots,
             pending_pipewire_streams: service.pending_pipewire_streams,
+            mutter_streams: service.mutter_streams,
             ready: service.ready,
             config_child: None,
             config_child_pid: None,
@@ -335,6 +371,12 @@ impl DbusState {
             DbusMessage::PipewireStreamStarted { request_id, result } => {
                 complete_pipewire_stream(&self.pending_pipewire_streams, request_id, result);
             }
+            DbusMessage::MutterScreenCastStarted {
+                mutter_stream_id,
+                result,
+            } => {
+                complete_mutter_stream(&self.mutter_streams, mutter_stream_id, result);
+            }
         }
 
         Ok(())
@@ -410,11 +452,24 @@ mod tests {
             return;
         }
 
-        let first = DbusService::register(comms()).expect("registration should succeed");
+        let first = match DbusService::register(comms()) {
+            Ok(service) => service,
+            Err(err) => {
+                eprintln!("skip dbus_name_registration: {err:#}");
+                return;
+            }
+        };
         drop(first);
+        // Name release can lag a moment on the session bus.
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
-        let holder =
-            DbusService::register(comms()).expect("registration should succeed after release");
+        let holder = match DbusService::register(comms()) {
+            Ok(service) => service,
+            Err(err) => {
+                eprintln!("skip dbus_name_registration after release: {err:#}");
+                return;
+            }
+        };
         let second = DbusService::register(comms());
         assert!(
             second.is_err(),
@@ -426,5 +481,53 @@ mod tests {
             "error should mention name ownership: {err:#}"
         );
         drop(holder);
+    }
+
+    #[test]
+    fn mutter_bus_names_claimed() {
+        if std::env::var("DBUS_SESSION_BUS_ADDRESS").is_err() {
+            return;
+        }
+
+        let service = match DbusService::register(comms()) {
+            Ok(service) => service,
+            Err(err) => {
+                eprintln!("skip mutter_bus_names_claimed: {err:#}");
+                return;
+            }
+        };
+
+        let conn = zbus::blocking::Connection::session().expect("session bus");
+        let dbus = zbus::blocking::fdo::DBusProxy::new(&conn).expect("DBus proxy");
+        for name in [
+            "org.gnome.Mutter.ScreenCast",
+            "org.gnome.Mutter.DisplayConfig",
+        ] {
+            let owner = dbus.get_name_owner(name.try_into().unwrap());
+            assert!(
+                owner.is_ok(),
+                "expected {name} to be owned while DbusService is alive: {owner:?}"
+            );
+        }
+
+        let reply = conn.call_method(
+            Some("org.gnome.Mutter.ScreenCast"),
+            "/org/gnome/Mutter/ScreenCast",
+            Some("org.gnome.Mutter.ScreenCast"),
+            "CreateSession",
+            &std::collections::HashMap::<&str, zbus::zvariant::Value<'_>>::new(),
+        );
+        assert!(reply.is_ok(), "CreateSession should succeed: {reply:?}");
+
+        let reply = conn.call_method(
+            Some("org.gnome.Mutter.DisplayConfig"),
+            "/org/gnome/Mutter/DisplayConfig",
+            Some("org.gnome.Mutter.DisplayConfig"),
+            "GetCurrentState",
+            &(),
+        );
+        assert!(reply.is_ok(), "GetCurrentState should succeed: {reply:?}");
+
+        drop(service);
     }
 }

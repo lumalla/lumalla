@@ -64,6 +64,8 @@ struct AppData {
     display_state: DisplayState,
     renderer_state: RendererState,
     screencast: ScreencastManager,
+    /// Mutter ScreenCast session id → PipeWire stream ids started for that session.
+    mutter_cast_streams: HashMap<u64, Vec<u32>>,
     /// Prevents `push_screencast_frames` → `arm_presents` re-entrancy.
     screencast_push_active: bool,
     frame_clock: Instant,
@@ -94,6 +96,7 @@ impl AppData {
             display_state,
             renderer_state,
             screencast: ScreencastManager::new(),
+            mutter_cast_streams: HashMap::new(),
             screencast_push_active: false,
             frame_clock: Instant::now(),
             drm_device_poll: HashMap::new(),
@@ -845,6 +848,79 @@ impl AppData {
                 MainMessage::StopPipewireStream { stream_id } => {
                     self.screencast.stop_stream(stream_id);
                     self.renderer_state.free_screencast_buffers(stream_id);
+                }
+                MainMessage::StartMutterScreenCast {
+                    mutter_stream_id,
+                    session_id,
+                    connector,
+                } => {
+                    let result = (|| -> Result<u32, String> {
+                        let output = self
+                            .display_state
+                            .outputs()
+                            .find(|o| o.name == connector)
+                            .ok_or_else(|| format!("no such monitor: {connector}"))?;
+                        let (x, y) = (output.x, output.y);
+                        let (width, height) = (output.width, output.height);
+                        if width <= 0 || height <= 0 {
+                            return Err(format!("monitor '{connector}' has invalid size"));
+                        }
+                        let max_fps = if output.refresh_mhz > 0 {
+                            ((output.refresh_mhz + 999) / 1000).max(1) as u32
+                        } else {
+                            60
+                        };
+                        let name = format!("Lumalla ScreenCast ({connector})");
+                        let stream_id = self.screencast.peek_next_stream_id();
+                        let exports = self
+                            .renderer_state
+                            .alloc_screencast_buffers(
+                                stream_id,
+                                width as u32,
+                                height as u32,
+                                ScreencastManager::dma_buffer_count(),
+                            )
+                            .map_err(|err| format!("{err:#}"))?;
+                        let dma_exports = exports
+                            .into_iter()
+                            .map(|export| DmaBufferExport {
+                                index: export.index,
+                                fd: export.fd,
+                                width: export.width,
+                                height: export.height,
+                                stride: export.stride,
+                                offset: export.offset,
+                                modifier: export.modifier,
+                            })
+                            .collect();
+                        let (pw_stream_id, node_id) = self
+                            .screencast
+                            .start_stream(x, y, width, height, name, max_fps, dma_exports)
+                            .map_err(|err| {
+                                self.renderer_state.free_screencast_buffers(stream_id);
+                                format!("{err:#}")
+                            })?;
+                        self.mutter_cast_streams
+                            .entry(session_id)
+                            .or_default()
+                            .push(pw_stream_id);
+                        Ok(node_id)
+                    })();
+                    if result.is_ok() {
+                        self.mark_present_dirty(event_loop, arena);
+                    }
+                    self.comms.dbus(DbusMessage::MutterScreenCastStarted {
+                        mutter_stream_id,
+                        result,
+                    });
+                }
+                MainMessage::StopMutterScreenCast { session_id } => {
+                    if let Some(stream_ids) = self.mutter_cast_streams.remove(&session_id) {
+                        for stream_id in stream_ids {
+                            self.screencast.stop_stream(stream_id);
+                            self.renderer_state.free_screencast_buffers(stream_id);
+                        }
+                    }
                 }
                 MainMessage::SetWindow {
                     id,

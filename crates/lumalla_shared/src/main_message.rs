@@ -149,6 +149,20 @@ pub enum MainMessage {
         /// Stream id returned from start.
         stream_id: u32,
     },
+    /// Start a Mutter ScreenCast stream for a named output (portal path).
+    StartMutterScreenCast {
+        /// Opaque stream id from the Mutter ScreenCast D-Bus object.
+        mutter_stream_id: u64,
+        /// Session that owns this stream (for stop grouping).
+        session_id: u64,
+        /// Output / connector name to capture.
+        connector: String,
+    },
+    /// Stop all PipeWire streams belonging to a Mutter ScreenCast session.
+    StopMutterScreenCast {
+        /// Mutter session id.
+        session_id: u64,
+    },
     /// Update window geometry. `id == None` targets the focused window.
     SetWindow {
         /// Window id, or `None` for the focused window.
