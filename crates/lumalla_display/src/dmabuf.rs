@@ -19,8 +19,43 @@ type ResourceKey = (ClientId, ObjectId);
 pub const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 /// DRM fourcc: ARGB8888 ('AR24').
 pub const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
+/// DRM fourcc: XBGR8888 ('XB24').
+pub const DRM_FORMAT_XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
+/// DRM fourcc: ABGR8888 ('AB24').
+pub const DRM_FORMAT_ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
 /// DRM_FORMAT_MOD_LINEAR
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+/// Map a DRM fourcc to the wl_shm format enum used for compositor bookkeeping.
+///
+/// GPU import uses [`ExportedDmabuf::drm_fourcc`]; ABGR/XBGR are remapped to the
+/// ARGB/XRGB shm enums because the renderer only accepts those for the `format` field.
+fn drm_fourcc_to_wl_shm(format: u32) -> Result<u32> {
+    match format {
+        DRM_FORMAT_ARGB8888 | DRM_FORMAT_ABGR8888 => Ok(WL_SHM_FORMAT_ARGB8888),
+        DRM_FORMAT_XRGB8888 | DRM_FORMAT_XBGR8888 => Ok(WL_SHM_FORMAT_XRGB8888),
+        _ => Err(DmabufError::new(
+            DmabufErrorKind::InvalidFormat,
+            "Unsupported dmabuf format",
+        )),
+    }
+}
+
+/// True when DRM channel order is R-first in little-endian memory (needs R↔B for shm).
+fn drm_fourcc_is_abgr_order(format: u32) -> bool {
+    matches!(format, DRM_FORMAT_ABGR8888 | DRM_FORMAT_XBGR8888)
+}
+
+fn swizzle_rb_in_place(pixels: &mut [u8], stride: usize, height: usize) {
+    for row in 0..height {
+        let start = row * stride;
+        let end = (start + stride).min(pixels.len());
+        let row = &mut pixels[start..end];
+        for px in row.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmabufErrorKind {
@@ -541,16 +576,10 @@ impl DmabufManager {
             std::ptr::copy_nonoverlapping(src, pixels.as_mut_ptr(), pixels.len());
             munmap(ptr, map_len);
         }
-        let format = match buffer.format {
-            DRM_FORMAT_ARGB8888 => WL_SHM_FORMAT_ARGB8888,
-            DRM_FORMAT_XRGB8888 => WL_SHM_FORMAT_XRGB8888,
-            _ => {
-                return Err(DmabufError::new(
-                    DmabufErrorKind::InvalidFormat,
-                    "Unsupported dmabuf format",
-                ));
-            }
-        };
+        let format = drm_fourcc_to_wl_shm(buffer.format)?;
+        if drm_fourcc_is_abgr_order(buffer.format) {
+            swizzle_rb_in_place(&mut pixels, stride, height);
+        }
         Ok(DmabufSnapshot {
             pixels,
             width,
@@ -572,16 +601,7 @@ impl DmabufManager {
             .ok_or_else(|| DmabufError::new(DmabufErrorKind::InvalidObject, "Unknown dmabuf"))?;
         let plane = &buffer.planes[0];
         let fd = dup_fd(plane.fd.as_raw_fd())?;
-        let wl_format = match buffer.format {
-            DRM_FORMAT_ARGB8888 => WL_SHM_FORMAT_ARGB8888,
-            DRM_FORMAT_XRGB8888 => WL_SHM_FORMAT_XRGB8888,
-            _ => {
-                return Err(DmabufError::new(
-                    DmabufErrorKind::InvalidFormat,
-                    "Unsupported dmabuf format",
-                ));
-            }
-        };
+        let wl_format = drm_fourcc_to_wl_shm(buffer.format)?;
         Ok(ExportedDmabuf {
             fd,
             width: buffer.width,
@@ -790,6 +810,49 @@ mod tests {
         assert_eq!(exported.drm_fourcc, DRM_FORMAT_XRGB8888);
         let snap = manager.snapshot_buffer(client_id, object(3)).unwrap();
         assert_eq!(snap.pixels, pixels);
+    }
+
+    #[test]
+    fn export_buffer_accepts_abgr8888() {
+        let mut manager = DmabufManager::default();
+        manager.set_supported_formats(
+            vec![(DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR)],
+            None,
+        );
+        let client_id = client(1);
+        manager.create_params(client_id, object(2)).unwrap();
+        // Little-endian ABGR memory: R G B A
+        let pixels = [0x11u8, 0x22, 0x33, 0xff];
+        manager
+            .add_plane(
+                client_id,
+                object(2),
+                memfd(&pixels),
+                0,
+                0,
+                4,
+                0,
+                DRM_FORMAT_MOD_LINEAR as u32,
+            )
+            .unwrap();
+        manager
+            .create_immed(
+                client_id,
+                object(2),
+                object(3),
+                1,
+                1,
+                DRM_FORMAT_ABGR8888,
+                0,
+            )
+            .unwrap();
+        let exported = manager.export_buffer(client_id, object(3)).unwrap();
+        assert_eq!(exported.drm_fourcc, DRM_FORMAT_ABGR8888);
+        assert_eq!(exported.wl_format, WL_SHM_FORMAT_ARGB8888);
+        let snap = manager.snapshot_buffer(client_id, object(3)).unwrap();
+        assert_eq!(snap.format, WL_SHM_FORMAT_ARGB8888);
+        // Swizzled to B G R A for shm ARGB layout.
+        assert_eq!(snap.pixels, [0x33, 0x22, 0x11, 0xff]);
     }
 
     #[test]
