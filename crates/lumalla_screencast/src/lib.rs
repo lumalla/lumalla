@@ -35,8 +35,9 @@ use pipewire::{
         },
         pod::{self, Pod, Property, PropertyFlags, serialize::PodSerializer},
         sys::{
-            SPA_DATA_FLAG_READWRITE, SPA_PARAM_BUFFERS_blocks, SPA_PARAM_BUFFERS_buffers,
-            SPA_PARAM_BUFFERS_dataType, SPA_PARAM_BUFFERS_size, SPA_PARAM_BUFFERS_stride,
+            SPA_DATA_FLAG_MAPPABLE, SPA_DATA_FLAG_READWRITE, SPA_PARAM_BUFFERS_blocks,
+            SPA_PARAM_BUFFERS_buffers, SPA_PARAM_BUFFERS_dataType, SPA_PARAM_BUFFERS_size,
+            SPA_PARAM_BUFFERS_stride,
         },
         utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle, SpaTypes},
     },
@@ -643,7 +644,38 @@ fn run_pipewire_thread(
     });
 
     let _core = core;
+
+    // DRIVER video sources need periodic trigger_process calls (see PipeWire
+    // video-src-alloc). Also wake the compositor so MemFd/DMA captures keep up.
+    let streams_for_timer = Rc::clone(&streams);
+    let on_wake_timer = Arc::clone(&on_wake);
+    let timer = mainloop.loop_().add_timer(move |_| {
+        let mut any = false;
+        for slot in streams_for_timer.borrow().values() {
+            if slot.inner.borrow().started {
+                any = true;
+                if let Err(err) = slot.stream.trigger_process() {
+                    debug!("drive timer trigger_process failed: {err}");
+                }
+            }
+        }
+        if any {
+            on_wake_timer(ScreencastWake::BlitNeeded);
+        }
+    });
+    if let Err(err) = timer
+        .update_timer(
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(16)),
+        )
+        .into_result()
+    {
+        warn!("Failed to arm PipeWire drive timer: {err}");
+    }
+
     mainloop.run();
+    // Keep timer alive until the loop exits.
+    drop(timer);
     Ok(())
 }
 
@@ -730,7 +762,7 @@ fn create_stream(
             }
         })
         .param_changed({
-            let pending_blits = Arc::clone(&pending_blits);
+            let _pending_blits = Arc::clone(&pending_blits);
             move |stream, user_data, id, param| {
                 let Some(param) = param else {
                     return;
@@ -855,7 +887,7 @@ fn create_stream(
                         return;
                     };
                     (*spa_data).type_ = DataType::DmaBuf.as_raw();
-                    (*spa_data).flags = SPA_DATA_FLAG_READWRITE;
+                    (*spa_data).flags = SPA_DATA_FLAG_READWRITE | SPA_DATA_FLAG_MAPPABLE;
                     (*spa_data).fd = slot.fd as i64;
                     (*spa_data).mapoffset = slot.offset;
                     (*spa_data).maxsize = slot.stride.saturating_mul(slot.height);
@@ -944,19 +976,20 @@ fn create_stream(
         .register()
         .context("failed to register PipeWire stream listener")?;
 
-    // Prefer DMA-BUF (BGRx + LINEAR), fall back to MemFd RGBA.
+    // Prefer MemFd RGBA first so browsers/tests that don't import DMA-BUF still
+    // get a working path. Offer LINEAR BGRx DMA-BUF as a second option.
     let mut params_bytes: Vec<Vec<u8>> = Vec::new();
-    params_bytes.push(serialize_enum_format(
-        width,
-        height,
-        VideoFormat::BGRx,
-        Some(0), // DRM_FORMAT_MOD_LINEAR
-    )?);
     params_bytes.push(serialize_enum_format(
         width,
         height,
         VideoFormat::RGBA,
         None,
+    )?);
+    params_bytes.push(serialize_enum_format(
+        width,
+        height,
+        VideoFormat::BGRx,
+        Some(0), // DRM_FORMAT_MOD_LINEAR
     )?);
 
     let mut params: Vec<&Pod> = params_bytes
@@ -998,14 +1031,14 @@ fn serialize_enum_format(
         pod::property!(
             FormatProperties::VideoFramerate,
             Fraction,
-            Fraction { num: 0, denom: 1 }
+            Fraction { num: 30, denom: 1 }
         ),
         pod::property!(
             FormatProperties::VideoMaxFramerate,
             Choice,
             Range,
             Fraction,
-            Fraction { num: 60, denom: 1 },
+            Fraction { num: 30, denom: 1 },
             Fraction { num: 1, denom: 1 },
             Fraction {
                 num: 60,
@@ -1014,9 +1047,11 @@ fn serialize_enum_format(
         ),
     ];
     if let Some(modifier) = modifier {
+        // Don't mark modifier MANDATORY — that can make negotiation fail for
+        // consumers that only speak MemFd RGBA.
         properties.push(Property {
             key: FormatProperties::VideoModifier.as_raw(),
-            flags: PropertyFlags::MANDATORY,
+            flags: PropertyFlags::empty(),
             value: pod::Value::Long(modifier as i64),
         });
     }
@@ -1079,7 +1114,7 @@ unsafe fn attach_memfd(
     unsafe {
         let spa_data = (*spa_buffer).datas;
         (*spa_data).type_ = DataType::MemFd.as_raw();
-        (*spa_data).flags = SPA_DATA_FLAG_READWRITE;
+        (*spa_data).flags = SPA_DATA_FLAG_READWRITE | SPA_DATA_FLAG_MAPPABLE;
         (*spa_data).fd = fd as i64;
         (*spa_data).mapoffset = 0;
         (*spa_data).maxsize = size as u32;

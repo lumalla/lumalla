@@ -5,7 +5,7 @@ edition = "2024"
 description = "PipeWire screencast stream helper for Lumalla"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumalla/lumalla"
-include = ["src/**/*", "LICENSE-*"]
+include = ["src/**/*", "tests/**/*", "LICENSE-*"]
 
 [dependencies]
 anyhow = { workspace = true }
