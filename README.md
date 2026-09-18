@@ -137,7 +137,8 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 
 | Function | Description |
 | --- | --- |
-| `spawn({command, args?})` | Spawn a process with the compositor’s Wayland environment. |
+| `spawn({command, args?})` | Spawn a process with the compositor’s Wayland environment (plus any vars from `set_extra_env`). |
+| `set_extra_env(name, value)` | Set an environment variable applied to all future `spawn` calls (e.g. `DISPLAY` for xwayland-satellite). |
 | `sleep(seconds)` | Blocking sleep in the config process (no D-Bus round-trip). |
 | `key(name)` | Press and release a named key. |
 | `type(text)` | Type UTF-8 text as key presses. |

@@ -453,10 +453,19 @@ impl FromLua for ConfigOutputSetting {
 }
 
 fn init_dbus_spawn(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> LuaResult<()> {
+    let spawn_client = client.clone();
     module.set(
         "spawn",
         lua.create_function(move |_, spawn: ConfigSpawn| {
-            dbus_result(client.proxy.spawn(&spawn.command, spawn.args))?;
+            dbus_result(spawn_client.proxy.spawn(&spawn.command, spawn.args))?;
+            Ok(())
+        })?,
+    )?;
+
+    module.set(
+        "set_extra_env",
+        lua.create_function(move |_, (name, value): (String, String)| {
+            dbus_result(client.proxy.set_extra_env(&name, &value))?;
             Ok(())
         })?,
     )?;
