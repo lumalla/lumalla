@@ -8,7 +8,7 @@ mod mutter;
 use std::{
     collections::HashMap,
     io,
-    process::Child,
+    process::{Child, Command},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicI32, Ordering},
@@ -97,6 +97,7 @@ impl DbusService {
             })?;
         info!("D-Bus service listening on {BUS_NAME}{OBJECT_PATH}");
 
+        let mut claimed_screen_cast = false;
         let (screen_cast, mutter_streams) =
             ScreenCast::new(Arc::clone(&outputs), comms, connection.clone());
         connection
@@ -104,7 +105,10 @@ impl DbusService {
             .at("/org/gnome/Mutter/ScreenCast", screen_cast)
             .context("Failed to register Mutter ScreenCast object")?;
         match connection.request_name("org.gnome.Mutter.ScreenCast") {
-            Ok(()) => info!("D-Bus service listening on org.gnome.Mutter.ScreenCast"),
+            Ok(()) => {
+                info!("D-Bus service listening on org.gnome.Mutter.ScreenCast");
+                claimed_screen_cast = true;
+            }
             Err(err) => warn!(
                 "Could not claim org.gnome.Mutter.ScreenCast (portal-gnome screencast may be unavailable): {err}"
             ),
@@ -122,6 +126,15 @@ impl DbusService {
             Err(err) => warn!(
                 "Could not claim org.gnome.Mutter.DisplayConfig (portal monitor list may be empty): {err}"
             ),
+        }
+
+        if claimed_screen_cast {
+            // portal-gnome only exports impl.portal.ScreenCast after it sees
+            // org.gnome.Mutter.ScreenCast. If it started earlier it stays in
+            // "settings only" mode until restarted — Chromium then offers tabs only
+            // and getDisplayMedia fails with NotAllowedError for monitors.
+            #[cfg(not(test))]
+            nudge_screencast_portals();
         }
 
         Ok(Self {
@@ -150,6 +163,29 @@ impl DbusService {
     pub fn set_wayland_display(&self, wayland_display: String) {
         info!("Setting WAYLAND_DISPLAY for D-Bus spawns to {wayland_display}");
         *self.wayland_display.lock().unwrap() = Some(wayland_display);
+    }
+}
+
+/// Restart portal backends so they pick up Lumalla's Mutter ScreenCast name.
+///
+/// Best-effort: failure must not prevent the compositor from starting.
+fn nudge_screencast_portals() {
+    // Restart gnome first so it re-exports ScreenCast, then the front-end portal
+    // so it rediscovers the implementation.
+    for unit in [
+        "xdg-desktop-portal-gnome.service",
+        "xdg-desktop-portal.service",
+    ] {
+        match Command::new("systemctl")
+            .args(["--user", "try-restart", unit])
+            .status()
+        {
+            Ok(status) if status.success() => {
+                info!("Restarted {unit} so portal ScreenCast can bind to Mutter");
+            }
+            Ok(status) => warn!("systemctl try-restart {unit} exited with {status}"),
+            Err(err) => warn!("Failed to restart {unit}: {err}"),
+        }
     }
 }
 

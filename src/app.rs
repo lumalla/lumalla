@@ -25,7 +25,7 @@ use lumalla_renderer::{
     CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RendererState, SurfaceFrame,
     is_present_wake_token,
 };
-use lumalla_screencast::{DmaBufferExport, ScreencastManager, VideoFrame};
+use lumalla_screencast::{DmaBufferExport, ScreencastManager, ScreencastWake, VideoFrame};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
@@ -96,8 +96,13 @@ impl AppData {
     ) -> Self {
         let screencast = ScreencastManager::new({
             let to_main = comms.main_sender();
-            std::sync::Arc::new(move |stream_id, result| {
-                let _ = to_main.send(MainMessage::PipewireStreamReady { stream_id, result });
+            std::sync::Arc::new(move |wake| match wake {
+                ScreencastWake::StreamReady { stream_id, result } => {
+                    let _ = to_main.send(MainMessage::PipewireStreamReady { stream_id, result });
+                }
+                ScreencastWake::BlitNeeded => {
+                    let _ = to_main.send(MainMessage::ScreencastBlitNeeded);
+                }
             })
         });
         Self {
@@ -1014,6 +1019,8 @@ impl AppData {
                         }
                     } else {
                         self.mark_present_dirty(event_loop, arena);
+                        // Blits may have been queued while the stream was still starting.
+                        self.push_screencast_frames(event_loop, arena);
                     }
                     match reply {
                         Some(PendingScreencastReply::Pipewire { request_id }) => {
@@ -1037,6 +1044,9 @@ impl AppData {
                             }
                         }
                     }
+                }
+                MainMessage::ScreencastBlitNeeded => {
+                    self.push_screencast_frames(event_loop, arena);
                 }
                 MainMessage::SetWindow {
                     id,
@@ -1764,14 +1774,26 @@ impl AppData {
 
         // DMA-BUF path: fill buffers that PipeWire has returned for a blit.
         let pending_blits = self.screencast.take_pending_blits();
+        let mut deferred = Vec::new();
         for (stream_id, index) in pending_blits {
-            let Some(stream) = self.screencast.streams().get(&stream_id) else {
+            let Some((x, y, width, height, uses_dmabuf)) =
+                self.screencast.stream_capture_region(stream_id)
+            else {
+                // Stream already torn down; ask PipeWire to recycle if possible.
+                let _ = self.screencast.queue_dma_buffer(stream_id, index);
                 continue;
             };
-            if !stream.uses_dmabuf() {
+            if !uses_dmabuf {
+                // Format not settled yet; try again after negotiation.
+                deferred.push((stream_id, index));
                 continue;
             }
-            let (x, y, width, height) = (stream.x, stream.y, stream.width, stream.height);
+            if let Some(stream) = self.screencast.streams().get(&stream_id)
+                && !stream.due_at(now)
+            {
+                deferred.push((stream_id, index));
+                continue;
+            }
             match self.renderer_state.blit_region_to_screencast_buffer(
                 stream_id, index, x, y, width, height, &outputs,
             ) {
@@ -1788,10 +1810,20 @@ impl AppData {
                 }
                 Err(err) => {
                     warn!("Unable to blit PipeWire DMA region for stream {stream_id}: {err:#}");
-                    self.renderer_state
-                        .release_screencast_buffer(stream_id, index);
+                    // Still queue so the DRIVER graph keeps moving (black frame beats stall).
+                    if let Err(queue_err) = self.screencast.queue_dma_buffer(stream_id, index) {
+                        warn!(
+                            "Unable to recycle DMA-BUF after blit failure for stream {stream_id}: {queue_err:#}"
+                        );
+                        self.renderer_state
+                            .release_screencast_buffer(stream_id, index);
+                    }
                 }
             }
+        }
+        if !deferred.is_empty() {
+            // Don't wake immediately — presents / later BlitNeeded will retry.
+            self.screencast.requeue_pending_blits_silent(deferred);
         }
 
         // MemFd path: CPU download when DMA-BUF was not negotiated.

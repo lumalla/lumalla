@@ -173,6 +173,8 @@ pub enum MainMessage {
         /// PipeWire node id, or an error string.
         result: Result<u32, String>,
     },
+    /// PipeWire dequeued a DMA-BUF that needs a GPU blit on the main thread.
+    ScreencastBlitNeeded,
     /// Update window geometry. `id == None` targets the focused window.
     SetWindow {
         /// Window id, or `None` for the focused window.

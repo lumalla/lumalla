@@ -78,12 +78,25 @@ pub struct DmaBufferExport {
     pub modifier: u64,
 }
 
-/// Notifies the compositor main thread when a PipeWire stream node id is known.
-pub type StreamReadyNotify = Arc<dyn Fn(u32, Result<u32, String>) + Send + Sync>;
+/// Notifies the compositor main thread about PipeWire screencast activity.
+pub enum ScreencastWake {
+    /// Stream node id is known (or start failed).
+    StreamReady {
+        /// Local stream id.
+        stream_id: u32,
+        /// PipeWire node id, or an error string.
+        result: Result<u32, String>,
+    },
+    /// One or more DMA-BUF slots need a GPU blit.
+    BlitNeeded,
+}
+
+/// Callback invoked from the PipeWire thread (must wake the main loop).
+pub type ScreencastWakeNotify = Arc<dyn Fn(ScreencastWake) + Send + Sync>;
 
 struct PendingStart {
     stream_id: u32,
-    notify: StreamReadyNotify,
+    notify: ScreencastWakeNotify,
     /// Ensures [`complete_pending`] runs at most once.
     completed: AtomicBool,
 }
@@ -212,16 +225,16 @@ pub struct ScreencastManager {
     thread: Option<JoinHandle<()>>,
     /// `(stream_id, buffer_index)` slots waiting for a GPU blit.
     pending_blits: Arc<Mutex<Vec<(u32, usize)>>>,
-    /// Called from the PipeWire thread when a stream is ready (or failed).
-    on_ready: StreamReadyNotify,
+    /// Called from the PipeWire thread when a stream is ready or a blit is needed.
+    on_wake: ScreencastWakeNotify,
 }
 
 impl ScreencastManager {
     /// Create a manager with no streams (PipeWire thread starts on first use).
     ///
-    /// `on_ready` is invoked from the PipeWire thread with `(stream_id, Result<node_id>)`.
-    /// It must wake the compositor main loop (e.g. by posting a message).
-    pub fn new(on_ready: StreamReadyNotify) -> Self {
+    /// `on_wake` is invoked from the PipeWire thread and must wake the compositor
+    /// main loop (e.g. by posting a message).
+    pub fn new(on_wake: ScreencastWakeNotify) -> Self {
         Self {
             next_id: 1,
             streams: HashMap::new(),
@@ -229,7 +242,7 @@ impl ScreencastManager {
             cmd_tx: None,
             thread: None,
             pending_blits: Arc::new(Mutex::new(Vec::new())),
-            on_ready,
+            on_wake,
         }
     }
 
@@ -258,6 +271,44 @@ impl ScreencastManager {
         std::mem::take(&mut *self.pending_blits.lock().unwrap())
     }
 
+    /// Re-queue blit work that could not be completed yet (e.g. stream still starting).
+    pub fn requeue_pending_blits(&self, blits: Vec<(u32, usize)>) {
+        if blits.is_empty() {
+            return;
+        }
+        self.pending_blits.lock().unwrap().extend(blits);
+        (self.on_wake)(ScreencastWake::BlitNeeded);
+    }
+
+    /// Like [`Self::requeue_pending_blits`] but without waking (caller schedules work).
+    pub fn requeue_pending_blits_silent(&self, blits: Vec<(u32, usize)>) {
+        if blits.is_empty() {
+            return;
+        }
+        self.pending_blits.lock().unwrap().extend(blits);
+    }
+
+    /// Capture region for an active or still-starting stream.
+    pub fn stream_capture_region(&self, stream_id: u32) -> Option<(i32, i32, i32, i32, bool)> {
+        if let Some(stream) = self.streams.get(&stream_id) {
+            return Some((
+                stream.x,
+                stream.y,
+                stream.width,
+                stream.height,
+                stream.uses_dmabuf(),
+            ));
+        }
+        let starting = self.starting.get(&stream_id)?;
+        Some((
+            starting.x,
+            starting.y,
+            starting.width,
+            starting.height,
+            starting.dma_negotiated.load(Ordering::Acquire),
+        ))
+    }
+
     fn ensure_thread(&mut self) -> anyhow::Result<&pw::channel::Sender<PwCommand>> {
         if self.cmd_tx.is_some() {
             return Ok(self.cmd_tx.as_ref().unwrap());
@@ -268,11 +319,12 @@ impl ScreencastManager {
         });
 
         let pending_blits = Arc::clone(&self.pending_blits);
+        let on_wake = Arc::clone(&self.on_wake);
         let (cmd_tx, cmd_rx) = pw::channel::channel::<PwCommand>();
         let thread = thread::Builder::new()
             .name(String::from("pipewire"))
             .spawn(move || {
-                if let Err(err) = run_pipewire_thread(cmd_rx, pending_blits) {
+                if let Err(err) = run_pipewire_thread(cmd_rx, pending_blits, on_wake) {
                     error!("PipeWire thread exited with error: {err:#}");
                 }
             })
@@ -292,7 +344,7 @@ impl ScreencastManager {
     ///
     /// `dma_exports` should contain [`Self::dma_buffer_count`] LINEAR DMA-BUF exports
     /// allocated by the renderer. Returns the local stream id immediately; the PipeWire
-    /// node id is delivered later via the [`StreamReadyNotify`] passed to [`Self::new`].
+    /// node id is delivered later via [`ScreencastWake::StreamReady`].
     /// Call [`Self::complete_start`] from the main thread when that notification arrives.
     pub fn start_stream(
         &mut self,
@@ -315,7 +367,7 @@ impl ScreencastManager {
 
         let pending = Arc::new(PendingStart {
             stream_id,
-            notify: Arc::clone(&self.on_ready),
+            notify: Arc::clone(&self.on_wake),
             completed: AtomicBool::new(false),
         });
         let dma_negotiated = Arc::new(AtomicBool::new(false));
@@ -349,7 +401,7 @@ impl ScreencastManager {
         Ok(stream_id)
     }
 
-    /// Apply a [`StreamReadyNotify`] result on the main thread.
+    /// Apply a [`ScreencastWake::StreamReady`] result on the main thread.
     ///
     /// On success, promotes the stream to active and returns the PipeWire node id.
     /// On failure or cancel, tears down any PipeWire-side stream resources.
@@ -470,13 +522,17 @@ fn complete_pending(pending: &PendingStart, result: Result<u32, String>) {
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        (pending.notify)(pending.stream_id, result);
+        (pending.notify)(ScreencastWake::StreamReady {
+            stream_id: pending.stream_id,
+            result,
+        });
     }
 }
 
 fn run_pipewire_thread(
     cmd_rx: pw::channel::Receiver<PwCommand>,
     pending_blits: Arc<Mutex<Vec<(u32, usize)>>>,
+    on_wake: ScreencastWakeNotify,
 ) -> anyhow::Result<()> {
     let mainloop = MainLoopRc::new(None).context("failed to create PipeWire MainLoop")?;
     let context = ContextRc::new(&mainloop, None).context("failed to create PipeWire Context")?;
@@ -489,6 +545,7 @@ fn run_pipewire_thread(
     let streams_for_cmds = Rc::clone(&streams);
     let core_for_cmds = core.clone();
     let pending_blits_cmds = Arc::clone(&pending_blits);
+    let on_wake_cmds = Arc::clone(&on_wake);
 
     let _attached = cmd_rx.attach(mainloop.loop_(), move |command| {
         match command {
@@ -510,6 +567,7 @@ fn run_pipewire_thread(
                 Arc::clone(&pending),
                 dma_negotiated,
                 Arc::clone(&pending_blits_cmds),
+                Arc::clone(&on_wake_cmds),
             ) {
                 Ok(slot) => {
                     streams_for_cmds.borrow_mut().insert(stream_id, slot);
@@ -565,6 +623,10 @@ fn run_pipewire_thread(
                 unsafe {
                     pw_stream_queue_buffer(slot.stream.as_raw_ptr(), pw_buffer.as_ptr());
                 }
+                // DRIVER streams must be re-triggered after producing a buffer.
+                if let Err(err) = slot.stream.trigger_process() {
+                    debug!("trigger_process after QueueDma for stream {stream_id}: {err}");
+                }
             }
             PwCommand::Destroy { stream_id } => {
                 streams_for_cmds.borrow_mut().remove(&stream_id);
@@ -596,6 +658,7 @@ fn create_stream(
     pending: Arc<PendingStart>,
     dma_negotiated: Arc<AtomicBool>,
     pending_blits: Arc<Mutex<Vec<(u32, usize)>>>,
+    on_wake: ScreencastWakeNotify,
 ) -> anyhow::Result<StreamSlot> {
     let stream = StreamRc::new(
         core.clone(),
@@ -762,7 +825,6 @@ fn create_stream(
                 }
 
                 // Kick DRIVER scheduling once format is known.
-                let _ = pending_blits;
                 if let Err(err) = stream.trigger_process() {
                     debug!("trigger_process after format: {err}");
                 }
@@ -818,36 +880,37 @@ fn create_stream(
         })
         .process({
             let pending_blits = Arc::clone(&pending_blits);
+            let on_wake = Arc::clone(&on_wake);
             move |stream, user_data| {
                 let mut inner = user_data.borrow_mut();
                 if inner.use_dmabuf {
-                    // Dequeue returned buffers and mark them for GPU fill on the main thread.
-                    loop {
-                        let ptr = unsafe { stream.dequeue_raw_buffer() };
-                        let Some(pw_buffer) = std::ptr::NonNull::new(ptr) else {
-                            break;
-                        };
-                        let fd = unsafe {
-                            let spa_buffer = (*pw_buffer.as_ptr()).buffer;
-                            if spa_buffer.is_null() || (*spa_buffer).n_datas == 0 {
-                                pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer.as_ptr());
-                                continue;
-                            }
-                            (*(*spa_buffer).datas).fd as RawFd
-                        };
-                        if let Some((index, slot)) = inner
-                            .dma_slots
-                            .iter_mut()
-                            .enumerate()
-                            .find(|(_, slot)| slot.fd == fd)
-                        {
-                            slot.pw_buffer = Some(pw_buffer);
-                            slot.state = DmaSlotState::NeedsBlit;
-                            pending_blits.lock().unwrap().push((stream_id, index));
-                        } else {
-                            unsafe {
-                                pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer.as_ptr());
-                            }
+                    // One buffer per process: keep the rest available to the consumer
+                    // while the main thread GPU-fills this slot.
+                    let ptr = unsafe { stream.dequeue_raw_buffer() };
+                    let Some(pw_buffer) = std::ptr::NonNull::new(ptr) else {
+                        return;
+                    };
+                    let fd = unsafe {
+                        let spa_buffer = (*pw_buffer.as_ptr()).buffer;
+                        if spa_buffer.is_null() || (*spa_buffer).n_datas == 0 {
+                            pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer.as_ptr());
+                            return;
+                        }
+                        (*(*spa_buffer).datas).fd as RawFd
+                    };
+                    if let Some((index, slot)) = inner
+                        .dma_slots
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(_, slot)| slot.fd == fd)
+                    {
+                        slot.pw_buffer = Some(pw_buffer);
+                        slot.state = DmaSlotState::NeedsBlit;
+                        pending_blits.lock().unwrap().push((stream_id, index));
+                        on_wake(ScreencastWake::BlitNeeded);
+                    } else {
+                        unsafe {
+                            pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer.as_ptr());
                         }
                     }
                     return;
