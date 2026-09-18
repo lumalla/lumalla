@@ -49,12 +49,28 @@ static PW_INIT: OnceCell<()> = OnceCell::new();
 
 const DMA_BUFFER_COUNT: usize = 4;
 
-/// Hard cap for capture rate. Monitor refresh (e.g. 240 Hz) must not drive
-/// full-framebuffer downloads/blits or the session can hard-freeze.
-const SCREENCAST_MAX_FPS: u32 = 30;
+/// Hard cap for capture rate (DMA path).
+const SCREENCAST_MAX_FPS: u32 = 10;
 
-/// Even lower cap for the CPU MemFd path (full RGBA readback).
-const SCREENCAST_MEMFD_MAX_FPS: u32 = 15;
+/// Lower cap for CPU MemFd readback.
+const SCREENCAST_MEMFD_MAX_FPS: u32 = 5;
+
+/// Longest edge for PipeWire buffers. Full 5K MemFd/DMA every frame hard-freezes.
+const SCREENCAST_MAX_EDGE: u32 = 1280;
+
+/// Shrink `width`×`height` so the longest edge is at most [`SCREENCAST_MAX_EDGE`].
+pub fn fit_output_size(width: u32, height: u32) -> (u32, u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    let longest = width.max(height);
+    if longest <= SCREENCAST_MAX_EDGE {
+        return (width, height);
+    }
+    let w = (u64::from(width) * u64::from(SCREENCAST_MAX_EDGE) / u64::from(longest)).max(1) as u32;
+    let h =
+        (u64::from(height) * u64::from(SCREENCAST_MAX_EDGE) / u64::from(longest)).max(1) as u32;
+    (w, h)
+}
 
 /// RGBA8 frame pushed from the compositor main thread (MemFd path).
 #[derive(Debug, Clone)]
@@ -114,6 +130,8 @@ struct StartingStream {
     y: i32,
     width: i32,
     height: i32,
+    out_width: u32,
+    out_height: u32,
     max_fps: u32,
     dma_negotiated: Arc<AtomicBool>,
 }
@@ -199,6 +217,10 @@ pub struct ActiveStream {
     pub width: i32,
     /// Capture region height in compositor space.
     pub height: i32,
+    /// PipeWire / DMA buffer width (may be downscaled).
+    pub out_width: u32,
+    /// PipeWire / DMA buffer height (may be downscaled).
+    pub out_height: u32,
     /// Maximum capture rate.
     pub max_fps: u32,
     /// Last successful capture time.
@@ -301,14 +323,21 @@ impl ScreencastManager {
         self.pending_blits.lock().unwrap().extend(blits);
     }
 
-    /// Capture region for an active or still-starting stream.
-    pub fn stream_capture_region(&self, stream_id: u32) -> Option<(i32, i32, i32, i32, bool)> {
+    /// Capture geometry for an active or still-starting stream.
+    ///
+    /// Returns `(x, y, capture_w, capture_h, out_w, out_h, uses_dmabuf)`.
+    pub fn stream_capture_region(
+        &self,
+        stream_id: u32,
+    ) -> Option<(i32, i32, i32, i32, u32, u32, bool)> {
         if let Some(stream) = self.streams.get(&stream_id) {
             return Some((
                 stream.x,
                 stream.y,
                 stream.width,
                 stream.height,
+                stream.out_width,
+                stream.out_height,
                 stream.uses_dmabuf(),
             ));
         }
@@ -318,6 +347,8 @@ impl ScreencastManager {
             starting.y,
             starting.width,
             starting.height,
+            starting.out_width,
+            starting.out_height,
             starting.dma_negotiated.load(Ordering::Acquire),
         ))
     }
@@ -353,12 +384,12 @@ impl ScreencastManager {
         self.next_id
     }
 
-    /// Begin creating a PipeWire output stream for a fixed-size region.
+    /// Begin creating a PipeWire output stream for a compositor region.
     ///
-    /// `dma_exports` should contain [`Self::dma_buffer_count`] LINEAR DMA-BUF exports
-    /// allocated by the renderer. Returns the local stream id immediately; the PipeWire
+    /// `dma_exports` must all share the (possibly downscaled) output size. The
+    /// capture rectangle `(x,y,width,height)` may be larger; the compositor scales
+    /// into the export size. Returns the local stream id immediately; the PipeWire
     /// node id is delivered later via [`ScreencastWake::StreamReady`].
-    /// Call [`Self::complete_start`] from the main thread when that notification arrives.
     pub fn start_stream(
         &mut self,
         x: i32,
@@ -375,6 +406,15 @@ impl ScreencastManager {
             "expected {DMA_BUFFER_COUNT} DMA-BUF exports, got {}",
             dma_exports.len()
         );
+        let out_width = dma_exports[0].width;
+        let out_height = dma_exports[0].height;
+        anyhow::ensure!(out_width > 0 && out_height > 0, "output size must be positive");
+        anyhow::ensure!(
+            dma_exports
+                .iter()
+                .all(|e| e.width == out_width && e.height == out_height),
+            "DMA-BUF exports must share the same size"
+        );
         let stream_id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
 
@@ -389,8 +429,8 @@ impl ScreencastManager {
         cmd_tx
             .send(PwCommand::Create {
                 stream_id,
-                width: width as u32,
-                height: height as u32,
+                width: out_width,
+                height: out_height,
                 name,
                 dma_exports,
                 pending,
@@ -405,12 +445,16 @@ impl ScreencastManager {
                 y,
                 width,
                 height,
+                out_width,
+                out_height,
                 max_fps: max_fps.max(1).min(SCREENCAST_MAX_FPS),
                 dma_negotiated,
             },
         );
 
-        info!("Starting PipeWire stream id={stream_id} {width}x{height}");
+        info!(
+            "Starting PipeWire stream id={stream_id} capture={width}x{height} out={out_width}x{out_height}"
+        );
         Ok(stream_id)
     }
 
@@ -442,14 +486,16 @@ impl ScreencastManager {
                         y: starting.y,
                         width: starting.width,
                         height: starting.height,
+                        out_width: starting.out_width,
+                        out_height: starting.out_height,
                         max_fps: starting.max_fps,
                         last_capture: None,
                         dma_negotiated: starting.dma_negotiated,
                     },
                 );
                 info!(
-                    "Started PipeWire stream id={stream_id} node_id={node_id} {}x{}",
-                    starting.width, starting.height
+                    "Started PipeWire stream id={stream_id} node_id={node_id} capture={}x{} out={}x{}",
+                    starting.width, starting.height, starting.out_width, starting.out_height
                 );
                 Ok(node_id)
             }
@@ -657,12 +703,12 @@ fn run_pipewire_thread(
 
     let _core = core;
 
-    // DRIVER video sources need periodic trigger_process (see PipeWire
-    // video-src-alloc). Wake the compositor at a low, hard-capped rate so MemFd
-    // captures and deferred DMA blits keep moving — never every display refresh.
+    // DRIVER sources need periodic trigger_process. Wake the compositor only at
+    // a low rate; buffers are downscaled (see fit_output_size) so this is safe.
     let streams_for_timer = Rc::clone(&streams);
     let on_wake_timer = Arc::clone(&on_wake);
-    let last_capture_wake = RefCell::new(Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now));
+    let last_capture_wake =
+        RefCell::new(Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now));
     let timer = mainloop.loop_().add_timer(move |_| {
         let mut any_started = false;
         for slot in streams_for_timer.borrow().values() {
@@ -678,16 +724,15 @@ fn run_pipewire_thread(
         }
         let now = Instant::now();
         let mut last = last_capture_wake.borrow_mut();
-        // Match SCREENCAST_MEMFD_MAX_FPS (15): enough for live preview, safe at 5K.
-        if now.saturating_duration_since(*last) >= Duration::from_millis(66) {
+        if now.saturating_duration_since(*last) >= Duration::from_millis(200) {
             *last = now;
             on_wake_timer(ScreencastWake::BlitNeeded);
         }
     });
     if let Err(err) = timer
         .update_timer(
-            Some(Duration::from_millis(33)),
-            Some(Duration::from_millis(33)),
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(100)),
         )
         .into_result()
     {
@@ -695,7 +740,6 @@ fn run_pipewire_thread(
     }
 
     mainloop.run();
-    // Keep timer alive until the loop exits.
     drop(timer);
     Ok(())
 }

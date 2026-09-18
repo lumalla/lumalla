@@ -25,7 +25,9 @@ use lumalla_renderer::{
     CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RendererState, SurfaceFrame,
     is_present_wake_token,
 };
-use lumalla_screencast::{DmaBufferExport, ScreencastManager, ScreencastWake, VideoFrame};
+use lumalla_screencast::{
+    DmaBufferExport, ScreencastManager, ScreencastWake, VideoFrame, fit_output_size,
+};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
@@ -857,12 +859,13 @@ impl AppData {
                 } => {
                     let stream_id = self.screencast.peek_next_stream_id();
                     let start_result = (|| -> Result<u32, String> {
+                        let (out_w, out_h) = fit_output_size(width as u32, height as u32);
                         let exports = self
                             .renderer_state
                             .alloc_screencast_buffers(
                                 stream_id,
-                                width as u32,
-                                height as u32,
+                                out_w,
+                                out_h,
                                 ScreencastManager::dma_buffer_count(),
                             )
                             .map_err(|err| format!("{err:#}"))?;
@@ -936,12 +939,13 @@ impl AppData {
                         };
                         let name = format!("Lumalla ScreenCast ({connector})");
                         let stream_id = self.screencast.peek_next_stream_id();
+                        let (out_w, out_h) = fit_output_size(width as u32, height as u32);
                         let exports = self
                             .renderer_state
                             .alloc_screencast_buffers(
                                 stream_id,
-                                width as u32,
-                                height as u32,
+                                out_w,
+                                out_h,
                                 ScreencastManager::dma_buffer_count(),
                             )
                             .map_err(|err| format!("{err:#}"))?;
@@ -1778,7 +1782,7 @@ impl AppData {
         let pending_blits = self.screencast.take_pending_blits();
         let mut deferred = Vec::new();
         for (stream_id, index) in pending_blits {
-            let Some((x, y, width, height, uses_dmabuf)) =
+            let Some((x, y, width, height, _out_w, _out_h, uses_dmabuf)) =
                 self.screencast.stream_capture_region(stream_id)
             else {
                 // Stream already torn down; ask PipeWire to recycle if possible.
@@ -1828,7 +1832,8 @@ impl AppData {
             self.screencast.requeue_pending_blits_silent(deferred);
         }
 
-        // MemFd path: CPU download when DMA-BUF was not negotiated.
+        // MemFd path: GPU-scale into the small screencast buffer, then read that back.
+        // Never download full 5K scanouts on the CPU (that freezes the session).
         let due: Vec<(u32, i32, i32, i32, i32)> = self
             .screencast
             .streams()
@@ -1846,10 +1851,9 @@ impl AppData {
             .collect();
 
         for (stream_id, x, y, width, height) in due {
-            match self
-                .renderer_state
-                .capture_region(x, y, width, height, &outputs)
-            {
+            match self.renderer_state.capture_region_for_screencast(
+                stream_id, x, y, width, height, &outputs,
+            ) {
                 Ok(image) => {
                     let frame = VideoFrame {
                         width: image.width,

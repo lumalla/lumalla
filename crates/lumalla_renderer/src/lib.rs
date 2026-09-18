@@ -1024,6 +1024,9 @@ impl RendererState {
     }
 
     /// GPU-blit the compositor region into screencast buffer `index`, waiting for completion.
+    ///
+    /// `width`/`height` are the capture rectangle in compositor space. The destination
+    /// buffer may be smaller; the blit scales to the buffer's full extent.
     pub fn blit_region_to_screencast_buffer(
         &mut self,
         stream_id: u32,
@@ -1044,6 +1047,19 @@ impl RendererState {
             "screencast region does not intersect any presented scanout"
         );
 
+        let (out_w, out_h) = {
+            let slots = self
+                .screencast_buffers
+                .get(&stream_id)
+                .context("screencast buffers missing")?;
+            let slot = slots
+                .get(index)
+                .context("screencast buffer index out of range")?;
+            let extent = slot.image.extent();
+            (extent.width, extent.height)
+        };
+        anyhow::ensure!(out_w > 0 && out_h > 0, "screencast buffer has empty size");
+
         // Wait for source scanout GPU work first.
         let mut source_names = HashSet::new();
         for region in &regions {
@@ -1063,6 +1079,8 @@ impl RendererState {
 
         let mut batch = GpuWorkBatch::new();
         let mut first = true;
+        let src_w = width as u32;
+        let src_h = height as u32;
         for region in &regions {
             let src_ptr = {
                 let scanout = self
@@ -1081,6 +1099,12 @@ impl RendererState {
                     .context("screencast buffer index out of range")?;
                 &slot.image as *const DmaBufImage
             };
+            let dest_x = (u64::from(region.dest_x) * u64::from(out_w) / u64::from(src_w.max(1))) as u32;
+            let dest_y = (u64::from(region.dest_y) * u64::from(out_h) / u64::from(src_h.max(1))) as u32;
+            let dest_w = (u64::from(region.logical_w) * u64::from(out_w) / u64::from(src_w.max(1)))
+                .max(1) as u32;
+            let dest_h = (u64::from(region.logical_h) * u64::from(out_h) / u64::from(src_h.max(1)))
+                .max(1) as u32;
             let vulkan = self
                 .vulkan
                 .as_ref()
@@ -1096,10 +1120,10 @@ impl RendererState {
                     region.fb_y,
                     region.fb_w,
                     region.fb_h,
-                    region.dest_x,
-                    region.dest_y,
-                    region.logical_w,
-                    region.logical_h,
+                    dest_x,
+                    dest_y,
+                    dest_w,
+                    dest_h,
                     first,
                 )?;
             }
@@ -1121,6 +1145,79 @@ impl RendererState {
             slot.in_use = true;
         }
         Ok(())
+    }
+
+    /// Capture a region into a downscaled RGBA frame via GPU blit + small readback.
+    ///
+    /// Uses a free screencast DMA buffer for `stream_id` as staging so MemFd path
+    /// never does a full-resolution scanout download (which freezes at 5K).
+    pub fn capture_region_for_screencast(
+        &mut self,
+        stream_id: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        outputs: &[Output],
+    ) -> anyhow::Result<CapturedImage> {
+        let index = self
+            .next_free_screencast_buffer(stream_id)
+            .context("no free screencast buffer for MemFd capture")?;
+        self.blit_region_to_screencast_buffer(
+            stream_id, index, x, y, width, height, outputs,
+        )?;
+
+        let (out_w, out_h, format) = {
+            let slots = self
+                .screencast_buffers
+                .get(&stream_id)
+                .context("screencast buffers missing after blit")?;
+            let slot = slots
+                .get(index)
+                .context("screencast buffer index out of range")?;
+            let extent = slot.image.extent();
+            (extent.width, extent.height, slot.image.format())
+        };
+
+        let vulkan = self
+            .vulkan
+            .as_ref()
+            .context("Vulkan missing for screencast MemFd readback")?;
+        let image_ptr = {
+            let slots = self
+                .screencast_buffers
+                .get(&stream_id)
+                .context("screencast buffers missing for readback")?;
+            let slot = slots
+                .get(index)
+                .context("screencast buffer index out of range")?;
+            &slot.image as *const DmaBufImage
+        };
+        // Safety: image is owned by self and lives for this call.
+        let bgra = unsafe { download_bgra_region(vulkan, &*image_ptr, 0, 0, out_w, out_h)? };
+
+        self.release_screencast_buffer(stream_id, index);
+
+        let mut rgba = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+        blit_bgra_to_rgba(
+            &bgra,
+            out_w,
+            out_h,
+            format,
+            &mut rgba,
+            out_w,
+            out_h,
+            0,
+            0,
+            out_w,
+            out_h,
+        )?;
+
+        Ok(CapturedImage {
+            width: out_w,
+            height: out_h,
+            rgba,
+        })
     }
 
     /// Mark a screencast buffer free for reuse after PipeWire has finished with it.
