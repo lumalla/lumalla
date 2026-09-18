@@ -23,9 +23,10 @@ use zbus::{
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Keep portal stream `size` aligned with PipeWire buffers (see screencast fit_output_size).
+/// Keep portal stream `size` aligned with DMA-BUF PipeWire buffers.
 fn fit_portal_size(width: i32, height: i32) -> (i32, i32) {
-    const MAX_EDGE: i32 = 1280;
+    // Match lumalla_screencast::fit_output_size (DMA max edge 7680).
+    const MAX_EDGE: i32 = 7680;
     let width = width.max(1);
     let height = height.max(1);
     let longest = width.max(height);

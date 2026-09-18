@@ -26,7 +26,8 @@ use lumalla_renderer::{
     is_present_wake_token,
 };
 use lumalla_screencast::{
-    DmaBufferExport, ScreencastManager, ScreencastWake, VideoFrame, fit_output_size,
+    DmaBufferExport, ScreencastManager, ScreencastWake, VideoFrame, fit_memfd_output_size,
+    fit_output_size,
 };
 use lumalla_seat::SeatState;
 use lumalla_shared::{
@@ -1782,7 +1783,7 @@ impl AppData {
         let pending_blits = self.screencast.take_pending_blits();
         let mut deferred = Vec::new();
         for (stream_id, index) in pending_blits {
-            let Some((x, y, width, height, _out_w, _out_h, uses_dmabuf)) =
+            let Some((x, y, width, height, out_w, out_h, uses_dmabuf)) =
                 self.screencast.stream_capture_region(stream_id)
             else {
                 // Stream already torn down; ask PipeWire to recycle if possible.
@@ -1801,7 +1802,15 @@ impl AppData {
                 continue;
             }
             match self.renderer_state.blit_region_to_screencast_buffer(
-                stream_id, index, x, y, width, height, &outputs,
+                stream_id,
+                index,
+                x,
+                y,
+                width,
+                height,
+                out_w,
+                out_h,
+                &outputs,
             ) {
                 Ok(()) => {
                     if let Err(err) = self.screencast.queue_dma_buffer(stream_id, index) {
@@ -1851,8 +1860,16 @@ impl AppData {
             .collect();
 
         for (stream_id, x, y, width, height) in due {
+            let (memfd_w, memfd_h) = fit_memfd_output_size(width as u32, height as u32);
             match self.renderer_state.capture_region_for_screencast(
-                stream_id, x, y, width, height, &outputs,
+                stream_id,
+                x,
+                y,
+                width,
+                height,
+                memfd_w,
+                memfd_h,
+                &outputs,
             ) {
                 Ok(image) => {
                     let frame = VideoFrame {

@@ -49,27 +49,38 @@ static PW_INIT: OnceCell<()> = OnceCell::new();
 
 const DMA_BUFFER_COUNT: usize = 4;
 
-/// Hard cap for capture rate (DMA path).
-const SCREENCAST_MAX_FPS: u32 = 10;
+/// Hard cap for DMA-BUF capture rate (GPU blit, no CPU readback).
+const SCREENCAST_DMA_MAX_FPS: u32 = 30;
 
-/// Lower cap for CPU MemFd readback.
+/// Hard cap for MemFd capture rate (GPU blit + CPU readback).
 const SCREENCAST_MEMFD_MAX_FPS: u32 = 5;
 
-/// Longest edge for PipeWire buffers. Full 5K MemFd/DMA every frame hard-freezes.
-const SCREENCAST_MAX_EDGE: u32 = 1280;
+/// Longest edge for DMA-BUF PipeWire buffers (native 5K fits).
+const SCREENCAST_DMA_MAX_EDGE: u32 = 7680;
 
-/// Shrink `width`×`height` so the longest edge is at most [`SCREENCAST_MAX_EDGE`].
-pub fn fit_output_size(width: u32, height: u32) -> (u32, u32) {
+/// Longest edge for MemFd frames — full-res CPU readback freezes the session.
+const SCREENCAST_MEMFD_MAX_EDGE: u32 = 1280;
+
+fn fit_edge(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
     let width = width.max(1);
     let height = height.max(1);
     let longest = width.max(height);
-    if longest <= SCREENCAST_MAX_EDGE {
+    if longest <= max_edge {
         return (width, height);
     }
-    let w = (u64::from(width) * u64::from(SCREENCAST_MAX_EDGE) / u64::from(longest)).max(1) as u32;
-    let h =
-        (u64::from(height) * u64::from(SCREENCAST_MAX_EDGE) / u64::from(longest)).max(1) as u32;
+    let w = (u64::from(width) * u64::from(max_edge) / u64::from(longest)).max(1) as u32;
+    let h = (u64::from(height) * u64::from(max_edge) / u64::from(longest)).max(1) as u32;
     (w, h)
+}
+
+/// Shrink for DMA-BUF / portal size (high cap — typically native).
+pub fn fit_output_size(width: u32, height: u32) -> (u32, u32) {
+    fit_edge(width, height, SCREENCAST_DMA_MAX_EDGE)
+}
+
+/// Shrink for MemFd RGBA frames (low cap — avoids 5K CPU readback).
+pub fn fit_memfd_output_size(width: u32, height: u32) -> (u32, u32) {
+    fit_edge(width, height, SCREENCAST_MEMFD_MAX_EDGE)
 }
 
 /// RGBA8 frame pushed from the compositor main thread (MemFd path).
@@ -447,7 +458,7 @@ impl ScreencastManager {
                 height,
                 out_width,
                 out_height,
-                max_fps: max_fps.max(1).min(SCREENCAST_MAX_FPS),
+                max_fps: max_fps.max(1).min(SCREENCAST_DMA_MAX_FPS),
                 dma_negotiated,
             },
         );
@@ -1067,12 +1078,13 @@ fn create_stream(
         .register()
         .context("failed to register PipeWire stream listener")?;
 
-    // Prefer MemFd RGBA first so browsers/tests that don't import DMA-BUF still
-    // get a working path. Offer LINEAR BGRx DMA-BUF as a second option.
+    // Prefer MemFd RGBA at a downscaled size so browsers stay cheap; offer
+    // LINEAR BGRx DMA-BUF at the full export size for OBS / DMA consumers.
+    let (memfd_w, memfd_h) = fit_memfd_output_size(width, height);
     let mut params_bytes: Vec<Vec<u8>> = Vec::new();
     params_bytes.push(serialize_enum_format(
-        width,
-        height,
+        memfd_w,
+        memfd_h,
         VideoFormat::RGBA,
         None,
     )?);

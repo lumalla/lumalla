@@ -1025,8 +1025,8 @@ impl RendererState {
 
     /// GPU-blit the compositor region into screencast buffer `index`, waiting for completion.
     ///
-    /// `width`/`height` are the capture rectangle in compositor space. The destination
-    /// buffer may be smaller; the blit scales to the buffer's full extent.
+    /// `width`/`height` are the capture rectangle in compositor space.
+    /// `dest_width`/`dest_height` are the blit destination size (must fit in the buffer).
     pub fn blit_region_to_screencast_buffer(
         &mut self,
         stream_id: u32,
@@ -1035,9 +1035,12 @@ impl RendererState {
         y: i32,
         width: i32,
         height: i32,
+        dest_width: u32,
+        dest_height: u32,
         outputs: &[Output],
     ) -> anyhow::Result<()> {
         anyhow::ensure!(width > 0 && height > 0, "capture region must be positive");
+        anyhow::ensure!(dest_width > 0 && dest_height > 0, "destination size must be positive");
         let regions: Vec<CaptureRegion> = outputs
             .iter()
             .flat_map(|output| CaptureRegion::from_output_views(output, x, y, width, height))
@@ -1047,7 +1050,7 @@ impl RendererState {
             "screencast region does not intersect any presented scanout"
         );
 
-        let (out_w, out_h) = {
+        let (buf_w, buf_h) = {
             let slots = self
                 .screencast_buffers
                 .get(&stream_id)
@@ -1058,7 +1061,12 @@ impl RendererState {
             let extent = slot.image.extent();
             (extent.width, extent.height)
         };
-        anyhow::ensure!(out_w > 0 && out_h > 0, "screencast buffer has empty size");
+        anyhow::ensure!(
+            dest_width <= buf_w && dest_height <= buf_h,
+            "destination {dest_width}x{dest_height} exceeds buffer {buf_w}x{buf_h}"
+        );
+        let out_w = dest_width;
+        let out_h = dest_height;
 
         // Wait for source scanout GPU work first.
         let mut source_names = HashSet::new();
@@ -1149,8 +1157,8 @@ impl RendererState {
 
     /// Capture a region into a downscaled RGBA frame via GPU blit + small readback.
     ///
-    /// Uses a free screencast DMA buffer for `stream_id` as staging so MemFd path
-    /// never does a full-resolution scanout download (which freezes at 5K).
+    /// Uses a free screencast DMA buffer for `stream_id` as staging. `dest_width`/
+    /// `dest_height` should be the MemFd size (≤ buffer) so CPU readback stays cheap.
     pub fn capture_region_for_screencast(
         &mut self,
         stream_id: u32,
@@ -1158,16 +1166,26 @@ impl RendererState {
         y: i32,
         width: i32,
         height: i32,
+        dest_width: u32,
+        dest_height: u32,
         outputs: &[Output],
     ) -> anyhow::Result<CapturedImage> {
         let index = self
             .next_free_screencast_buffer(stream_id)
             .context("no free screencast buffer for MemFd capture")?;
         self.blit_region_to_screencast_buffer(
-            stream_id, index, x, y, width, height, outputs,
+            stream_id,
+            index,
+            x,
+            y,
+            width,
+            height,
+            dest_width,
+            dest_height,
+            outputs,
         )?;
 
-        let (out_w, out_h, format) = {
+        let format = {
             let slots = self
                 .screencast_buffers
                 .get(&stream_id)
@@ -1175,8 +1193,7 @@ impl RendererState {
             let slot = slots
                 .get(index)
                 .context("screencast buffer index out of range")?;
-            let extent = slot.image.extent();
-            (extent.width, extent.height, slot.image.format())
+            slot.image.format()
         };
 
         let vulkan = self
@@ -1194,28 +1211,30 @@ impl RendererState {
             &slot.image as *const DmaBufImage
         };
         // Safety: image is owned by self and lives for this call.
-        let bgra = unsafe { download_bgra_region(vulkan, &*image_ptr, 0, 0, out_w, out_h)? };
+        let bgra = unsafe {
+            download_bgra_region(vulkan, &*image_ptr, 0, 0, dest_width, dest_height)?
+        };
 
         self.release_screencast_buffer(stream_id, index);
 
-        let mut rgba = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+        let mut rgba = vec![0u8; (dest_width as usize) * (dest_height as usize) * 4];
         blit_bgra_to_rgba(
             &bgra,
-            out_w,
-            out_h,
+            dest_width,
+            dest_height,
             format,
             &mut rgba,
-            out_w,
-            out_h,
+            dest_width,
+            dest_height,
             0,
             0,
-            out_w,
-            out_h,
+            dest_width,
+            dest_height,
         )?;
 
         Ok(CapturedImage {
-            width: out_w,
-            height: out_h,
+            width: dest_width,
+            height: dest_height,
             rgba,
         })
     }
