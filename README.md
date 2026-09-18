@@ -14,6 +14,91 @@
 
 - Linux with io_uring (kernel 5.19+ recommended for async cancel-by-fd; Accept / RecvMsg / SendMsg / Timeout ABS)
 
+## Lua API
+
+Configuration runs in a separate `lumalla_config` process. Scripts load the module with `local lum = require("lumalla")` and talk to the compositor over D-Bus.
+
+Config files are passed with `--config <path>`, or loaded from `~/.config/lumalla/*.lua` when no path is given. See `init.lua` for a full example.
+
+Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 switch VTs.
+
+### Lifecycle
+
+| Function | Description |
+| --- | --- |
+| `on_startup(callback)` | Called once when the compositor is ready. `callback()` takes no args. |
+| `on_connector_change(callback)` | Called when outputs change. `callback(outputs)` receives the same tables as `get_outputs`. |
+| `on_drm_devices_change(callback)` | Called when DRM devices change. `callback(devices)` matches `get_drm_devices`. |
+
+### Session
+
+| Function | Description |
+| --- | --- |
+| `quit()` / `shutdown()` | Shut down the compositor. |
+| `toggle_debug_ui()` | Toggle the debug overlay. |
+| `start_pipewire_stream({x, y, width, height, name?, max_fps?})` | Start a PipeWire stream of a region. Returns `{id, node_id}`. Empty `name` becomes `"Lumalla"`; `max_fps` of `0` defaults to 30. |
+| `stop_pipewire_stream(stream_id)` | Stop a stream by id from `start_pipewire_stream`. |
+
+### Keyboard
+
+| Function | Description |
+| --- | --- |
+| `set_xkb({rules?, model?, layout?, variant?, options?})` | Set XKB RMLVO. Call before `map_key` so key names resolve against the active layout. |
+| `map_key({key, mods?, on?, consume?/suppress?, callback})` | Bind a key. `mods` is a pipe-separated string: `"shift"`, `"ctrl"`, `"alt"`, `"logo"` / `"super"`. `on` is `"down"`/`"press"` (default) or `"up"`/`"release"`. `consume` / `suppress` default to `true`. |
+
+### Outputs and views
+
+| Function | Description |
+| --- | --- |
+| `get_outputs()` | Return current logical outputs. |
+| `add_output(output)` | Add a logical output (no views). |
+| `remove_output(name)` | Remove an output by name. |
+| `add_view(output_name, view)` | Add or replace a view on an output. |
+| `remove_view(output_name, view_name)` | Remove a view. |
+| `add_output_with_view(output)` | `add_output` plus a `"main"` view mapping `x`/`y`/`width`/`height` as the source rectangle. |
+
+**Output table:** `name`, `width`, `height`, and optionally `description`, `x`, `y`, `scale` (default 1), `refresh_mhz` (default 60000), `mm_width` / `physical_width_mm`, `mm_height` / `physical_height_mm`, `virtual` / `is_virtual`. Returned tables use `mm_width`, `mm_height`, and `virtual`.
+
+**View table:** `name`, plus either nested `source` / `dest` `{x, y, width, height}` or flat `source_x`… / `dest_x`… fields.
+
+### DRM
+
+| Function | Description |
+| --- | --- |
+| `get_drm_devices()` | Return DRM primary nodes with connectors and modes. |
+| `set_render_device(path)` | Select the Vulkan render device. `nil` or `""` selects automatically. |
+| `set_output_configs({{name, enabled?, mode?}, ...})` | Enable/disable connectors and pick a mode by name. `enabled` defaults to `true`. |
+
+**DRM device:** `path`, `selected_render_device`, `connectors[]` with `name`, `connector_id`, `connector_type`, `connected`, `mm_width`, `mm_height`, `modes[]` (`name`, `width`, `height`, `refresh_hz`, `preferred`).
+
+### Windows, zones, and rules
+
+| Function | Description |
+| --- | --- |
+| `get_windows()` | Return `{id, app_id, title, x, y, width, height, focused}` for each window. |
+| `get_focused_window()` | Focused window id, or `nil`. |
+| `set_window({id?, x?, y?, width?, height?})` | Set geometry. Omitted fields stay unchanged; omit `id` (or pass `0`) for the focused window. |
+| `focus_window({id?, raise?})` | Focus a window (`raise` defaults to `false`). |
+| `raise_window({id?})` | Raise without changing focus. |
+| `add_zone({name, x?, y?, default?, composition?, default_width?, default_height?})` | Add or replace a zone. `composition` defaults to `"free"`; size defaults to 800×600. |
+| `remove_zone(name)` | Remove a zone. |
+| `add_window_to_zone({id?, zone})` | Assign a window to a zone. |
+| `remove_window_from_zone({id?})` | Clear zone membership. |
+| `add_window_rule({app_id, zone?, x?, y?, width?, height?})` | Placement rule for an `app_id`. |
+| `clear_window_rules()` | Clear all window rules. |
+
+### Spawn and input injection
+
+| Function | Description |
+| --- | --- |
+| `spawn({command, args?})` | Spawn a process with the compositor’s Wayland environment. |
+| `sleep(seconds)` | Blocking sleep in the config process (no D-Bus round-trip). |
+| `key(name)` | Press and release a named key. |
+| `type(text)` | Type UTF-8 text as key presses. |
+| `pointer_move(x, y)` | Absolute pointer move. |
+| `click(x, y, button?)` | Click at coordinates (`button` defaults to `0`). |
+| `screenshot(x, y, width, height, path)` | Capture a region to a PNG file. |
+
 ## Debugging compositor issues
 
 For bugs that only show up with real clients (focus loss, popups vanishing, bad hit-testing), prefer a **headless Lumalla + the offending app** over guessing from code alone.
