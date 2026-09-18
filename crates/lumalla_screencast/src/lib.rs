@@ -657,33 +657,37 @@ fn run_pipewire_thread(
                 let Some(slot) = streams.get(&stream_id) else {
                     return;
                 };
-                let mut inner = slot.inner.borrow_mut();
-                let Some(dma) = inner.dma_slots.get_mut(index) else {
-                    return;
-                };
-                if dma.state != DmaSlotState::NeedsBlit {
-                    return;
-                }
-                let Some(pw_buffer) = dma.pw_buffer else {
-                    return;
-                };
-                unsafe {
-                    let spa_buffer = (*pw_buffer.as_ptr()).buffer;
-                    if spa_buffer.is_null() || (*spa_buffer).n_datas == 0 {
+                let stream = slot.stream.clone();
+                let pw_buffer = {
+                    let mut inner = slot.inner.borrow_mut();
+                    let Some(dma) = inner.dma_slots.get_mut(index) else {
+                        return;
+                    };
+                    if dma.state != DmaSlotState::NeedsBlit {
                         return;
                     }
-                    let spa_data = (*spa_buffer).datas;
-                    let chunk = (*spa_data).chunk;
-                    (*chunk).offset = dma.offset;
-                    (*chunk).stride = dma.stride as i32;
-                    (*chunk).size = dma.stride.saturating_mul(dma.height);
-                }
-                dma.state = DmaSlotState::WithPw;
+                    let Some(pw_buffer) = dma.pw_buffer else {
+                        return;
+                    };
+                    unsafe {
+                        let spa_buffer = (*pw_buffer.as_ptr()).buffer;
+                        if spa_buffer.is_null() || (*spa_buffer).n_datas == 0 {
+                            return;
+                        }
+                        let spa_data = (*spa_buffer).datas;
+                        let chunk = (*spa_data).chunk;
+                        (*chunk).offset = dma.offset;
+                        (*chunk).stride = dma.stride as i32;
+                        (*chunk).size = dma.stride.saturating_mul(dma.height);
+                    }
+                    dma.state = DmaSlotState::WithPw;
+                    pw_buffer
+                };
+                // Drop RefCell borrow before queue/trigger — both can re-enter `process`.
                 unsafe {
-                    pw_stream_queue_buffer(slot.stream.as_raw_ptr(), pw_buffer.as_ptr());
+                    pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer.as_ptr());
                 }
-                // DRIVER streams must be re-triggered after producing a buffer.
-                if let Err(err) = slot.stream.trigger_process() {
+                if let Err(err) = stream.trigger_process() {
                     debug!("trigger_process after QueueDma for stream {stream_id}: {err}");
                 }
             }
@@ -711,12 +715,20 @@ fn run_pipewire_thread(
         RefCell::new(Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now));
     let timer = mainloop.loop_().add_timer(move |_| {
         let mut any_started = false;
-        for slot in streams_for_timer.borrow().values() {
-            if slot.inner.borrow().started {
-                any_started = true;
-                if let Err(err) = slot.stream.trigger_process() {
-                    debug!("drive timer trigger_process failed: {err}");
-                }
+        let to_trigger: Vec<StreamRc> = {
+            let streams = streams_for_timer.borrow();
+            streams
+                .values()
+                .filter(|slot| slot.inner.borrow().started)
+                .map(|slot| {
+                    any_started = true;
+                    slot.stream.clone()
+                })
+                .collect()
+        };
+        for stream in to_trigger {
+            if let Err(err) = stream.trigger_process() {
+                debug!("drive timer trigger_process failed: {err}");
             }
         }
         if !any_started {
@@ -916,6 +928,9 @@ fn create_stream(
                 .expect("serialize buffer params")
                 .0
                 .into_inner();
+                drop(inner);
+
+                // Drop RefCell borrow before update_params/trigger — both may re-enter process.
                 let mut params = [Pod::from_bytes(&values).expect("buffer params pod")];
                 if let Err(err) = stream.update_params(&mut params) {
                     warn!("Failed to update PipeWire buffer params: {err}");
