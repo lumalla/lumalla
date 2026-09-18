@@ -133,8 +133,11 @@ impl DbusService {
             // org.gnome.Mutter.ScreenCast. If it started earlier it stays in
             // "settings only" mode until restarted — Chromium then offers tabs only
             // and getDisplayMedia fails with NotAllowedError for monitors.
+            //
+            // Must not block compositor startup: a synchronous systemctl restart
+            // can deadlock waiting on the still-starting session.
             #[cfg(not(test))]
-            nudge_screencast_portals();
+            nudge_screencast_portals_later();
         }
 
         Ok(Self {
@@ -168,25 +171,29 @@ impl DbusService {
 
 /// Restart portal backends so they pick up Lumalla's Mutter ScreenCast name.
 ///
-/// Best-effort: failure must not prevent the compositor from starting.
-fn nudge_screencast_portals() {
-    // Restart gnome first so it re-exports ScreenCast, then the front-end portal
-    // so it rediscovers the implementation.
-    for unit in [
-        "xdg-desktop-portal-gnome.service",
-        "xdg-desktop-portal.service",
-    ] {
-        match Command::new("systemctl")
-            .args(["--user", "try-restart", unit])
-            .status()
-        {
-            Ok(status) if status.success() => {
-                info!("Restarted {unit} so portal ScreenCast can bind to Mutter");
+/// Runs after a short delay on a detached thread, and uses `--no-block`, so the
+/// compositor can finish starting without waiting on systemd.
+fn nudge_screencast_portals_later() {
+    thread::spawn(|| {
+        thread::sleep(std::time::Duration::from_secs(2));
+        // Restart gnome first so it re-exports ScreenCast, then the front-end portal
+        // so it rediscovers the implementation.
+        for unit in [
+            "xdg-desktop-portal-gnome.service",
+            "xdg-desktop-portal.service",
+        ] {
+            match Command::new("systemctl")
+                .args(["--user", "--no-block", "try-restart", unit])
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    info!("Requested restart of {unit} so portal ScreenCast can bind to Mutter");
+                }
+                Ok(status) => warn!("systemctl try-restart {unit} exited with {status}"),
+                Err(err) => warn!("Failed to restart {unit}: {err}"),
             }
-            Ok(status) => warn!("systemctl try-restart {unit} exited with {status}"),
-            Err(err) => warn!("Failed to restart {unit}: {err}"),
         }
-    }
+    });
 }
 
 /// `user_data` id used for the config-child `WaitId` SQE.
