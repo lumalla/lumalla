@@ -23,6 +23,20 @@ use zbus::{
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Keep portal stream `size` aligned with PipeWire buffers (see screencast fit_output_size).
+fn fit_portal_size(width: i32, height: i32) -> (i32, i32) {
+    const MAX_EDGE: i32 = 1280;
+    let width = width.max(1);
+    let height = height.max(1);
+    let longest = width.max(height);
+    if longest <= MAX_EDGE {
+        return (width, height);
+    }
+    let w = ((width as i64) * (MAX_EDGE as i64) / (longest as i64)).max(1) as i32;
+    let h = ((height as i64) * (MAX_EDGE as i64) / (longest as i64)).max(1) as i32;
+    (w, h)
+}
+
 /// Shared handles so the D-Bus thread can emit `PipeWireStreamAdded`.
 #[derive(Clone)]
 pub(crate) struct MutterStreamRegistry {
@@ -259,12 +273,15 @@ impl Session {
         let path = OwnedObjectPath::try_from(path)
             .map_err(|err| fdo::Error::Failed(format!("invalid stream path: {err}")))?;
 
+        // Match PipeWire buffer size (compositor downscales long edge to 1280).
+        let (out_w, out_h) = fit_portal_size(output.width, output.height);
+
         let stream = Stream {
             id: stream_id,
             session_id: self.id,
             connector: connector.to_string(),
             position: (output.x, output.y),
-            size: (output.width, output.height),
+            size: (out_w, out_h),
             was_started: Arc::new(AtomicBool::new(false)),
             comms: self.comms.clone(),
         };

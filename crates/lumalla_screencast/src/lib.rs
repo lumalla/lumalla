@@ -952,7 +952,9 @@ fn create_stream(
                         return;
                     };
                     (*spa_data).type_ = DataType::DmaBuf.as_raw();
-                    (*spa_data).flags = SPA_DATA_FLAG_READWRITE | SPA_DATA_FLAG_MAPPABLE;
+                    // Do not set MAPPABLE — DMA-BUF consumers (OBS) import via EGL/Vulkan.
+                    // MAPPABLE can make them mmap and see zeros/black.
+                    (*spa_data).flags = SPA_DATA_FLAG_READWRITE;
                     (*spa_data).fd = slot.fd as i64;
                     (*spa_data).mapoffset = slot.offset;
                     (*spa_data).maxsize = slot.stride.saturating_mul(slot.height);
@@ -995,17 +997,26 @@ fn create_stream(
                         }
                         (*(*spa_buffer).datas).fd as RawFd
                     };
-                    if let Some((index, slot)) = inner
+                    // Match by the pw_buffer pointer from add_buffer — PipeWire may
+                    // dup the DMA fd, so comparing fds alone often fails and we would
+                    // re-queue empty buffers (black frames in OBS).
+                    let matched = inner
                         .dma_slots
                         .iter_mut()
                         .enumerate()
-                        .find(|(_, slot)| slot.fd == fd)
-                    {
+                        .find(|(_, slot)| {
+                            slot.pw_buffer.map(std::ptr::NonNull::as_ptr) == Some(pw_buffer.as_ptr())
+                                || slot.fd == fd
+                        });
+                    if let Some((index, slot)) = matched {
                         slot.pw_buffer = Some(pw_buffer);
                         slot.state = DmaSlotState::NeedsBlit;
                         pending_blits.lock().unwrap().push((stream_id, index));
                         on_wake(ScreencastWake::BlitNeeded);
                     } else {
+                        warn!(
+                            "DMA process: no slot for buffer fd={fd} stream={stream_id}; re-queue empty"
+                        );
                         unsafe {
                             pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer.as_ptr());
                         }
