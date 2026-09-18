@@ -44,6 +44,15 @@ pub const SHUTDOWN_TIMEOUT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 6;
 /// DRM primary-node fds use this high token range to avoid Wayland client tokens.
 pub const DRM_DEVICE_TOKEN_BASE: u64 = 1 << 16;
 
+/// D-Bus / portal reply waiting on an in-flight PipeWire stream start.
+enum PendingScreencastReply {
+    Pipewire { request_id: usize },
+    Mutter {
+        mutter_stream_id: u64,
+        session_id: u64,
+    },
+}
+
 struct DrmDeviceRegistration {
     fd: RawFd,
     token: u64,
@@ -64,6 +73,8 @@ struct AppData {
     display_state: DisplayState,
     renderer_state: RendererState,
     screencast: ScreencastManager,
+    /// Local PipeWire stream id → D-Bus reply still waiting for node id.
+    pending_screencast_replies: HashMap<u32, PendingScreencastReply>,
     /// Mutter ScreenCast session id → PipeWire stream ids started for that session.
     mutter_cast_streams: HashMap<u64, Vec<u32>>,
     /// Prevents `push_screencast_frames` → `arm_presents` re-entrancy.
@@ -83,6 +94,12 @@ impl AppData {
         display_state: DisplayState,
         renderer_state: RendererState,
     ) -> Self {
+        let screencast = ScreencastManager::new({
+            let to_main = comms.main_sender();
+            std::sync::Arc::new(move |stream_id, result| {
+                let _ = to_main.send(MainMessage::PipewireStreamReady { stream_id, result });
+            })
+        });
         Self {
             comms,
             _dbus_thread_completion_fd,
@@ -95,7 +112,8 @@ impl AppData {
             clients: ConnectedClients::new(),
             display_state,
             renderer_state,
-            screencast: ScreencastManager::new(),
+            screencast,
+            pending_screencast_replies: HashMap::new(),
             mutter_cast_streams: HashMap::new(),
             screencast_push_active: false,
             frame_clock: Instant::now(),
@@ -767,7 +785,30 @@ impl AppData {
                 }
                 MainMessage::Shutdown => {
                     if !self.shutting_down {
-                        let ids: Vec<u32> = self.screencast.streams().keys().copied().collect();
+                        let mut ids: Vec<u32> =
+                            self.screencast.streams().keys().copied().collect();
+                        ids.extend(self.pending_screencast_replies.keys().copied());
+                        ids.sort_unstable();
+                        ids.dedup();
+                        for (_stream_id, reply) in self.pending_screencast_replies.drain() {
+                            match reply {
+                                PendingScreencastReply::Pipewire { request_id } => {
+                                    self.comms.dbus(DbusMessage::PipewireStreamStarted {
+                                        request_id,
+                                        result: Err(String::from("compositor shutting down")),
+                                    });
+                                }
+                                PendingScreencastReply::Mutter {
+                                    mutter_stream_id, ..
+                                } => {
+                                    self.comms.dbus(DbusMessage::MutterScreenCastStarted {
+                                        mutter_stream_id,
+                                        result: Err(String::from("compositor shutting down")),
+                                    });
+                                }
+                            }
+                        }
+                        self.mutter_cast_streams.clear();
                         self.screencast.shutdown();
                         for id in ids {
                             self.renderer_state.free_screencast_buffers(id);
@@ -810,7 +851,7 @@ impl AppData {
                     max_fps,
                 } => {
                     let stream_id = self.screencast.peek_next_stream_id();
-                    let result = (|| -> Result<(u32, u32), String> {
+                    let start_result = (|| -> Result<u32, String> {
                         let exports = self
                             .renderer_state
                             .alloc_screencast_buffers(
@@ -839,13 +880,31 @@ impl AppData {
                                 format!("{err:#}")
                             })
                     })();
-                    if result.is_ok() {
-                        self.mark_present_dirty(event_loop, arena);
+                    match start_result {
+                        Ok(stream_id) => {
+                            self.pending_screencast_replies.insert(
+                                stream_id,
+                                PendingScreencastReply::Pipewire { request_id },
+                            );
+                            self.mark_present_dirty(event_loop, arena);
+                        }
+                        Err(err) => {
+                            self.comms.dbus(DbusMessage::PipewireStreamStarted {
+                                request_id,
+                                result: Err(err),
+                            });
+                        }
                     }
-                    self.comms
-                        .dbus(DbusMessage::PipewireStreamStarted { request_id, result });
                 }
                 MainMessage::StopPipewireStream { stream_id } => {
+                    if let Some(PendingScreencastReply::Pipewire { request_id }) =
+                        self.pending_screencast_replies.remove(&stream_id)
+                    {
+                        self.comms.dbus(DbusMessage::PipewireStreamStarted {
+                            request_id,
+                            result: Err(String::from("stream start was cancelled")),
+                        });
+                    }
                     self.screencast.stop_stream(stream_id);
                     self.renderer_state.free_screencast_buffers(stream_id);
                 }
@@ -854,7 +913,7 @@ impl AppData {
                     session_id,
                     connector,
                 } => {
-                    let result = (|| -> Result<u32, String> {
+                    let start_result = (|| -> Result<u32, String> {
                         let output = self
                             .display_state
                             .outputs()
@@ -893,32 +952,89 @@ impl AppData {
                                 modifier: export.modifier,
                             })
                             .collect();
-                        let (pw_stream_id, node_id) = self
-                            .screencast
+                        self.screencast
                             .start_stream(x, y, width, height, name, max_fps, dma_exports)
                             .map_err(|err| {
                                 self.renderer_state.free_screencast_buffers(stream_id);
                                 format!("{err:#}")
-                            })?;
-                        self.mutter_cast_streams
-                            .entry(session_id)
-                            .or_default()
-                            .push(pw_stream_id);
-                        Ok(node_id)
+                            })
                     })();
-                    if result.is_ok() {
-                        self.mark_present_dirty(event_loop, arena);
+                    match start_result {
+                        Ok(stream_id) => {
+                            self.pending_screencast_replies.insert(
+                                stream_id,
+                                PendingScreencastReply::Mutter {
+                                    mutter_stream_id,
+                                    session_id,
+                                },
+                            );
+                            self.mutter_cast_streams
+                                .entry(session_id)
+                                .or_default()
+                                .push(stream_id);
+                            self.mark_present_dirty(event_loop, arena);
+                        }
+                        Err(err) => {
+                            self.comms.dbus(DbusMessage::MutterScreenCastStarted {
+                                mutter_stream_id,
+                                result: Err(err),
+                            });
+                        }
                     }
-                    self.comms.dbus(DbusMessage::MutterScreenCastStarted {
-                        mutter_stream_id,
-                        result,
-                    });
                 }
                 MainMessage::StopMutterScreenCast { session_id } => {
                     if let Some(stream_ids) = self.mutter_cast_streams.remove(&session_id) {
                         for stream_id in stream_ids {
+                            if let Some(PendingScreencastReply::Mutter {
+                                mutter_stream_id, ..
+                            }) = self.pending_screencast_replies.remove(&stream_id)
+                            {
+                                self.comms.dbus(DbusMessage::MutterScreenCastStarted {
+                                    mutter_stream_id,
+                                    result: Err(String::from("stream start was cancelled")),
+                                });
+                            }
                             self.screencast.stop_stream(stream_id);
                             self.renderer_state.free_screencast_buffers(stream_id);
+                        }
+                    }
+                }
+                MainMessage::PipewireStreamReady { stream_id, result } => {
+                    let reply = self.pending_screencast_replies.remove(&stream_id);
+                    let completed = self.screencast.complete_start(stream_id, result);
+                    if completed.is_err() {
+                        self.renderer_state.free_screencast_buffers(stream_id);
+                        if let Some(PendingScreencastReply::Mutter { session_id, .. }) = &reply {
+                            if let Some(ids) = self.mutter_cast_streams.get_mut(session_id) {
+                                ids.retain(|id| *id != stream_id);
+                                if ids.is_empty() {
+                                    self.mutter_cast_streams.remove(session_id);
+                                }
+                            }
+                        }
+                    } else {
+                        self.mark_present_dirty(event_loop, arena);
+                    }
+                    match reply {
+                        Some(PendingScreencastReply::Pipewire { request_id }) => {
+                            let result = completed.map(|node_id| (stream_id, node_id));
+                            self.comms
+                                .dbus(DbusMessage::PipewireStreamStarted { request_id, result });
+                        }
+                        Some(PendingScreencastReply::Mutter {
+                            mutter_stream_id, ..
+                        }) => {
+                            self.comms.dbus(DbusMessage::MutterScreenCastStarted {
+                                mutter_stream_id,
+                                result: completed,
+                            });
+                        }
+                        None => {
+                            if let Ok(_node_id) = completed {
+                                // Orphan success (reply already cancelled): drop the stream.
+                                self.screencast.stop_stream(stream_id);
+                                self.renderer_state.free_screencast_buffers(stream_id);
+                            }
                         }
                     }
                 }

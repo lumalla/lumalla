@@ -9,7 +9,7 @@ use std::{
     os::fd::{AsRawFd, OwnedFd, RawFd},
     rc::Rc,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -78,10 +78,23 @@ pub struct DmaBufferExport {
     pub modifier: u64,
 }
 
-#[derive(Debug)]
+/// Notifies the compositor main thread when a PipeWire stream node id is known.
+pub type StreamReadyNotify = Arc<dyn Fn(u32, Result<u32, String>) + Send + Sync>;
+
 struct PendingStart {
-    result: Mutex<Option<Result<u32, String>>>,
-    done: Condvar,
+    stream_id: u32,
+    notify: StreamReadyNotify,
+    /// Ensures [`complete_pending`] runs at most once.
+    completed: AtomicBool,
+}
+
+struct StartingStream {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    max_fps: u32,
+    dma_negotiated: Arc<AtomicBool>,
 }
 
 enum PwCommand {
@@ -193,27 +206,30 @@ impl ActiveStream {
 pub struct ScreencastManager {
     next_id: u32,
     streams: HashMap<u32, ActiveStream>,
+    /// Streams waiting for PipeWire to report a node id.
+    starting: HashMap<u32, StartingStream>,
     cmd_tx: Option<pw::channel::Sender<PwCommand>>,
     thread: Option<JoinHandle<()>>,
     /// `(stream_id, buffer_index)` slots waiting for a GPU blit.
     pending_blits: Arc<Mutex<Vec<(u32, usize)>>>,
-}
-
-impl Default for ScreencastManager {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Called from the PipeWire thread when a stream is ready (or failed).
+    on_ready: StreamReadyNotify,
 }
 
 impl ScreencastManager {
     /// Create a manager with no streams (PipeWire thread starts on first use).
-    pub fn new() -> Self {
+    ///
+    /// `on_ready` is invoked from the PipeWire thread with `(stream_id, Result<node_id>)`.
+    /// It must wake the compositor main loop (e.g. by posting a message).
+    pub fn new(on_ready: StreamReadyNotify) -> Self {
         Self {
             next_id: 1,
             streams: HashMap::new(),
+            starting: HashMap::new(),
             cmd_tx: None,
             thread: None,
             pending_blits: Arc::new(Mutex::new(Vec::new())),
+            on_ready,
         }
     }
 
@@ -222,9 +238,9 @@ impl ScreencastManager {
         DMA_BUFFER_COUNT
     }
 
-    /// Whether any streams are currently active.
+    /// Whether any streams are currently active or still starting.
     pub fn has_streams(&self) -> bool {
-        !self.streams.is_empty()
+        !self.streams.is_empty() || !self.starting.is_empty()
     }
 
     /// Borrow active streams.
@@ -272,10 +288,12 @@ impl ScreencastManager {
         self.next_id
     }
 
-    /// Create a PipeWire output stream for a fixed-size region.
+    /// Begin creating a PipeWire output stream for a fixed-size region.
     ///
     /// `dma_exports` should contain [`Self::dma_buffer_count`] LINEAR DMA-BUF exports
-    /// allocated by the renderer. Blocks until the node id is known.
+    /// allocated by the renderer. Returns the local stream id immediately; the PipeWire
+    /// node id is delivered later via the [`StreamReadyNotify`] passed to [`Self::new`].
+    /// Call [`Self::complete_start`] from the main thread when that notification arrives.
     pub fn start_stream(
         &mut self,
         x: i32,
@@ -285,7 +303,7 @@ impl ScreencastManager {
         name: String,
         max_fps: u32,
         dma_exports: Vec<DmaBufferExport>,
-    ) -> anyhow::Result<(u32, u32)> {
+    ) -> anyhow::Result<u32> {
         anyhow::ensure!(width > 0 && height > 0, "stream region must be positive");
         anyhow::ensure!(
             dma_exports.len() == DMA_BUFFER_COUNT,
@@ -296,8 +314,9 @@ impl ScreencastManager {
         self.next_id = self.next_id.wrapping_add(1).max(1);
 
         let pending = Arc::new(PendingStart {
-            result: Mutex::new(None),
-            done: Condvar::new(),
+            stream_id,
+            notify: Arc::clone(&self.on_ready),
+            completed: AtomicBool::new(false),
         });
         let dma_negotiated = Arc::new(AtomicBool::new(false));
 
@@ -309,34 +328,71 @@ impl ScreencastManager {
                 height: height as u32,
                 name,
                 dma_exports,
-                pending: Arc::clone(&pending),
+                pending,
                 dma_negotiated: Arc::clone(&dma_negotiated),
             })
             .map_err(|_| anyhow!("PipeWire thread is not accepting commands"))?;
 
-        let mut guard = pending.result.lock().unwrap();
-        while guard.is_none() {
-            guard = pending.done.wait(guard).unwrap();
-        }
-        let node_id = guard.take().unwrap().map_err(|err| anyhow!(err))?;
-
-        self.streams.insert(
+        self.starting.insert(
             stream_id,
-            ActiveStream {
-                id: stream_id,
-                node_id,
+            StartingStream {
                 x,
                 y,
                 width,
                 height,
                 max_fps: max_fps.max(1),
-                last_capture: None,
                 dma_negotiated,
             },
         );
 
-        info!("Started PipeWire stream id={stream_id} node_id={node_id} {width}x{height}");
-        Ok((stream_id, node_id))
+        info!("Starting PipeWire stream id={stream_id} {width}x{height}");
+        Ok(stream_id)
+    }
+
+    /// Apply a [`StreamReadyNotify`] result on the main thread.
+    ///
+    /// On success, promotes the stream to active and returns the PipeWire node id.
+    /// On failure or cancel, tears down any PipeWire-side stream resources.
+    pub fn complete_start(
+        &mut self,
+        stream_id: u32,
+        result: Result<u32, String>,
+    ) -> Result<u32, String> {
+        let Some(starting) = self.starting.remove(&stream_id) else {
+            // Start was cancelled via [`Self::stop_stream`], or this is a duplicate notify.
+            if result.is_ok() {
+                self.send_destroy(stream_id);
+            }
+            return Err(String::from("stream start was cancelled"));
+        };
+
+        match result {
+            Ok(node_id) => {
+                self.streams.insert(
+                    stream_id,
+                    ActiveStream {
+                        id: stream_id,
+                        node_id,
+                        x: starting.x,
+                        y: starting.y,
+                        width: starting.width,
+                        height: starting.height,
+                        max_fps: starting.max_fps,
+                        last_capture: None,
+                        dma_negotiated: starting.dma_negotiated,
+                    },
+                );
+                info!(
+                    "Started PipeWire stream id={stream_id} node_id={node_id} {}x{}",
+                    starting.width, starting.height
+                );
+                Ok(node_id)
+            }
+            Err(err) => {
+                self.send_destroy(stream_id);
+                Err(err)
+            }
+        }
     }
 
     /// Push a MemFd/CPU frame.
@@ -361,24 +417,35 @@ impl ScreencastManager {
         Ok(())
     }
 
-    /// Stop a stream. No-op if the id is unknown.
-    pub fn stop_stream(&mut self, stream_id: u32) {
-        if self.streams.remove(&stream_id).is_none() {
-            return;
+    fn send_destroy(&self, stream_id: u32) {
+        if let Some(cmd_tx) = self.cmd_tx.as_ref() {
+            let _ = cmd_tx.send(PwCommand::Destroy { stream_id });
         }
         self.pending_blits
             .lock()
             .unwrap()
             .retain(|(id, _)| *id != stream_id);
-        if let Some(cmd_tx) = self.cmd_tx.as_ref() {
-            let _ = cmd_tx.send(PwCommand::Destroy { stream_id });
+    }
+
+    /// Stop a stream. No-op if the id is unknown.
+    pub fn stop_stream(&mut self, stream_id: u32) {
+        let was_starting = self.starting.remove(&stream_id).is_some();
+        let was_active = self.streams.remove(&stream_id).is_some();
+        if !was_starting && !was_active {
+            return;
         }
+        self.send_destroy(stream_id);
         info!("Stopped PipeWire stream id={stream_id}");
     }
 
     /// Tear down all streams and stop the PipeWire thread.
     pub fn shutdown(&mut self) {
-        let ids: Vec<u32> = self.streams.keys().copied().collect();
+        let ids: Vec<u32> = self
+            .streams
+            .keys()
+            .copied()
+            .chain(self.starting.keys().copied())
+            .collect();
         for id in ids {
             self.stop_stream(id);
         }
@@ -398,13 +465,13 @@ impl Drop for ScreencastManager {
 }
 
 fn complete_pending(pending: &PendingStart, result: Result<u32, String>) {
+    if pending
+        .completed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
     {
-        let mut guard = pending.result.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(result);
-        }
+        (pending.notify)(pending.stream_id, result);
     }
-    pending.done.notify_one();
 }
 
 fn run_pipewire_thread(

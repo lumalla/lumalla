@@ -163,6 +163,16 @@ pub enum MainMessage {
         /// Mutter session id.
         session_id: u64,
     },
+    /// PipeWire finished creating a stream previously requested on the main thread.
+    ///
+    /// Carries the PipeWire node id on success. Delivered asynchronously so stream start
+    /// never blocks the compositor event loop.
+    PipewireStreamReady {
+        /// Local stream id assigned when start was requested.
+        stream_id: u32,
+        /// PipeWire node id, or an error string.
+        result: Result<u32, String>,
+    },
     /// Update window geometry. `id == None` targets the focused window.
     SetWindow {
         /// Window id, or `None` for the focused window.
