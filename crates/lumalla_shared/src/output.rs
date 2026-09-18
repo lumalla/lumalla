@@ -29,6 +29,84 @@ impl View {
             self.source = (sx, sy, new_w, new_h);
         }
     }
+
+    /// Whether output-local `(x, y)` lies inside this view's destination.
+    pub fn contains_dest(&self, x: f64, y: f64) -> bool {
+        let (dx, dy, dw, dh) = self.dest;
+        dw > 0
+            && dh > 0
+            && x >= dx as f64
+            && y >= dy as f64
+            && x < (dx + dw) as f64
+            && y < (dy + dh) as f64
+    }
+
+    /// Whether global compositor `(x, y)` lies inside this view's source.
+    pub fn contains_source(&self, x: f64, y: f64) -> bool {
+        let (sx, sy, sw, sh) = self.source;
+        sw > 0
+            && sh > 0
+            && x >= sx as f64
+            && y >= sy as f64
+            && x < (sx + sw) as f64
+            && y < (sy + sh) as f64
+    }
+
+    /// Map an output-local point into this view's source (global) space.
+    pub fn dest_to_source(&self, x: f64, y: f64) -> (f64, f64) {
+        let (sx, sy, sw, sh) = self.source;
+        let (dx, dy, dw, dh) = self.dest;
+        if dw <= 0 || dh <= 0 {
+            return (x, y);
+        }
+        (
+            sx as f64 + (x - dx as f64) * (sw as f64 / dw as f64),
+            sy as f64 + (y - dy as f64) * (sh as f64 / dh as f64),
+        )
+    }
+
+    /// Map a global compositor point into this view's destination (output-local).
+    pub fn source_to_dest(&self, x: f64, y: f64) -> (f64, f64) {
+        let (sx, sy, sw, sh) = self.source;
+        let (dx, dy, dw, dh) = self.dest;
+        if sw <= 0 || sh <= 0 {
+            return (x, y);
+        }
+        (
+            dx as f64 + (x - sx as f64) * (dw as f64 / sw as f64),
+            dy as f64 + (y - sy as f64) * (dh as f64 / sh as f64),
+        )
+    }
+}
+
+/// Topmost view whose destination contains `(x, y)` (later views paint on top).
+pub fn view_at_dest(views: &[View], x: f64, y: f64) -> Option<&View> {
+    views.iter().rev().find(|view| view.contains_dest(x, y))
+}
+
+/// Topmost view whose source contains `(x, y)` (later views paint on top).
+pub fn view_at_source(views: &[View], x: f64, y: f64) -> Option<&View> {
+    views.iter().rev().find(|view| view.contains_source(x, y))
+}
+
+/// Map output-local coordinates into global compositor space through the active view.
+///
+/// When no view covers the point, falls back to the last view, then identity.
+pub fn map_dest_to_source(views: &[View], x: f64, y: f64) -> (f64, f64) {
+    match view_at_dest(views, x, y).or_else(|| views.last()) {
+        Some(view) => view.dest_to_source(x, y),
+        None => (x, y),
+    }
+}
+
+/// Map global compositor coordinates into output-local space through the active view.
+///
+/// When no view covers the point, falls back to the last view, then identity.
+pub fn map_source_to_dest(views: &[View], x: f64, y: f64) -> (f64, f64) {
+    match view_at_source(views, x, y).or_else(|| views.last()) {
+        Some(view) => view.source_to_dest(x, y),
+        None => (x, y),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

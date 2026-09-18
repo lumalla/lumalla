@@ -105,6 +105,9 @@ end
 --- Active view names on the demo output (remove before applying a preset).
 local active_views = {}
 
+--- Tracked "main" camera into the scene (source rect). Updated by presets and view-move mode.
+local main_view = nil
+
 local function clear_views(output_name)
 	for _, name in ipairs(active_views) do
 		pcall(lum.remove_view, output_name, name)
@@ -117,6 +120,35 @@ local function set_views(output_name, views)
 	for _, view in ipairs(views) do
 		lum.add_view(output_name, view)
 		table.insert(active_views, view.name)
+		if view.name == "main" and view.source then
+			main_view = {
+				x = view.source.x,
+				y = view.source.y,
+				w = view.source.width,
+				h = view.source.height,
+			}
+		end
+	end
+end
+
+local function push_main_view()
+	local output = primary_output()
+	if not output or not main_view then
+		return
+	end
+	lum.add_view(output.name, {
+		name = "main",
+		source = {
+			x = math.floor(main_view.x + 0.5),
+			y = math.floor(main_view.y + 0.5),
+			width = math.max(1, math.floor(main_view.w + 0.5)),
+			height = math.max(1, math.floor(main_view.h + 0.5)),
+		},
+		dest = { x = 0, y = 0, width = output.width, height = output.height },
+	})
+	-- Keep active_views in sync when view-move mode collapses to a single camera.
+	if #active_views ~= 1 or active_views[1] ~= "main" then
+		active_views = { "main" }
 	end
 end
 
@@ -142,6 +174,7 @@ local function apply_view_preset(preset)
 		})
 	elseif preset == "split" then
 		-- Two side-by-side cameras into the left/right halves of the scene.
+		main_view = nil
 		set_views(name, {
 			{
 				name = "left",
@@ -190,6 +223,70 @@ local function apply_view_preset(preset)
 	end
 end
 
+--- logo held: view-move mode — middle-drag pans the main camera; scroll zooms it.
+local BTN_MIDDLE = 0x112
+local view_move_mode = false
+local middle_dragging = false
+
+local function enter_view_move_mode()
+	view_move_mode = true
+	local output = primary_output()
+	if not output then
+		return
+	end
+	if not main_view then
+		main_view = { x = 0, y = 0, w = output.width, h = output.height }
+	end
+	-- Collapse multi-view presets to a single pan/zoomable main camera.
+	clear_views(output.name)
+	push_main_view()
+end
+
+local function leave_view_move_mode()
+	view_move_mode = false
+	middle_dragging = false
+end
+
+local function pan_main_view(dx, dy)
+	local output = primary_output()
+	if not output or not main_view then
+		return
+	end
+	-- Map screen deltas into source space (grab-the-content: drag right → source moves left).
+	local scale_x = main_view.w / output.width
+	local scale_y = main_view.h / output.height
+	main_view.x = main_view.x - dx * scale_x
+	main_view.y = main_view.y - dy * scale_y
+	push_main_view()
+end
+
+local function zoom_main_view(value)
+	local output = primary_output()
+	if not output or not main_view or value == 0 then
+		return
+	end
+	-- Scroll up / negative → zoom in (smaller source); scroll down → zoom out.
+	local factor = value < 0 and (1 / 1.1) or 1.1
+	local min_w = math.max(32, math.floor(output.width * 0.05))
+	local min_h = math.max(32, math.floor(output.height * 0.05))
+	local cx = main_view.x + main_view.w / 2
+	local cy = main_view.y + main_view.h / 2
+	local new_w = math.max(min_w, main_view.w * factor)
+	local new_h = math.max(min_h, main_view.h * factor)
+	-- Keep aspect ratio locked to the panel.
+	local aspect = output.width / output.height
+	if new_w / new_h > aspect then
+		new_h = new_w / aspect
+	else
+		new_w = new_h * aspect
+	end
+	main_view.w = new_w
+	main_view.h = new_h
+	main_view.x = cx - new_w / 2
+	main_view.y = cy - new_h / 2
+	push_main_view()
+end
+
 lum.add_zone({
 	name = "main",
 	x = 0,
@@ -199,6 +296,47 @@ lum.add_zone({
 	default_width = 800,
 	default_height = 600,
 })
+
+-- Call set_xkb before map_key so binding key names resolve against the active layout.
+lum.set_xkb({
+	layout = "de",
+})
+
+--- Hold logo to enter view-move mode; release to leave.
+for _, key in ipairs({ "Super_L", "Super_R" }) do
+	lum.map_key({
+		key = key,
+		on = "down",
+		consume = false,
+		callback = enter_view_move_mode,
+	})
+	lum.map_key({
+		key = key,
+		on = "up",
+		consume = false,
+		callback = leave_view_move_mode,
+	})
+end
+
+lum.on_cursor_click(function(_x, _y, button, pressed)
+	if not view_move_mode or button ~= BTN_MIDDLE then
+		return
+	end
+	middle_dragging = pressed
+end)
+
+lum.on_cursor_move(function(_x, _y, dx, dy)
+	if view_move_mode and middle_dragging then
+		pan_main_view(dx, dy)
+	end
+end)
+
+lum.on_cursor_scroll(function(_x, _y, axis, value)
+	-- Vertical scroll only.
+	if view_move_mode and axis == 0 then
+		zoom_main_view(value)
+	end
+end)
 
 lum.on_startup(function()
 	local output = enable_outputs()
@@ -225,11 +363,6 @@ lum.on_startup(function()
 	lum.spawn({ command = "wezterm", args = { "start", "--always-new-process" } })
 	lum.spawn({ command = "qalculate-qt" })
 end)
-
--- Call set_xkb before map_key so binding key names resolve against the active layout.
-lum.set_xkb({
-	layout = "de",
-})
 
 --- logo+arrows: switch view presets (cameras into the scene).
 lum.map_key({

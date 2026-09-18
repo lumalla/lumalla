@@ -287,10 +287,12 @@ fn apply_pointer_constraint_commit(
         .apply_surface_commit(ctx.client_id, surface_id);
     for confine in confined {
         let (px, py) = state.seat_manager.pointer_position();
+        let views = state.pointer_views();
+        let (scene_x, scene_y) = lumalla_shared::map_dest_to_source(&views, px, py);
         let Some((sx, sy)) =
             state
                 .surface_manager
-                .surface_local_coords(confine.client_id, confine.surface, px, py)
+                .surface_local_coords(confine.client_id, confine.surface, scene_x, scene_y)
         else {
             continue;
         };
@@ -311,12 +313,13 @@ fn apply_pointer_constraint_commit(
             state
                 .pointer_constraints_manager
                 .region_for(confine.client_id, confine.object_id),
-            px,
-            py,
+            scene_x,
+            scene_y,
         ) else {
             continue;
         };
-        state.seat_manager.set_pointer_position(gx, gy);
+        let (dx, dy) = lumalla_shared::map_source_to_dest(&views, gx, gy);
+        state.seat_manager.set_pointer_position(dx, dy);
         let (nsx, nsy) = state
             .surface_manager
             .surface_local_coords(confine.client_id, confine.surface, gx, gy)
@@ -346,12 +349,14 @@ fn activate_pending_constraints_for_writer(state: &mut DisplayState, ctx: &mut C
         return;
     }
     let (pointer_x, pointer_y) = state.seat_manager.pointer_position();
+    let views = state.pointer_views();
+    let (scene_x, scene_y) = lumalla_shared::map_dest_to_source(&views, pointer_x, pointer_y);
     state.pointer_constraints_manager.activate_if_ready(
         ctx.client_id,
         focus_surface,
         focus_pointer,
-        pointer_x,
-        pointer_y,
+        scene_x,
+        scene_y,
         &state.surface_manager,
         ctx.writer,
     );
@@ -1071,6 +1076,15 @@ impl WlDataDevice for DisplayState {
             .pointer_focus_for_client(ctx.client_id)
             .or_else(|| self.surface_manager.pointer_target(ctx.client_id, 0.0, 0.0));
         let (px, py) = self.seat_manager.pointer_position();
+        let views = self.pointer_views();
+        let (scene_x, scene_y) = lumalla_shared::map_dest_to_source(&views, px, py);
+        let (enter_x, enter_y) = match target {
+            Some(surface) => self
+                .surface_manager
+                .surface_local_coords(ctx.client_id, surface, scene_x, scene_y)
+                .unwrap_or((scene_x as f32, scene_y as f32)),
+            None => (scene_x as f32, scene_y as f32),
+        };
 
         if let Err(error) = self.data_device_manager.start_drag(
             ctx.client_id,
@@ -1080,8 +1094,8 @@ impl WlDataDevice for DisplayState {
             params.icon(),
             params.serial(),
             target,
-            px as f32,
-            py as f32,
+            enter_x,
+            enter_y,
             ctx.registry,
             ctx.writer,
         ) {
@@ -1680,6 +1694,7 @@ impl WlSeat for DisplayState {
             ctx.writer,
             None,
             &self.surface_manager,
+            &self.pointer_views(),
         );
     }
 

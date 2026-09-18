@@ -85,6 +85,16 @@ struct AppData {
     frame_clock: Instant,
     drm_device_poll: HashMap<PathBuf, DrmDeviceRegistration>,
     next_drm_device_token: usize,
+    /// Emit CursorMoved to config when true.
+    listen_cursor_move: bool,
+    /// Emit CursorClicked to config when true.
+    listen_cursor_click: bool,
+    /// Emit CursorScrolled to config when true.
+    listen_cursor_scroll: bool,
+    /// Accumulated relative pointer delta for the current input batch.
+    pending_cursor_dx: f64,
+    /// Accumulated relative pointer delta for the current input batch.
+    pending_cursor_dy: f64,
 }
 
 impl AppData {
@@ -127,6 +137,11 @@ impl AppData {
             frame_clock: Instant::now(),
             drm_device_poll: HashMap::new(),
             next_drm_device_token: 0,
+            listen_cursor_move: false,
+            listen_cursor_click: false,
+            listen_cursor_scroll: false,
+            pending_cursor_dx: 0.0,
+            pending_cursor_dy: 0.0,
         }
     }
 
@@ -244,6 +259,7 @@ impl AppData {
                     }
                     self.flush_client_sends(event_loop, arena);
                     if pointer_changed {
+                        self.maybe_emit_cursor_moved();
                         if let Err(err) = self.renderer_state.update_pointer_position(
                             self.display_state.pointer_position().0.round() as i32,
                             self.display_state.pointer_position().1.round() as i32,
@@ -745,6 +761,8 @@ impl AppData {
                     } else {
                         self.renderer_state
                             .set_output_views(&output, self.views_for_output(&output));
+                        self.display_state
+                            .refresh_pointer_focus(&mut self.clients, arena);
                         self.request_present_immediate(event_loop, arena);
                         self.emit_outputs_changed();
                     }
@@ -758,6 +776,8 @@ impl AppData {
                     } else {
                         self.renderer_state
                             .set_output_views(&output, self.views_for_output(&output));
+                        self.display_state
+                            .refresh_pointer_focus(&mut self.clients, arena);
                         self.request_present_immediate(event_loop, arena);
                         self.emit_outputs_changed();
                     }
@@ -1101,6 +1121,15 @@ impl AppData {
                 MainMessage::ClearWindowRules => {
                     self.display_state.clear_window_rules();
                 }
+                MainMessage::SetCursorListening {
+                    listen_move,
+                    listen_click,
+                    listen_scroll,
+                } => {
+                    self.listen_cursor_move = listen_move;
+                    self.listen_cursor_click = listen_click;
+                    self.listen_cursor_scroll = listen_scroll;
+                }
             }
         }
         self.flush_client_sends(event_loop, arena);
@@ -1122,11 +1151,13 @@ impl AppData {
                 .input_state
                 .inject_type_text(&text, &mut |event| events.push(event)),
             InjectedInput::PointerMove { x, y } => {
+                let (x, y) = self.display_state.map_scene_to_pointer(x, y);
                 self.input_state
                     .inject_pointer_move(x, y, &mut |event| events.push(event));
                 Ok(())
             }
             InjectedInput::PointerClick { x, y, button } => {
+                let (x, y) = self.display_state.map_scene_to_pointer(x, y);
                 self.input_state.inject_pointer_click(
                     x,
                     y,
@@ -1142,6 +1173,7 @@ impl AppData {
         }
         self.flush_client_sends(event_loop, arena);
         if pointer_changed {
+            self.maybe_emit_cursor_moved();
             if let Err(err) = self.renderer_state.update_pointer_position(
                 self.display_state.pointer_position().0.round() as i32,
                 self.display_state.pointer_position().1.round() as i32,
@@ -1189,6 +1221,10 @@ impl AppData {
                 dy_unaccel,
             }) => {
                 pointer_changed = true;
+                if self.listen_cursor_move {
+                    self.pending_cursor_dx += dx;
+                    self.pending_cursor_dy += dy;
+                }
                 self.display_state.handle_pointer_motion(
                     &mut self.clients,
                     time_msec,
@@ -1201,6 +1237,7 @@ impl AppData {
             }
             SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {
                 pointer_changed = true;
+                let origin = self.listen_cursor_move.then(|| self.display_state.pointer_position());
                 self.display_state.handle_pointer_absolute(
                     &mut self.clients,
                     time_msec,
@@ -1208,6 +1245,11 @@ impl AppData {
                     y,
                     arena,
                 );
+                if let Some((ox, oy)) = origin {
+                    let (nx, ny) = self.display_state.pointer_position();
+                    self.pending_cursor_dx += nx - ox;
+                    self.pending_cursor_dy += ny - oy;
+                }
             }
             SeatEvent::Pointer(PointerEvent::Button {
                 time_msec,
@@ -1221,6 +1263,16 @@ impl AppData {
                     pressed,
                     arena,
                 );
+                if self.listen_cursor_click {
+                    let (x, y) = self.display_state.pointer_position();
+                    let lua_button = if button == BTN_LEFT { 0 } else { button };
+                    self.comms.dbus(DbusMessage::EmitCursorClicked {
+                        x,
+                        y,
+                        button: lua_button,
+                        pressed,
+                    });
+                }
             }
             SeatEvent::Pointer(PointerEvent::Axis {
                 time_msec,
@@ -1234,6 +1286,15 @@ impl AppData {
                     value,
                     arena,
                 );
+                if self.listen_cursor_scroll {
+                    let (x, y) = self.display_state.pointer_position();
+                    self.comms.dbus(DbusMessage::EmitCursorScrolled {
+                        x,
+                        y,
+                        axis,
+                        value: f64::from(value),
+                    });
+                }
             }
             SeatEvent::Touch(TouchEvent::Down {
                 time_msec,
@@ -1279,6 +1340,21 @@ impl AppData {
             }
         }
         pointer_changed
+    }
+
+    fn maybe_emit_cursor_moved(&mut self) {
+        if !self.listen_cursor_move {
+            self.pending_cursor_dx = 0.0;
+            self.pending_cursor_dy = 0.0;
+            return;
+        }
+        let (x, y) = self.display_state.pointer_position();
+        let dx = self.pending_cursor_dx;
+        let dy = self.pending_cursor_dy;
+        self.pending_cursor_dx = 0.0;
+        self.pending_cursor_dy = 0.0;
+        self.comms
+            .dbus(DbusMessage::EmitCursorMoved { x, y, dx, dy });
     }
 
     fn emit_outputs_changed(&self) {

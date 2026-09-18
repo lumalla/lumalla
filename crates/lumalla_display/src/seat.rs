@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use allocator_api2::vec::Vec as ArenaVec;
-use lumalla_shared::KeymapMemfd;
+use lumalla_shared::{KeymapMemfd, View, map_dest_to_source, map_source_to_dest};
 use lumalla_wayland_protocol::{
     ClientConnection, ClientId, ObjectId,
     buffer::Writer,
@@ -77,7 +77,10 @@ pub struct SeatManager {
     keyboards: Vec<SeatKeyboard>,
     pointers: Vec<SeatPointer>,
     touches: Vec<SeatTouch>,
-    /// Output-local pointer position in pixels.
+    /// Output-local (monitor/dest) pointer position in pixels.
+    ///
+    /// Hit-testing and client surface coordinates are derived by mapping through
+    /// the active [`lumalla_shared::View`] into global compositor (source) space.
     pointer_x: f64,
     pointer_y: f64,
     output_width: u32,
@@ -247,6 +250,7 @@ impl SeatManager {
         writer: &mut Writer,
         focus_surface: Option<ObjectId>,
         surface_manager: &SurfaceManager,
+        views: &[View],
     ) {
         let mut enter_serial = None;
         if let Some(surface) = focus_surface {
@@ -256,6 +260,7 @@ impl SeatManager {
                 surface,
                 surface_manager,
                 client_id,
+                views,
             ));
             if version >= 5 {
                 writer.wl_pointer_frame(pointer_id);
@@ -692,6 +697,7 @@ impl SeatManager {
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
         relative_pointers: &RelativePointerManager,
+        views: &[View],
         time_msec: u32,
         dx: f64,
         dy: f64,
@@ -704,6 +710,7 @@ impl SeatManager {
             surface_manager,
             constraints,
             relative_pointers,
+            views,
             time_msec,
             Some((dx, dy, dx_unaccel, dy_unaccel)),
             |seat| {
@@ -720,6 +727,7 @@ impl SeatManager {
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
         relative_pointers: &RelativePointerManager,
+        views: &[View],
         time_msec: u32,
         x: f64,
         y: f64,
@@ -732,6 +740,7 @@ impl SeatManager {
             surface_manager,
             constraints,
             relative_pointers,
+            views,
             time_msec,
             // Absolute devices: relative delta is the unclipped intended motion.
             Some((x - old_x, y - old_y, x - old_x, y - old_y)),
@@ -749,6 +758,7 @@ impl SeatManager {
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
         relative_pointers: &RelativePointerManager,
+        views: &[View],
         time_msec: u32,
         relative: Option<(f64, f64, f64, f64)>,
         update: impl FnOnce(&mut Self),
@@ -758,19 +768,22 @@ impl SeatManager {
         let locked = active.is_some_and(|c| c.kind == ConstraintKind::Locked);
         if !locked {
             update(self);
+            self.clamp_pointer();
             if let Some(confine) = active.filter(|c| c.kind == ConstraintKind::Confined) {
-                if let Some((x, y)) = surface_manager.clamp_global_to_constraint(
+                let (sx, sy) = map_dest_to_source(views, self.pointer_x, self.pointer_y);
+                if let Some((cx, cy)) = surface_manager.clamp_global_to_constraint(
                     confine.client_id,
                     confine.surface,
                     constraints.region_for(confine.client_id, confine.object_id),
-                    self.pointer_x,
-                    self.pointer_y,
+                    sx,
+                    sy,
                 ) {
-                    self.pointer_x = x;
-                    self.pointer_y = y;
+                    let (dx, dy) = map_source_to_dest(views, cx, cy);
+                    self.pointer_x = dx;
+                    self.pointer_y = dy;
+                    self.clamp_pointer();
                 }
             }
-            self.clamp_pointer();
         }
 
         let send_motion = !locked;
@@ -778,6 +791,7 @@ impl SeatManager {
             clients,
             surface_manager,
             constraints,
+            views,
             time_msec,
             send_motion,
             arena,
@@ -881,13 +895,15 @@ impl SeatManager {
         &mut self,
         clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
+        views: &[View],
         time_msec: u32,
         touch_id: i32,
         x: f64,
         y: f64,
         arena: &Arena,
     ) {
-        let Some((client_id, surface)) = surface_manager.global_pointer_target(None, x, y) else {
+        let (sx, sy) = map_dest_to_source(views, x, y);
+        let Some((client_id, surface)) = surface_manager.global_pointer_target(None, sx, sy) else {
             return;
         };
         self.active_touches.insert(touch_id, (client_id, surface));
@@ -903,8 +919,8 @@ impl SeatManager {
                 continue;
             };
             let (local_x, local_y) = surface_manager
-                .surface_local_coords(client_id, surface, x, y)
-                .unwrap_or((x as f32, y as f32));
+                .surface_local_coords(client_id, surface, sx, sy)
+                .unwrap_or((sx as f32, sy as f32));
             let serial = self.serial.next_grab_serial();
             client
                 .writer_mut()
@@ -953,6 +969,7 @@ impl SeatManager {
         &mut self,
         clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
+        views: &[View],
         time_msec: u32,
         touch_id: i32,
         x: f64,
@@ -962,6 +979,7 @@ impl SeatManager {
         let Some((client_id, surface)) = self.active_touches.get(&touch_id).copied() else {
             return;
         };
+        let (sx, sy) = map_dest_to_source(views, x, y);
         let mut touches = ArenaVec::new_in(arena);
         touches.extend(
             self.touches
@@ -970,8 +988,8 @@ impl SeatManager {
                 .map(|t| t.id),
         );
         let (local_x, local_y) = surface_manager
-            .surface_local_coords(client_id, surface, x, y)
-            .unwrap_or((x as f32, y as f32));
+            .surface_local_coords(client_id, surface, sx, sy)
+            .unwrap_or((sx as f32, sy as f32));
         for object_id in touches {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
@@ -1040,14 +1058,16 @@ impl SeatManager {
         clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
         constraints: &mut PointerConstraintsManager,
+        views: &[View],
         time_msec: u32,
         send_motion: bool,
         arena: &Arena,
     ) {
+        let (scene_x, scene_y) = map_dest_to_source(views, self.pointer_x, self.pointer_y);
         let sticky = constraints.active_for_seat().map(|c| (c.client_id, c.surface));
         let target = match sticky {
             Some((client_id, surface)) => Some((client_id, surface)),
-            None => surface_manager.global_pointer_target(None, self.pointer_x, self.pointer_y),
+            None => surface_manager.global_pointer_target(None, scene_x, scene_y),
         };
 
         // Leave pointers whose focus no longer matches the target.
@@ -1089,13 +1109,8 @@ impl SeatManager {
         };
 
         let (sx, sy) = surface_manager
-            .surface_local_coords(
-                target_client,
-                target_surface,
-                self.pointer_x,
-                self.pointer_y,
-            )
-            .unwrap_or((self.pointer_x as f32, self.pointer_y as f32));
+            .surface_local_coords(target_client, target_surface, scene_x, scene_y)
+            .unwrap_or((scene_x as f32, scene_y as f32));
 
         let mut enter_list = ArenaVec::new_in(arena);
         enter_list.extend(
@@ -1148,8 +1163,8 @@ impl SeatManager {
             clients,
             surface_manager,
             pointer_focus,
-            self.pointer_x,
-            self.pointer_y,
+            scene_x,
+            scene_y,
         );
     }
 
@@ -1195,11 +1210,13 @@ impl SeatManager {
         surface: ObjectId,
         surface_manager: &SurfaceManager,
         client_id: ClientId,
+        views: &[View],
     ) -> u32 {
         let serial = self.serial.next_serial();
+        let (scene_x, scene_y) = map_dest_to_source(views, self.pointer_x, self.pointer_y);
         let (surface_x, surface_y) = surface_manager
-            .surface_local_coords(client_id, surface, self.pointer_x, self.pointer_y)
-            .unwrap_or((self.pointer_x as f32, self.pointer_y as f32));
+            .surface_local_coords(client_id, surface, scene_x, scene_y)
+            .unwrap_or((scene_x as f32, scene_y as f32));
         writer
             .wl_pointer_enter(pointer_id)
             .serial(serial)
@@ -1393,6 +1410,7 @@ mod tests {
             &mut writer,
             None,
             &SurfaceManager::default(),
+            &[],
         );
         assert_eq!(seat.pointers.len(), 1);
         assert_eq!(seat.pointers[0].id, object(10));
@@ -1423,7 +1441,7 @@ mod tests {
             .unwrap();
         let _ = surfaces.commit(client_id, surface).unwrap();
 
-        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces);
+        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces, &[]);
         let enter_serial = seat.pointers[0].enter_serial.unwrap();
 
         seat.set_cursor(
@@ -1476,7 +1494,7 @@ mod tests {
             .unwrap();
         let _ = surfaces.commit(client_id, surface).unwrap();
 
-        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces);
+        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces, &[]);
         let enter_serial = seat.pointers[0].enter_serial.unwrap();
         assert_eq!(seat.pointer_cursor(), PointerCursor::Default);
 
@@ -1512,7 +1530,7 @@ mod tests {
         surfaces
             .create_shell_surface(client_id, object(30), surface)
             .unwrap();
-        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces);
+        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces, &[]);
         let enter_serial = seat.pointers[0].enter_serial.unwrap();
 
         let err = seat
@@ -1563,6 +1581,7 @@ mod tests {
             &mut writer,
             Some(surface_a),
             &surfaces,
+            &[],
         );
         seat.create_pointer(
             client_b,
@@ -1571,6 +1590,7 @@ mod tests {
             &mut writer,
             Some(surface_b),
             &surfaces,
+            &[],
         );
         let serial_a = seat.pointers[0].enter_serial.unwrap();
         let serial_b = seat.pointers[1].enter_serial.unwrap();
@@ -1614,6 +1634,7 @@ mod tests {
             &mut writer,
             Some(surface),
             &SurfaceManager::default(),
+            &[],
         );
         assert_eq!(seat.pointers[0].focus, Some(surface));
         seat.leave_pointers_on_surface(client_id, surface, &mut writer);
@@ -1649,7 +1670,7 @@ mod tests {
         let _ = (receiver, sender);
         assert!(seat.active_touches.is_empty());
         let arena = Arena::new();
-        seat.handle_touch_down(&mut clients, &surfaces, 1, 7, 10.0, 20.0, &arena);
+        seat.handle_touch_down(&mut clients, &surfaces, &[], 1, 7, 10.0, 20.0, &arena);
         // No client connection means events are skipped after tracking insert... actually
         // insert happens before client lookup, so active_touches should be set.
         assert_eq!(seat.active_touches.get(&7), Some(&(client_id, surface)));
@@ -1690,6 +1711,7 @@ mod tests {
             &surfaces,
             &mut constraints,
             &RelativePointerManager::default(),
+            &[],
             1,
             40.0,
             30.0,
@@ -1754,6 +1776,7 @@ mod tests {
             &surfaces,
             &mut constraints,
             &crate::relative_pointer::RelativePointerManager::default(),
+            &[],
             1,
             500.0,
             500.0,

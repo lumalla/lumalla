@@ -40,6 +40,9 @@ pub struct ExternalConfig {
     on_startup: Rc<RefCell<Option<CallbackRef>>>,
     on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
     on_drm_devices_change: Rc<RefCell<Option<CallbackRef>>>,
+    on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
+    on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
+    on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
     outputs: HashMap<String, Output>,
     config_watcher: ConfigWatcher,
     reload_receiver: mpsc::Receiver<PathBuf>,
@@ -57,6 +60,9 @@ impl ExternalConfig {
         let on_startup = Rc::new(RefCell::new(None));
         let on_connector_change = Rc::new(RefCell::new(None));
         let on_drm_devices_change = Rc::new(RefCell::new(None));
+        let on_cursor_move = Rc::new(RefCell::new(None));
+        let on_cursor_click = Rc::new(RefCell::new(None));
+        let on_cursor_scroll = Rc::new(RefCell::new(None));
         let (reload_tx, reload_receiver) = mpsc::channel();
         let config_watcher = ConfigWatcher::new(reload_tx)?;
         let repl_socket = args.repl_socket_path()?;
@@ -68,6 +74,9 @@ impl ExternalConfig {
             on_startup.clone(),
             on_connector_change.clone(),
             on_drm_devices_change.clone(),
+            on_cursor_move.clone(),
+            on_cursor_click.clone(),
+            on_cursor_scroll.clone(),
         )?;
 
         let mut state = Self {
@@ -77,6 +86,9 @@ impl ExternalConfig {
             on_startup,
             on_connector_change,
             on_drm_devices_change,
+            on_cursor_move,
+            on_cursor_click,
+            on_cursor_scroll,
             outputs: HashMap::new(),
             config_watcher,
             reload_receiver,
@@ -161,6 +173,9 @@ impl ExternalConfig {
             }
 
             while let Ok(path) = self.reload_receiver.try_recv() {
+                *self.on_cursor_move.borrow_mut() = None;
+                *self.on_cursor_click.borrow_mut() = None;
+                *self.on_cursor_scroll.borrow_mut() = None;
                 if let Err(err) =
                     reload_config_file(&self.lua, &self.client, &self.callback_state, &path)
                 {
@@ -234,6 +249,18 @@ impl ExternalConfig {
                 let binding_id: String = message.body().deserialize()?;
                 self.handle_binding_activated(&binding_id)?;
             }
+            Some(signals::CURSOR_MOVED) => {
+                let (x, y, dx, dy): (f64, f64, f64, f64) = message.body().deserialize()?;
+                self.handle_cursor_moved(x, y, dx, dy)?;
+            }
+            Some(signals::CURSOR_CLICKED) => {
+                let (x, y, button, pressed): (f64, f64, u32, bool) = message.body().deserialize()?;
+                self.handle_cursor_clicked(x, y, button, pressed)?;
+            }
+            Some(signals::CURSOR_SCROLLED) => {
+                let (x, y, axis, value): (f64, f64, u32, f64) = message.body().deserialize()?;
+                self.handle_cursor_scrolled(x, y, axis, value)?;
+            }
             Some(other) => {
                 warn!("Ignoring unknown compositor signal: {other}");
             }
@@ -285,6 +312,54 @@ impl ExternalConfig {
         {
             // Keep the config process alive so later key bindings still work.
             warn!("Key binding callback {binding_id} failed: {err:#}");
+        }
+        Ok(())
+    }
+
+    fn handle_cursor_moved(&mut self, x: f64, y: f64, dx: f64, dy: f64) -> anyhow::Result<()> {
+        if let Some(on_cursor_move) = *self.on_cursor_move.borrow() {
+            if let Err(err) = self
+                .callback_state
+                .run_callback::<(f64, f64, f64, f64), ()>(on_cursor_move, (x, y, dx, dy))
+            {
+                warn!("Cursor move callback failed: {err:#}");
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_cursor_clicked(
+        &mut self,
+        x: f64,
+        y: f64,
+        button: u32,
+        pressed: bool,
+    ) -> anyhow::Result<()> {
+        if let Some(on_cursor_click) = *self.on_cursor_click.borrow() {
+            if let Err(err) = self
+                .callback_state
+                .run_callback::<(f64, f64, u32, bool), ()>(on_cursor_click, (x, y, button, pressed))
+            {
+                warn!("Cursor click callback failed: {err:#}");
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_cursor_scrolled(
+        &mut self,
+        x: f64,
+        y: f64,
+        axis: u32,
+        value: f64,
+    ) -> anyhow::Result<()> {
+        if let Some(on_cursor_scroll) = *self.on_cursor_scroll.borrow() {
+            if let Err(err) = self
+                .callback_state
+                .run_callback::<(f64, f64, u32, f64), ()>(on_cursor_scroll, (x, y, axis, value))
+            {
+                warn!("Cursor scroll callback failed: {err:#}");
+            }
         }
         Ok(())
     }

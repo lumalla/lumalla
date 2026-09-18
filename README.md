@@ -75,6 +75,9 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 | `on_startup(callback)` | Called once when the compositor is ready. `callback()` takes no args. |
 | `on_connector_change(callback)` | Called when outputs change. `callback(outputs)` receives the same tables as `get_outputs`. |
 | `on_drm_devices_change(callback)` | Called when DRM devices change. `callback(devices)` matches `get_drm_devices`. |
+| `on_cursor_move(callback)` | Called when the pointer moves. `callback(x, y, dx, dy)` receives **monitor/output-local** absolute coordinates and the relative delta for that input batch. Emission is opt-in and coalesced per input batch. |
+| `on_cursor_click(callback)` | Called on pointer button press/release. `callback(x, y, button, pressed)` — coordinates are monitor/output-local; `button` is `0` for left (same as `click`), otherwise a Linux `BTN_*` code; `pressed` is `true` on press. |
+| `on_cursor_scroll(callback)` | Called on pointer scroll. `callback(x, y, axis, value)` — coordinates are monitor/output-local; `axis` is `0` vertical / `1` horizontal; `value` is the libinput scroll delta. |
 
 ### Session
 
@@ -142,8 +145,8 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 | `sleep(seconds)` | Blocking sleep in the config process (no D-Bus round-trip). |
 | `key(name)` | Press and release a named key. |
 | `type(text)` | Type UTF-8 text as key presses. |
-| `pointer_move(x, y)` | Absolute pointer move. |
-| `click(x, y, button?)` | Click at coordinates (`button` defaults to `0`). |
+| `pointer_move(x, y)` | Absolute pointer move. `x`/`y` are global compositor (scene) coordinates; they are mapped through the active view onto the monitor. |
+| `click(x, y, button?)` | Click at scene coordinates (`button` defaults to `0`). Mapped through the active view like `pointer_move`. |
 | `screenshot(x, y, width, height, path)` | Capture a region to a PNG file. |
 
 ## Debugging compositor issues

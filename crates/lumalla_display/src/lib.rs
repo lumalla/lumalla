@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use anyhow::Context;
-use lumalla_shared::{WindowGeometryUpdate, WindowRule, WindowState};
+use lumalla_shared::{View, WindowGeometryUpdate, WindowRule, WindowState, map_source_to_dest};
 use stumpalo::Arena;
 use lumalla_wayland_protocol::protocols::presentation_time::{
     WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK, WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION,
@@ -247,11 +247,13 @@ impl DisplayState {
         dy_unaccel: f64,
         arena: &Arena,
     ) {
+        let views = self.pointer_views();
         self.seat_manager.handle_pointer_motion(
             clients,
             &self.surface_manager,
             &mut self.pointer_constraints_manager,
             &self.relative_pointer_manager,
+            &views,
             time_msec,
             dx,
             dy,
@@ -269,11 +271,13 @@ impl DisplayState {
         y: f64,
         arena: &Arena,
     ) {
+        let views = self.pointer_views();
         self.seat_manager.handle_pointer_absolute(
             clients,
             &self.surface_manager,
             &mut self.pointer_constraints_manager,
             &self.relative_pointer_manager,
+            &views,
             time_msec,
             x,
             y,
@@ -289,10 +293,12 @@ impl DisplayState {
         clients: &mut ConnectedClients,
         arena: &Arena,
     ) {
+        let views = self.pointer_views();
         self.seat_manager.update_pointer_focus_and_motion(
             clients,
             &self.surface_manager,
             &mut self.pointer_constraints_manager,
+            &views,
             0,
             false,
             arena,
@@ -303,8 +309,29 @@ impl DisplayState {
         self.seat_manager.set_output_geometry(width, height);
     }
 
+    /// Output-local (monitor) pointer position.
     pub fn pointer_position(&self) -> (f64, f64) {
         self.seat_manager.pointer_position()
+    }
+
+    /// Map global compositor coordinates into output-local pointer space.
+    pub fn map_scene_to_pointer(&self, x: f64, y: f64) -> (f64, f64) {
+        map_source_to_dest(&self.pointer_views(), x, y)
+    }
+
+    /// Views used for pointer dest↔source mapping (primary/first output with views).
+    pub fn pointer_views(&self) -> Vec<View> {
+        self.output_manager
+            .outputs()
+            .find(|output| !output.views.is_empty())
+            .map(|output| output.views.clone())
+            .or_else(|| {
+                self.output_manager
+                    .outputs()
+                    .next()
+                    .map(|output| output.views.clone())
+            })
+            .unwrap_or_default()
     }
 
     pub fn pointer_cursor(&self) -> PointerCursor {
@@ -326,10 +353,12 @@ impl DisplayState {
         if pressed {
             // Resolve the top-most surface under the cursor before focusing; do not
             // trust sticky pointer focus from a covered window.
+            let views = self.pointer_views();
             self.seat_manager.update_pointer_focus_and_motion(
                 clients,
                 &self.surface_manager,
                 &mut self.pointer_constraints_manager,
+                &views,
                 time_msec,
                 false,
                 arena,
@@ -416,9 +445,11 @@ impl DisplayState {
         y: f64,
         arena: &Arena,
     ) {
+        let views = self.pointer_views();
         self.seat_manager.handle_touch_down(
             clients,
             &self.surface_manager,
+            &views,
             time_msec,
             touch_id,
             x,
@@ -447,9 +478,11 @@ impl DisplayState {
         y: f64,
         arena: &Arena,
     ) {
+        let views = self.pointer_views();
         self.seat_manager.handle_touch_motion(
             clients,
             &self.surface_manager,
+            &views,
             time_msec,
             touch_id,
             x,

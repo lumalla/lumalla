@@ -201,4 +201,13 @@ pub enum MainMessage {
         /// Window id, or `None` for the focused window.
         id: Option<u32>,
     },
+    /// Enable or disable emitting cursor move / click / scroll signals to config.
+    SetCursorListening {
+        /// Emit [`crate::DbusMessage::EmitCursorMoved`] after pointer motion.
+        listen_move: bool,
+        /// Emit [`crate::DbusMessage::EmitCursorClicked`] on pointer buttons.
+        listen_click: bool,
+        /// Emit [`crate::DbusMessage::EmitCursorScrolled`] on pointer axis.
+        listen_scroll: bool,
+    },
 }

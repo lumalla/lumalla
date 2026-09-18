@@ -461,6 +461,23 @@ impl WindowManagerHandler for CompositorHandler {
         Ok(())
     }
 
+    fn set_cursor_listening(
+        &mut self,
+        listen_move: bool,
+        listen_click: bool,
+        listen_scroll: bool,
+    ) -> zbus::fdo::Result<()> {
+        info!(
+            "Set cursor listening over D-Bus: move={listen_move} click={listen_click} scroll={listen_scroll}"
+        );
+        self.state.comms.main(MainMessage::SetCursorListening {
+            listen_move,
+            listen_click,
+            listen_scroll,
+        });
+        Ok(())
+    }
+
     fn capture_screenshot(
         &mut self,
         x: i32,

@@ -24,7 +24,9 @@ pub use drm::{DrmConnector, DrmDeviceState, DrmMode, OutputConfig};
 pub use keymap_memfd::KeymapMemfd;
 pub use main_message::{InjectedInput, MainMessage};
 pub use mods::Mods;
-pub use output::{Output, View};
+pub use output::{
+    Output, View, map_dest_to_source, map_source_to_dest, view_at_dest, view_at_source,
+};
 pub use ring::{
     Completion, EventLoop, Interest, OpKind, SharedWaker, Waker, decode_user_data,
     encode_user_data, monotonic_deadline_after, monotonic_now,

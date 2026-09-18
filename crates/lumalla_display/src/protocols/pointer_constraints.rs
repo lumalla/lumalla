@@ -194,13 +194,15 @@ fn create_constraint(
 
     // Activate immediately if the pointer is already focused inside the region.
     let (px, py) = state.seat_manager.pointer_position();
+    let views = state.pointer_views();
+    let (scene_x, scene_y) = lumalla_shared::map_dest_to_source(&views, px, py);
     if state.seat_manager.pointer_focus(ctx.client_id, pointer) == Some(surface) {
         state.pointer_constraints_manager.activate_if_ready(
             ctx.client_id,
             surface,
             pointer,
-            px,
-            py,
+            scene_x,
+            scene_y,
             &state.surface_manager,
             ctx.writer,
         );
@@ -225,7 +227,9 @@ impl ZwpLockedPointerV1 for DisplayState {
                     sx,
                     sy,
                 ) {
-                    self.seat_manager.set_pointer_position(gx, gy);
+                    let views = self.pointer_views();
+                    let (dx, dy) = lumalla_shared::map_source_to_dest(&views, gx, gy);
+                    self.seat_manager.set_pointer_position(dx, dy);
                 }
             }
         }

@@ -17,6 +17,39 @@ pub enum DbusMessage {
     EmitDrmDevicesChanged(Vec<DrmDeviceState>),
     /// Broadcast that a custom key binding was activated.
     EmitBindingActivated(String),
+    /// Broadcast absolute pointer position after motion (when listening).
+    EmitCursorMoved {
+        /// Absolute X in output-local (monitor) space.
+        x: f64,
+        /// Absolute Y in output-local (monitor) space.
+        y: f64,
+        /// Relative X delta for this input batch.
+        dx: f64,
+        /// Relative Y delta for this input batch.
+        dy: f64,
+    },
+    /// Broadcast a pointer button press/release (when listening).
+    EmitCursorClicked {
+        /// X coordinate in output-local (monitor) space.
+        x: f64,
+        /// Y coordinate in output-local (monitor) space.
+        y: f64,
+        /// Button code (`0` = left; otherwise Linux `BTN_*`).
+        button: u32,
+        /// `true` on press, `false` on release.
+        pressed: bool,
+    },
+    /// Broadcast a pointer scroll axis event (when listening).
+    EmitCursorScrolled {
+        /// X coordinate in output-local (monitor) space.
+        x: f64,
+        /// Y coordinate in output-local (monitor) space.
+        y: f64,
+        /// Axis: `0` = vertical, `1` = horizontal.
+        axis: u32,
+        /// Scroll delta (libinput scroll value; sign depends on axis direction).
+        value: f64,
+    },
     /// Set `WAYLAND_DISPLAY` used for processes spawned over D-Bus.
     SetWaylandDisplay(String),
     /// Spawn a process over D-Bus.

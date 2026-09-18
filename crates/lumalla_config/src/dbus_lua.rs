@@ -72,6 +72,9 @@ pub(crate) fn init_dbus_module(
     on_startup: Rc<RefCell<Option<CallbackRef>>>,
     on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
     on_drm_devices_change: Rc<RefCell<Option<CallbackRef>>>,
+    on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
+    on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
+    on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
 ) -> LuaResult<LuaTable> {
     let module = lua.create_table()?;
 
@@ -104,6 +107,59 @@ pub(crate) fn init_dbus_module(
         lua.create_function(move |_, callback: LuaFunction| {
             let callback = cb_state.register_callback(callback);
             *on_drm_devices_change_cb.borrow_mut() = Some(callback);
+            Ok(())
+        })?,
+    )?;
+
+    let sync_cursor_listening = {
+        let move_cb = on_cursor_move.clone();
+        let click_cb = on_cursor_click.clone();
+        let scroll_cb = on_cursor_scroll.clone();
+        let sync_client = client.clone();
+        move || -> LuaResult<()> {
+            dbus_result(sync_client.proxy.set_cursor_listening(
+                move_cb.borrow().is_some(),
+                click_cb.borrow().is_some(),
+                scroll_cb.borrow().is_some(),
+            ))
+        }
+    };
+
+    let cb_state = callback_state.clone();
+    let on_cursor_move_cb = on_cursor_move.clone();
+    let sync_move = sync_cursor_listening.clone();
+    module.set(
+        "on_cursor_move",
+        lua.create_function(move |_, callback: LuaFunction| {
+            let callback = cb_state.register_callback(callback);
+            *on_cursor_move_cb.borrow_mut() = Some(callback);
+            sync_move()?;
+            Ok(())
+        })?,
+    )?;
+
+    let cb_state = callback_state.clone();
+    let on_cursor_click_cb = on_cursor_click.clone();
+    let sync_click = sync_cursor_listening.clone();
+    module.set(
+        "on_cursor_click",
+        lua.create_function(move |_, callback: LuaFunction| {
+            let callback = cb_state.register_callback(callback);
+            *on_cursor_click_cb.borrow_mut() = Some(callback);
+            sync_click()?;
+            Ok(())
+        })?,
+    )?;
+
+    let cb_state = callback_state.clone();
+    let on_cursor_scroll_cb = on_cursor_scroll.clone();
+    let sync_scroll = sync_cursor_listening;
+    module.set(
+        "on_cursor_scroll",
+        lua.create_function(move |_, callback: LuaFunction| {
+            let callback = cb_state.register_callback(callback);
+            *on_cursor_scroll_cb.borrow_mut() = Some(callback);
+            sync_scroll()?;
             Ok(())
         })?,
     )?;
@@ -167,6 +223,9 @@ pub(crate) fn register_dbus_module(
     on_startup: Rc<RefCell<Option<CallbackRef>>>,
     on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
     on_drm_devices_change: Rc<RefCell<Option<CallbackRef>>>,
+    on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
+    on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
+    on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
 ) -> anyhow::Result<()> {
     lua.register_module(
         LUA_MODULE_NAME,
@@ -177,6 +236,9 @@ pub(crate) fn register_dbus_module(
             on_startup,
             on_connector_change,
             on_drm_devices_change,
+            on_cursor_move,
+            on_cursor_click,
+            on_cursor_scroll,
         )
         .map_err(|err| anyhow::anyhow!("Unable to create D-Bus config module: {err}"))?,
     )
@@ -1360,6 +1422,10 @@ pub(crate) fn reload_config_file(
     callback_state: &CallbackState,
     path: &std::path::Path,
 ) -> anyhow::Result<()> {
+    client
+        .proxy
+        .set_cursor_listening(false, false, false)
+        .context("Failed to clear cursor listening before config reload")?;
     client
         .proxy
         .clear_keymaps()

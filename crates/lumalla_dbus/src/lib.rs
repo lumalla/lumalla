@@ -383,6 +383,33 @@ impl DbusState {
                     &(&binding_id,),
                 )?;
             }
+            DbusMessage::EmitCursorMoved { x, y, dx, dy } => {
+                emit_signal(&self.connection, signals::CURSOR_MOVED, &(x, y, dx, dy))?;
+            }
+            DbusMessage::EmitCursorClicked {
+                x,
+                y,
+                button,
+                pressed,
+            } => {
+                emit_signal(
+                    &self.connection,
+                    signals::CURSOR_CLICKED,
+                    &(x, y, button, pressed),
+                )?;
+            }
+            DbusMessage::EmitCursorScrolled {
+                x,
+                y,
+                axis,
+                value,
+            } => {
+                emit_signal(
+                    &self.connection,
+                    signals::CURSOR_SCROLLED,
+                    &(x, y, axis, value),
+                )?;
+            }
             DbusMessage::SetWaylandDisplay(wayland_display) => {
                 info!("Setting WAYLAND_DISPLAY for D-Bus spawns to {wayland_display}");
                 *self.wayland_display.lock().unwrap() = Some(wayland_display);

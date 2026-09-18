@@ -1075,20 +1075,20 @@ fn draw_views(
             output_height,
             Some(&clip),
         );
-        draw_cursor_layer(
-            compositor,
-            device,
-            recorder,
-            cache,
-            view,
-            cursor,
-            pointer_x,
-            pointer_y,
-            output_width,
-            output_height,
-            Some(&clip),
-        );
     }
+    // Cursor is monitor/dest-native: draw once in output pixels, never through a view.
+    draw_cursor_layer(
+        compositor,
+        device,
+        recorder,
+        cache,
+        cursor,
+        pointer_x,
+        pointer_y,
+        output_width,
+        output_height,
+        outer_clip,
+    );
 }
 
 fn draw_scene_layers(
@@ -1136,7 +1136,6 @@ fn draw_cursor_layer(
     device: &Device,
     recorder: &mut CommandBufferRecorder<'_>,
     cache: &SurfaceTextureCache,
-    view: &View,
     cursor: CursorDraw<'_>,
     pointer_x: i32,
     pointer_y: i32,
@@ -1152,7 +1151,7 @@ fn draw_cursor_layer(
     let Some(texture) = cache.texture(cursor_key) else {
         return;
     };
-    let dest = map_rect_through_view(view, cursor_dest_rect(cursor_frame, pointer_x, pointer_y));
+    let dest = cursor_dest_rect(cursor_frame, pointer_x, pointer_y);
     if dest[2] > 0.0
         && dest[3] > 0.0
         && clip.is_none_or(|clip| dest_intersects_clip(dest, clip))

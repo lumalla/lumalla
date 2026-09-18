@@ -131,6 +131,18 @@ pub trait WindowManagerHandler: Send + Sync {
     /// Click a pointer button at absolute compositor coordinates.
     fn inject_pointer_click(&mut self, x: f64, y: f64, button: u32) -> zbus::fdo::Result<()>;
 
+    /// Enable or disable cursor move / click / scroll signals to config clients.
+    ///
+    /// When disabled (default), the compositor does not emit
+    /// [`signals::CURSOR_MOVED`] / [`signals::CURSOR_CLICKED`] /
+    /// [`signals::CURSOR_SCROLLED`].
+    fn set_cursor_listening(
+        &mut self,
+        listen_move: bool,
+        listen_click: bool,
+        listen_scroll: bool,
+    ) -> zbus::fdo::Result<()>;
+
     /// Capture a compositor region to a PNG file at `path`.
     ///
     /// Blocks until the file is written or an error occurs.
@@ -174,6 +186,12 @@ pub mod signals {
     pub const DRM_DEVICES_CHANGED: &str = "DrmDevicesChanged";
     /// A configured key binding was activated.
     pub const BINDING_ACTIVATED: &str = "BindingActivated";
+    /// Pointer moved (only while cursor move listening is enabled).
+    pub const CURSOR_MOVED: &str = "CursorMoved";
+    /// Pointer button pressed or released (only while cursor click listening is enabled).
+    pub const CURSOR_CLICKED: &str = "CursorClicked";
+    /// Pointer scroll axis event (only while cursor scroll listening is enabled).
+    pub const CURSOR_SCROLLED: &str = "CursorScrolled";
 }
 
 #[cfg_attr(
@@ -349,6 +367,16 @@ impl WindowManager {
         self.handler.inject_pointer_click(x, y, button)
     }
 
+    fn set_cursor_listening(
+        &mut self,
+        listen_move: bool,
+        listen_click: bool,
+        listen_scroll: bool,
+    ) -> zbus::fdo::Result<()> {
+        self.handler
+            .set_cursor_listening(listen_move, listen_click, listen_scroll)
+    }
+
     fn capture_screenshot(
         &mut self,
         x: i32,
@@ -381,4 +409,31 @@ impl WindowManager {
 
     #[zbus(signal)]
     async fn binding_activated(emitter: &SignalEmitter<'_>, binding_id: &str) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn cursor_moved(
+        emitter: &SignalEmitter<'_>,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn cursor_clicked(
+        emitter: &SignalEmitter<'_>,
+        x: f64,
+        y: f64,
+        button: u32,
+        pressed: bool,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn cursor_scrolled(
+        emitter: &SignalEmitter<'_>,
+        x: f64,
+        y: f64,
+        axis: u32,
+        value: f64,
+    ) -> zbus::Result<()>;
 }
