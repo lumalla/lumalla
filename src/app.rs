@@ -1756,7 +1756,8 @@ impl AppData {
     fn pending_present_work(&self) -> bool {
         self.display_state.pending_frame_callback_count() > 0
             || self.display_state.pending_presentation_feedback_count() > 0
-            || self.screencast.has_streams()
+        // Screencast captures are paced by ScreencastBlitNeeded (PipeWire thread),
+        // not by forcing continuous presents (that recreated a 5K busy-loop).
     }
 
     fn push_screencast_frames(&mut self, event_loop: &mut EventLoop, arena: &Arena) {

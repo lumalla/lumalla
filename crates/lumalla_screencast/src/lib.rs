@@ -657,17 +657,31 @@ fn run_pipewire_thread(
 
     let _core = core;
 
-    // DRIVER video sources need periodic trigger_process calls (see PipeWire
-    // video-src-alloc). Do NOT wake the compositor from this timer — that caused
-    // a present/capture busy-loop and hard freezes at high resolutions.
+    // DRIVER video sources need periodic trigger_process (see PipeWire
+    // video-src-alloc). Wake the compositor at a low, hard-capped rate so MemFd
+    // captures and deferred DMA blits keep moving — never every display refresh.
     let streams_for_timer = Rc::clone(&streams);
+    let on_wake_timer = Arc::clone(&on_wake);
+    let last_capture_wake = RefCell::new(Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now));
     let timer = mainloop.loop_().add_timer(move |_| {
+        let mut any_started = false;
         for slot in streams_for_timer.borrow().values() {
             if slot.inner.borrow().started {
+                any_started = true;
                 if let Err(err) = slot.stream.trigger_process() {
                     debug!("drive timer trigger_process failed: {err}");
                 }
             }
+        }
+        if !any_started {
+            return;
+        }
+        let now = Instant::now();
+        let mut last = last_capture_wake.borrow_mut();
+        // Match SCREENCAST_MEMFD_MAX_FPS (15): enough for live preview, safe at 5K.
+        if now.saturating_duration_since(*last) >= Duration::from_millis(66) {
+            *last = now;
+            on_wake_timer(ScreencastWake::BlitNeeded);
         }
     });
     if let Err(err) = timer
