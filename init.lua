@@ -260,7 +260,7 @@ local function pan_main_view(dx, dy)
 	push_main_view()
 end
 
-local function zoom_main_view(value)
+local function zoom_main_view(cursor_x, cursor_y, value)
 	local output = primary_output()
 	if not output or not main_view or value == 0 then
 		return
@@ -269,8 +269,13 @@ local function zoom_main_view(value)
 	local factor = value < 0 and (1 / 1.1) or 1.1
 	local min_w = math.max(32, math.floor(output.width * 0.05))
 	local min_h = math.max(32, math.floor(output.height * 0.05))
-	local cx = main_view.x + main_view.w / 2
-	local cy = main_view.y + main_view.h / 2
+
+	-- Scene point currently under the cursor (monitor → source).
+	local fx = cursor_x / output.width
+	local fy = cursor_y / output.height
+	local focus_x = main_view.x + fx * main_view.w
+	local focus_y = main_view.y + fy * main_view.h
+
 	local new_w = math.max(min_w, main_view.w * factor)
 	local new_h = math.max(min_h, main_view.h * factor)
 	-- Keep aspect ratio locked to the panel.
@@ -280,10 +285,12 @@ local function zoom_main_view(value)
 	else
 		new_w = new_h * aspect
 	end
+
+	-- Keep that scene point under the cursor after the scale (Miro-style).
 	main_view.w = new_w
 	main_view.h = new_h
-	main_view.x = cx - new_w / 2
-	main_view.y = cy - new_h / 2
+	main_view.x = focus_x - fx * new_w
+	main_view.y = focus_y - fy * new_h
 	push_main_view()
 end
 
@@ -331,10 +338,10 @@ lum.on_cursor_move(function(_x, _y, dx, dy)
 	end
 end)
 
-lum.on_cursor_scroll(function(_x, _y, axis, value)
-	-- Vertical scroll only.
+lum.on_cursor_scroll(function(x, y, axis, value)
+	-- Vertical scroll only; zoom toward the cursor.
 	if view_move_mode and axis == 0 then
-		zoom_main_view(value)
+		zoom_main_view(x, y, value)
 	end
 end)
 
