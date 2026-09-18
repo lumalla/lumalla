@@ -1145,23 +1145,14 @@ impl RendererState {
     /// DRM format/modifier pairs clients may use with linux-dmabuf.
     ///
     /// Ensures Vulkan is initialized against the preferred render device so the
-    /// advertised set matches what import will accept.
+    /// advertised set matches what import will accept. Falls back to Vulkan
+    /// without a preferred path when no seat-opened DRM device exists yet
+    /// (headless / before virtual outputs or DRM activate).
     pub fn supported_dmabuf_formats(&mut self) -> anyhow::Result<Vec<(u32, u64)>> {
         if let Some(path) = self.resolved_render_device_path() {
             self.ensure_vulkan(Some(&path))?;
-        } else if self.has_virtual_outputs() {
-            self.ensure_vulkan(None)?;
         } else {
-            return Ok(vec![
-                (
-                    crate::vulkan::DRM_FORMAT_XRGB8888,
-                    crate::vulkan::DRM_FORMAT_MOD_LINEAR,
-                ),
-                (
-                    crate::vulkan::DRM_FORMAT_ARGB8888,
-                    crate::vulkan::DRM_FORMAT_MOD_LINEAR,
-                ),
-            ]);
+            self.ensure_vulkan(None)?;
         }
         let vulkan = self
             .vulkan
@@ -1171,8 +1162,43 @@ impl RendererState {
     }
 
     /// DRM device path used for linux-dmabuf feedback `main_device` / tranche target.
+    ///
+    /// Prefers a seat-opened primary node. When none is open (headless / before DRM
+    /// activate), falls back to the DRM path of the Vulkan GPU so clients can still
+    /// resolve `main_device` via `drmGetDeviceFromDevId`.
     pub fn dmabuf_feedback_device_path(&mut self) -> Option<PathBuf> {
-        self.resolved_render_device_path()
+        if let Some(path) = self.resolved_render_device_path() {
+            return Some(path);
+        }
+        if self.vulkan.is_none()
+            && let Err(err) = self.ensure_vulkan(None)
+        {
+            warn!("Unable to init Vulkan for dmabuf feedback device: {err:#}");
+            return None;
+        }
+        self.vulkan
+            .as_ref()
+            .and_then(|v| v.drm_device_path().cloned())
+    }
+
+    /// Whether `name` is a virtual (non-KMS) present target.
+    pub fn output_is_virtual(&self, name: &str) -> bool {
+        self.virtual_outputs.contains_key(name)
+            || self
+                .scanouts
+                .get(name)
+                .is_some_and(|scanout| scanout.physical.is_none())
+    }
+
+    /// Nominal refresh period for an output present control, in nanoseconds.
+    pub fn output_refresh_ns(&self, name: &str) -> Option<u32> {
+        self.output_presents.get(name).map(|control| {
+            control
+                .scheduler
+                .frame_period()
+                .as_nanos()
+                .min(u128::from(u32::MAX)) as u32
+        })
     }
 
     /// Open missing DRM devices via the seat (fresh open after VT resume).

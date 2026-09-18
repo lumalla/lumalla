@@ -1436,6 +1436,7 @@ impl AppData {
             arena,
         ) {
             Ok(result) => {
+                self.maybe_complete_virtual_presentation_feedback(&result.presented_outputs);
                 self.maybe_complete_frame_callbacks(event_loop, result.status, arena);
                 if !result.presented_outputs.is_empty() && !self.screencast_push_active {
                     self.push_screencast_frames(event_loop, arena);
@@ -1495,6 +1496,9 @@ impl AppData {
                     self.seat_state.is_enabled(),
                 ) {
                     Ok(result) => {
+                        self.maybe_complete_virtual_presentation_feedback(
+                            &result.presented_outputs,
+                        );
                         self.maybe_complete_frame_callbacks(event_loop, result.status, arena);
                         if !result.presented_outputs.is_empty() && !self.screencast_push_active {
                             self.push_screencast_frames(event_loop, arena);
@@ -1527,6 +1531,38 @@ impl AppData {
         self.display_state
             .complete_frame_callbacks(&mut self.clients, time_msec);
         self.flush_client_sends(event_loop, arena);
+    }
+
+    /// Virtual presents have no KMS page-flip, so complete `wp_presentation_feedback`
+    /// immediately after a successful present (same client-visible result as DRM flips).
+    fn maybe_complete_virtual_presentation_feedback(&mut self, presented_outputs: &[String]) {
+        if presented_outputs.is_empty() {
+            return;
+        }
+        if !presented_outputs
+            .iter()
+            .any(|name| self.renderer_state.output_is_virtual(name))
+        {
+            return;
+        }
+        if self.display_state.pending_presentation_feedback_count() == 0 {
+            return;
+        }
+
+        let refresh_ns = presented_outputs
+            .iter()
+            .find_map(|name| self.renderer_state.output_refresh_ns(name))
+            .unwrap_or(16_666_666);
+        let (tv_sec, tv_usec) = monotonic_time_sec_usec();
+        self.display_state.complete_presentation_feedbacks(
+            &mut self.clients,
+            PresentationFlipInfo {
+                tv_sec,
+                tv_usec,
+                sequence: 0,
+                refresh_ns,
+            },
+        );
     }
 
     fn sync_drm_device_poll(
@@ -1752,8 +1788,12 @@ fn configure_dmabuf_formats(
     let formats = renderer_state.supported_dmabuf_formats()?;
     let device_path = renderer_state.dmabuf_feedback_device_path();
     info!(
-        "Advertising {} linux-dmabuf format/modifier pairs",
-        formats.len()
+        "Advertising {} linux-dmabuf format/modifier pairs (main_device={})",
+        formats.len(),
+        device_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".into())
     );
     display_state.set_dmabuf_formats(formats, device_path.as_deref(), clients);
     Ok(())
@@ -1872,4 +1912,20 @@ fn start_dbus_service(
         )
         .context("Unable to poll dbus thread completion pid")?;
     Ok(unsafe { OwnedFd::from_raw_fd(thread_complete_fd) })
+}
+
+/// `CLOCK_MONOTONIC` as `(sec, usec)` for synthetic virtual-present feedback.
+fn monotonic_time_sec_usec() -> (u32, u32) {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec out-parameter.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 {
+        return (0, 0);
+    }
+    let sec = u32::try_from(ts.tv_sec.max(0)).unwrap_or(u32::MAX);
+    let usec = u32::try_from(ts.tv_nsec.max(0) / 1000).unwrap_or(u32::MAX);
+    (sec, usec)
 }
