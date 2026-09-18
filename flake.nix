@@ -11,7 +11,7 @@
     naersk,
     nixpkgs,
   }:
-    flake-utils.lib.eachDefaultSystem (
+    (flake-utils.lib.eachDefaultSystem (
       system: let
         pkgs = (import nixpkgs) {
           inherit system;
@@ -209,5 +209,9 @@
           RUST_LOG = "debug";
         };
       }
-    );
+    ))
+    // {
+      homeManagerModules.default = import ./nix/home-manager.nix self;
+      nixosModules.default = import ./nix/nixos.nix self;
+    };
 }

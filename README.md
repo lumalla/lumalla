@@ -14,6 +14,52 @@
 
 - Linux with io_uring (kernel 5.19+ recommended for async cancel-by-fd; Accept / RecvMsg / SendMsg / Timeout ABS)
 
+## NixOS and home-manager
+
+The flake exposes modules that wire seatd, xdg-desktop-portal, packages, and a `start_lumalla` helper so you do not need to hand-roll session plumbing.
+
+**NixOS** (portals + seatd):
+
+```nix
+{
+  imports = [ inputs.lumalla.nixosModules.default ];
+  programs.lumalla.enable = true;
+}
+```
+
+**home-manager** (packages, `start_lumalla`, optional config install):
+
+```nix
+{
+  imports = [ inputs.lumalla.homeManagerModules.default ];
+  programs.lumalla.enable = true;
+  programs.lumalla.configFile = ./lumalla-init.lua; # or configText = ''...'';
+}
+```
+
+Import both when using home-manager as a NixOS module. After rebuild, log in on a TTY and run `start_lumalla`.
+
+`start_lumalla` sets `XDG_CURRENT_DESKTOP=lumalla`, starts `nixos-fake-graphical-session.target`, and launches `lumalla -- lumalla-config --config ~/.config/lumalla/init.lua --repl`.
+
+Your Lua config should still push compositor env into the user session once the compositor is up (portals need `WAYLAND_DISPLAY`), and optionally spawn `xwayland-satellite`:
+
+```lua
+lum.on_startup(function()
+  lum.spawn({
+    command = "dbus-update-activation-environment",
+    args = {
+      "--systemd",
+      "WAYLAND_DISPLAY",
+      "XDG_CURRENT_DESKTOP",
+      "XDG_SESSION_TYPE",
+      "XDG_SESSION_DESKTOP",
+    },
+  })
+  lum.spawn({ command = "xwayland-satellite", args = { ":1" } })
+  -- ...
+end)
+```
+
 ## Lua API
 
 Configuration runs in a separate `lumalla_config` process. Scripts load the module with `local lum = require("lumalla")` and talk to the compositor over D-Bus.
