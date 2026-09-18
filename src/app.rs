@@ -1760,6 +1760,7 @@ impl AppData {
     }
 
     fn push_screencast_frames(&mut self, event_loop: &mut EventLoop, arena: &Arena) {
+        let _ = event_loop;
         if !self.screencast.has_streams() {
             return;
         }
@@ -1868,12 +1869,8 @@ impl AppData {
             }
         }
 
-        // Keep presenting while streams are alive so captures continue.
-        if self.screencast.has_streams() {
-            self.screencast_push_active = true;
-            self.mark_present_dirty(event_loop, arena);
-            self.screencast_push_active = false;
-        }
+        // Do not mark_present_dirty here. Coupling capture to an immediate present
+        // re-arm created a busy-loop that hard-froze the session at 5K.
     }
 }
 

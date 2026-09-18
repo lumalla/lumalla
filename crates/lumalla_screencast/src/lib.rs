@@ -49,6 +49,13 @@ static PW_INIT: OnceCell<()> = OnceCell::new();
 
 const DMA_BUFFER_COUNT: usize = 4;
 
+/// Hard cap for capture rate. Monitor refresh (e.g. 240 Hz) must not drive
+/// full-framebuffer downloads/blits or the session can hard-freeze.
+const SCREENCAST_MAX_FPS: u32 = 30;
+
+/// Even lower cap for the CPU MemFd path (full RGBA readback).
+const SCREENCAST_MEMFD_MAX_FPS: u32 = 15;
+
 /// RGBA8 frame pushed from the compositor main thread (MemFd path).
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
@@ -203,7 +210,12 @@ pub struct ActiveStream {
 impl ActiveStream {
     /// Whether a new frame should be captured at `now`.
     pub fn due_at(&self, now: Instant) -> bool {
-        let min_interval = Duration::from_secs_f64(1.0 / f64::from(self.max_fps.max(1)));
+        let fps = if self.uses_dmabuf() {
+            self.max_fps
+        } else {
+            self.max_fps.min(SCREENCAST_MEMFD_MAX_FPS)
+        };
+        let min_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
         match self.last_capture {
             None => true,
             Some(last) => now.saturating_duration_since(last) >= min_interval,
@@ -393,7 +405,7 @@ impl ScreencastManager {
                 y,
                 width,
                 height,
-                max_fps: max_fps.max(1),
+                max_fps: max_fps.max(1).min(SCREENCAST_MAX_FPS),
                 dma_negotiated,
             },
         );
@@ -646,27 +658,22 @@ fn run_pipewire_thread(
     let _core = core;
 
     // DRIVER video sources need periodic trigger_process calls (see PipeWire
-    // video-src-alloc). Also wake the compositor so MemFd/DMA captures keep up.
+    // video-src-alloc). Do NOT wake the compositor from this timer — that caused
+    // a present/capture busy-loop and hard freezes at high resolutions.
     let streams_for_timer = Rc::clone(&streams);
-    let on_wake_timer = Arc::clone(&on_wake);
     let timer = mainloop.loop_().add_timer(move |_| {
-        let mut any = false;
         for slot in streams_for_timer.borrow().values() {
             if slot.inner.borrow().started {
-                any = true;
                 if let Err(err) = slot.stream.trigger_process() {
                     debug!("drive timer trigger_process failed: {err}");
                 }
             }
         }
-        if any {
-            on_wake_timer(ScreencastWake::BlitNeeded);
-        }
     });
     if let Err(err) = timer
         .update_timer(
-            Some(Duration::from_millis(1)),
-            Some(Duration::from_millis(16)),
+            Some(Duration::from_millis(33)),
+            Some(Duration::from_millis(33)),
         )
         .into_result()
     {
