@@ -220,5 +220,11 @@ pub enum MainMessage {
         consume_click: bool,
         /// Withhold matching axis events from Wayland clients.
         consume_scroll: bool,
+        /// Required modifiers for move listener (subset match; empty = always).
+        mods_move: Mods,
+        /// Required modifiers for click listener (subset match; empty = always).
+        mods_click: Mods,
+        /// Required modifiers for scroll listener (subset match; empty = always).
+        mods_scroll: Mods,
     },
 }

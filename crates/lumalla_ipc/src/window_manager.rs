@@ -3,7 +3,7 @@
 use zbus::{interface, object_server::SignalEmitter};
 
 use crate::types::{
-    DrmDeviceInfo, KeyBindingInfo, OutputConfigInfo, OutputInfo, ViewInfo, WindowInfo,
+    DrmDeviceInfo, KeyBindingInfo, ModsInfo, OutputConfigInfo, OutputInfo, ViewInfo, WindowInfo,
     WindowRuleInfo, XkbInfo, ZoneInfo,
 };
 
@@ -140,9 +140,9 @@ pub trait WindowManagerHandler: Send + Sync {
     /// [`signals::CURSOR_MOVED`] / [`signals::CURSOR_CLICKED`] /
     /// [`signals::CURSOR_SCROLLED`].
     ///
-    /// When a `consume_*` flag is true, matching pointer events are delivered to
-    /// the config listener but not forwarded to Wayland clients (same idea as
-    /// [`Self::map_key`] `consume`).
+    /// When a `consume_*` flag is true **and** the listener's `mods_*` match the
+    /// currently pressed modifiers, matching pointer events are delivered to the
+    /// config listener but not forwarded to Wayland clients.
     fn set_cursor_listening(
         &mut self,
         listen_move: bool,
@@ -151,6 +151,9 @@ pub trait WindowManagerHandler: Send + Sync {
         consume_move: bool,
         consume_click: bool,
         consume_scroll: bool,
+        mods_move: ModsInfo,
+        mods_click: ModsInfo,
+        mods_scroll: ModsInfo,
     ) -> zbus::fdo::Result<()>;
 
     /// Capture a compositor region to a PNG file at `path`.
@@ -389,6 +392,9 @@ impl WindowManager {
         consume_move: bool,
         consume_click: bool,
         consume_scroll: bool,
+        mods_move: ModsInfo,
+        mods_click: ModsInfo,
+        mods_scroll: ModsInfo,
     ) -> zbus::fdo::Result<()> {
         self.handler.set_cursor_listening(
             listen_move,
@@ -397,6 +403,9 @@ impl WindowManager {
             consume_move,
             consume_click,
             consume_scroll,
+            mods_move,
+            mods_click,
+            mods_scroll,
         )
     }
 

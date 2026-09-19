@@ -20,7 +20,9 @@ use lumalla_display::{
     ClientId, ConnectedClients, DisplayState, KeyboardModifiers, OutputInfo, PointerCursor,
     PresentationFlipInfo, ReadResult, SurfaceUpdate, Wayland, create_wayland_display,
 };
-use lumalla_input::{BTN_LEFT, InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent};
+use lumalla_input::{
+    BTN_LEFT, InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent, mods_is_subset,
+};
 use lumalla_renderer::{
     CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RendererState, SurfaceFrame,
     is_present_wake_token,
@@ -32,7 +34,7 @@ use lumalla_screencast::{
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
-    OpKind, encode_user_data, message_loop_with_channel, ring::MESSAGE_CHANNEL_TOKEN,
+    Mods, OpKind, encode_user_data, message_loop_with_channel, ring::MESSAGE_CHANNEL_TOKEN,
 };
 
 use crate::args::Args;
@@ -97,6 +99,12 @@ struct AppData {
     consume_cursor_click: bool,
     /// Withhold pointer axis from Wayland clients while listening.
     consume_cursor_scroll: bool,
+    /// Required mods for move listener (empty = always active while listening).
+    cursor_move_mods: Mods,
+    /// Required mods for click listener (empty = always active while listening).
+    cursor_click_mods: Mods,
+    /// Required mods for scroll listener (empty = always active while listening).
+    cursor_scroll_mods: Mods,
     /// Accumulated relative pointer delta for the current input batch.
     pending_cursor_dx: f64,
     /// Accumulated relative pointer delta for the current input batch.
@@ -149,6 +157,9 @@ impl AppData {
             consume_cursor_move: false,
             consume_cursor_click: false,
             consume_cursor_scroll: false,
+            cursor_move_mods: Mods::default(),
+            cursor_click_mods: Mods::default(),
+            cursor_scroll_mods: Mods::default(),
             pending_cursor_dx: 0.0,
             pending_cursor_dy: 0.0,
         }
@@ -765,18 +776,22 @@ impl AppData {
                     self.emit_outputs_changed();
                 }
                 MainMessage::AddView { output, view } => {
-                    if let Err(err) =
-                        self.display_state
-                            .add_view(&output, view.clone(), &mut self.clients)
+                    match self
+                        .display_state
+                        .add_view(&output, view.clone(), &mut self.clients)
                     {
-                        error!("Unable to add view {output}/{}: {err:#}", view.name);
-                    } else {
-                        self.renderer_state
-                            .set_output_views(&output, self.views_for_output(&output));
-                        self.display_state
-                            .refresh_pointer_focus(&mut self.clients, arena);
-                        self.request_present_immediate(event_loop, arena);
-                        self.emit_outputs_changed();
+                        Ok(true) => {
+                            self.renderer_state
+                                .set_output_views(&output, self.views_for_output(&output));
+                            self.display_state
+                                .refresh_pointer_focus(&mut self.clients, arena);
+                            self.request_present_immediate(event_loop, arena);
+                            self.emit_outputs_changed();
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            error!("Unable to add view {output}/{}: {err:#}", view.name);
+                        }
                     }
                 }
                 MainMessage::RemoveView { output, view } => {
@@ -1140,6 +1155,9 @@ impl AppData {
                     consume_move,
                     consume_click,
                     consume_scroll,
+                    mods_move,
+                    mods_click,
+                    mods_scroll,
                 } => {
                     self.listen_cursor_move = listen_move;
                     self.listen_cursor_click = listen_click;
@@ -1147,6 +1165,9 @@ impl AppData {
                     self.consume_cursor_move = consume_move;
                     self.consume_cursor_click = consume_click;
                     self.consume_cursor_scroll = consume_scroll;
+                    self.cursor_move_mods = mods_move;
+                    self.cursor_click_mods = mods_click;
+                    self.cursor_scroll_mods = mods_scroll;
                 }
             }
         }
@@ -1239,11 +1260,15 @@ impl AppData {
                 dy_unaccel,
             }) => {
                 pointer_changed = true;
-                if self.listen_cursor_move {
+                let active = self.cursor_listener_active(
+                    self.listen_cursor_move,
+                    self.cursor_move_mods,
+                );
+                if active {
                     self.pending_cursor_dx += dx;
                     self.pending_cursor_dy += dy;
                 }
-                if self.listen_cursor_move && self.consume_cursor_move {
+                if active && self.consume_cursor_move {
                     self.display_state.nudge_pointer(dx, dy);
                 } else {
                     self.display_state.handle_pointer_motion(
@@ -1259,8 +1284,12 @@ impl AppData {
             }
             SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {
                 pointer_changed = true;
-                let origin = self.listen_cursor_move.then(|| self.display_state.pointer_position());
-                if self.listen_cursor_move && self.consume_cursor_move {
+                let active = self.cursor_listener_active(
+                    self.listen_cursor_move,
+                    self.cursor_move_mods,
+                );
+                let origin = active.then(|| self.display_state.pointer_position());
+                if active && self.consume_cursor_move {
                     self.display_state.set_pointer_position(x, y);
                 } else {
                     self.display_state.handle_pointer_absolute(
@@ -1282,7 +1311,11 @@ impl AppData {
                 button,
                 pressed,
             }) => {
-                if !(self.listen_cursor_click && self.consume_cursor_click) {
+                let active = self.cursor_listener_active(
+                    self.listen_cursor_click,
+                    self.cursor_click_mods,
+                );
+                if !(active && self.consume_cursor_click) {
                     self.display_state.handle_pointer_button(
                         &mut self.clients,
                         time_msec,
@@ -1291,7 +1324,7 @@ impl AppData {
                         arena,
                     );
                 }
-                if self.listen_cursor_click {
+                if active {
                     let (x, y) = self.display_state.pointer_position();
                     let lua_button = if button == BTN_LEFT { 0 } else { button };
                     self.comms.dbus(DbusMessage::EmitCursorClicked {
@@ -1307,7 +1340,11 @@ impl AppData {
                 axis,
                 value,
             }) => {
-                if !(self.listen_cursor_scroll && self.consume_cursor_scroll) {
+                let active = self.cursor_listener_active(
+                    self.listen_cursor_scroll,
+                    self.cursor_scroll_mods,
+                );
+                if !(active && self.consume_cursor_scroll) {
                     self.display_state.handle_pointer_axis(
                         &mut self.clients,
                         time_msec,
@@ -1316,7 +1353,7 @@ impl AppData {
                         arena,
                     );
                 }
-                if self.listen_cursor_scroll {
+                if active {
                     let (x, y) = self.display_state.pointer_position();
                     self.comms.dbus(DbusMessage::EmitCursorScrolled {
                         x,
@@ -1372,10 +1409,12 @@ impl AppData {
         pointer_changed
     }
 
+    fn cursor_listener_active(&self, listening: bool, required: Mods) -> bool {
+        listening && mods_is_subset(required, self.input_state.pressed_mods())
+    }
+
     fn maybe_emit_cursor_moved(&mut self) {
-        if !self.listen_cursor_move {
-            self.pending_cursor_dx = 0.0;
-            self.pending_cursor_dy = 0.0;
+        if self.pending_cursor_dx == 0.0 && self.pending_cursor_dy == 0.0 {
             return;
         }
         let (x, y) = self.display_state.pointer_position();

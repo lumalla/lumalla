@@ -146,10 +146,28 @@ local function push_main_view()
 		},
 		dest = { x = 0, y = 0, width = output.width, height = output.height },
 	})
-	-- Keep active_views in sync when view-move mode collapses to a single camera.
-	if #active_views ~= 1 or active_views[1] ~= "main" then
-		active_views = { "main" }
+end
+
+--- Collapse multi-view presets to a single main camera without a blank frame.
+local function ensure_single_main_view()
+	local output = primary_output()
+	if not output then
+		return
 	end
+	if not main_view then
+		main_view = { x = 0, y = 0, w = output.width, h = output.height }
+	end
+	if #active_views == 1 and active_views[1] == "main" then
+		return
+	end
+	-- Keep main on-screen first, then drop extras (never go through zero views).
+	push_main_view()
+	for _, name in ipairs(active_views) do
+		if name ~= "main" then
+			pcall(lum.remove_view, output.name, name)
+		end
+	end
+	active_views = { "main" }
 end
 
 --- View presets: logo+arrows cycle how the output looks into compositor space.
@@ -227,57 +245,8 @@ end
 local BTN_MIDDLE = 0x112
 local view_move_mode = false
 local middle_dragging = false
-local view_move_callbacks = {}
-
-local function enter_view_move_mode()
-	view_move_mode = true
-	local output = primary_output()
-	if not output then
-		return
-	end
-	if not main_view then
-		main_view = { x = 0, y = 0, w = output.width, h = output.height }
-	end
-	-- Collapse multi-view presets to a single pan/zoomable main camera.
-	clear_views(output.name)
-	push_main_view()
-	view_move_callbacks = {
-		lum.on_cursor_click({
-			consume = true,
-			callback = function(_x, _y, button, pressed)
-				if button ~= BTN_MIDDLE then
-					return
-				end
-				middle_dragging = pressed
-			end,
-		}),
-		lum.on_cursor_move({
-			consume = true,
-			callback = function(_x, _y, dx, dy)
-				if middle_dragging then
-					pan_main_view(dx, dy)
-				end
-			end,
-		}),
-		lum.on_cursor_scroll({
-			consume = true,
-			callback = function(x, y, axis, value)
-				if axis == 0 then
-					zoom_main_view(x, y, value)
-				end
-			end,
-		}),
-	}
-end
-
-local function leave_view_move_mode()
-	view_move_mode = false
-	middle_dragging = false
-	for _, id in ipairs(view_move_callbacks) do
-		lum.off(id)
-	end
-	view_move_callbacks = {}
-end
+--- Super_L / Super_R refcount so releasing one key does not end the mode early.
+local super_held = 0
 
 local function pan_main_view(dx, dy)
 	local output = primary_output()
@@ -324,6 +293,54 @@ local function zoom_main_view(cursor_x, cursor_y, value)
 	main_view.x = focus_x - fx * new_w
 	main_view.y = focus_y - fy * new_h
 	push_main_view()
+end
+
+-- Listen only while logo is held; consume so clients don't see the drag/scroll.
+lum.on_cursor_click({
+	mods = "logo",
+	consume = true,
+	callback = function(_x, _y, button, pressed)
+		if not view_move_mode or button ~= BTN_MIDDLE then
+			return
+		end
+		middle_dragging = pressed
+	end,
+})
+lum.on_cursor_move({
+	mods = "logo",
+	consume = true,
+	callback = function(_x, _y, dx, dy)
+		if view_move_mode and middle_dragging then
+			pan_main_view(dx, dy)
+		end
+	end,
+})
+lum.on_cursor_scroll({
+	mods = "logo",
+	consume = true,
+	callback = function(x, y, axis, value)
+		if view_move_mode and axis == 0 then
+			zoom_main_view(x, y, value)
+		end
+	end,
+})
+
+local function enter_view_move_mode()
+	super_held = super_held + 1
+	if super_held ~= 1 then
+		return
+	end
+	view_move_mode = true
+	ensure_single_main_view()
+end
+
+local function leave_view_move_mode()
+	super_held = math.max(0, super_held - 1)
+	if super_held ~= 0 then
+		return
+	end
+	view_move_mode = false
+	middle_dragging = false
 end
 
 lum.add_zone({

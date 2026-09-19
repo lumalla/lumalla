@@ -123,6 +123,9 @@ pub(crate) fn init_dbus_module(
     let consume_cursor_move = Rc::new(RefCell::new(false));
     let consume_cursor_click = Rc::new(RefCell::new(false));
     let consume_cursor_scroll = Rc::new(RefCell::new(false));
+    let mods_cursor_move = Rc::new(RefCell::new(Mods::default()));
+    let mods_cursor_click = Rc::new(RefCell::new(Mods::default()));
+    let mods_cursor_scroll = Rc::new(RefCell::new(Mods::default()));
 
     let sync_cursor_listening = {
         let move_cb = on_cursor_move.clone();
@@ -131,6 +134,9 @@ pub(crate) fn init_dbus_module(
         let consume_move = consume_cursor_move.clone();
         let consume_click = consume_cursor_click.clone();
         let consume_scroll = consume_cursor_scroll.clone();
+        let mods_move = mods_cursor_move.clone();
+        let mods_click = mods_cursor_click.clone();
+        let mods_scroll = mods_cursor_scroll.clone();
         let sync_client = client.clone();
         move || -> LuaResult<()> {
             dbus_result(sync_client.proxy.set_cursor_listening(
@@ -140,6 +146,9 @@ pub(crate) fn init_dbus_module(
                 *consume_move.borrow(),
                 *consume_click.borrow(),
                 *consume_scroll.borrow(),
+                ModsInfo::from(*mods_move.borrow()),
+                ModsInfo::from(*mods_click.borrow()),
+                ModsInfo::from(*mods_scroll.borrow()),
             ))
         }
     };
@@ -147,6 +156,7 @@ pub(crate) fn init_dbus_module(
     let cb_state = callback_state.clone();
     let on_cursor_move_cb = on_cursor_move.clone();
     let consume_move = consume_cursor_move.clone();
+    let mods_move = mods_cursor_move.clone();
     let sync_move = sync_cursor_listening.clone();
     module.set(
         "on_cursor_move",
@@ -157,6 +167,7 @@ pub(crate) fn init_dbus_module(
             let callback = cb_state.register_callback(listener.callback);
             *on_cursor_move_cb.borrow_mut() = Some(callback);
             *consume_move.borrow_mut() = listener.consume;
+            *mods_move.borrow_mut() = listener.mods;
             sync_move()?;
             Ok(callback.callback_id)
         })?,
@@ -165,6 +176,7 @@ pub(crate) fn init_dbus_module(
     let cb_state = callback_state.clone();
     let on_cursor_click_cb = on_cursor_click.clone();
     let consume_click = consume_cursor_click.clone();
+    let mods_click = mods_cursor_click.clone();
     let sync_click = sync_cursor_listening.clone();
     module.set(
         "on_cursor_click",
@@ -175,6 +187,7 @@ pub(crate) fn init_dbus_module(
             let callback = cb_state.register_callback(listener.callback);
             *on_cursor_click_cb.borrow_mut() = Some(callback);
             *consume_click.borrow_mut() = listener.consume;
+            *mods_click.borrow_mut() = listener.mods;
             sync_click()?;
             Ok(callback.callback_id)
         })?,
@@ -183,6 +196,7 @@ pub(crate) fn init_dbus_module(
     let cb_state = callback_state.clone();
     let on_cursor_scroll_cb = on_cursor_scroll.clone();
     let consume_scroll = consume_cursor_scroll.clone();
+    let mods_scroll = mods_cursor_scroll.clone();
     let sync_scroll = sync_cursor_listening.clone();
     module.set(
         "on_cursor_scroll",
@@ -193,6 +207,7 @@ pub(crate) fn init_dbus_module(
             let callback = cb_state.register_callback(listener.callback);
             *on_cursor_scroll_cb.borrow_mut() = Some(callback);
             *consume_scroll.borrow_mut() = listener.consume;
+            *mods_scroll.borrow_mut() = listener.mods;
             sync_scroll()?;
             Ok(callback.callback_id)
         })?,
@@ -210,6 +225,9 @@ pub(crate) fn init_dbus_module(
     let off_consume_move = consume_cursor_move;
     let off_consume_click = consume_cursor_click;
     let off_consume_scroll = consume_cursor_scroll;
+    let off_mods_move = mods_cursor_move;
+    let off_mods_click = mods_cursor_click;
+    let off_mods_scroll = mods_cursor_scroll;
     let off_sync = sync_cursor_listening;
     module.set(
         "off",
@@ -228,14 +246,17 @@ pub(crate) fn init_dbus_module(
             let mut sync_cursor = false;
             if clear_slot(&off_move) {
                 *off_consume_move.borrow_mut() = false;
+                *off_mods_move.borrow_mut() = Mods::default();
                 sync_cursor = true;
             }
             if clear_slot(&off_click) {
                 *off_consume_click.borrow_mut() = false;
+                *off_mods_click.borrow_mut() = Mods::default();
                 sync_cursor = true;
             }
             if clear_slot(&off_scroll) {
                 *off_consume_scroll.borrow_mut() = false;
+                *off_mods_scroll.borrow_mut() = Mods::default();
                 sync_cursor = true;
             }
             let _ = clear_slot(&off_startup);
@@ -980,10 +1001,26 @@ struct ConfigKeymap {
     callback: LuaFunction,
 }
 
-/// Cursor listener: a bare function, or `{ callback = fn, consume = bool }`.
+/// Cursor listener: a bare function, or `{ callback = fn, consume?, mods? }`.
 struct ConfigCursorListener {
     callback: LuaFunction,
     consume: bool,
+    mods: Mods,
+}
+
+fn parse_mods_string(mods: &str) -> Mods {
+    let mut parsed = Mods::default();
+    for mod_key in mods.split('|') {
+        match mod_key {
+            "shift" => parsed.shift = true,
+            "logo" | "super" => parsed.logo = true,
+            "ctrl" => parsed.ctrl = true,
+            "alt" => parsed.alt = true,
+            "" => {}
+            _ => log::warn!("Unhandled mod key: {mod_key}"),
+        }
+    }
+    parsed
 }
 
 impl FromLua for ConfigCursorListener {
@@ -992,6 +1029,7 @@ impl FromLua for ConfigCursorListener {
             LuaValue::Function(callback) => Ok(Self {
                 callback,
                 consume: false,
+                mods: Mods::default(),
             }),
             LuaValue::Table(table) => {
                 let callback: LuaFunction = table.get("callback").map_err(|_| {
@@ -1009,13 +1047,20 @@ impl FromLua for ConfigCursorListener {
                     .flatten()
                     .or_else(|| table.get::<Option<bool>>("suppress").ok().flatten())
                     .unwrap_or(false);
-                Ok(Self { callback, consume })
+                let mods = parse_mods_string(
+                    &table.get::<String>("mods").unwrap_or_default(),
+                );
+                Ok(Self {
+                    callback,
+                    consume,
+                    mods,
+                })
             }
             other => Err(LuaError::FromLuaConversionError {
                 from: other.type_name(),
                 to: String::from("ConfigCursorListener"),
                 message: Some(String::from(
-                    "Expected a function or { callback, consume? } table",
+                    "Expected a function or { callback, consume?, mods? } table",
                 )),
             }),
         }
@@ -1052,17 +1097,7 @@ impl FromLua for ConfigXkb {
 impl FromLua for ConfigKeymap {
     fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
         let table = value.as_table().unwrap();
-        let mut mods = Mods::default();
-        for mod_key in table.get::<String>("mods").unwrap_or_default().split('|') {
-            match mod_key {
-                "shift" => mods.shift = true,
-                "logo" | "super" => mods.logo = true,
-                "ctrl" => mods.ctrl = true,
-                "alt" => mods.alt = true,
-                "" => {}
-                _ => log::warn!("Unhandled mod key: {mod_key}"),
-            }
-        }
+        let mods = parse_mods_string(&table.get::<String>("mods").unwrap_or_default());
         let on = table
             .get::<Option<String>>("on")
             .unwrap_or(None)
@@ -1555,7 +1590,17 @@ pub(crate) fn reload_config_file(
 ) -> anyhow::Result<()> {
     client
         .proxy
-        .set_cursor_listening(false, false, false, false, false, false)
+        .set_cursor_listening(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            ModsInfo::default(),
+            ModsInfo::default(),
+            ModsInfo::default(),
+        )
         .context("Failed to clear cursor listening before config reload")?;
     client
         .proxy

@@ -15,7 +15,7 @@ use std::{
 use log::{error, info, warn};
 use lumalla_input::evdev_keycode_from_name_with_xkb;
 use lumalla_ipc::{
-    INTERFACE_NAME, KeyBindingInfo, OBJECT_PATH, WindowManagerHandler,
+    INTERFACE_NAME, KeyBindingInfo, ModsInfo, OBJECT_PATH, WindowManagerHandler,
     types::{
         DrmDeviceInfo, OutputConfigInfo, OutputInfo, ViewInfo, WindowInfo, WindowRuleInfo, XkbInfo,
         ZoneInfo,
@@ -481,9 +481,13 @@ impl WindowManagerHandler for CompositorHandler {
         consume_move: bool,
         consume_click: bool,
         consume_scroll: bool,
+        mods_move: ModsInfo,
+        mods_click: ModsInfo,
+        mods_scroll: ModsInfo,
     ) -> zbus::fdo::Result<()> {
         info!(
-            "Set cursor listening over D-Bus: move={listen_move}/{consume_move} click={listen_click}/{consume_click} scroll={listen_scroll}/{consume_scroll}"
+            "Set cursor listening over D-Bus: move={listen_move}/{consume_move}/{:?} click={listen_click}/{consume_click}/{:?} scroll={listen_scroll}/{consume_scroll}/{:?}",
+            mods_move, mods_click, mods_scroll
         );
         self.state.comms.main(MainMessage::SetCursorListening {
             listen_move,
@@ -492,6 +496,9 @@ impl WindowManagerHandler for CompositorHandler {
             consume_move,
             consume_click,
             consume_scroll,
+            mods_move: Mods::from(mods_move),
+            mods_click: Mods::from(mods_click),
+            mods_scroll: Mods::from(mods_scroll),
         });
         Ok(())
     }

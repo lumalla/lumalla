@@ -202,6 +202,11 @@ impl InputState {
         self.xkb.modifiers()
     }
 
+    /// Current pressed modifiers as tracked for key bindings.
+    pub fn pressed_mods(&self) -> Mods {
+        self.mods
+    }
+
     pub fn enable_seat(&mut self, seat_name: &str) -> anyhow::Result<()> {
         self.libinput.assign_seat(seat_name)?;
         self.libinput.resume()?;
@@ -567,14 +572,14 @@ fn mods_for_binding_match(key: u32, mods: Mods) -> Mods {
     match_mods
 }
 
-/// True when every modifier required by `binding` is present in `pressed`.
+/// True when every modifier required by `required` is present in `pressed`.
 ///
 /// Extra pressed modifiers are allowed (i3/sway-style subset match).
-fn mods_is_subset(binding: Mods, pressed: Mods) -> bool {
-    (!binding.ctrl || pressed.ctrl)
-        && (!binding.alt || pressed.alt)
-        && (!binding.shift || pressed.shift)
-        && (!binding.logo || pressed.logo)
+pub fn mods_is_subset(required: Mods, pressed: Mods) -> bool {
+    (!required.ctrl || pressed.ctrl)
+        && (!required.alt || pressed.alt)
+        && (!required.shift || pressed.shift)
+        && (!required.logo || pressed.logo)
 }
 
 fn mod_count(mods: Mods) -> u32 {

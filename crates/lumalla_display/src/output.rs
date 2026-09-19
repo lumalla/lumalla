@@ -162,7 +162,7 @@ impl OutputManager {
         output_name: &str,
         view: View,
         clients: &mut ConnectedClients,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let global_id = *self
             .by_name
             .get(output_name)
@@ -172,6 +172,9 @@ impl OutputManager {
             .get_mut(&global_id)
             .with_context(|| format!("Unknown output: {output_name}"))?;
         if let Some(existing) = info.views.iter_mut().find(|v| v.name == view.name) {
+            if *existing == view {
+                return Ok(false);
+            }
             *existing = view;
         } else {
             info.views.push(view);
@@ -179,7 +182,7 @@ impl OutputManager {
         info.sync_location_from_views();
         let info = info.clone();
         self.update_output(global_id, info, clients);
-        Ok(())
+        Ok(true)
     }
 
     pub fn remove_view(

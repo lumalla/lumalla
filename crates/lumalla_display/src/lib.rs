@@ -798,7 +798,7 @@ impl DisplayState {
         output_name: &str,
         view: lumalla_shared::View,
         clients: &mut ConnectedClients,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.output_manager
             .add_view(output_name, view, clients)
     }
