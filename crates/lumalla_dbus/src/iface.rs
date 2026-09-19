@@ -408,6 +408,18 @@ impl WindowManagerHandler for CompositorHandler {
         Ok(())
     }
 
+    fn unmap_key(&mut self, binding_id: &str) -> zbus::fdo::Result<()> {
+        self.state
+            .keymaps
+            .lock()
+            .unwrap()
+            .retain(|b| b.binding_id != binding_id);
+        self.state.comms.main(MainMessage::RemoveKeymap {
+            binding_id: binding_id.to_owned(),
+        });
+        Ok(())
+    }
+
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()> {
         self.state.keymaps.lock().unwrap().clear();
         self.state.comms.main(MainMessage::ClearKeymaps);
@@ -466,14 +478,20 @@ impl WindowManagerHandler for CompositorHandler {
         listen_move: bool,
         listen_click: bool,
         listen_scroll: bool,
+        consume_move: bool,
+        consume_click: bool,
+        consume_scroll: bool,
     ) -> zbus::fdo::Result<()> {
         info!(
-            "Set cursor listening over D-Bus: move={listen_move} click={listen_click} scroll={listen_scroll}"
+            "Set cursor listening over D-Bus: move={listen_move}/{consume_move} click={listen_click}/{consume_click} scroll={listen_scroll}/{consume_scroll}"
         );
         self.state.comms.main(MainMessage::SetCursorListening {
             listen_move,
             listen_click,
             listen_scroll,
+            consume_move,
+            consume_click,
+            consume_scroll,
         });
         Ok(())
     }

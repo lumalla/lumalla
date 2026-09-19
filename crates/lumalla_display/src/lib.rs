@@ -314,6 +314,16 @@ impl DisplayState {
         self.seat_manager.pointer_position()
     }
 
+    /// Move the compositor pointer without notifying Wayland clients.
+    pub fn nudge_pointer(&mut self, dx: f64, dy: f64) {
+        self.seat_manager.nudge_pointer(dx, dy);
+    }
+
+    /// Set the compositor pointer without notifying Wayland clients.
+    pub fn set_pointer_position(&mut self, x: f64, y: f64) {
+        self.seat_manager.set_pointer_position(x, y);
+    }
+
     /// Map global compositor coordinates into output-local pointer space.
     pub fn map_scene_to_pointer(&self, x: f64, y: f64) -> (f64, f64) {
         map_source_to_dest(&self.pointer_views(), x, y)

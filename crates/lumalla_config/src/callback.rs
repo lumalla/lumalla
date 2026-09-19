@@ -140,7 +140,9 @@ impl CallbackState {
         self.inner.borrow().callbacks.get(&callback_ref).cloned()
     }
 
-    /// Forgets the given callback
+    /// Forgets the given callback.
+    ///
+    /// Returns `true` if the callback was registered via [`Self::register_keymap_callback`].
     ///
     /// # Example
     /// ```
@@ -155,7 +157,10 @@ impl CallbackState {
     /// let result: anyhow::Result<()> = callback_state.run_callback(callback_ref, ());
     /// assert!(result.is_err());
     /// ```
-    pub fn forget_callback(&self, callback_ref: CallbackRef) {
-        self.inner.borrow_mut().callbacks.remove(&callback_ref);
+    pub fn forget_callback(&self, callback_ref: CallbackRef) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        let was_keymap = inner.keymap_callbacks.remove(&callback_ref);
+        inner.callbacks.remove(&callback_ref);
+        was_keymap
     }
 }

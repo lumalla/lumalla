@@ -72,12 +72,13 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 
 | Function | Description |
 | --- | --- |
-| `on_startup(callback)` | Called once when the compositor is ready. `callback()` takes no args. |
-| `on_connector_change(callback)` | Called when outputs change. `callback(outputs)` receives the same tables as `get_outputs`. |
-| `on_drm_devices_change(callback)` | Called when DRM devices change. `callback(devices)` matches `get_drm_devices`. |
-| `on_cursor_move(callback)` | Called when the pointer moves. `callback(x, y, dx, dy)` receives **monitor/output-local** absolute coordinates and the relative delta for that input batch. Emission is opt-in and coalesced per input batch. |
-| `on_cursor_click(callback)` | Called on pointer button press/release. `callback(x, y, button, pressed)` — coordinates are monitor/output-local; `button` is `0` for left (same as `click`), otherwise a Linux `BTN_*` code; `pressed` is `true` on press. |
-| `on_cursor_scroll(callback)` | Called on pointer scroll. `callback(x, y, axis, value)` — coordinates are monitor/output-local; `axis` is `0` vertical / `1` horizontal; `value` is the libinput scroll delta. |
+| `on_startup(callback)` | Called once when the compositor is ready. `callback()` takes no args. Returns a callback id. |
+| `on_connector_change(callback)` | Called when outputs change. `callback(outputs)` receives the same tables as `get_outputs`. Returns a callback id. |
+| `on_drm_devices_change(callback)` | Called when DRM devices change. `callback(devices)` matches `get_drm_devices`. Returns a callback id. |
+| `on_cursor_move(callback \| {callback, consume?})` | Called when the pointer moves. `callback(x, y, dx, dy)` receives **monitor/output-local** absolute coordinates and the relative delta for that input batch. Emission is opt-in and coalesced per input batch. `consume` (default `false`) withholds the event from Wayland clients. Returns a callback id. |
+| `on_cursor_click(callback \| {callback, consume?})` | Called on pointer button press/release. `callback(x, y, button, pressed)` — coordinates are monitor/output-local; `button` is `0` for left (same as `click`), otherwise a Linux `BTN_*` code; `pressed` is `true` on press. `consume` defaults to `false`. Returns a callback id. |
+| `on_cursor_scroll(callback \| {callback, consume?})` | Called on pointer scroll. `callback(x, y, axis, value)` — coordinates are monitor/output-local; `axis` is `0` vertical / `1` horizontal; `value` is the libinput scroll delta. `consume` defaults to `false`. Returns a callback id. |
+| `off(callback_id)` | Stop any callback previously returned by `map_key`, `on_startup`, `on_cursor_*`, etc. |
 
 ### Session
 
@@ -93,7 +94,7 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 | Function | Description |
 | --- | --- |
 | `set_xkb({rules?, model?, layout?, variant?, options?})` | Set XKB RMLVO. Call before `map_key` so key names resolve against the active layout. |
-| `map_key({key, mods?, on?, consume?/suppress?, callback})` | Bind a key. `mods` is a pipe-separated string: `"shift"`, `"ctrl"`, `"alt"`, `"logo"` / `"super"`. `on` is `"down"`/`"press"` (default) or `"up"`/`"release"`. `consume` / `suppress` default to `true`. |
+| `map_key({key, mods?, on?, consume?/suppress?, callback})` | Bind a key. `mods` is a pipe-separated string: `"shift"`, `"ctrl"`, `"alt"`, `"logo"` / `"super"`. `on` is `"down"`/`"press"` (default) or `"up"`/`"release"`. `consume` / `suppress` default to `true`. Returns a callback id for `off`. |
 
 ### Outputs and views
 

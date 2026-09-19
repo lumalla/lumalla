@@ -91,6 +91,12 @@ struct AppData {
     listen_cursor_click: bool,
     /// Emit CursorScrolled to config when true.
     listen_cursor_scroll: bool,
+    /// Withhold pointer motion from Wayland clients while listening.
+    consume_cursor_move: bool,
+    /// Withhold pointer buttons from Wayland clients while listening.
+    consume_cursor_click: bool,
+    /// Withhold pointer axis from Wayland clients while listening.
+    consume_cursor_scroll: bool,
     /// Accumulated relative pointer delta for the current input batch.
     pending_cursor_dx: f64,
     /// Accumulated relative pointer delta for the current input batch.
@@ -140,6 +146,9 @@ impl AppData {
             listen_cursor_move: false,
             listen_cursor_click: false,
             listen_cursor_scroll: false,
+            consume_cursor_move: false,
+            consume_cursor_click: false,
+            consume_cursor_scroll: false,
             pending_cursor_dx: 0.0,
             pending_cursor_dy: 0.0,
         }
@@ -664,6 +673,9 @@ impl AppData {
                 MainMessage::ClearKeymaps => {
                     self.input_state.clear_keymaps();
                 }
+                MainMessage::RemoveKeymap { binding_id } => {
+                    self.input_state.remove_keymap(&binding_id);
+                }
                 MainMessage::SetXkb(config) => {
                     if let Err(err) = self.input_state.set_xkb(config) {
                         error!("Unable to set XKB keymap: {err:#}");
@@ -1125,10 +1137,16 @@ impl AppData {
                     listen_move,
                     listen_click,
                     listen_scroll,
+                    consume_move,
+                    consume_click,
+                    consume_scroll,
                 } => {
                     self.listen_cursor_move = listen_move;
                     self.listen_cursor_click = listen_click;
                     self.listen_cursor_scroll = listen_scroll;
+                    self.consume_cursor_move = consume_move;
+                    self.consume_cursor_click = consume_click;
+                    self.consume_cursor_scroll = consume_scroll;
                 }
             }
         }
@@ -1225,26 +1243,34 @@ impl AppData {
                     self.pending_cursor_dx += dx;
                     self.pending_cursor_dy += dy;
                 }
-                self.display_state.handle_pointer_motion(
-                    &mut self.clients,
-                    time_msec,
-                    dx,
-                    dy,
-                    dx_unaccel,
-                    dy_unaccel,
-                    arena,
-                );
+                if self.listen_cursor_move && self.consume_cursor_move {
+                    self.display_state.nudge_pointer(dx, dy);
+                } else {
+                    self.display_state.handle_pointer_motion(
+                        &mut self.clients,
+                        time_msec,
+                        dx,
+                        dy,
+                        dx_unaccel,
+                        dy_unaccel,
+                        arena,
+                    );
+                }
             }
             SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {
                 pointer_changed = true;
                 let origin = self.listen_cursor_move.then(|| self.display_state.pointer_position());
-                self.display_state.handle_pointer_absolute(
-                    &mut self.clients,
-                    time_msec,
-                    x,
-                    y,
-                    arena,
-                );
+                if self.listen_cursor_move && self.consume_cursor_move {
+                    self.display_state.set_pointer_position(x, y);
+                } else {
+                    self.display_state.handle_pointer_absolute(
+                        &mut self.clients,
+                        time_msec,
+                        x,
+                        y,
+                        arena,
+                    );
+                }
                 if let Some((ox, oy)) = origin {
                     let (nx, ny) = self.display_state.pointer_position();
                     self.pending_cursor_dx += nx - ox;
@@ -1256,13 +1282,15 @@ impl AppData {
                 button,
                 pressed,
             }) => {
-                self.display_state.handle_pointer_button(
-                    &mut self.clients,
-                    time_msec,
-                    button,
-                    pressed,
-                    arena,
-                );
+                if !(self.listen_cursor_click && self.consume_cursor_click) {
+                    self.display_state.handle_pointer_button(
+                        &mut self.clients,
+                        time_msec,
+                        button,
+                        pressed,
+                        arena,
+                    );
+                }
                 if self.listen_cursor_click {
                     let (x, y) = self.display_state.pointer_position();
                     let lua_button = if button == BTN_LEFT { 0 } else { button };
@@ -1279,13 +1307,15 @@ impl AppData {
                 axis,
                 value,
             }) => {
-                self.display_state.handle_pointer_axis(
-                    &mut self.clients,
-                    time_msec,
-                    axis,
-                    value,
-                    arena,
-                );
+                if !(self.listen_cursor_scroll && self.consume_cursor_scroll) {
+                    self.display_state.handle_pointer_axis(
+                        &mut self.clients,
+                        time_msec,
+                        axis,
+                        value,
+                        arena,
+                    );
+                }
                 if self.listen_cursor_scroll {
                     let (x, y) = self.display_state.pointer_position();
                     self.comms.dbus(DbusMessage::EmitCursorScrolled {

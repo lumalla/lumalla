@@ -345,6 +345,13 @@ impl SeatManager {
         self.clamp_pointer();
     }
 
+    /// Relative move without notifying Wayland clients.
+    pub fn nudge_pointer(&mut self, dx: f64, dy: f64) {
+        self.pointer_x += dx;
+        self.pointer_y += dy;
+        self.clamp_pointer();
+    }
+
     /// Focused pointer for a specific pointer object, if any.
     pub fn pointer_focus(
         &self,

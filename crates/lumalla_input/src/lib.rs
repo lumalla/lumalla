@@ -242,6 +242,11 @@ impl InputState {
         self.keymaps.clear();
     }
 
+    /// Remove all bindings with the given id (normally at most one).
+    pub fn remove_keymap(&mut self, binding_id: &str) {
+        self.keymaps.retain(|b| b.binding_id != binding_id);
+    }
+
     pub fn as_raw_fd(&self) -> RawFd {
         self.libinput.as_raw_fd()
     }

@@ -227,6 +227,7 @@ end
 local BTN_MIDDLE = 0x112
 local view_move_mode = false
 local middle_dragging = false
+local view_move_callbacks = {}
 
 local function enter_view_move_mode()
 	view_move_mode = true
@@ -240,11 +241,42 @@ local function enter_view_move_mode()
 	-- Collapse multi-view presets to a single pan/zoomable main camera.
 	clear_views(output.name)
 	push_main_view()
+	view_move_callbacks = {
+		lum.on_cursor_click({
+			consume = true,
+			callback = function(_x, _y, button, pressed)
+				if button ~= BTN_MIDDLE then
+					return
+				end
+				middle_dragging = pressed
+			end,
+		}),
+		lum.on_cursor_move({
+			consume = true,
+			callback = function(_x, _y, dx, dy)
+				if middle_dragging then
+					pan_main_view(dx, dy)
+				end
+			end,
+		}),
+		lum.on_cursor_scroll({
+			consume = true,
+			callback = function(x, y, axis, value)
+				if axis == 0 then
+					zoom_main_view(x, y, value)
+				end
+			end,
+		}),
+	}
 end
 
 local function leave_view_move_mode()
 	view_move_mode = false
 	middle_dragging = false
+	for _, id in ipairs(view_move_callbacks) do
+		lum.off(id)
+	end
+	view_move_callbacks = {}
 end
 
 local function pan_main_view(dx, dy)
@@ -324,26 +356,6 @@ for _, key in ipairs({ "Super_L", "Super_R" }) do
 		callback = leave_view_move_mode,
 	})
 end
-
-lum.on_cursor_click(function(_x, _y, button, pressed)
-	if not view_move_mode or button ~= BTN_MIDDLE then
-		return
-	end
-	middle_dragging = pressed
-end)
-
-lum.on_cursor_move(function(_x, _y, dx, dy)
-	if view_move_mode and middle_dragging then
-		pan_main_view(dx, dy)
-	end
-end)
-
-lum.on_cursor_scroll(function(x, y, axis, value)
-	-- Vertical scroll only; zoom toward the cursor.
-	if view_move_mode and axis == 0 then
-		zoom_main_view(x, y, value)
-	end
-end)
 
 lum.on_startup(function()
 	local output = enable_outputs()

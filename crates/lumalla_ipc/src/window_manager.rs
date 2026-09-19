@@ -113,6 +113,9 @@ pub trait WindowManagerHandler: Send + Sync {
     /// Register a key binding.
     fn map_key(&mut self, binding: KeyBindingInfo) -> zbus::fdo::Result<()>;
 
+    /// Remove a key binding previously registered with [`Self::map_key`].
+    fn unmap_key(&mut self, binding_id: &str) -> zbus::fdo::Result<()>;
+
     /// Clear all key bindings.
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()>;
 
@@ -136,11 +139,18 @@ pub trait WindowManagerHandler: Send + Sync {
     /// When disabled (default), the compositor does not emit
     /// [`signals::CURSOR_MOVED`] / [`signals::CURSOR_CLICKED`] /
     /// [`signals::CURSOR_SCROLLED`].
+    ///
+    /// When a `consume_*` flag is true, matching pointer events are delivered to
+    /// the config listener but not forwarded to Wayland clients (same idea as
+    /// [`Self::map_key`] `consume`).
     fn set_cursor_listening(
         &mut self,
         listen_move: bool,
         listen_click: bool,
         listen_scroll: bool,
+        consume_move: bool,
+        consume_click: bool,
+        consume_scroll: bool,
     ) -> zbus::fdo::Result<()>;
 
     /// Capture a compositor region to a PNG file at `path`.
@@ -343,6 +353,10 @@ impl WindowManager {
         self.handler.map_key(binding)
     }
 
+    fn unmap_key(&mut self, binding_id: &str) -> zbus::fdo::Result<()> {
+        self.handler.unmap_key(binding_id)
+    }
+
     fn clear_keymaps(&mut self) -> zbus::fdo::Result<()> {
         self.handler.clear_keymaps()
     }
@@ -372,9 +386,18 @@ impl WindowManager {
         listen_move: bool,
         listen_click: bool,
         listen_scroll: bool,
+        consume_move: bool,
+        consume_click: bool,
+        consume_scroll: bool,
     ) -> zbus::fdo::Result<()> {
-        self.handler
-            .set_cursor_listening(listen_move, listen_click, listen_scroll)
+        self.handler.set_cursor_listening(
+            listen_move,
+            listen_click,
+            listen_scroll,
+            consume_move,
+            consume_click,
+            consume_scroll,
+        )
     }
 
     fn capture_screenshot(

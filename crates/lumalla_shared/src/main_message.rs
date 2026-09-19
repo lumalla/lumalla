@@ -64,6 +64,11 @@ pub enum MainMessage {
     },
     /// Clears all compositor key bindings.
     ClearKeymaps,
+    /// Remove a single key binding by the id returned from config `map_key`.
+    RemoveKeymap {
+        /// Binding id previously passed to [`Self::AddKeymap`].
+        binding_id: String,
+    },
     /// Replace the XKB keymap from RMLVO names.
     SetXkb(XkbConfig),
     /// Select the Vulkan render device by DRM primary path (`None` = auto).
@@ -209,5 +214,11 @@ pub enum MainMessage {
         listen_click: bool,
         /// Emit [`crate::DbusMessage::EmitCursorScrolled`] on pointer axis.
         listen_scroll: bool,
+        /// Withhold matching motion events from Wayland clients.
+        consume_move: bool,
+        /// Withhold matching button events from Wayland clients.
+        consume_click: bool,
+        /// Withhold matching axis events from Wayland clients.
+        consume_scroll: bool,
     },
 }
