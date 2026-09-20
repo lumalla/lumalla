@@ -19,4 +19,6 @@ pub struct WindowState {
     pub focused: bool,
     /// Zone name this window belongs to, if any.
     pub zone: Option<String>,
+    /// Paint-stack index (higher = closer to top / more recently raised).
+    pub stack: u32,
 }

@@ -1157,6 +1157,11 @@ impl AppData {
                     }
                     Err(err) => error!("Unable to raise window: {err}"),
                 },
+                MainMessage::CloseWindow { id } => {
+                    if let Err(err) = self.display_state.close_window(id, &mut self.clients) {
+                        error!("Unable to close window: {err}");
+                    }
+                }
                 MainMessage::AddWindowRule(rule) => {
                     self.display_state.add_window_rule(rule);
                 }

@@ -847,6 +847,15 @@ fn init_dbus_window(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
         })?,
     )?;
 
+    let close_client = client.clone();
+    module.set(
+        "close_window",
+        lua.create_function(move |_, window: ConfigRaiseWindow| {
+            dbus_result(close_client.proxy.close_window(window.id.unwrap_or(0)))?;
+            Ok(())
+        })?,
+    )?;
+
     let get_client = client.clone();
     module.set(
         "get_windows",
@@ -1429,6 +1438,7 @@ struct ConfigWindow {
     height: i32,
     focused: bool,
     zone: Option<String>,
+    stack: u32,
 }
 
 impl From<WindowInfo> for ConfigWindow {
@@ -1447,6 +1457,7 @@ impl From<WindowInfo> for ConfigWindow {
             } else {
                 Some(window.zone)
             },
+            stack: window.stack,
         }
     }
 }
@@ -1463,6 +1474,7 @@ impl IntoLua for ConfigWindow {
         table.set("height", self.height)?;
         table.set("focused", self.focused)?;
         table.set("zone", self.zone)?;
+        table.set("stack", self.stack)?;
         table.into_lua(lua)
     }
 }

@@ -886,6 +886,21 @@ impl DisplayState {
         Ok(())
     }
 
+    /// Ask a client to close a window via `xdg_toplevel.close`.
+    ///
+    /// This is a request only; the client may ignore it or prompt the user.
+    pub fn close_window(
+        &mut self,
+        id: Option<u32>,
+        clients: &mut ConnectedClients,
+    ) -> Result<(), WindowError> {
+        let (client_id, toplevel) = self.window_manager.resolve_toplevel(id)?;
+        if let Some(client) = clients.get_mut(&client_id) {
+            client.writer_mut().xdg_toplevel_close(toplevel);
+        }
+        Ok(())
+    }
+
     pub fn add_window_rule(&mut self, rule: WindowRule) {
         self.window_manager.add_rule(rule);
     }

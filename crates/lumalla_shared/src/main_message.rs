@@ -216,6 +216,12 @@ pub enum MainMessage {
         /// Window id, or `None` for the focused window.
         id: Option<u32>,
     },
+    /// Ask a client to close a window (`xdg_toplevel.close`).
+    /// `id == None` targets the focused window.
+    CloseWindow {
+        /// Window id, or `None` for the focused window.
+        id: Option<u32>,
+    },
     /// Enable or disable emitting cursor move / click / scroll signals to config.
     SetCursorListening {
         /// Emit [`crate::DbusMessage::EmitCursorMoved`] after pointer motion.

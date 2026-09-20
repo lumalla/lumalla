@@ -505,6 +505,16 @@ impl WindowManager {
         (pos, pos)
     }
 
+    /// Resolve a window id to its xdg_toplevel. `None` / `0` → focused window.
+    pub fn resolve_toplevel(&self, id: Option<u32>) -> Result<(ClientId, ObjectId), WindowError> {
+        let target = self.resolve_window_id(id)?;
+        let window = self
+            .windows
+            .get(&target)
+            .ok_or(WindowError::UnknownWindow(target))?;
+        Ok((window.client_id, window.toplevel))
+    }
+
     fn snapshot_window(
         &self,
         window: &ManagedWindow,
@@ -527,6 +537,7 @@ impl WindowManager {
             height,
             focused: self.focused_id == Some(window.id),
             zone: window.zone.clone(),
+            stack: surface_manager.paint_order_index(window.client_id, window.wl_surface),
         }
     }
 }

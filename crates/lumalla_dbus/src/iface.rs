@@ -332,6 +332,13 @@ impl WindowManagerHandler for CompositorHandler {
         Ok(())
     }
 
+    fn close_window(&mut self, id: u32) -> zbus::fdo::Result<()> {
+        self.state.comms.main(MainMessage::CloseWindow {
+            id: if id == 0 { None } else { Some(id) },
+        });
+        Ok(())
+    }
+
     fn spawn(&mut self, command: &str, args: Vec<String>) -> zbus::fdo::Result<()> {
         spawn_process(
             command,

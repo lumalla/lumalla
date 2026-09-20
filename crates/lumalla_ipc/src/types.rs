@@ -585,6 +585,8 @@ pub struct WindowInfo {
     pub focused: bool,
     /// Zone name this window belongs to, if any.
     pub zone: String,
+    /// Paint-stack index (higher = closer to top / more recently raised).
+    pub stack: u32,
 }
 
 impl From<&WindowState> for WindowInfo {
@@ -599,6 +601,7 @@ impl From<&WindowState> for WindowInfo {
             height: window.height,
             focused: window.focused,
             zone: window.zone.clone().unwrap_or_default(),
+            stack: window.stack,
         }
     }
 }

@@ -312,6 +312,15 @@ impl SurfaceManager {
             .retain(|entry| *entry != (client_id, surface_id));
     }
 
+    /// Index in paint order (0 = bottom). Missing surfaces report `0`.
+    pub fn paint_order_index(&self, client_id: ClientId, surface_id: ObjectId) -> u32 {
+        self.paint_order
+            .iter()
+            .position(|entry| *entry == (client_id, surface_id))
+            .map(|index| index as u32)
+            .unwrap_or(0)
+    }
+
     /// Geometry hit-test for a client: top-most mapped surface containing (x, y).
     pub fn pointer_target(&self, client_id: ClientId, x: f64, y: f64) -> Option<ObjectId> {
         self.hit_test(Some(client_id), x, y)

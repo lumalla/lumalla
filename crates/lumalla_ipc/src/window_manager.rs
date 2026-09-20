@@ -93,6 +93,10 @@ pub trait WindowManagerHandler: Send + Sync {
     /// Pass `id = 0` to target the focused window.
     fn raise_window(&mut self, id: u32) -> zbus::fdo::Result<()>;
 
+    /// Ask a client to close a window (`xdg_toplevel.close`).
+    /// Pass `id = 0` to target the focused window.
+    fn close_window(&mut self, id: u32) -> zbus::fdo::Result<()>;
+
     /// Spawn a child process.
     fn spawn(&mut self, command: &str, args: Vec<String>) -> zbus::fdo::Result<()>;
 
@@ -345,6 +349,10 @@ impl WindowManager {
 
     fn raise_window(&mut self, id: u32) -> zbus::fdo::Result<()> {
         self.handler.raise_window(id)
+    }
+
+    fn close_window(&mut self, id: u32) -> zbus::fdo::Result<()> {
+        self.handler.close_window(id)
     }
 
     fn spawn(&mut self, command: &str, args: Vec<String>) -> zbus::fdo::Result<()> {

@@ -125,11 +125,12 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 
 | Function | Description |
 | --- | --- |
-| `get_windows()` | Return `{id, app_id, title, x, y, width, height, focused, zone?}` for each window. `zone` is the zone name when assigned, otherwise `nil`. |
+| `get_windows()` | Return `{id, app_id, title, x, y, width, height, focused, zone?, stack}` for each window. `zone` is the zone name when assigned, otherwise `nil`. `stack` is paint order (higher = closer to top). |
 | `get_focused_window()` | Focused window id, or `nil`. |
 | `set_window({id?, x?, y?, width?, height?})` | Set geometry. Omitted fields stay unchanged; omit `id` (or pass `0`) for the focused window. |
 | `focus_window({id?, raise?})` | Focus a window (`raise` defaults to `false`). |
 | `raise_window({id?})` | Raise without changing focus. |
+| `close_window({id?})` | Ask the client to close via `xdg_toplevel.close` (client may ignore / prompt). Omit `id` for the focused window. |
 | `add_zone({name, x?, y?, default?, composition?, default_width?, default_height?})` | Add or replace a zone. `composition` defaults to `"free"`; size defaults to 800×600. |
 | `remove_zone(name)` | Remove a zone. |
 | `add_guide({name, kind?, layer?, ...})` | Add or replace a guide (helper line/box). See below. |
