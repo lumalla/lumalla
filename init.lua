@@ -355,9 +355,12 @@ lum.add_zone({
 
 --- Demo guides: layout boxes under windows, snap lines above. logo+g toggles.
 local guides_visible = true
+local demo_guide_names = { "term", "calc", "left-margin", "midline" }
 
 local function apply_demo_guides(w, h)
-	lum.clear_guides()
+	for _, name in ipairs(demo_guide_names) do
+		pcall(lum.remove_guide, name)
+	end
 	if not guides_visible then
 		return
 	end
@@ -419,6 +422,22 @@ local function apply_demo_guides(w, h)
 		color = { r = 180, g = 255, b = 120, a = 160 },
 		stroke = 1,
 		label = "mid",
+	})
+end
+
+--- Scene-space helper box labeled with the view name (source camera rect).
+local function add_view_helper(name, source)
+	lum.add_guide({
+		name = "view-" .. name,
+		kind = "box",
+		layer = "above",
+		x = source.x,
+		y = source.y,
+		width = source.width,
+		height = source.height,
+		color = { r = 220, g = 180, b = 255, a = 220 },
+		stroke = 2,
+		label = name,
 	})
 end
 
@@ -556,14 +575,15 @@ lum.map_key({
 				end
 				local w, h = output.width, output.height
 				local pip_w, pip_h = math.floor(w * 0.28), math.floor(h * 0.28)
+				local source = {
+					x = w - math.floor(w * 0.35),
+					y = 0,
+					width = math.floor(w * 0.35),
+					height = math.floor(h * 0.45),
+				}
 				lum.add_view(output.name, {
 					name = name,
-					source = {
-						x = w - math.floor(w * 0.35),
-						y = 0,
-						width = math.floor(w * 0.35),
-						height = math.floor(h * 0.45),
-					},
+					source = source,
 					dest = {
 						x = w - pip_w - 24,
 						y = h - pip_h - 24,
@@ -571,6 +591,7 @@ lum.map_key({
 						height = pip_h,
 					},
 				})
+				add_view_helper(name, source)
 				table.insert(active_views, name)
 			end,
 		})
