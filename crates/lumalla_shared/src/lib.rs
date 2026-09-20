@@ -24,7 +24,7 @@ pub use dbus_message::DbusMessage;
 pub use drm::{DrmConnector, DrmDeviceState, DrmMode, OutputConfig};
 pub use guide::{ColorRgba, Guide, GuideKind, GuideLayer};
 pub use keymap_memfd::KeymapMemfd;
-pub use main_message::{InjectedInput, MainMessage};
+pub use main_message::{InjectedInput, MainMessage, MutterScreenCastTarget};
 pub use mods::Mods;
 pub use output::{
     Output, View, map_dest_to_source, map_source_to_dest, view_at_dest, view_at_source,

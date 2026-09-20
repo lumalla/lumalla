@@ -40,6 +40,21 @@ pub enum InjectedInput {
     },
 }
 
+/// Target for a Mutter ScreenCast stream.
+#[derive(Debug, Clone)]
+pub enum MutterScreenCastTarget {
+    /// Capture a named output / connector.
+    Monitor {
+        /// Output connector name.
+        connector: String,
+    },
+    /// Capture an isolated window surface tree.
+    Window {
+        /// Lumalla window id.
+        window_id: u32,
+    },
+}
+
 /// Represents the messages that can be sent to the main thread
 pub enum MainMessage {
     /// Requests the application to shut down
@@ -159,19 +174,32 @@ pub enum MainMessage {
         /// Maximum capture rate (frames per second).
         max_fps: u32,
     },
+    /// Start a PipeWire video stream of an isolated window surface tree.
+    ///
+    /// `window_id == 0` targets the focused window.
+    StartPipewireWindowStream {
+        /// Correlates the reply on the D-Bus thread.
+        request_id: usize,
+        /// Window id (`0` = focused).
+        window_id: u32,
+        /// PipeWire node name.
+        name: String,
+        /// Maximum capture rate (frames per second).
+        max_fps: u32,
+    },
     /// Stop a PipeWire video stream previously started via [`Self::StartPipewireStream`].
     StopPipewireStream {
         /// Stream id returned from start.
         stream_id: u32,
     },
-    /// Start a Mutter ScreenCast stream for a named output (portal path).
+    /// Start a Mutter ScreenCast stream (portal path).
     StartMutterScreenCast {
         /// Opaque stream id from the Mutter ScreenCast D-Bus object.
         mutter_stream_id: u64,
         /// Session that owns this stream (for stop grouping).
         session_id: u64,
-        /// Output / connector name to capture.
-        connector: String,
+        /// Capture target.
+        target: MutterScreenCastTarget,
     },
     /// Stop all PipeWire streams belonging to a Mutter ScreenCast session.
     StopMutterScreenCast {

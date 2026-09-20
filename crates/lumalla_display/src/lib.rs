@@ -595,6 +595,24 @@ impl DisplayState {
         self.surface_manager.collect_scene_surfaces(scene);
     }
 
+    /// Capture layers for a managed window: content AABB and surface tree.
+    ///
+    /// Returns `(window_id, origin_x, origin_y, width, height, layers)`. `window_id`
+    /// of `0` / `None` resolves to the focused window.
+    pub fn window_capture_layers(
+        &self,
+        window_id: Option<u32>,
+    ) -> Option<(u32, i32, i32, i32, i32, Vec<SceneSurface>)> {
+        let resolved = self.window_manager.resolve_window_id(window_id).ok()?;
+        let (client_id, root) = self.window_manager.resolve_surface(Some(resolved)).ok()?;
+        let layers = self.surface_manager.collect_surface_tree(client_id, root);
+        let (x, y, width, height) = self.surface_manager.bounds_of_scene_surfaces(&layers)?;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some((resolved, x, y, width, height, layers))
+    }
+
     pub fn pending_frame_callback_count(&self) -> usize {
         self.pending_frame_callbacks.len()
     }

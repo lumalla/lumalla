@@ -29,7 +29,7 @@ use lumalla_ipc::{
 use lumalla_shared::{
     Comms, Completion, DbusMessage, DrmDeviceState, EventLoop, MainMessage, OpKind, Output,
 };
-use mutter::{DisplayConfig, ScreenCast, complete_mutter_stream};
+use mutter::{DisplayConfig, ScreenCast, ShellIntrospect, complete_mutter_stream};
 use zbus::{Error as ZbusError, blocking::connection};
 
 use crate::iface::spawn_process_with_options;
@@ -99,8 +99,12 @@ impl DbusService {
         info!("D-Bus service listening on {BUS_NAME}{OBJECT_PATH}");
 
         let mut claimed_screen_cast = false;
-        let (screen_cast, mutter_streams) =
-            ScreenCast::new(Arc::clone(&outputs), comms, connection.clone());
+        let (screen_cast, mutter_streams) = ScreenCast::new(
+            Arc::clone(&outputs),
+            Arc::clone(&state.windows),
+            comms,
+            connection.clone(),
+        );
         connection
             .object_server()
             .at("/org/gnome/Mutter/ScreenCast", screen_cast)
@@ -126,6 +130,27 @@ impl DbusService {
             Ok(()) => info!("D-Bus service listening on org.gnome.Mutter.DisplayConfig"),
             Err(err) => warn!(
                 "Could not claim org.gnome.Mutter.DisplayConfig (portal monitor list may be empty): {err}"
+            ),
+        }
+
+        connection
+            .object_server()
+            .at(
+                "/org/gnome/Shell/Introspect",
+                ShellIntrospect::new(Arc::clone(&state.windows)),
+            )
+            .context("Failed to register Shell Introspect object")?;
+        match connection.request_name("org.gnome.Shell.Introspect") {
+            Ok(()) => info!("D-Bus service listening on org.gnome.Shell.Introspect"),
+            Err(err) => warn!(
+                "Could not claim org.gnome.Shell.Introspect (portal window picker may be empty): {err}"
+            ),
+        }
+        // Also try org.gnome.Shell so portal clients that look there can find Introspect.
+        match connection.request_name("org.gnome.Shell") {
+            Ok(()) => info!("D-Bus service listening on org.gnome.Shell"),
+            Err(err) => warn!(
+                "Could not claim org.gnome.Shell (portal may use Introspect name only): {err}"
             ),
         }
 

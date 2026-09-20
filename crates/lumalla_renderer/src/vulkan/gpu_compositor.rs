@@ -1160,6 +1160,90 @@ pub fn composite_to_scanout(
     Ok(())
 }
 
+/// Composite scene layers into an arbitrary DMA image (e.g. screencast buffer).
+///
+/// Uses a single view mapping (no guides/cursor). Leaves the image in `GENERAL`.
+pub fn composite_layers_to_image(
+    vulkan: &VulkanContext,
+    batch: &mut GpuWorkBatch,
+    compositor: &GpuCompositor,
+    cache: &SurfaceTextureCache,
+    render_pass: &RenderPass,
+    image: &DmaBufImage,
+    framebuffer: &Framebuffer,
+    image_old_layout: vk::ImageLayout,
+    output_width: u32,
+    output_height: u32,
+    clear_color: [f32; 4],
+    view: &View,
+    layers: &[&SurfaceFrame],
+) -> anyhow::Result<()> {
+    let clear_value = vk::ClearValue {
+        color: vk::ClearColorValue {
+            float32: clear_color,
+        },
+    };
+
+    let device = vulkan.device();
+    let command_pool = vulkan.graphics_command_pool();
+    let command_buffer = command_pool.allocate_command_buffer(device)?;
+
+    let record_result = (|| -> anyhow::Result<()> {
+        let mut recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
+        transition_scanout_for_render(
+            device,
+            recorder.command_buffer(),
+            image,
+            image_old_layout,
+        )?;
+        recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
+        draw_scene_layers(
+            compositor,
+            device,
+            &mut recorder,
+            cache,
+            view,
+            layers,
+            output_width,
+            output_height,
+            None,
+        );
+        recorder.end_render_pass();
+
+        // Transition to GENERAL for PipeWire export / CPU readback.
+        let barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image.image())
+            .subresource_range(color_subresource_range());
+        unsafe {
+            device.handle().cmd_pipeline_barrier(
+                recorder.command_buffer(),
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+
+        recorder.end()?;
+        Ok(())
+    })();
+
+    if let Err(error) = record_result {
+        command_pool.free_command_buffers(device, &[command_buffer]);
+        return Err(error);
+    }
+    batch.push(command_buffer, None);
+    Ok(())
+}
+
 fn draw_views(
     compositor: &GpuCompositor,
     device: &Device,

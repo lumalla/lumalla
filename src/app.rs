@@ -28,13 +28,14 @@ use lumalla_renderer::{
     is_present_wake_token,
 };
 use lumalla_screencast::{
-    DmaBufferExport, ScreencastManager, ScreencastWake, VideoFrame, fit_memfd_output_size,
-    fit_output_size,
+    DmaBufferExport, ScreencastManager, ScreencastSource, ScreencastWake, VideoFrame,
+    fit_memfd_output_size, fit_output_size,
 };
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
-    Mods, OpKind, encode_user_data, message_loop_with_channel, ring::MESSAGE_CHANNEL_TOKEN,
+    Mods, MutterScreenCastTarget, OpKind, encode_user_data, message_loop_with_channel,
+    ring::MESSAGE_CHANNEL_TOKEN,
 };
 
 use crate::args::Args;
@@ -945,12 +946,49 @@ impl AppData {
                             })
                             .collect();
                         self.screencast
-                            .start_stream(x, y, width, height, name, max_fps, dma_exports)
+                            .start_stream(
+                                ScreencastSource::Region {
+                                    x,
+                                    y,
+                                    width,
+                                    height,
+                                },
+                                x,
+                                y,
+                                width,
+                                height,
+                                name,
+                                max_fps,
+                                dma_exports,
+                            )
                             .map_err(|err| {
                                 self.renderer_state.free_screencast_buffers(stream_id);
                                 format!("{err:#}")
                             })
                     })();
+                    match start_result {
+                        Ok(stream_id) => {
+                            self.pending_screencast_replies.insert(
+                                stream_id,
+                                PendingScreencastReply::Pipewire { request_id },
+                            );
+                            self.mark_present_dirty(event_loop, arena);
+                        }
+                        Err(err) => {
+                            self.comms.dbus(DbusMessage::PipewireStreamStarted {
+                                request_id,
+                                result: Err(err),
+                            });
+                        }
+                    }
+                }
+                MainMessage::StartPipewireWindowStream {
+                    request_id,
+                    window_id,
+                    name,
+                    max_fps,
+                } => {
+                    let start_result = self.start_window_screencast(window_id, name, max_fps);
                     match start_result {
                         Ok(stream_id) => {
                             self.pending_screencast_replies.insert(
@@ -982,54 +1020,76 @@ impl AppData {
                 MainMessage::StartMutterScreenCast {
                     mutter_stream_id,
                     session_id,
-                    connector,
+                    target,
                 } => {
                     let start_result = (|| -> Result<u32, String> {
-                        let output = self
-                            .display_state
-                            .outputs()
-                            .find(|o| o.name == connector)
-                            .ok_or_else(|| format!("no such monitor: {connector}"))?;
-                        let (x, y) = (output.x, output.y);
-                        let (width, height) = (output.width, output.height);
-                        if width <= 0 || height <= 0 {
-                            return Err(format!("monitor '{connector}' has invalid size"));
+                        match target {
+                            MutterScreenCastTarget::Monitor { connector } => {
+                                let output = self
+                                    .display_state
+                                    .outputs()
+                                    .find(|o| o.name == connector)
+                                    .ok_or_else(|| format!("no such monitor: {connector}"))?;
+                                let (x, y) = (output.x, output.y);
+                                let (width, height) = (output.width, output.height);
+                                if width <= 0 || height <= 0 {
+                                    return Err(format!("monitor '{connector}' has invalid size"));
+                                }
+                                let max_fps = if output.refresh_mhz > 0 {
+                                    ((output.refresh_mhz + 999) / 1000).max(1) as u32
+                                } else {
+                                    60
+                                };
+                                let name = format!("Lumalla ScreenCast ({connector})");
+                                let stream_id = self.screencast.peek_next_stream_id();
+                                let (out_w, out_h) = fit_output_size(width as u32, height as u32);
+                                let exports = self
+                                    .renderer_state
+                                    .alloc_screencast_buffers(
+                                        stream_id,
+                                        out_w,
+                                        out_h,
+                                        ScreencastManager::dma_buffer_count(),
+                                    )
+                                    .map_err(|err| format!("{err:#}"))?;
+                                let dma_exports = exports
+                                    .into_iter()
+                                    .map(|export| DmaBufferExport {
+                                        index: export.index,
+                                        fd: export.fd,
+                                        width: export.width,
+                                        height: export.height,
+                                        stride: export.stride,
+                                        offset: export.offset,
+                                        modifier: export.modifier,
+                                    })
+                                    .collect();
+                                self.screencast
+                                    .start_stream(
+                                        ScreencastSource::Region {
+                                            x,
+                                            y,
+                                            width,
+                                            height,
+                                        },
+                                        x,
+                                        y,
+                                        width,
+                                        height,
+                                        name,
+                                        max_fps,
+                                        dma_exports,
+                                    )
+                                    .map_err(|err| {
+                                        self.renderer_state.free_screencast_buffers(stream_id);
+                                        format!("{err:#}")
+                                    })
+                            }
+                            MutterScreenCastTarget::Window { window_id } => {
+                                let name = format!("Lumalla ScreenCast (window {window_id})");
+                                self.start_window_screencast(window_id, name, 30)
+                            }
                         }
-                        let max_fps = if output.refresh_mhz > 0 {
-                            ((output.refresh_mhz + 999) / 1000).max(1) as u32
-                        } else {
-                            60
-                        };
-                        let name = format!("Lumalla ScreenCast ({connector})");
-                        let stream_id = self.screencast.peek_next_stream_id();
-                        let (out_w, out_h) = fit_output_size(width as u32, height as u32);
-                        let exports = self
-                            .renderer_state
-                            .alloc_screencast_buffers(
-                                stream_id,
-                                out_w,
-                                out_h,
-                                ScreencastManager::dma_buffer_count(),
-                            )
-                            .map_err(|err| format!("{err:#}"))?;
-                        let dma_exports = exports
-                            .into_iter()
-                            .map(|export| DmaBufferExport {
-                                index: export.index,
-                                fd: export.fd,
-                                width: export.width,
-                                height: export.height,
-                                stride: export.stride,
-                                offset: export.offset,
-                                modifier: export.modifier,
-                            })
-                            .collect();
-                        self.screencast
-                            .start_stream(x, y, width, height, name, max_fps, dma_exports)
-                            .map_err(|err| {
-                                self.renderer_state.free_screencast_buffers(stream_id);
-                                format!("{err:#}")
-                            })
                     })();
                     match start_result {
                         Ok(stream_id) => {
@@ -1930,6 +1990,70 @@ impl AppData {
         // not by forcing continuous presents (that recreated a 5K busy-loop).
     }
 
+    fn start_window_screencast(
+        &mut self,
+        window_id: u32,
+        name: String,
+        max_fps: u32,
+    ) -> Result<u32, String> {
+        let id = if window_id == 0 { None } else { Some(window_id) };
+        let (resolved_id, x, y, width, height, _layers) = self
+            .display_state
+            .window_capture_layers(id)
+            .ok_or_else(|| {
+                if window_id == 0 {
+                    String::from("no focused window to capture")
+                } else {
+                    format!("no such window: {window_id}")
+                }
+            })?;
+        let stream_id = self.screencast.peek_next_stream_id();
+        let (out_w, out_h) = fit_output_size(width as u32, height as u32);
+        let exports = self
+            .renderer_state
+            .alloc_screencast_buffers(
+                stream_id,
+                out_w,
+                out_h,
+                ScreencastManager::dma_buffer_count(),
+            )
+            .map_err(|err| format!("{err:#}"))?;
+        let dma_exports = exports
+            .into_iter()
+            .map(|export| DmaBufferExport {
+                index: export.index,
+                fd: export.fd,
+                width: export.width,
+                height: export.height,
+                stride: export.stride,
+                offset: export.offset,
+                modifier: export.modifier,
+            })
+            .collect();
+        self.screencast
+            .start_stream(
+                ScreencastSource::Window {
+                    window_id: resolved_id,
+                },
+                x,
+                y,
+                width,
+                height,
+                name,
+                max_fps,
+                dma_exports,
+            )
+            .map_err(|err| {
+                self.renderer_state.free_screencast_buffers(stream_id);
+                format!("{err:#}")
+            })
+    }
+
+    fn stop_screencast_stream(&mut self, stream_id: u32) {
+        self.screencast.stop_stream(stream_id);
+        self.renderer_state.free_screencast_buffers(stream_id);
+    }
+
     fn push_screencast_frames(&mut self, event_loop: &mut EventLoop, arena: &Arena) {
         let _ = event_loop;
         if !self.screencast.has_streams() {
@@ -1944,6 +2068,37 @@ impl AppData {
                 .map(lumalla_shared::Output::from),
         );
 
+        // Refresh window geometry / tear down destroyed window streams.
+        let mut stop_ids = Vec::new();
+        let all_ids: Vec<u32> = self.screencast.streams().keys().copied().collect();
+        for stream_id in all_ids {
+            let Some(source) = self.screencast.stream_source(stream_id) else {
+                continue;
+            };
+            let ScreencastSource::Window { window_id } = source else {
+                continue;
+            };
+            match self.display_state.window_capture_layers(Some(window_id)) {
+                Some((_, x, y, width, height, _)) => {
+                    self.screencast
+                        .update_capture_geometry(stream_id, x, y, width, height);
+                }
+                None => stop_ids.push(stream_id),
+            }
+        }
+        for stream_id in stop_ids {
+            warn!("Stopping PipeWire window stream {stream_id}: window gone");
+            if let Some(PendingScreencastReply::Pipewire { request_id }) =
+                self.pending_screencast_replies.remove(&stream_id)
+            {
+                self.comms.dbus(DbusMessage::PipewireStreamStarted {
+                    request_id,
+                    result: Err(String::from("window was destroyed")),
+                });
+            }
+            self.stop_screencast_stream(stream_id);
+        }
+
         // DMA-BUF path: fill buffers that PipeWire has returned for a blit.
         let pending_blits = self.screencast.take_pending_blits();
         let mut deferred = Vec::new();
@@ -1951,12 +2106,10 @@ impl AppData {
             let Some((x, y, width, height, out_w, out_h, uses_dmabuf)) =
                 self.screencast.stream_capture_region(stream_id)
             else {
-                // Stream already torn down; ask PipeWire to recycle if possible.
                 let _ = self.screencast.queue_dma_buffer(stream_id, index);
                 continue;
             };
             if !uses_dmabuf {
-                // Format not settled yet; try again after negotiation.
                 deferred.push((stream_id, index));
                 continue;
             }
@@ -1966,17 +2119,28 @@ impl AppData {
                 deferred.push((stream_id, index));
                 continue;
             }
-            match self.renderer_state.blit_region_to_screencast_buffer(
-                stream_id,
-                index,
-                x,
-                y,
-                width,
-                height,
-                out_w,
-                out_h,
-                &outputs,
-            ) {
+
+            let blit_result = match self.screencast.stream_source(stream_id) {
+                Some(ScreencastSource::Window { window_id }) => {
+                    match self.display_state.window_capture_layers(Some(window_id)) {
+                        Some((_, ox, oy, w, h, layers)) => {
+                            let keys: Vec<(u32, u32)> = layers
+                                .iter()
+                                .map(|s| (s.client_id.get(), s.surface_id.get()))
+                                .collect();
+                            self.renderer_state.composite_window_to_screencast_buffer(
+                                stream_id, index, &keys, ox, oy, w, h, out_w, out_h,
+                            )
+                        }
+                        None => Err(anyhow::anyhow!("window {window_id} gone")),
+                    }
+                }
+                _ => self.renderer_state.blit_region_to_screencast_buffer(
+                    stream_id, index, x, y, width, height, out_w, out_h, &outputs,
+                ),
+            };
+
+            match blit_result {
                 Ok(()) => {
                     if let Err(err) = self.screencast.queue_dma_buffer(stream_id, index) {
                         warn!("Unable to queue DMA-BUF for stream {stream_id}: {err:#}");
@@ -1989,8 +2153,7 @@ impl AppData {
                     }
                 }
                 Err(err) => {
-                    warn!("Unable to blit PipeWire DMA region for stream {stream_id}: {err:#}");
-                    // Still queue so the DRIVER graph keeps moving (black frame beats stall).
+                    warn!("Unable to fill PipeWire DMA buffer for stream {stream_id}: {err:#}");
                     if let Err(queue_err) = self.screencast.queue_dma_buffer(stream_id, index) {
                         warn!(
                             "Unable to recycle DMA-BUF after blit failure for stream {stream_id}: {queue_err:#}"
@@ -2002,13 +2165,11 @@ impl AppData {
             }
         }
         if !deferred.is_empty() {
-            // Don't wake immediately — presents / later BlitNeeded will retry.
             self.screencast.requeue_pending_blits_silent(deferred);
         }
 
         // MemFd path: GPU-scale into the small screencast buffer, then read that back.
-        // Never download full 5K scanouts on the CPU (that freezes the session).
-        let due: Vec<(u32, i32, i32, i32, i32)> = self
+        let due: Vec<(u32, ScreencastSource, i32, i32, i32, i32)> = self
             .screencast
             .streams()
             .values()
@@ -2016,6 +2177,7 @@ impl AppData {
             .map(|stream| {
                 (
                     stream.id,
+                    stream.source,
                     stream.x,
                     stream.y,
                     stream.width,
@@ -2024,18 +2186,29 @@ impl AppData {
             })
             .collect();
 
-        for (stream_id, x, y, width, height) in due {
+        for (stream_id, source, x, y, width, height) in due {
             let (memfd_w, memfd_h) = fit_memfd_output_size(width as u32, height as u32);
-            match self.renderer_state.capture_region_for_screencast(
-                stream_id,
-                x,
-                y,
-                width,
-                height,
-                memfd_w,
-                memfd_h,
-                &outputs,
-            ) {
+            let capture_result = match source {
+                ScreencastSource::Window { window_id } => {
+                    match self.display_state.window_capture_layers(Some(window_id)) {
+                        Some((_, ox, oy, w, h, layers)) => {
+                            let keys: Vec<(u32, u32)> = layers
+                                .iter()
+                                .map(|s| (s.client_id.get(), s.surface_id.get()))
+                                .collect();
+                            let (mw, mh) = fit_memfd_output_size(w as u32, h as u32);
+                            self.renderer_state.capture_window_for_screencast(
+                                stream_id, &keys, ox, oy, w, h, mw, mh,
+                            )
+                        }
+                        None => Err(anyhow::anyhow!("window {window_id} gone")),
+                    }
+                }
+                ScreencastSource::Region { .. } => self.renderer_state.capture_region_for_screencast(
+                    stream_id, x, y, width, height, memfd_w, memfd_h, &outputs,
+                ),
+            };
+            match capture_result {
                 Ok(image) => {
                     let frame = VideoFrame {
                         width: image.width,
@@ -2051,13 +2224,10 @@ impl AppData {
                     }
                 }
                 Err(err) => {
-                    warn!("Unable to capture PipeWire region for stream {stream_id}: {err:#}");
+                    warn!("Unable to capture PipeWire frame for stream {stream_id}: {err:#}");
                 }
             }
         }
-
-        // Do not mark_present_dirty here. Coupling capture to an immediate present
-        // re-arm created a busy-loop that hard-froze the session at 5K.
     }
 }
 

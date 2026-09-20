@@ -11,7 +11,7 @@ use std::{
 
 use log::{debug, warn};
 use lumalla_ipc::types::OutputInfo;
-use lumalla_shared::{Comms, MainMessage};
+use lumalla_shared::{Comms, MainMessage, MutterScreenCastTarget, WindowState};
 use zbus::{
     fdo,
     interface,
@@ -91,8 +91,6 @@ pub(crate) fn complete_mutter_stream(
             } else {
                 debug!("Emitted PipeWireStreamAdded node_id={node_id} on {path}");
             }
-            // Keep path available only until signal; re-insert so Stop can find nothing.
-            // Session Stop removes objects via object_server; path map entry is gone.
         }
         Err(err) => {
             warn!("Mutter ScreenCast start failed for stream {mutter_stream_id}: {err}");
@@ -103,6 +101,7 @@ pub(crate) fn complete_mutter_stream(
 #[derive(Clone)]
 pub(crate) struct ScreenCast {
     outputs: Arc<Mutex<Vec<OutputInfo>>>,
+    windows: Arc<Mutex<Vec<WindowState>>>,
     comms: Comms,
     connection: Connection,
     registry: MutterStreamRegistry,
@@ -111,6 +110,7 @@ pub(crate) struct ScreenCast {
 impl ScreenCast {
     pub(crate) fn new(
         outputs: Arc<Mutex<Vec<OutputInfo>>>,
+        windows: Arc<Mutex<Vec<WindowState>>>,
         comms: Comms,
         connection: Connection,
     ) -> (Self, MutterStreamRegistry) {
@@ -118,6 +118,7 @@ impl ScreenCast {
         (
             Self {
                 outputs,
+                windows,
                 comms,
                 connection,
                 registry: registry.clone(),
@@ -130,6 +131,17 @@ impl ScreenCast {
 #[derive(Debug, Default, DeserializeDict, Type, Clone, Copy, PartialEq, Eq)]
 #[zvariant(signature = "dict")]
 struct RecordMonitorProperties {
+    #[zvariant(rename = "cursor-mode")]
+    _cursor_mode: Option<u32>,
+    #[zvariant(rename = "is-recording")]
+    _is_recording: Option<bool>,
+}
+
+#[derive(Debug, Default, DeserializeDict, Type, Clone, Copy, PartialEq, Eq)]
+#[zvariant(signature = "dict")]
+struct RecordWindowProperties {
+    #[zvariant(rename = "window-id")]
+    window_id: Option<u64>,
     #[zvariant(rename = "cursor-mode")]
     _cursor_mode: Option<u32>,
     #[zvariant(rename = "is-recording")]
@@ -149,6 +161,7 @@ struct StreamParameters {
 struct Session {
     id: u64,
     outputs: Arc<Mutex<Vec<OutputInfo>>>,
+    windows: Arc<Mutex<Vec<WindowState>>>,
     comms: Comms,
     connection: Connection,
     registry: MutterStreamRegistry,
@@ -156,11 +169,17 @@ struct Session {
     stopped: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone)]
+enum StreamTarget {
+    Monitor { connector: String },
+    Window { window_id: u32 },
+}
+
 #[derive(Clone)]
 struct Stream {
     id: u64,
     session_id: u64,
-    connector: String,
+    target: StreamTarget,
     position: (i32, i32),
     size: (i32, i32),
     was_started: Arc<AtomicBool>,
@@ -187,6 +206,7 @@ impl ScreenCast {
         let session = Session {
             id: session_id,
             outputs: Arc::clone(&self.outputs),
+            windows: Arc::clone(&self.windows),
             comms: self.comms.clone(),
             connection: self.connection.clone(),
             registry: self.registry.clone(),
@@ -274,13 +294,14 @@ impl Session {
         let path = OwnedObjectPath::try_from(path)
             .map_err(|err| fdo::Error::Failed(format!("invalid stream path: {err}")))?;
 
-        // Match PipeWire buffer size (compositor downscales long edge to 1280).
         let (out_w, out_h) = fit_portal_size(output.width, output.height);
 
         let stream = Stream {
             id: stream_id,
             session_id: self.id,
-            connector: connector.to_string(),
+            target: StreamTarget::Monitor {
+                connector: connector.to_string(),
+            },
             position: (output.x, output.y),
             size: (out_w, out_h),
             was_started: Arc::new(AtomicBool::new(false)),
@@ -302,11 +323,74 @@ impl Session {
 
     fn record_window(
         &mut self,
-        _properties: HashMap<&str, Value<'_>>,
+        properties: RecordWindowProperties,
     ) -> fdo::Result<OwnedObjectPath> {
-        Err(fdo::Error::Failed(
-            "RecordWindow is not supported yet".into(),
-        ))
+        let window_id = match properties.window_id {
+            Some(id) => {
+                if id > u64::from(u32::MAX) {
+                    return Err(fdo::Error::Failed(format!(
+                        "window-id {id} is out of range"
+                    )));
+                }
+                let id = id as u32;
+                let windows = self.windows.lock().unwrap();
+                if !windows.iter().any(|w| w.id == id) {
+                    return Err(fdo::Error::Failed(format!("no such window: {id}")));
+                }
+                id
+            }
+            None => {
+                let windows = self.windows.lock().unwrap();
+                windows
+                    .iter()
+                    .find(|w| w.focused)
+                    .map(|w| w.id)
+                    .ok_or_else(|| fdo::Error::Failed("no focused window".into()))?
+            }
+        };
+
+        let (x, y, width, height) = {
+            let windows = self.windows.lock().unwrap();
+            let window = windows
+                .iter()
+                .find(|w| w.id == window_id)
+                .ok_or_else(|| fdo::Error::Failed(format!("no such window: {window_id}")))?;
+            (window.x, window.y, window.width, window.height)
+        };
+        if width <= 0 || height <= 0 {
+            return Err(fdo::Error::Failed("window has invalid size".into()));
+        }
+
+        debug!("Mutter RecordWindow window-id={window_id}");
+
+        let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+        let path = format!("/org/gnome/Mutter/ScreenCast/Stream/u{stream_id}");
+        let path = OwnedObjectPath::try_from(path)
+            .map_err(|err| fdo::Error::Failed(format!("invalid stream path: {err}")))?;
+
+        let (out_w, out_h) = fit_portal_size(width, height);
+
+        let stream = Stream {
+            id: stream_id,
+            session_id: self.id,
+            target: StreamTarget::Window { window_id },
+            position: (x, y),
+            size: (out_w, out_h),
+            was_started: Arc::new(AtomicBool::new(false)),
+            comms: self.comms.clone(),
+        };
+
+        match self.connection.object_server().at(&path, stream.clone()) {
+            Ok(true) => {
+                self.registry.insert(stream_id, path.clone());
+                self.streams.lock().unwrap().push((stream, path.clone()));
+                Ok(path)
+            }
+            Ok(false) => Err(fdo::Error::Failed("stream path already exists".into())),
+            Err(err) => Err(fdo::Error::Failed(format!(
+                "error creating stream object: {err}"
+            ))),
+        }
     }
 
     fn record_area(
@@ -340,10 +424,14 @@ impl Stream {
 
     #[zbus(property)]
     fn parameters(&self) -> StreamParameters {
+        let output_name = match &self.target {
+            StreamTarget::Monitor { connector } => connector.clone(),
+            StreamTarget::Window { window_id } => format!("window-{window_id}"),
+        };
         StreamParameters {
             position: self.position,
             size: self.size,
-            output_name: self.connector.clone(),
+            output_name,
         }
     }
 }
@@ -353,10 +441,18 @@ impl Stream {
         if self.was_started.swap(true, Ordering::SeqCst) {
             return;
         }
+        let target = match &self.target {
+            StreamTarget::Monitor { connector } => MutterScreenCastTarget::Monitor {
+                connector: connector.clone(),
+            },
+            StreamTarget::Window { window_id } => MutterScreenCastTarget::Window {
+                window_id: *window_id,
+            },
+        };
         self.comms.main(MainMessage::StartMutterScreenCast {
             mutter_stream_id: self.id,
             session_id: self.session_id,
-            connector: self.connector.clone(),
+            target,
         });
     }
 }
@@ -368,5 +464,20 @@ impl Drop for Session {
                 session_id: self.id,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_window_properties_parse_window_id() {
+        let props = RecordWindowProperties {
+            window_id: Some(42),
+            _cursor_mode: None,
+            _is_recording: Some(true),
+        };
+        assert_eq!(props.window_id, Some(42));
     }
 }

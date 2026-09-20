@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use lumalla_screencast::{DmaBufferExport, ScreencastManager, ScreencastWake, VideoFrame};
+use lumalla_screencast::{
+    DmaBufferExport, ScreencastManager, ScreencastSource, ScreencastWake, VideoFrame,
+};
 use pipewire::{
     self as pw,
     context::ContextRc,
@@ -251,6 +253,12 @@ fn memfd_source_delivers_frames_to_consumer() {
         .lock()
         .unwrap()
         .start_stream(
+            ScreencastSource::Region {
+                x: 0,
+                y: 0,
+                width: width as i32,
+                height: height as i32,
+            },
             0,
             0,
             width as i32,

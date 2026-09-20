@@ -421,6 +421,54 @@ impl WindowManagerHandler for CompositorHandler {
         }
     }
 
+    fn start_pipewire_stream_window(
+        &mut self,
+        window_id: u32,
+        name: &str,
+        max_fps: u32,
+    ) -> zbus::fdo::Result<(u32, u32)> {
+        let name = if name.is_empty() {
+            String::from("Lumalla Window")
+        } else {
+            name.to_string()
+        };
+        let max_fps = if max_fps == 0 { 30 } else { max_fps };
+
+        let request_id = {
+            let mut next = self.state.next_pipewire_request_id.lock().unwrap();
+            let id = *next;
+            *next = next.wrapping_add(1);
+            id
+        };
+        let pending = Arc::new(PendingPipewireStream {
+            result: Mutex::new(None),
+            done: Condvar::new(),
+        });
+        self.state
+            .pending_pipewire_streams
+            .lock()
+            .unwrap()
+            .insert(request_id, Arc::clone(&pending));
+
+        self.state
+            .comms
+            .main(MainMessage::StartPipewireWindowStream {
+                request_id,
+                window_id,
+                name,
+                max_fps,
+            });
+
+        let mut guard = pending.result.lock().unwrap();
+        while guard.is_none() {
+            guard = pending.done.wait(guard).unwrap();
+        }
+        match guard.take().unwrap() {
+            Ok(ids) => Ok(ids),
+            Err(err) => Err(zbus::fdo::Error::Failed(err)),
+        }
+    }
+
     fn stop_pipewire_stream(&mut self, stream_id: u32) -> zbus::fdo::Result<()> {
         self.state
             .comms

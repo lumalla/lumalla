@@ -41,9 +41,9 @@ pub use crate::scene_backing::{
 };
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
-    DmaBufImage, GpuCompositor, GpuWorkBatch, SurfaceTextureCache, VulkanContext,
-    blit_image_region, composite_to_scanout, copy_scanout_frame, download_bgra_region,
-    map_rect_through_view, vulkan_to_drm_fourcc,
+    DmaBufImage, Framebuffer, GpuCompositor, GpuWorkBatch, SurfaceTextureCache, VulkanContext,
+    blit_image_region, composite_layers_to_image, composite_to_scanout, copy_scanout_frame,
+    download_bgra_region, map_rect_through_view, vulkan_to_drm_fourcc,
 };
 
 struct GpuRenderResources {
@@ -407,9 +407,12 @@ pub struct ScreencastDmaExport {
 
 struct ScreencastDmaSlot {
     image: DmaBufImage,
+    framebuffer: Framebuffer,
     /// Original export fd kept alive for the image memory.
     _export_fd: OwnedFd,
     in_use: bool,
+    /// True until the first GPU fill (layout still UNDEFINED).
+    fresh: bool,
 }
 
 fn dup_owned_fd(fd: RawFd) -> anyhow::Result<OwnedFd> {
@@ -1021,6 +1024,8 @@ impl RendererState {
                 .vulkan
                 .as_mut()
                 .context("Vulkan is not initialized for screencast buffers")?;
+            vulkan.ensure_scanout_render_pass()?;
+            let render_pass = vulkan.scanout_render_pass()?;
             for index in 0..count {
                 let image = DmaBufImage::allocate(
                     vulkan.device(),
@@ -1030,6 +1035,13 @@ impl RendererState {
                     format,
                 )
                 .with_context(|| format!("allocate screencast buffer {index}"))?;
+                let framebuffer = Framebuffer::from_view(
+                    vulkan.device(),
+                    render_pass,
+                    image.view(),
+                    image.extent(),
+                )
+                .with_context(|| format!("create screencast framebuffer {index}"))?;
                 let export_fd = image
                     .export_dma_buf()
                     .context("export screencast DMA-BUF")?;
@@ -1047,8 +1059,10 @@ impl RendererState {
                 exports.push(info);
                 slots.push(ScreencastDmaSlot {
                     image,
+                    framebuffer,
                     _export_fd: export_fd,
                     in_use: false,
+                    fresh: true,
                 });
             }
         }
@@ -1189,8 +1203,226 @@ impl RendererState {
             .and_then(|slots| slots.get_mut(index))
         {
             slot.in_use = true;
+            slot.fresh = false;
         }
         Ok(())
+    }
+
+    /// Composite only the given surface layers into screencast buffer `index`.
+    ///
+    /// `origin`/`width`/`height` are the window AABB in compositor space. Layers are
+    /// drawn with a view that maps that AABB onto `dest_width`×`dest_height`.
+    /// Clear is transparent; guides and cursor are omitted.
+    pub fn composite_window_to_screencast_buffer(
+        &mut self,
+        stream_id: u32,
+        index: usize,
+        layers: &[(u32, u32)],
+        origin_x: i32,
+        origin_y: i32,
+        width: i32,
+        height: i32,
+        dest_width: u32,
+        dest_height: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(width > 0 && height > 0, "window capture size must be positive");
+        anyhow::ensure!(dest_width > 0 && dest_height > 0, "destination size must be positive");
+
+        let (buf_w, buf_h, fresh) = {
+            let slots = self
+                .screencast_buffers
+                .get(&stream_id)
+                .context("screencast buffers missing")?;
+            let slot = slots
+                .get(index)
+                .context("screencast buffer index out of range")?;
+            let extent = slot.image.extent();
+            (extent.width, extent.height, slot.fresh)
+        };
+        anyhow::ensure!(
+            dest_width <= buf_w && dest_height <= buf_h,
+            "destination {dest_width}x{dest_height} exceeds buffer {buf_w}x{buf_h}"
+        );
+
+        let frame_layers: Vec<&SurfaceFrame> = layers
+            .iter()
+            .filter_map(|key| self.surface_frames.get(key))
+            .collect();
+
+        let view = View {
+            name: String::from("screencast-window"),
+            source: (origin_x, origin_y, width, height),
+            dest: (0, 0, dest_width as i32, dest_height as i32),
+        };
+
+        let mut batch = GpuWorkBatch::new();
+        {
+            let vulkan = self
+                .vulkan
+                .as_mut()
+                .context("Vulkan missing for window screencast")?;
+            self.gpu.ensure_compositor(vulkan)?;
+            let compositor = self
+                .gpu
+                .compositor
+                .take()
+                .context("GPU compositor missing")?;
+
+            let result = (|| -> anyhow::Result<()> {
+                self.gpu.surface_textures.sync_scene(
+                    vulkan,
+                    &compositor,
+                    &mut batch,
+                    &frame_layers,
+                    CursorDraw::Hidden,
+                    &CompositeMode::Full,
+                    &HashSet::new(),
+                    &HashMap::new(),
+                    &[],
+                    false,
+                )?;
+
+                vulkan.ensure_scanout_render_pass()?;
+                let render_pass = vulkan.scanout_render_pass()?;
+                let image_old_layout = if fresh {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    vk::ImageLayout::GENERAL
+                };
+
+                let (image_ptr, fb_ptr) = {
+                    let slots = self
+                        .screencast_buffers
+                        .get(&stream_id)
+                        .context("screencast buffers missing")?;
+                    let slot = slots
+                        .get(index)
+                        .context("screencast buffer index out of range")?;
+                    (
+                        &slot.image as *const DmaBufImage,
+                        &slot.framebuffer as *const Framebuffer,
+                    )
+                };
+
+                // Safety: both are owned by self for this call.
+                unsafe {
+                    composite_layers_to_image(
+                        vulkan,
+                        &mut batch,
+                        &compositor,
+                        &self.gpu.surface_textures,
+                        render_pass,
+                        &*image_ptr,
+                        &*fb_ptr,
+                        image_old_layout,
+                        dest_width,
+                        dest_height,
+                        [0.0, 0.0, 0.0, 0.0],
+                        &view,
+                        &frame_layers,
+                    )?;
+                }
+                Ok(())
+            })();
+            self.gpu.compositor = Some(compositor);
+            result?;
+        }
+
+        let vulkan = self
+            .vulkan
+            .as_ref()
+            .context("Vulkan missing for window screencast submit")?;
+        let pending = batch.submit(vulkan.device())?;
+        pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
+
+        if let Some(slot) = self
+            .screencast_buffers
+            .get_mut(&stream_id)
+            .and_then(|slots| slots.get_mut(index))
+        {
+            slot.in_use = true;
+            slot.fresh = false;
+        }
+        Ok(())
+    }
+
+    /// Capture a window tree into a downscaled RGBA frame via GPU composite + readback.
+    pub fn capture_window_for_screencast(
+        &mut self,
+        stream_id: u32,
+        layers: &[(u32, u32)],
+        origin_x: i32,
+        origin_y: i32,
+        width: i32,
+        height: i32,
+        dest_width: u32,
+        dest_height: u32,
+    ) -> anyhow::Result<CapturedImage> {
+        let index = self
+            .next_free_screencast_buffer(stream_id)
+            .context("no free screencast buffer for MemFd window capture")?;
+        self.composite_window_to_screencast_buffer(
+            stream_id,
+            index,
+            layers,
+            origin_x,
+            origin_y,
+            width,
+            height,
+            dest_width,
+            dest_height,
+        )?;
+
+        let format = {
+            let slots = self
+                .screencast_buffers
+                .get(&stream_id)
+                .context("screencast buffers missing after composite")?;
+            let slot = slots
+                .get(index)
+                .context("screencast buffer index out of range")?;
+            slot.image.format()
+        };
+
+        let vulkan = self
+            .vulkan
+            .as_ref()
+            .context("Vulkan missing for window MemFd readback")?;
+        let image_ptr = {
+            let slots = self
+                .screencast_buffers
+                .get(&stream_id)
+                .context("screencast buffers missing for readback")?;
+            let slot = slots
+                .get(index)
+                .context("screencast buffer index out of range")?;
+            &slot.image as *const DmaBufImage
+        };
+        let bgra = unsafe {
+            download_bgra_region(vulkan, &*image_ptr, 0, 0, dest_width, dest_height)?
+        };
+
+        self.release_screencast_buffer(stream_id, index);
+
+        let mut rgba = vec![0u8; (dest_width as usize) * (dest_height as usize) * 4];
+        let _ = blit_bgra_to_rgba(
+            &bgra,
+            dest_width,
+            dest_height,
+            format,
+            &mut rgba,
+            dest_width,
+            dest_height,
+            0,
+            0,
+            dest_width,
+            dest_height,
+        );
+        Ok(CapturedImage {
+            width: dest_width,
+            height: dest_height,
+            rgba,
+        })
     }
 
     /// Capture a region into a downscaled RGBA frame via GPU blit + small readback.

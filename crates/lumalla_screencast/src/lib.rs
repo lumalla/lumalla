@@ -137,6 +137,7 @@ struct PendingStart {
 }
 
 struct StartingStream {
+    source: ScreencastSource,
     x: i32,
     y: i32,
     width: i32,
@@ -213,6 +214,27 @@ struct StreamSlot {
     inner: Rc<RefCell<StreamInner>>,
 }
 
+/// What a PipeWire stream is capturing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreencastSource {
+    /// Fixed compositor-space rectangle (may include overlaps from scanout blit).
+    Region {
+        /// Left edge in compositor space.
+        x: i32,
+        /// Top edge in compositor space.
+        y: i32,
+        /// Width in compositor space.
+        width: i32,
+        /// Height in compositor space.
+        height: i32,
+    },
+    /// Isolated composite of one managed window's surface tree.
+    Window {
+        /// Lumalla window id.
+        window_id: u32,
+    },
+}
+
 /// Region stream tracked on the compositor main thread.
 #[derive(Debug)]
 pub struct ActiveStream {
@@ -220,6 +242,8 @@ pub struct ActiveStream {
     pub id: u32,
     /// PipeWire node id for consumers.
     pub node_id: u32,
+    /// Capture source (region or window).
+    pub source: ScreencastSource,
     /// Capture region left edge in compositor space.
     pub x: i32,
     /// Capture region top edge in compositor space.
@@ -364,6 +388,64 @@ impl ScreencastManager {
         ))
     }
 
+    /// Capture source for an active or still-starting stream.
+    pub fn stream_source(&self, stream_id: u32) -> Option<ScreencastSource> {
+        if let Some(stream) = self.streams.get(&stream_id) {
+            return Some(stream.source);
+        }
+        self.starting.get(&stream_id).map(|s| s.source)
+    }
+
+    /// Update live capture geometry (window move/resize). Does not resize PipeWire buffers.
+    ///
+    /// Frames are scaled into the existing `out_width`×`out_height` DMA pool.
+    pub fn update_capture_geometry(
+        &mut self,
+        stream_id: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        if width <= 0 || height <= 0 {
+            return false;
+        }
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.x = x;
+            stream.y = y;
+            stream.width = width;
+            stream.height = height;
+            return true;
+        }
+        if let Some(starting) = self.starting.get_mut(&stream_id) {
+            starting.x = x;
+            starting.y = y;
+            starting.width = width;
+            starting.height = height;
+            return true;
+        }
+        false
+    }
+
+    /// Stream ids (active or starting) targeting `window_id`.
+    pub fn stream_ids_for_window(&self, window_id: u32) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .streams
+            .iter()
+            .filter_map(|(id, stream)| match stream.source {
+                ScreencastSource::Window { window_id: wid } if wid == window_id => Some(*id),
+                _ => None,
+            })
+            .collect();
+        ids.extend(self.starting.iter().filter_map(|(id, starting)| {
+            match starting.source {
+                ScreencastSource::Window { window_id: wid } if wid == window_id => Some(*id),
+                _ => None,
+            }
+        }));
+        ids
+    }
+
     fn ensure_thread(&mut self) -> anyhow::Result<&pw::channel::Sender<PwCommand>> {
         if self.cmd_tx.is_some() {
             return Ok(self.cmd_tx.as_ref().unwrap());
@@ -395,14 +477,15 @@ impl ScreencastManager {
         self.next_id
     }
 
-    /// Begin creating a PipeWire output stream for a compositor region.
+    /// Begin creating a PipeWire output stream.
     ///
     /// `dma_exports` must all share the (possibly downscaled) output size. The
-    /// capture rectangle `(x,y,width,height)` may be larger; the compositor scales
-    /// into the export size. Returns the local stream id immediately; the PipeWire
-    /// node id is delivered later via [`ScreencastWake::StreamReady`].
+    /// capture rectangle may be larger; the compositor scales into the export size.
+    /// Returns the local stream id immediately; the PipeWire node id is delivered
+    /// later via [`ScreencastWake::StreamReady`].
     pub fn start_stream(
         &mut self,
+        source: ScreencastSource,
         x: i32,
         y: i32,
         width: i32,
@@ -452,6 +535,7 @@ impl ScreencastManager {
         self.starting.insert(
             stream_id,
             StartingStream {
+                source,
                 x,
                 y,
                 width,
@@ -464,7 +548,7 @@ impl ScreencastManager {
         );
 
         info!(
-            "Starting PipeWire stream id={stream_id} capture={width}x{height} out={out_width}x{out_height}"
+            "Starting PipeWire stream id={stream_id} source={source:?} capture={width}x{height} out={out_width}x{out_height}"
         );
         Ok(stream_id)
     }
@@ -493,6 +577,7 @@ impl ScreencastManager {
                     ActiveStream {
                         id: stream_id,
                         node_id,
+                        source: starting.source,
                         x: starting.x,
                         y: starting.y,
                         width: starting.width,

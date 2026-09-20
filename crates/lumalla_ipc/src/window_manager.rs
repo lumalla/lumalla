@@ -120,6 +120,18 @@ pub trait WindowManagerHandler: Send + Sync {
         max_fps: u32,
     ) -> zbus::fdo::Result<(u32, u32)>;
 
+    /// Start a PipeWire video stream of an isolated window.
+    ///
+    /// Blocks until the PipeWire node is connected. Returns `(stream_id, node_id)`.
+    /// `window_id == 0` targets the focused window. Empty `name` uses
+    /// `"Lumalla Window"`. `max_fps == 0` defaults to 30.
+    fn start_pipewire_stream_window(
+        &mut self,
+        window_id: u32,
+        name: &str,
+        max_fps: u32,
+    ) -> zbus::fdo::Result<(u32, u32)>;
+
     /// Stop a PipeWire video stream. Idempotent if the stream is already gone.
     fn stop_pipewire_stream(&mut self, stream_id: u32) -> zbus::fdo::Result<()>;
 
@@ -378,6 +390,16 @@ impl WindowManager {
     ) -> zbus::fdo::Result<(u32, u32)> {
         self.handler
             .start_pipewire_stream(x, y, width, height, name, max_fps)
+    }
+
+    fn start_pipewire_stream_window(
+        &mut self,
+        window_id: u32,
+        name: &str,
+        max_fps: u32,
+    ) -> zbus::fdo::Result<(u32, u32)> {
+        self.handler
+            .start_pipewire_stream_window(window_id, name, max_fps)
     }
 
     fn stop_pipewire_stream(&mut self, stream_id: u32) -> zbus::fdo::Result<()> {

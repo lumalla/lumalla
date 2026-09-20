@@ -87,7 +87,8 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 | `quit()` / `shutdown()` | Shut down the compositor. |
 | `toggle_debug_ui()` | Toggle the debug overlay. |
 | `start_pipewire_stream({x, y, width, height, name?, max_fps?})` | Start a PipeWire stream of a region. Returns `{id, node_id}`. Empty `name` becomes `"Lumalla"`; `max_fps` of `0` defaults to 30. |
-| `stop_pipewire_stream(stream_id)` | Stop a stream by id from `start_pipewire_stream`. |
+| `start_pipewire_stream_window({id?, name?, max_fps?})` | Start a PipeWire stream of one window's surfaces (isolated). `id` of `0`/omitted uses the focused window. Returns `{id, node_id}`. |
+| `stop_pipewire_stream(stream_id)` | Stop a stream by id from `start_pipewire_stream` / `start_pipewire_stream_window`. |
 
 ### Keyboard
 

@@ -352,7 +352,7 @@ impl WindowManager {
         ))
     }
 
-    fn resolve_window_id(&self, id: Option<u32>) -> Result<u32, WindowError> {
+    pub(crate) fn resolve_window_id(&self, id: Option<u32>) -> Result<u32, WindowError> {
         match id {
             Some(id) if id != 0 => {
                 if !self.windows.contains_key(&id) {

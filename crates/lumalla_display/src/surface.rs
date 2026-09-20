@@ -264,6 +264,73 @@ impl SurfaceManager {
         }
     }
 
+    /// Flatten one mapped surface tree (toplevel + subsurfaces + role children).
+    pub fn collect_surface_tree(
+        &self,
+        client_id: ClientId,
+        root: ObjectId,
+    ) -> Vec<SceneSurface> {
+        let mut scene = allocator_api2::vec::Vec::new();
+        if self.is_mapped(client_id, root).unwrap_or(false) {
+            self.flatten_surface_tree(client_id, root, &mut scene);
+        }
+        scene.into_iter().collect()
+    }
+
+    /// Axis-aligned bounds of a surface tree in compositor space.
+    ///
+    /// Returns `(origin_x, origin_y, width, height)`, or `None` if the tree is empty
+    /// or has no committed content.
+    pub fn surface_tree_bounds(
+        &self,
+        client_id: ClientId,
+        root: ObjectId,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let tree = self.collect_surface_tree(client_id, root);
+        self.bounds_of_scene_surfaces(&tree)
+    }
+
+    /// Axis-aligned bounds of already-collected scene surfaces.
+    pub fn bounds_of_scene_surfaces(
+        &self,
+        surfaces: &[SceneSurface],
+    ) -> Option<(i32, i32, i32, i32)> {
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let mut any = false;
+        for entry in surfaces {
+            let Some(surface) = self.surfaces.get(&(entry.client_id, entry.surface_id)) else {
+                continue;
+            };
+            let Some((bw, bh)) = surface.buffer_size else {
+                continue;
+            };
+            let scale = surface.current.buffer_scale.max(1);
+            let Some((width, height)) = effective_surface_size(
+                Some((bw, bh)),
+                scale,
+                surface.current.buffer_transform,
+                &surface.current.viewport,
+            ) else {
+                continue;
+            };
+            if width <= 0 || height <= 0 {
+                continue;
+            }
+            any = true;
+            min_x = min_x.min(entry.x);
+            min_y = min_y.min(entry.y);
+            max_x = max_x.max(entry.x.saturating_add(width));
+            max_y = max_y.max(entry.y.saturating_add(height));
+        }
+        if !any {
+            return None;
+        }
+        Some((min_x, min_y, max_x.saturating_sub(min_x), max_y.saturating_sub(min_y)))
+    }
+
     fn flatten_surface_tree<A: allocator_api2::alloc::Allocator>(
         &self,
         client_id: ClientId,
@@ -2894,6 +2961,52 @@ mod tests {
                 .map(|entry| entry.surface_id)
                 .collect::<Vec<_>>(),
             vec![object(3), object(2), object(4)]
+        );
+    }
+
+    #[test]
+    fn collect_surface_tree_and_bounds_cover_subsurfaces() {
+        let mut manager = SurfaceManager::default();
+        for id in [2, 3] {
+            manager.create_surface(client(1), object(id));
+        }
+        manager
+            .create_shell_surface(client(1), object(10), object(2))
+            .unwrap();
+        manager
+            .set_shell_mode(client(1), object(10), ShellMode::Toplevel)
+            .unwrap();
+        manager
+            .set_surface_layout(client(1), object(2), 10, 20)
+            .unwrap();
+        manager
+            .create_subsurface(client(1), object(11), object(3), object(2))
+            .unwrap();
+        manager.set_position(client(1), object(11), 50, 0).unwrap();
+
+        manager
+            .attach(client(1), object(3), Some(object(30)), 0, 0, 1)
+            .unwrap();
+        manager
+            .set_committed_buffer_size(client(1), object(3), 40, 40)
+            .unwrap();
+        manager.commit(client(1), object(3)).unwrap();
+        manager
+            .attach(client(1), object(2), Some(object(20)), 0, 0, 1)
+            .unwrap();
+        manager
+            .set_committed_buffer_size(client(1), object(2), 100, 80)
+            .unwrap();
+        manager.commit(client(1), object(2)).unwrap();
+
+        let tree = manager.collect_surface_tree(client(1), object(2));
+        assert_eq!(
+            tree.iter().map(|s| s.surface_id).collect::<Vec<_>>(),
+            vec![object(2), object(3)]
+        );
+        assert_eq!(
+            manager.surface_tree_bounds(client(1), object(2)),
+            Some((0, 0, 100, 80))
         );
     }
 
