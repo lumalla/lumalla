@@ -17,4 +17,6 @@ pub struct WindowState {
     pub height: i32,
     /// Whether this window currently has keyboard focus.
     pub focused: bool,
+    /// Zone name this window belongs to, if any.
+    pub zone: Option<String>,
 }

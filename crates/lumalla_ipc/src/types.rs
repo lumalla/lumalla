@@ -583,6 +583,8 @@ pub struct WindowInfo {
     pub height: i32,
     /// Whether this window currently has keyboard focus.
     pub focused: bool,
+    /// Zone name this window belongs to, if any.
+    pub zone: String,
 }
 
 impl From<&WindowState> for WindowInfo {
@@ -596,6 +598,7 @@ impl From<&WindowState> for WindowInfo {
             width: window.width,
             height: window.height,
             focused: window.focused,
+            zone: window.zone.clone().unwrap_or_default(),
         }
     }
 }

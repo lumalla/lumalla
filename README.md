@@ -125,7 +125,7 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 
 | Function | Description |
 | --- | --- |
-| `get_windows()` | Return `{id, app_id, title, x, y, width, height, focused}` for each window. |
+| `get_windows()` | Return `{id, app_id, title, x, y, width, height, focused, zone?}` for each window. `zone` is the zone name when assigned, otherwise `nil`. |
 | `get_focused_window()` | Focused window id, or `nil`. |
 | `set_window({id?, x?, y?, width?, height?})` | Set geometry. Omitted fields stay unchanged; omit `id` (or pass `0`) for the focused window. |
 | `focus_window({id?, raise?})` | Focus a window (`raise` defaults to `false`). |

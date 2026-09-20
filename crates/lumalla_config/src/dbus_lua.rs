@@ -1428,6 +1428,7 @@ struct ConfigWindow {
     width: i32,
     height: i32,
     focused: bool,
+    zone: Option<String>,
 }
 
 impl From<WindowInfo> for ConfigWindow {
@@ -1441,6 +1442,11 @@ impl From<WindowInfo> for ConfigWindow {
             width: window.width,
             height: window.height,
             focused: window.focused,
+            zone: if window.zone.is_empty() {
+                None
+            } else {
+                Some(window.zone)
+            },
         }
     }
 }
@@ -1456,6 +1462,7 @@ impl IntoLua for ConfigWindow {
         table.set("width", self.width)?;
         table.set("height", self.height)?;
         table.set("focused", self.focused)?;
+        table.set("zone", self.zone)?;
         table.into_lua(lua)
     }
 }

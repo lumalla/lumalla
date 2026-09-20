@@ -526,6 +526,7 @@ impl WindowManager {
             width,
             height,
             focused: self.focused_id == Some(window.id),
+            zone: window.zone.clone(),
         }
     }
 }
