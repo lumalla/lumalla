@@ -1,0 +1,28 @@
+[package]
+name = "lumalla_ui_bin"
+version = "0.1.0"
+edition = "2024"
+description = "lumalla-ui form helper binary"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lumalla/lumalla"
+include = ["src/**/*", "LICENSE-*"]
+
+[[bin]]
+name = "lumalla-ui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+serde_json = "1"
+lumalla_ui = { path = "../lumalla_ui" }
+eframe = { version = "0.31", default-features = false, features = [
+    "wgpu",
+    "wayland",
+    "x11",
+    "default_fonts",
+] }
+
+[build-dependencies]
+pkg-config = { workspace = true }

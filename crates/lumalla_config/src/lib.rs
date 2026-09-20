@@ -8,6 +8,7 @@ mod config_watcher;
 mod dbus_lua;
 mod external;
 mod repl;
+mod ui;
 
 pub use args::Args;
 pub use callback::CallbackState;

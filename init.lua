@@ -438,6 +438,61 @@ lum.map_key({
 	end,
 })
 
+--- logo+n: prompt for a new named view (PiP-sized) via lum.ui.
+lum.map_key({
+	key = "n",
+	mods = "logo",
+	callback = function()
+		lum.ui({
+			title = "New view",
+			fields = {
+				{
+					id = "name",
+					type = "text",
+					label = "Name",
+					placeholder = "pip",
+					focus = true,
+				},
+			},
+			actions = {
+				{ id = "cancel", label = "Cancel" },
+				{ id = "ok", label = "Create", primary = true, submit = true },
+			},
+			on_submit = function(values, action)
+				if action ~= "ok" then
+					return
+				end
+				local name = values.name
+				if type(name) ~= "string" or name == "" then
+					return
+				end
+				local output = primary_output()
+				if not output then
+					return
+				end
+				local w, h = output.width, output.height
+				local pip_w, pip_h = math.floor(w * 0.28), math.floor(h * 0.28)
+				lum.add_view(output.name, {
+					name = name,
+					source = {
+						x = w - math.floor(w * 0.35),
+						y = 0,
+						width = math.floor(w * 0.35),
+						height = math.floor(h * 0.45),
+					},
+					dest = {
+						x = w - pip_w - 24,
+						y = h - pip_h - 24,
+						width = pip_w,
+						height = pip_h,
+					},
+				})
+				table.insert(active_views, name)
+			end,
+		})
+	end,
+})
+
 --- logo+r: toggle PipeWire stream of the primary output.
 local pipewire_stream_id = nil
 lum.map_key({

@@ -11,5 +11,5 @@ fi
 
 export RUST_BACKTRACE=1
 
-cargo build -p lumalla_config
+cargo build -p lumalla_config -p lumalla_ui_bin
 exec cargo run -- -- ./target/debug/lumalla_config --config ./init.lua --repl

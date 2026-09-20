@@ -22,7 +22,7 @@ use zbus::blocking::Connection;
 use zbus::blocking::fdo::DBusProxy;
 use zbus::names::BusName;
 
-use crate::{args::Args, callback::CallbackState};
+use crate::{args::Args, callback::CallbackState, ui::UiHost};
 
 const LUA_MODULE_NAME: &str = "lumalla";
 
@@ -75,6 +75,7 @@ pub(crate) fn init_dbus_module(
     on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
+    ui_host: UiHost,
 ) -> LuaResult<LuaTable> {
     let module = lua.create_table()?;
 
@@ -316,12 +317,13 @@ pub(crate) fn init_dbus_module(
         })?,
     )?;
 
-    init_dbus_keymap(lua, &module, client.clone(), callback_state)?;
+    init_dbus_keymap(lua, &module, client.clone(), callback_state.clone())?;
     init_dbus_output(lua, &module, client.clone())?;
     init_dbus_drm(lua, &module, client.clone())?;
     init_dbus_spawn(lua, &module, client.clone())?;
     init_dbus_input(lua, &module, client.clone())?;
     init_dbus_window(lua, &module, client)?;
+    crate::ui::register_ui(lua, &module, callback_state, ui_host)?;
 
     Ok(module)
 }
@@ -336,6 +338,7 @@ pub(crate) fn register_dbus_module(
     on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
+    ui_host: UiHost,
 ) -> anyhow::Result<()> {
     lua.register_module(
         LUA_MODULE_NAME,
@@ -349,6 +352,7 @@ pub(crate) fn register_dbus_module(
             on_cursor_move,
             on_cursor_click,
             on_cursor_scroll,
+            ui_host,
         )
         .map_err(|err| anyhow::anyhow!("Unable to create D-Bus config module: {err}"))?,
     )

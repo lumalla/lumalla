@@ -31,6 +31,7 @@
             libclang
             libdrm.dev
             pipewire.dev
+            wayland.dev
           ];
           buildInputs = with pkgs; [
             seatd
@@ -41,14 +42,18 @@
             libdrm
             libgbm
             pipewire
+            wayland
+            libglvnd
+            mesa
           ];
-          PKG_CONFIG_PATH = "${pkgs.seatd.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libgbm}/lib/pkgconfig:${pkgs.pipewire.dev}/lib/pkgconfig";
+          PKG_CONFIG_PATH = "${pkgs.seatd.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libgbm}/lib/pkgconfig:${pkgs.pipewire.dev}/lib/pkgconfig:${pkgs.wayland.dev}/lib/pkgconfig";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
-          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.libdrm}/lib:${pkgs.libgbm}/lib:${pkgs.libinput}/lib:${pkgs.libxkbcommon}/lib:${pkgs.systemd}/lib:${pkgs.pipewire}/lib";
+          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.libdrm}/lib:${pkgs.libgbm}/lib:${pkgs.libinput}/lib:${pkgs.libxkbcommon}/lib:${pkgs.systemd}/lib:${pkgs.pipewire}/lib:${pkgs.wayland}/lib:${pkgs.libglvnd}/lib:${pkgs.mesa}/lib";
           # libgbm/libdrm for link search; force libvulkan into NEEDED/RUNPATH so
           # ash::Entry::load() works without the flake shell's LD_LIBRARY_PATH.
-          LIBRARY_PATH = "${pkgs.libgbm}/lib:${pkgs.vulkan-loader}/lib";
-          RUSTFLAGS = "-L ${pkgs.libgbm}/lib -L ${pkgs.libdrm}/lib -L ${pkgs.vulkan-loader}/lib -C link-arg=-Wl,--push-state,--no-as-needed -C link-arg=-lvulkan -C link-arg=-Wl,--pop-state";
+          # wayland-client is also forced for lumalla-ui (wayland-sys dlopen).
+          LIBRARY_PATH = "${pkgs.libgbm}/lib:${pkgs.vulkan-loader}/lib:${pkgs.wayland}/lib";
+          RUSTFLAGS = "-L ${pkgs.libgbm}/lib -L ${pkgs.libdrm}/lib -L ${pkgs.vulkan-loader}/lib -L ${pkgs.wayland}/lib -C link-arg=-Wl,--push-state,--no-as-needed -C link-arg=-lvulkan -C link-arg=-lwayland-client -C link-arg=-Wl,--pop-state";
         };
 
         cargoRuntimeInputs = with pkgs; [
@@ -113,15 +118,24 @@
             '';
           });
 
-        # What most consumers want: compositor + config on PATH.
+        # Form UI helper (`lumalla_ui_bin` / `lumalla-ui`).
+        lumallaUi = naersk'.buildPackage (commonBuildArgs
+          // {
+            pname = "lumalla-ui";
+            cargoBuildOptions = opts: opts ++ ["-p" "lumalla_ui_bin"];
+            cargoTestOptions = opts: opts ++ ["-p" "lumalla_ui_bin"];
+          });
+
+        # What most consumers want: compositor + config + UI helper on PATH.
         lumallaWithConfig = pkgs.symlinkJoin {
           name = "lumalla";
-          paths = [lumalla lumallaConfig];
+          paths = [lumalla lumallaConfig lumallaUi];
         };
       in {
         packages.default = lumallaWithConfig;
         packages.lumalla = lumalla;
         packages.lumalla-config = lumallaConfig;
+        packages.lumalla-ui = lumallaUi;
         packages.run-local = runLocal;
         packages.lumalla-repl = repl;
         packages.lumalla-repl-local = replLocal;
@@ -199,12 +213,15 @@
             libdrm
             libgbm
             pipewire
+            wayland
+            libglvnd
+            mesa
           ];
-          PKG_CONFIG_PATH = "${pkgs.seatd.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libgbm}/lib/pkgconfig:${pkgs.pipewire.dev}/lib/pkgconfig";
+          PKG_CONFIG_PATH = "${pkgs.seatd.dev}/lib/pkgconfig:${pkgs.libinput.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig:${pkgs.systemd.dev}/lib/pkgconfig:${pkgs.libdrm.dev}/lib/pkgconfig:${pkgs.libgbm}/lib/pkgconfig:${pkgs.pipewire.dev}/lib/pkgconfig:${pkgs.wayland.dev}/lib/pkgconfig";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
-          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.libdrm}/lib:${pkgs.libgbm}/lib:${pkgs.libinput}/lib:${pkgs.libxkbcommon}/lib:${pkgs.systemd}/lib:${pkgs.pipewire}/lib";
-          LIBRARY_PATH = "${pkgs.libgbm}/lib:${pkgs.vulkan-loader}/lib";
-          RUSTFLAGS = "-L ${pkgs.libgbm}/lib -L ${pkgs.libdrm}/lib -L ${pkgs.vulkan-loader}/lib -C link-arg=-Wl,--push-state,--no-as-needed -C link-arg=-lvulkan -C link-arg=-Wl,--pop-state";
+          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.libdrm}/lib:${pkgs.libgbm}/lib:${pkgs.libinput}/lib:${pkgs.libxkbcommon}/lib:${pkgs.systemd}/lib:${pkgs.pipewire}/lib:${pkgs.wayland}/lib:${pkgs.libglvnd}/lib:${pkgs.mesa}/lib";
+          LIBRARY_PATH = "${pkgs.libgbm}/lib:${pkgs.vulkan-loader}/lib:${pkgs.wayland}/lib";
+          RUSTFLAGS = "-L ${pkgs.libgbm}/lib -L ${pkgs.libdrm}/lib -L ${pkgs.vulkan-loader}/lib -L ${pkgs.wayland}/lib -C link-arg=-Wl,--push-state,--no-as-needed -C link-arg=-lvulkan -C link-arg=-lwayland-client -C link-arg=-Wl,--pop-state";
           VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
           RUST_LOG = "debug";
         };

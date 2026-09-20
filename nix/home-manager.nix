@@ -27,7 +27,7 @@ in {
       type = lib.types.package;
       default = defaultPackage;
       defaultText = lib.literalExpression "inputs.lumalla.packages.\${system}.default";
-      description = "Lumalla package (compositor + lumalla-config).";
+      description = "Lumalla package (compositor + lumalla-config + lumalla-ui).";
     };
 
     replPackage = lib.mkOption {

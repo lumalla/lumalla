@@ -137,11 +137,12 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 | `add_window_rule({app_id, zone?, x?, y?, width?, height?})` | Placement rule for an `app_id`. |
 | `clear_window_rules()` | Clear all window rules. |
 
-### Spawn and input injection
+### Spawn, forms, and input injection
 
 | Function | Description |
 | --- | --- |
 | `spawn({command, args?})` | Spawn a process with the compositor’s Wayland environment (plus any vars from `set_extra_env`). |
+| `ui(spec)` | Open a small form via the `lumalla-ui` helper (must be on `PATH`, or set `LUMALLA_UI`). Uses wgpu/Vulkan Wayland (not OpenGL). Returns immediately; results arrive in callbacks. See below. |
 | `set_extra_env(name, value)` | Set an environment variable applied to all future `spawn` calls (e.g. `DISPLAY` for xwayland-satellite). |
 | `sleep(seconds)` | Blocking sleep in the config process (no D-Bus round-trip). |
 | `key(name)` | Press and release a named key. |
@@ -149,6 +150,43 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 | `pointer_move(x, y)` | Absolute pointer move. `x`/`y` are global compositor (scene) coordinates; they are mapped through the active view onto the monitor. |
 | `click(x, y, button?)` | Click at scene coordinates (`button` defaults to `0`). Mapped through the active view like `pointer_move`. |
 | `screenshot(x, y, width, height, path)` | Capture a region to a PNG file. |
+
+#### `lum.ui` form DSL
+
+Opens a Wayland form window as a separate client. Only one form may be open at a time.
+
+**Spec keys:** `title`, `fields`, `actions`, `on_submit(values, action)`, `on_cancel()`, and optionally `validate(values)`, `on_change(id, value, values)`, `on_action(action, values)`.
+
+If any of `validate` / `on_change` / `on_action` is set, the helper runs in **interactive** mode (NDJSON over stdin/stdout). Otherwise it is **simple**: the process exits with a JSON result and `on_submit` / `on_cancel` run once.
+
+**Field types:** `text` (`placeholder`, `default`, `password`, `focus`), `choice` (`options` as strings or `{id, label}`, `default`), `toggle` (`default`), `label` (static; omitted from `values`).
+
+**Actions:** `{ id, label?, primary?, submit? }`. `submit = true` finishes the form. Escape / window close / a `cancel` action calls `on_cancel`.
+
+```lua
+lum.map_key({
+  key = "n",
+  mods = "logo",
+  callback = function()
+    lum.ui({
+      title = "New view",
+      fields = {
+        { id = "name", type = "text", label = "Name", placeholder = "pip", focus = true },
+      },
+      actions = {
+        { id = "cancel", label = "Cancel" },
+        { id = "ok", label = "Create", primary = true, submit = true },
+      },
+      on_submit = function(values, action)
+        if action ~= "ok" then return end
+        -- use values.name with lum.add_view(...)
+      end,
+    })
+  end,
+})
+```
+
+`validate` may return `true`, `false, "message"`, or an update table `{ fields = { { id = "...", error = "..." } } }`. `on_change` / `on_action` use the same return shapes; `on_change` updates are pushed asynchronously to the helper.
 
 ## Debugging compositor issues
 

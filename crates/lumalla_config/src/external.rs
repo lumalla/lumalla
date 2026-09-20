@@ -25,6 +25,7 @@ use crate::dbus_lua::{
     watch_config_files,
 };
 use crate::repl::{ReplRequest, ReplResponse, start_repl_server};
+use crate::ui::{self, UiHost, UiHostEvent};
 
 enum RunEvent {
     Signal(Message),
@@ -46,6 +47,7 @@ pub struct ExternalConfig {
     outputs: HashMap<String, Output>,
     config_watcher: ConfigWatcher,
     reload_receiver: mpsc::Receiver<PathBuf>,
+    ui_receiver: mpsc::Receiver<UiHostEvent>,
     repl_socket: Option<PathBuf>,
     shutting_down: bool,
     startup_done: bool,
@@ -66,6 +68,7 @@ impl ExternalConfig {
         let (reload_tx, reload_receiver) = mpsc::channel();
         let config_watcher = ConfigWatcher::new(reload_tx)?;
         let repl_socket = args.repl_socket_path()?;
+        let (ui_host, ui_receiver) = UiHost::new();
 
         register_dbus_module(
             &lua,
@@ -77,6 +80,7 @@ impl ExternalConfig {
             on_cursor_move.clone(),
             on_cursor_click.clone(),
             on_cursor_scroll.clone(),
+            ui_host,
         )?;
 
         let mut state = Self {
@@ -92,6 +96,7 @@ impl ExternalConfig {
             outputs: HashMap::new(),
             config_watcher,
             reload_receiver,
+            ui_receiver,
             repl_socket,
             shutting_down: false,
             startup_done: false,
@@ -189,6 +194,10 @@ impl ExternalConfig {
                 }
             }
 
+            while let Ok(event) = self.ui_receiver.try_recv() {
+                self.handle_ui_event(event);
+            }
+
             match event_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(RunEvent::Signal(message)) => {
                     if let Err(err) = self.handle_signal(message) {
@@ -227,6 +236,59 @@ impl ExternalConfig {
         };
         if request.reply.send(response).is_err() {
             warn!("REPL client disconnected before receiving response");
+        }
+    }
+
+    fn handle_ui_event(&self, event: UiHostEvent) {
+        match event {
+            UiHostEvent::SimpleFinished {
+                on_submit,
+                on_cancel,
+                outcome,
+            } => {
+                ui::handle_simple_finished(
+                    &self.callback_state,
+                    &self.lua,
+                    on_submit,
+                    on_cancel,
+                    outcome,
+                );
+            }
+            UiHostEvent::Interactive {
+                callbacks,
+                event,
+                reply,
+                stdin,
+                terminal_done,
+            } => {
+                let response = ui::handle_interactive_event(
+                    &self.callback_state,
+                    &self.lua,
+                    &callbacks,
+                    event,
+                    &stdin,
+                    &terminal_done,
+                );
+                if let Some(tx) = reply {
+                    if let Some(response) = response {
+                        let _ = tx.send(response);
+                    } else {
+                        let _ = tx.send(lumalla_ui::UiReply::Ok);
+                    }
+                }
+            }
+            UiHostEvent::InteractiveClosed {
+                on_cancel,
+                terminal_done,
+            } => {
+                if !terminal_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let Some(cb) = on_cancel {
+                        if let Err(err) = self.callback_state.run_callback::<(), ()>(cb, ()) {
+                            warn!("lum.ui on_cancel failed: {err:#}");
+                        }
+                    }
+                }
+            }
         }
     }
 
