@@ -353,6 +353,75 @@ lum.add_zone({
 	default_height = 600,
 })
 
+--- Demo guides: layout boxes under windows, snap lines above. logo+g toggles.
+local guides_visible = true
+
+local function apply_demo_guides(w, h)
+	lum.clear_guides()
+	if not guides_visible then
+		return
+	end
+
+	local term_x, term_y = 40, 40
+	local term_w, term_h = math.floor(w * 0.55), h - 80
+	local calc_x, calc_y = math.floor(w * 0.62), 80
+	local calc_w, calc_h = math.floor(w * 0.32), math.floor(h * 0.4)
+
+	-- Under windows: region outlines for the demo placements.
+	lum.add_guide({
+		name = "term",
+		kind = "box",
+		layer = "below",
+		x = term_x,
+		y = term_y,
+		width = term_w,
+		height = term_h,
+		color = { r = 80, g = 160, b = 255, a = 180 },
+		stroke = 2,
+		fill = { r = 80, g = 160, b = 255, a = 28 },
+		label = "term",
+	})
+	lum.add_guide({
+		name = "calc",
+		kind = "box",
+		layer = "below",
+		x = calc_x,
+		y = calc_y,
+		width = calc_w,
+		height = calc_h,
+		color = { r = 255, g = 140, b = 60, a = 200 },
+		stroke = 2,
+		fill = { r = 255, g = 140, b = 60, a = 28 },
+		label = "calc",
+	})
+
+	-- Over windows: margin + midline helpers.
+	lum.add_guide({
+		name = "left-margin",
+		kind = "line",
+		layer = "above",
+		x1 = 40,
+		y1 = 0,
+		x2 = 40,
+		y2 = h,
+		color = { r = 255, g = 80, b = 80, a = 200 },
+		stroke = 1,
+		label = "x40",
+	})
+	lum.add_guide({
+		name = "midline",
+		kind = "line",
+		layer = "above",
+		x1 = 0,
+		y1 = math.floor(h / 2),
+		x2 = w,
+		y2 = math.floor(h / 2),
+		color = { r = 180, g = 255, b = 120, a = 160 },
+		stroke = 1,
+		label = "mid",
+	})
+end
+
 -- Call set_xkb before map_key so binding key names resolve against the active layout.
 lum.set_xkb({
 	layout = "de",
@@ -396,6 +465,8 @@ lum.on_startup(function()
 		height = math.floor(h * 0.4),
 	})
 
+	apply_demo_guides(w, h)
+
 	lum.spawn({ command = "wezterm", args = { "start", "--always-new-process" } })
 	lum.spawn({ command = "qalculate-qt" })
 end)
@@ -435,6 +506,19 @@ lum.map_key({
 	mods = "logo",
 	callback = function()
 		lum.set_window({ width = 1200, height = 800 })
+	end,
+})
+
+--- logo+g: toggle demo guides (boxes below windows, lines above).
+lum.map_key({
+	key = "g",
+	mods = "logo",
+	callback = function()
+		guides_visible = not guides_visible
+		local output = primary_output()
+		if output then
+			apply_demo_guides(output.width, output.height)
+		end
 	end,
 })
 

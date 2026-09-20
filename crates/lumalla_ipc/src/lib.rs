@@ -7,8 +7,8 @@ pub mod types;
 mod window_manager;
 
 pub use types::{
-    DrmConnectorInfo, DrmDeviceInfo, DrmModeInfo, KeyBindingInfo, ModsInfo, OutputConfigInfo,
-    OutputInfo, ViewInfo, WindowInfo, WindowRuleInfo, XkbInfo, ZoneInfo,
+    ColorInfo, DrmConnectorInfo, DrmDeviceInfo, DrmModeInfo, GuideInfo, KeyBindingInfo, ModsInfo,
+    OutputConfigInfo, OutputInfo, ViewInfo, WindowInfo, WindowRuleInfo, XkbInfo, ZoneInfo,
 };
 pub use window_manager::{WindowManager, WindowManagerHandler, WindowManagerProxy, signals};
 

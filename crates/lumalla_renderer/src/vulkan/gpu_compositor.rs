@@ -8,13 +8,15 @@ use std::ptr;
 
 use anyhow::Context;
 use ash::vk;
-use lumalla_shared::{BufferTransform, View};
+use lumalla_shared::{BufferTransform, Guide, GuideKind, GuideLayer, View};
 
+use crate::bitmap_font;
 use crate::default_cursor::default_cursor_frame;
 use crate::scene_backing::{CompositeMode, DamageRect, UploadRect, buffer_damage_to_upload_rect};
 use crate::{CursorDraw, CursorFrame, DmabufAttachment, SurfaceFrame};
 
 const WL_SHM_FORMAT_XRGB8888: u32 = 1;
+const WL_SHM_FORMAT_ARGB8888: u32 = 0;
 
 use super::{
     CommandBufferRecorder, CommandPool, DescriptorPool, DescriptorSetLayout, Device, DmaBufImage,
@@ -22,8 +24,10 @@ use super::{
     RenderPass, Sampler, ShaderModule, VulkanContext, drm_fourcc_to_vulkan,
 };
 
-const MAX_SURFACE_TEXTURES: u32 = 256;
+const MAX_SURFACE_TEXTURES: u32 = 320;
 const CURSOR_TEXTURE_KEY: (u32, u32) = (u32::MAX, u32::MAX);
+/// Synthetic owner id for guide label textures (`surface_id` = guide index).
+const GUIDE_LABEL_OWNER: u32 = u32::MAX - 1;
 
 /// Batched GPU command buffers for one present, submitted together.
 pub struct GpuWorkBatch {
@@ -120,10 +124,25 @@ struct LayerPushConstants {
     buffer_transform: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SolidPushConstants {
+    dest: [f32; 4],
+    color: [f32; 4],
+    output_size: [f32; 2],
+    half_width: f32,
+    _pad: f32,
+    p0: [f32; 2],
+    p1: [f32; 2],
+}
+
 pub struct GpuCompositor {
     pipeline: GraphicsPipeline,
+    solid_pipeline: GraphicsPipeline,
     _vert_shader: ShaderModule,
     _frag_shader: ShaderModule,
+    _solid_vert_shader: ShaderModule,
+    _solid_frag_shader: ShaderModule,
     descriptor_layout: DescriptorSetLayout,
     descriptor_pool: DescriptorPool,
     sampler: Sampler,
@@ -139,9 +158,19 @@ impl GpuCompositor {
             env!("OUT_DIR"),
             "/composite.frag.spv"
         )));
+        let solid_vert_spv = spv_from_bytes(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/solid.vert.spv"
+        )));
+        let solid_frag_spv = spv_from_bytes(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/solid.frag.spv"
+        )));
 
         let vert_shader = ShaderModule::from_spirv(device, &vert_spv)?;
         let frag_shader = ShaderModule::from_spirv(device, &frag_spv)?;
+        let solid_vert_shader = ShaderModule::from_spirv(device, &solid_vert_spv)?;
+        let solid_frag_shader = ShaderModule::from_spirv(device, &solid_frag_spv)?;
         let descriptor_layout = DescriptorSetLayout::new_texture_sampler(device)?;
         let descriptor_pool =
             DescriptorPool::new_combined_image_sampler(device, MAX_SURFACE_TEXTURES)?;
@@ -160,10 +189,24 @@ impl GpuCompositor {
             .push_constant_range(push_constants)
             .build()?;
 
+        let solid_push = vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            offset: 0,
+            size: mem::size_of::<SolidPushConstants>() as u32,
+        };
+        let solid_pipeline = GraphicsPipelineBuilder::new(device, render_pass)
+            .vertex_shader(&solid_vert_shader)
+            .fragment_shader(&solid_frag_shader)
+            .push_constant_range(solid_push)
+            .build()?;
+
         Ok(Self {
             pipeline,
+            solid_pipeline,
             _vert_shader: vert_shader,
             _frag_shader: frag_shader,
+            _solid_vert_shader: solid_vert_shader,
+            _solid_frag_shader: solid_frag_shader,
             descriptor_layout,
             descriptor_pool,
             sampler,
@@ -196,6 +239,55 @@ impl GpuCompositor {
             device.handle().cmd_push_constants(
                 recorder.command_buffer(),
                 self.pipeline.layout(),
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                bytemuck::bytes_of(&push),
+            );
+        }
+        recorder.set_viewport_fullscreen(output_width, output_height);
+        if let Some(clip) = clip {
+            recorder.set_scissor(clip);
+        } else {
+            recorder.set_scissor_fullscreen(output_width, output_height);
+        }
+        recorder.draw_fullscreen_quad();
+    }
+
+    fn draw_solid(
+        &self,
+        device: &Device,
+        recorder: &mut CommandBufferRecorder,
+        dest: [f32; 4],
+        color: [f32; 4],
+        output_width: u32,
+        output_height: u32,
+        half_width: f32,
+        p0: [f32; 2],
+        p1: [f32; 2],
+        clip: Option<&vk::Rect2D>,
+    ) {
+        if dest[2] <= 0.0 || dest[3] <= 0.0 {
+            return;
+        }
+        if let Some(clip) = clip {
+            if !dest_intersects_clip(dest, clip) {
+                return;
+            }
+        }
+        recorder.bind_pipeline(&self.solid_pipeline);
+        let push = SolidPushConstants {
+            dest,
+            color,
+            output_size: [output_width as f32, output_height as f32],
+            half_width,
+            _pad: 0.0,
+            p0,
+            p1,
+        };
+        unsafe {
+            device.handle().cmd_push_constants(
+                recorder.command_buffer(),
+                self.solid_pipeline.layout(),
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytemuck::bytes_of(&push),
@@ -645,6 +737,32 @@ impl SurfaceTextureCache {
         Ok(())
     }
 
+    /// Upload or replace a guide label texture keyed by guide list index.
+    pub fn sync_guide_label(
+        &mut self,
+        vulkan: &mut VulkanContext,
+        compositor: &GpuCompositor,
+        batch: &mut GpuWorkBatch,
+        guide_index: u32,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        let key = (GUIDE_LABEL_OWNER, guide_index);
+        self.sync_shm_pixels(
+            vulkan,
+            compositor,
+            batch,
+            key,
+            guide_index.wrapping_add(1),
+            pixels,
+            width,
+            height,
+            width.saturating_mul(4),
+            WL_SHM_FORMAT_ARGB8888,
+        )
+    }
+
     pub fn sync_scene(
         &mut self,
         vulkan: &mut VulkanContext,
@@ -961,6 +1079,7 @@ pub fn composite_to_scanout(
     composite_mode: CompositeMode,
     views: &[View],
     layers: &[&SurfaceFrame],
+    guides: &[Guide],
     cursor: CursorDraw<'_>,
     pointer_x: i32,
     pointer_y: i32,
@@ -994,6 +1113,7 @@ pub fn composite_to_scanout(
                     cache,
                     views,
                     layers,
+                    guides,
                     cursor,
                     pointer_x,
                     pointer_y,
@@ -1015,6 +1135,7 @@ pub fn composite_to_scanout(
                         cache,
                         views,
                         layers,
+                        guides,
                         cursor,
                         pointer_x,
                         pointer_y,
@@ -1046,6 +1167,7 @@ fn draw_views(
     cache: &SurfaceTextureCache,
     views: &[View],
     layers: &[&SurfaceFrame],
+    guides: &[Guide],
     cursor: CursorDraw<'_>,
     pointer_x: i32,
     pointer_y: i32,
@@ -1064,6 +1186,18 @@ fn draw_views(
             },
             None => view_clip,
         };
+        draw_guides(
+            compositor,
+            device,
+            recorder,
+            cache,
+            view,
+            guides,
+            GuideLayer::Below,
+            output_width,
+            output_height,
+            Some(&clip),
+        );
         draw_scene_layers(
             compositor,
             device,
@@ -1071,6 +1205,18 @@ fn draw_views(
             cache,
             view,
             layers,
+            output_width,
+            output_height,
+            Some(&clip),
+        );
+        draw_guides(
+            compositor,
+            device,
+            recorder,
+            cache,
+            view,
+            guides,
+            GuideLayer::Above,
             output_width,
             output_height,
             Some(&clip),
@@ -1089,6 +1235,208 @@ fn draw_views(
         output_height,
         outer_clip,
     );
+}
+
+fn draw_guides(
+    compositor: &GpuCompositor,
+    device: &Device,
+    recorder: &mut CommandBufferRecorder<'_>,
+    cache: &SurfaceTextureCache,
+    view: &View,
+    guides: &[Guide],
+    layer: GuideLayer,
+    output_width: u32,
+    output_height: u32,
+    clip: Option<&vk::Rect2D>,
+) {
+    for (index, guide) in guides.iter().enumerate() {
+        if guide.layer != layer {
+            continue;
+        }
+        draw_guide_geometry(
+            compositor,
+            device,
+            recorder,
+            view,
+            guide,
+            output_width,
+            output_height,
+            clip,
+        );
+        if !guide.label.is_empty() {
+            draw_guide_label(
+                compositor,
+                device,
+                recorder,
+                cache,
+                view,
+                guide,
+                index as u32,
+                output_width,
+                output_height,
+                clip,
+            );
+        }
+    }
+}
+
+fn draw_guide_geometry(
+    compositor: &GpuCompositor,
+    device: &Device,
+    recorder: &mut CommandBufferRecorder<'_>,
+    view: &View,
+    guide: &Guide,
+    output_width: u32,
+    output_height: u32,
+    clip: Option<&vk::Rect2D>,
+) {
+    let color = guide.color.premultiplied_f32();
+    let stroke = guide.stroke.max(1) as f32;
+    match &guide.kind {
+        GuideKind::Box {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            if let Some(fill) = guide.fill {
+                let dest = map_rect_through_view(
+                    view,
+                    [*x as f32, *y as f32, *width as f32, *height as f32],
+                );
+                compositor.draw_solid(
+                    device,
+                    recorder,
+                    dest,
+                    fill.premultiplied_f32(),
+                    output_width,
+                    output_height,
+                    -1.0,
+                    [0.0, 0.0],
+                    [0.0, 0.0],
+                    clip,
+                );
+            }
+            let w = *width as f32;
+            let h = *height as f32;
+            let sx = *x as f32;
+            let sy = *y as f32;
+            // Top, bottom, left, right edges in scene space.
+            let edges = [
+                [sx, sy, w, stroke],
+                [sx, sy + h - stroke, w, stroke],
+                [sx, sy, stroke, h],
+                [sx + w - stroke, sy, stroke, h],
+            ];
+            for edge in edges {
+                if edge[2] <= 0.0 || edge[3] <= 0.0 {
+                    continue;
+                }
+                let dest = map_rect_through_view(view, edge);
+                compositor.draw_solid(
+                    device,
+                    recorder,
+                    dest,
+                    color,
+                    output_width,
+                    output_height,
+                    -1.0,
+                    [0.0, 0.0],
+                    [0.0, 0.0],
+                    clip,
+                );
+            }
+        }
+        GuideKind::Line { x1, y1, x2, y2 } => {
+            let p0 = map_point_through_view(view, *x1 as f32, *y1 as f32);
+            let p1 = map_point_through_view(view, *x2 as f32, *y2 as f32);
+            let half = scale_length_through_view(view, stroke) * 0.5;
+            let min_x = p0[0].min(p1[0]) - half - 1.0;
+            let min_y = p0[1].min(p1[1]) - half - 1.0;
+            let max_x = p0[0].max(p1[0]) + half + 1.0;
+            let max_y = p0[1].max(p1[1]) + half + 1.0;
+            let dest = [min_x, min_y, (max_x - min_x).max(1.0), (max_y - min_y).max(1.0)];
+            compositor.draw_solid(
+                device,
+                recorder,
+                dest,
+                color,
+                output_width,
+                output_height,
+                half.max(0.5),
+                p0,
+                p1,
+                clip,
+            );
+        }
+    }
+}
+
+fn draw_guide_label(
+    compositor: &GpuCompositor,
+    device: &Device,
+    recorder: &mut CommandBufferRecorder<'_>,
+    cache: &SurfaceTextureCache,
+    view: &View,
+    guide: &Guide,
+    guide_index: u32,
+    output_width: u32,
+    output_height: u32,
+    clip: Option<&vk::Rect2D>,
+) {
+    let key = (GUIDE_LABEL_OWNER, guide_index);
+    let Some(texture) = cache.texture(key) else {
+        return;
+    };
+    let (lw, lh) = bitmap_font::label_size(&guide.label);
+    let (lx, ly) = label_scene_origin(guide, lw as i32, lh as i32);
+    let dest = map_rect_through_view(view, [lx as f32, ly as f32, lw as f32, lh as f32]);
+    if dest[2] <= 0.0 || dest[3] <= 0.0 {
+        return;
+    }
+    if let Some(clip) = clip {
+        if !dest_intersects_clip(dest, clip) {
+            return;
+        }
+    }
+    compositor.draw_layer(
+        device,
+        recorder,
+        texture,
+        dest,
+        [0.0, 0.0, 1.0, 1.0],
+        output_width,
+        output_height,
+        false,
+        BufferTransform::Normal,
+        clip,
+    );
+}
+
+fn label_scene_origin(guide: &Guide, label_w: i32, label_h: i32) -> (i32, i32) {
+    match &guide.kind {
+        GuideKind::Box { x, y, .. } => (*x, *y - label_h - 2),
+        GuideKind::Line { x1, y1, x2, y2 } => {
+            let mx = (*x1 + *x2) / 2;
+            let my = (*y1 + *y2) / 2;
+            (mx - label_w / 2, my - label_h - 2)
+        }
+    }
+}
+
+fn map_point_through_view(view: &View, x: f32, y: f32) -> [f32; 2] {
+    let rect = map_rect_through_view(view, [x, y, 1.0, 1.0]);
+    [rect[0], rect[1]]
+}
+
+fn scale_length_through_view(view: &View, length: f32) -> f32 {
+    let (sx, _, sw, _) = view.source;
+    let (_, _, dw, _) = view.dest;
+    let _ = sx;
+    if sw <= 0 {
+        return length;
+    }
+    length * (dw as f32 / sw as f32)
 }
 
 fn draw_scene_layers(

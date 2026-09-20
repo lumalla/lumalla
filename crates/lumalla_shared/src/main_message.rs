@@ -1,3 +1,4 @@
+use crate::Guide;
 use crate::Mods;
 use crate::Output;
 use crate::OutputConfig;
@@ -103,6 +104,15 @@ pub enum MainMessage {
         /// Zone name previously passed to [`Self::AddZone`].
         name: String,
     },
+    /// Add or replace a guide by name.
+    AddGuide(Guide),
+    /// Remove a guide by name.
+    RemoveGuide {
+        /// Guide name previously passed to [`Self::AddGuide`].
+        name: String,
+    },
+    /// Remove all guides.
+    ClearGuides,
     /// Assign a window to a zone and apply its composition strategy.
     /// `window == None` targets the focused window.
     AddWindowToZone {

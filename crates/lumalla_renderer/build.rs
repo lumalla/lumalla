@@ -18,6 +18,16 @@ fn main() {
         &format!("{out_dir}/composite.frag.spv"),
         naga::ShaderStage::Fragment,
     );
+    compile_wgsl(
+        "shaders/solid.vert.wgsl",
+        &format!("{out_dir}/solid.vert.spv"),
+        naga::ShaderStage::Vertex,
+    );
+    compile_wgsl(
+        "shaders/solid.frag.wgsl",
+        &format!("{out_dir}/solid.frag.spv"),
+        naga::ShaderStage::Fragment,
+    );
 }
 
 fn compile_wgsl(path: &str, out_path: &str, stage: naga::ShaderStage) {

@@ -3,8 +3,8 @@
 use zbus::{interface, object_server::SignalEmitter};
 
 use crate::types::{
-    DrmDeviceInfo, KeyBindingInfo, ModsInfo, OutputConfigInfo, OutputInfo, ViewInfo, WindowInfo,
-    WindowRuleInfo, XkbInfo, ZoneInfo,
+    DrmDeviceInfo, GuideInfo, KeyBindingInfo, ModsInfo, OutputConfigInfo, OutputInfo, ViewInfo,
+    WindowInfo, WindowRuleInfo, XkbInfo, ZoneInfo,
 };
 
 /// Server-side handler for [`WindowManager`] D-Bus methods.
@@ -43,6 +43,18 @@ pub trait WindowManagerHandler: Send + Sync {
 
     /// Remove a zone by name.
     fn remove_zone(&mut self, name: &str) -> zbus::fdo::Result<()>;
+
+    /// Add or replace a guide by name.
+    fn add_guide(&mut self, guide: GuideInfo) -> zbus::fdo::Result<()>;
+
+    /// Remove a guide by name.
+    fn remove_guide(&mut self, name: &str) -> zbus::fdo::Result<()>;
+
+    /// Remove all guides.
+    fn clear_guides(&mut self) -> zbus::fdo::Result<()>;
+
+    /// Return current guides.
+    fn get_guides(&self) -> zbus::fdo::Result<Vec<GuideInfo>>;
 
     /// Add a window placement rule.
     fn add_window_rule(&mut self, rule: WindowRuleInfo) -> zbus::fdo::Result<()>;
@@ -274,6 +286,22 @@ impl WindowManager {
 
     fn remove_zone(&mut self, name: &str) -> zbus::fdo::Result<()> {
         self.handler.remove_zone(name)
+    }
+
+    fn add_guide(&mut self, guide: GuideInfo) -> zbus::fdo::Result<()> {
+        self.handler.add_guide(guide)
+    }
+
+    fn remove_guide(&mut self, name: &str) -> zbus::fdo::Result<()> {
+        self.handler.remove_guide(name)
+    }
+
+    fn clear_guides(&mut self) -> zbus::fdo::Result<()> {
+        self.handler.clear_guides()
+    }
+
+    fn get_guides(&self) -> zbus::fdo::Result<Vec<GuideInfo>> {
+        self.handler.get_guides()
     }
 
     fn add_window_rule(&mut self, rule: WindowRuleInfo) -> zbus::fdo::Result<()> {

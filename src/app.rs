@@ -817,6 +817,21 @@ impl AppData {
                         error!("Unable to remove unknown zone {name}");
                     }
                 }
+                MainMessage::AddGuide(guide) => {
+                    self.renderer_state.add_guide(guide);
+                    self.request_present_immediate(event_loop, arena);
+                }
+                MainMessage::RemoveGuide { name } => {
+                    if !self.renderer_state.remove_guide(&name) {
+                        error!("Unable to remove unknown guide {name}");
+                    } else {
+                        self.request_present_immediate(event_loop, arena);
+                    }
+                }
+                MainMessage::ClearGuides => {
+                    self.renderer_state.clear_guides();
+                    self.request_present_immediate(event_loop, arena);
+                }
                 MainMessage::AddWindowToZone { window, zone } => {
                     match self
                         .display_state

@@ -7,12 +7,15 @@ use anyhow::Context;
 use ash::vk;
 use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
-use lumalla_shared::{BufferTransform, CapturedImage, DrmDeviceState, Output, OutputConfig, View};
+use lumalla_shared::{
+    BufferTransform, CapturedImage, DrmDeviceState, Guide, Output, OutputConfig, View,
+};
 use stumpalo::Arena;
 
 pub mod drm;
 pub mod vulkan;
 
+mod bitmap_font;
 mod default_cursor;
 mod present_control;
 mod scanout_pool;
@@ -352,6 +355,8 @@ pub struct RendererState {
     virtual_outputs: HashMap<String, VirtualOutput>,
     /// Views keyed by output name; empty means the output presents clear color only.
     output_views: HashMap<String, Vec<View>>,
+    /// Compositor-drawn guides (scene space), back-to-front within each layer.
+    guides: Vec<Guide>,
     scanouts: HashMap<String, OutputScanout>,
     /// Per-output schedule + present-wake timeout state.
     output_presents: HashMap<String, OutputPresentControl>,
@@ -423,6 +428,7 @@ impl RendererState {
             output_configs: HashMap::new(),
             virtual_outputs: HashMap::new(),
             output_views: HashMap::new(),
+            guides: Vec::new(),
             scanouts: HashMap::new(),
             output_presents: HashMap::new(),
             next_present_wake_token: 0,
@@ -551,6 +557,38 @@ impl RendererState {
         }
         self.pending_full_redraw = true;
         self.mark_dirty_if_active();
+    }
+
+    /// Add or replace a guide by name.
+    pub fn add_guide(&mut self, guide: Guide) {
+        if let Some(slot) = self.guides.iter_mut().find(|g| g.name == guide.name) {
+            *slot = guide;
+        } else {
+            self.guides.push(guide);
+        }
+        self.pending_full_redraw = true;
+        self.mark_dirty_if_active();
+    }
+
+    /// Remove a guide by name. Returns whether it existed.
+    pub fn remove_guide(&mut self, name: &str) -> bool {
+        let before = self.guides.len();
+        self.guides.retain(|g| g.name != name);
+        let removed = self.guides.len() != before;
+        if removed {
+            self.pending_full_redraw = true;
+            self.mark_dirty_if_active();
+        }
+        removed
+    }
+
+    /// Remove all guides.
+    pub fn clear_guides(&mut self) {
+        if !self.guides.is_empty() {
+            self.guides.clear();
+            self.pending_full_redraw = true;
+            self.mark_dirty_if_active();
+        }
     }
 
     /// Drop views for an output (blank presents until new views are set).
@@ -2020,6 +2058,19 @@ impl RendererState {
                 .compositor
                 .take()
                 .context("GPU compositor missing after init")?;
+            let label_uploads: Vec<(u32, Vec<u8>, u32, u32)> = self
+                .guides
+                .iter()
+                .enumerate()
+                .filter(|(_, guide)| !guide.label.is_empty())
+                .map(|(index, guide)| {
+                    let (pixels, width, height) = crate::bitmap_font::rasterize_label(
+                        &guide.label,
+                        guide.effective_label_color(),
+                    );
+                    (index as u32, pixels, width, height)
+                })
+                .collect();
             let gpu_result = (|| -> anyhow::Result<()> {
                 self.gpu.surface_textures.sync_scene(
                     vulkan,
@@ -2033,6 +2084,18 @@ impl RendererState {
                     &_pending_damage,
                     pointer_damage || cursor_buffer_dirty,
                 )?;
+
+                for (index, pixels, width, height) in &label_uploads {
+                    self.gpu.surface_textures.sync_guide_label(
+                        vulkan,
+                        &compositor,
+                        &mut batch,
+                        *index,
+                        pixels,
+                        *width,
+                        *height,
+                    )?;
+                }
 
                 vulkan.ensure_scanout_render_pass()?;
                 let render_pass = match &composite_mode {
@@ -2062,6 +2125,7 @@ impl RendererState {
                     composite_mode,
                     &views,
                     &layers,
+                    &self.guides,
                     cursor,
                     pointer_x,
                     pointer_y,

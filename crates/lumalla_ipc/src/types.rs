@@ -1,8 +1,8 @@
 //! D-Bus serializable types.
 
 use lumalla_shared::{
-    CompositionStrategy, DrmConnector, DrmDeviceState, DrmMode, Mods, Output, WindowRule,
-    WindowState, Zone,
+    ColorRgba, CompositionStrategy, DrmConnector, DrmDeviceState, DrmMode, Guide, GuideKind,
+    GuideLayer, Mods, Output, WindowRule, WindowState, Zone,
 };
 use serde::{Deserialize, Serialize};
 use zbus::zvariant::Type;
@@ -345,6 +345,173 @@ impl From<ZoneInfo> for Zone {
             },
         };
         Zone::new(zone.name, zone.x, zone.y, zone.default, composition)
+    }
+}
+
+/// RGBA color (0–255 per channel) for D-Bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct ColorInfo {
+    /// Red.
+    pub r: u8,
+    /// Green.
+    pub g: u8,
+    /// Blue.
+    pub b: u8,
+    /// Alpha.
+    pub a: u8,
+}
+
+impl From<ColorRgba> for ColorInfo {
+    fn from(c: ColorRgba) -> Self {
+        Self {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: c.a,
+        }
+    }
+}
+
+impl From<ColorInfo> for ColorRgba {
+    fn from(c: ColorInfo) -> Self {
+        Self {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: c.a,
+        }
+    }
+}
+
+/// Guide definition exposed over D-Bus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct GuideInfo {
+    /// Guide name.
+    pub name: String,
+    /// `"box"` or `"line"`.
+    pub kind: String,
+    /// `"above"` or `"below"`.
+    pub layer: String,
+    /// Box left edge (ignored for lines).
+    pub x: i32,
+    /// Box top edge (ignored for lines).
+    pub y: i32,
+    /// Box width (ignored for lines).
+    pub width: i32,
+    /// Box height (ignored for lines).
+    pub height: i32,
+    /// Line start X (ignored for boxes).
+    pub x1: i32,
+    /// Line start Y (ignored for boxes).
+    pub y1: i32,
+    /// Line end X (ignored for boxes).
+    pub x2: i32,
+    /// Line end Y (ignored for boxes).
+    pub y2: i32,
+    /// Stroke / line color.
+    pub color: ColorInfo,
+    /// Stroke width in scene pixels.
+    pub stroke: i32,
+    /// Whether [`Self::fill`] is set (boxes only).
+    pub has_fill: bool,
+    /// Optional box fill color.
+    pub fill: ColorInfo,
+    /// Optional label text.
+    pub label: String,
+    /// Whether [`Self::label_color`] overrides the stroke color.
+    pub has_label_color: bool,
+    /// Optional label color.
+    pub label_color: ColorInfo,
+}
+
+impl From<Guide> for GuideInfo {
+    fn from(guide: Guide) -> Self {
+        let (x, y, width, height, x1, y1, x2, y2) = match guide.kind {
+            GuideKind::Box {
+                x,
+                y,
+                width,
+                height,
+            } => (x, y, width, height, 0, 0, 0, 0),
+            GuideKind::Line { x1, y1, x2, y2 } => (0, 0, 0, 0, x1, y1, x2, y2),
+        };
+        let kind = match guide.kind {
+            GuideKind::Box { .. } => "box",
+            GuideKind::Line { .. } => "line",
+        };
+        let (has_fill, fill) = match guide.fill {
+            Some(c) => (true, ColorInfo::from(c)),
+            None => (
+                false,
+                ColorInfo {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 0,
+                },
+            ),
+        };
+        let (has_label_color, label_color) = match guide.label_color {
+            Some(c) => (true, ColorInfo::from(c)),
+            None => (false, ColorInfo::from(guide.color)),
+        };
+        Self {
+            name: guide.name,
+            kind: String::from(kind),
+            layer: String::from(guide.layer.as_str()),
+            x,
+            y,
+            width,
+            height,
+            x1,
+            y1,
+            x2,
+            y2,
+            color: ColorInfo::from(guide.color),
+            stroke: guide.stroke,
+            has_fill,
+            fill,
+            label: guide.label,
+            has_label_color,
+            label_color,
+        }
+    }
+}
+
+impl From<GuideInfo> for Guide {
+    fn from(info: GuideInfo) -> Self {
+        let kind = match info.kind.as_str() {
+            "line" => GuideKind::Line {
+                x1: info.x1,
+                y1: info.y1,
+                x2: info.x2,
+                y2: info.y2,
+            },
+            _ => GuideKind::Box {
+                x: info.x,
+                y: info.y,
+                width: info.width.max(0),
+                height: info.height.max(0),
+            },
+        };
+        Self {
+            name: info.name,
+            kind,
+            layer: GuideLayer::parse(&info.layer),
+            color: info.color.into(),
+            stroke: info.stroke.max(1),
+            fill: if info.has_fill {
+                Some(info.fill.into())
+            } else {
+                None
+            },
+            label: info.label,
+            label_color: if info.has_label_color {
+                Some(info.label_color.into())
+            } else {
+                None
+            },
+        }
     }
 }
 

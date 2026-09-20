@@ -132,10 +132,16 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 | `raise_window({id?})` | Raise without changing focus. |
 | `add_zone({name, x?, y?, default?, composition?, default_width?, default_height?})` | Add or replace a zone. `composition` defaults to `"free"`; size defaults to 800×600. |
 | `remove_zone(name)` | Remove a zone. |
+| `add_guide({name, kind?, layer?, ...})` | Add or replace a guide (helper line/box). See below. |
+| `remove_guide(name)` | Remove a guide. |
+| `clear_guides()` | Remove all guides. |
+| `get_guides()` | Return current guides as tables. |
 | `add_window_to_zone({id?, zone})` | Assign a window to a zone. |
 | `remove_window_from_zone({id?})` | Clear zone membership. |
 | `add_window_rule({app_id, zone?, x?, y?, width?, height?})` | Placement rule for an `app_id`. |
 | `clear_window_rules()` | Clear all window rules. |
+
+**Guide table:** `name` (required), `kind` (`"box"` default or `"line"`), `layer` (`"below"` default or `"above"`), `color` `{r,g,b,a}` (0–255; default amber), `stroke` (scene px, default 1), optional `fill` `{r,g,b,a}` (boxes), optional `label` (bitmap `A–Za–z0–9`; other chars including space are blank cells), optional `label_color`. Boxes use `x`,`y`,`width`,`height`. Lines use `x1`,`y1`,`x2`,`y2`. Coordinates are compositor/scene space.
 
 ### Spawn, forms, and input injection
 

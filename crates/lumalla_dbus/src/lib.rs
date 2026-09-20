@@ -69,6 +69,7 @@ impl DbusService {
             keymaps: Arc::new(Mutex::new(Vec::new())),
             xkb_config: Arc::new(Mutex::new(lumalla_shared::XkbConfig::default())),
             windows: Arc::new(Mutex::new(Vec::new())),
+            guides: Arc::new(Mutex::new(Vec::new())),
             pending_screenshots: Arc::clone(&pending_screenshots),
             pending_pipewire_streams: Arc::clone(&pending_pipewire_streams),
             next_pipewire_request_id: Arc::new(Mutex::new(1)),

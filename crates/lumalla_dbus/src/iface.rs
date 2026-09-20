@@ -17,8 +17,8 @@ use lumalla_input::evdev_keycode_from_name_with_xkb;
 use lumalla_ipc::{
     INTERFACE_NAME, KeyBindingInfo, ModsInfo, OBJECT_PATH, WindowManagerHandler,
     types::{
-        DrmDeviceInfo, OutputConfigInfo, OutputInfo, ViewInfo, WindowInfo, WindowRuleInfo, XkbInfo,
-        ZoneInfo,
+        DrmDeviceInfo, GuideInfo, OutputConfigInfo, OutputInfo, ViewInfo, WindowInfo,
+        WindowRuleInfo, XkbInfo, ZoneInfo,
     },
 };
 use lumalla_shared::{
@@ -53,6 +53,7 @@ pub(crate) struct ServiceState {
     pub keymaps: Arc<Mutex<Vec<KeyBindingInfo>>>,
     pub xkb_config: Arc<Mutex<XkbConfig>>,
     pub windows: Arc<Mutex<Vec<WindowState>>>,
+    pub guides: Arc<Mutex<Vec<GuideInfo>>>,
     pub pending_screenshots: Arc<Mutex<HashMap<usize, Arc<PendingScreenshot>>>>,
     pub pending_pipewire_streams: Arc<Mutex<HashMap<usize, Arc<PendingPipewireStream>>>>,
     pub next_pipewire_request_id: Arc<Mutex<usize>>,
@@ -203,6 +204,44 @@ impl WindowManagerHandler for CompositorHandler {
             name: name.to_owned(),
         });
         Ok(())
+    }
+
+    fn add_guide(&mut self, guide: GuideInfo) -> zbus::fdo::Result<()> {
+        info!("Add guide over D-Bus: {}", guide.name);
+        {
+            let mut guides = self.state.guides.lock().unwrap();
+            if let Some(slot) = guides.iter_mut().find(|g| g.name == guide.name) {
+                *slot = guide.clone();
+            } else {
+                guides.push(guide.clone());
+            }
+        }
+        self.state.comms.main(MainMessage::AddGuide(guide.into()));
+        Ok(())
+    }
+
+    fn remove_guide(&mut self, name: &str) -> zbus::fdo::Result<()> {
+        info!("Remove guide over D-Bus: {name}");
+        self.state
+            .guides
+            .lock()
+            .unwrap()
+            .retain(|g| g.name != name);
+        self.state.comms.main(MainMessage::RemoveGuide {
+            name: name.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn clear_guides(&mut self) -> zbus::fdo::Result<()> {
+        info!("Clear guides over D-Bus");
+        self.state.guides.lock().unwrap().clear();
+        self.state.comms.main(MainMessage::ClearGuides);
+        Ok(())
+    }
+
+    fn get_guides(&self) -> zbus::fdo::Result<Vec<GuideInfo>> {
+        Ok(self.state.guides.lock().unwrap().clone())
     }
 
     fn add_window_rule(&mut self, rule: WindowRuleInfo) -> zbus::fdo::Result<()> {

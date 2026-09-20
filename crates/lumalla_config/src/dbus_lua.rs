@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use lumalla_ipc::{
-    BUS_NAME, DrmDeviceInfo, KeyBindingInfo, ModsInfo, OutputConfigInfo, OutputInfo, ViewInfo,
-    WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo, ZoneInfo,
+    BUS_NAME, ColorInfo, DrmDeviceInfo, GuideInfo, KeyBindingInfo, ModsInfo, OutputConfigInfo,
+    OutputInfo, ViewInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo, ZoneInfo,
 };
 use lumalla_shared::{CallbackRef, Mods, Output, geometry_field_to_dbus};
 use mlua::{
@@ -759,6 +759,46 @@ fn init_dbus_window(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
         })?,
     )?;
 
+    let add_guide_client = client.clone();
+    module.set(
+        "add_guide",
+        lua.create_function(move |_, guide: ConfigGuide| {
+            dbus_result(add_guide_client.proxy.add_guide(guide.into()))?;
+            Ok(())
+        })?,
+    )?;
+
+    let remove_guide_client = client.clone();
+    module.set(
+        "remove_guide",
+        lua.create_function(move |_, name: String| {
+            dbus_result(remove_guide_client.proxy.remove_guide(&name))?;
+            Ok(())
+        })?,
+    )?;
+
+    let clear_guides_client = client.clone();
+    module.set(
+        "clear_guides",
+        lua.create_function(move |_, ()| {
+            dbus_result(clear_guides_client.proxy.clear_guides())?;
+            Ok(())
+        })?,
+    )?;
+
+    let get_guides_client = client.clone();
+    module.set(
+        "get_guides",
+        lua.create_function(move |lua, ()| {
+            let guides = dbus_result(get_guides_client.proxy.get_guides())?;
+            let table = lua.create_table()?;
+            for (index, guide) in guides.into_iter().enumerate() {
+                table.set(index + 1, ConfigGuide::from(guide))?;
+            }
+            Ok(table)
+        })?,
+    )?;
+
     let add_to_zone_client = client.clone();
     module.set(
         "add_window_to_zone",
@@ -1481,6 +1521,235 @@ impl FromLua for ConfigZone {
             default_width: table.get("default_width").unwrap_or(800),
             default_height: table.get("default_height").unwrap_or(600),
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ConfigColor {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+impl FromLua for ConfigColor {
+    fn from_lua(value: LuaValue, _: &Lua) -> LuaResult<Self> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaColor",
+                to: String::from("ConfigColor"),
+                message: Some(String::from("Expected a Lua table for color {r,g,b,a}")),
+            })?;
+        Ok(Self {
+            r: table.get("r").unwrap_or(255),
+            g: table.get("g").unwrap_or(255),
+            b: table.get("b").unwrap_or(255),
+            a: table.get("a").unwrap_or(255),
+        })
+    }
+}
+
+impl From<ConfigColor> for ColorInfo {
+    fn from(c: ConfigColor) -> Self {
+        Self {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: c.a,
+        }
+    }
+}
+
+impl From<ColorInfo> for ConfigColor {
+    fn from(c: ColorInfo) -> Self {
+        Self {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: c.a,
+        }
+    }
+}
+
+impl IntoLua for ConfigColor {
+    fn into_lua(self, lua: &Lua) -> LuaResult<LuaValue> {
+        let table = lua.create_table()?;
+        table.set("r", self.r)?;
+        table.set("g", self.g)?;
+        table.set("b", self.b)?;
+        table.set("a", self.a)?;
+        Ok(LuaValue::Table(table))
+    }
+}
+
+struct ConfigGuide {
+    name: String,
+    kind: String,
+    layer: String,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    color: ConfigColor,
+    stroke: i32,
+    fill: Option<ConfigColor>,
+    label: String,
+    label_color: Option<ConfigColor>,
+}
+
+impl FromLua for ConfigGuide {
+    fn from_lua(value: LuaValue, lua: &Lua) -> LuaResult<Self> {
+        let table = value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaGuide",
+                to: String::from("ConfigGuide"),
+                message: Some(String::from("Expected a Lua table for the guide")),
+            })?;
+        let default_color = ConfigColor {
+            r: 255,
+            g: 180,
+            b: 0,
+            a: 200,
+        };
+        let color = match table.get::<LuaValue>("color")? {
+            LuaValue::Nil => default_color,
+            other => ConfigColor::from_lua(other, lua)?,
+        };
+        let fill = match table.get::<LuaValue>("fill")? {
+            LuaValue::Nil => None,
+            other => Some(ConfigColor::from_lua(other, lua)?),
+        };
+        let label_color = match table.get::<LuaValue>("label_color")? {
+            LuaValue::Nil => None,
+            other => Some(ConfigColor::from_lua(other, lua)?),
+        };
+        Ok(Self {
+            name: table.get("name")?,
+            kind: table
+                .get("kind")
+                .unwrap_or_else(|_| String::from("box")),
+            layer: table
+                .get("layer")
+                .unwrap_or_else(|_| String::from("below")),
+            x: table.get("x").unwrap_or(0),
+            y: table.get("y").unwrap_or(0),
+            width: table.get("width").unwrap_or(0),
+            height: table.get("height").unwrap_or(0),
+            x1: table.get("x1").unwrap_or(0),
+            y1: table.get("y1").unwrap_or(0),
+            x2: table.get("x2").unwrap_or(0),
+            y2: table.get("y2").unwrap_or(0),
+            color,
+            stroke: table.get("stroke").unwrap_or(1),
+            fill,
+            label: table.get("label").unwrap_or_default(),
+            label_color,
+        })
+    }
+}
+
+impl From<ConfigGuide> for GuideInfo {
+    fn from(guide: ConfigGuide) -> Self {
+        let (has_fill, fill) = match guide.fill {
+            Some(c) => (true, ColorInfo::from(c)),
+            None => (
+                false,
+                ColorInfo {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 0,
+                },
+            ),
+        };
+        let (has_label_color, label_color) = match guide.label_color {
+            Some(c) => (true, ColorInfo::from(c)),
+            None => (false, ColorInfo::from(guide.color.clone())),
+        };
+        Self {
+            name: guide.name,
+            kind: guide.kind,
+            layer: guide.layer,
+            x: guide.x,
+            y: guide.y,
+            width: guide.width,
+            height: guide.height,
+            x1: guide.x1,
+            y1: guide.y1,
+            x2: guide.x2,
+            y2: guide.y2,
+            color: ColorInfo::from(guide.color),
+            stroke: guide.stroke,
+            has_fill,
+            fill,
+            label: guide.label,
+            has_label_color,
+            label_color,
+        }
+    }
+}
+
+impl From<GuideInfo> for ConfigGuide {
+    fn from(info: GuideInfo) -> Self {
+        Self {
+            name: info.name,
+            kind: info.kind,
+            layer: info.layer,
+            x: info.x,
+            y: info.y,
+            width: info.width,
+            height: info.height,
+            x1: info.x1,
+            y1: info.y1,
+            x2: info.x2,
+            y2: info.y2,
+            color: ConfigColor::from(info.color),
+            stroke: info.stroke,
+            fill: if info.has_fill {
+                Some(ConfigColor::from(info.fill))
+            } else {
+                None
+            },
+            label: info.label,
+            label_color: if info.has_label_color {
+                Some(ConfigColor::from(info.label_color))
+            } else {
+                None
+            },
+        }
+    }
+}
+
+impl IntoLua for ConfigGuide {
+    fn into_lua(self, lua: &Lua) -> LuaResult<LuaValue> {
+        let table = lua.create_table()?;
+        table.set("name", self.name)?;
+        table.set("kind", self.kind)?;
+        table.set("layer", self.layer)?;
+        table.set("x", self.x)?;
+        table.set("y", self.y)?;
+        table.set("width", self.width)?;
+        table.set("height", self.height)?;
+        table.set("x1", self.x1)?;
+        table.set("y1", self.y1)?;
+        table.set("x2", self.x2)?;
+        table.set("y2", self.y2)?;
+        table.set("color", self.color)?;
+        table.set("stroke", self.stroke)?;
+        if let Some(fill) = self.fill {
+            table.set("fill", fill)?;
+        }
+        table.set("label", self.label)?;
+        if let Some(label_color) = self.label_color {
+            table.set("label_color", label_color)?;
+        }
+        Ok(LuaValue::Table(table))
     }
 }
 
