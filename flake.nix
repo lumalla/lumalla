@@ -119,11 +119,28 @@
           });
 
         # Form UI helper (`lumalla_ui_bin` / `lumalla-ui`).
+        # eframe/wgpu/winit dlopen xkb/EGL/gbm at runtime; force those onto
+        # LD_LIBRARY_PATH so live NixOS sessions (no flake shell) can show forms.
+        uiRuntimeLibs = pkgs.lib.makeLibraryPath (with pkgs; [
+          vulkan-loader
+          wayland
+          libxkbcommon
+          libglvnd
+          libgbm
+          libdrm
+          mesa
+        ]);
+
         lumallaUi = naersk'.buildPackage (commonBuildArgs
           // {
             pname = "lumalla-ui";
             cargoBuildOptions = opts: opts ++ ["-p" "lumalla_ui_bin"];
             cargoTestOptions = opts: opts ++ ["-p" "lumalla_ui_bin"];
+            nativeBuildInputs = commonBuildArgs.nativeBuildInputs ++ [pkgs.makeWrapper];
+            postInstall = ''
+              wrapProgram $out/bin/lumalla-ui \
+                --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${uiRuntimeLibs}"
+            '';
           });
 
         # What most consumers want: compositor + config + UI helper on PATH.
