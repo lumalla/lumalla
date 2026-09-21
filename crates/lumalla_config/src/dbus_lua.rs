@@ -71,7 +71,6 @@ pub(crate) fn init_dbus_module(
     callback_state: CallbackState,
     on_startup: Rc<RefCell<Option<CallbackRef>>>,
     on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
-    on_drm_devices_change: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
@@ -93,6 +92,7 @@ pub(crate) fn init_dbus_module(
         })?,
     )?;
 
+    // Hotplug (+ Ready): callback receives DRM devices (same shape as get_drm_devices).
     let cb_state = callback_state.clone();
     let on_connector_change_cb = on_connector_change.clone();
     module.set(
@@ -103,20 +103,6 @@ pub(crate) fn init_dbus_module(
             }
             let callback = cb_state.register_callback(callback);
             *on_connector_change_cb.borrow_mut() = Some(callback);
-            Ok(callback.callback_id)
-        })?,
-    )?;
-
-    let cb_state = callback_state.clone();
-    let on_drm_devices_change_cb = on_drm_devices_change.clone();
-    module.set(
-        "on_drm_devices_change",
-        lua.create_function(move |_, callback: LuaFunction| {
-            if let Some(old) = on_drm_devices_change_cb.borrow_mut().take() {
-                cb_state.forget_callback(old);
-            }
-            let callback = cb_state.register_callback(callback);
-            *on_drm_devices_change_cb.borrow_mut() = Some(callback);
             Ok(callback.callback_id)
         })?,
     )?;
@@ -219,7 +205,6 @@ pub(crate) fn init_dbus_module(
     let off_client = client.clone();
     let off_startup = on_startup.clone();
     let off_connector = on_connector_change.clone();
-    let off_drm = on_drm_devices_change.clone();
     let off_move = on_cursor_move.clone();
     let off_click = on_cursor_click.clone();
     let off_scroll = on_cursor_scroll.clone();
@@ -262,7 +247,6 @@ pub(crate) fn init_dbus_module(
             }
             let _ = clear_slot(&off_startup);
             let _ = clear_slot(&off_connector);
-            let _ = clear_slot(&off_drm);
 
             let was_keymap = off_cb_state.forget_callback(callback_ref);
             if was_keymap {
@@ -352,7 +336,6 @@ pub(crate) fn register_dbus_module(
     callback_state: CallbackState,
     on_startup: Rc<RefCell<Option<CallbackRef>>>,
     on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
-    on_drm_devices_change: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
@@ -366,7 +349,6 @@ pub(crate) fn register_dbus_module(
             callback_state,
             on_startup,
             on_connector_change,
-            on_drm_devices_change,
             on_cursor_move,
             on_cursor_click,
             on_cursor_scroll,

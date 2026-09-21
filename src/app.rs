@@ -645,7 +645,7 @@ impl AppData {
                             );
                         }
                         self.sync_wayland_output_from_drm();
-                        self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
+                        self.comms.dbus(DbusMessage::SetDrmDevices(
                             self.renderer_state.drm_device_states(),
                         ));
                         self.renderer_state.mark_scene_dirty();
@@ -725,7 +725,7 @@ impl AppData {
                     } else {
                         self.request_present_immediate(event_loop, arena);
                     }
-                    self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
+                    self.comms.dbus(DbusMessage::SetDrmDevices(
                         self.renderer_state.drm_device_states(),
                     ));
                 }
@@ -735,7 +735,7 @@ impl AppData {
                     } else {
                         self.request_present_immediate(event_loop, arena);
                     }
-                    self.comms.dbus(DbusMessage::EmitDrmDevicesChanged(
+                    self.comms.dbus(DbusMessage::SetDrmDevices(
                         self.renderer_state.drm_device_states(),
                     ));
                 }

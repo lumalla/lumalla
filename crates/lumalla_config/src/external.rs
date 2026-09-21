@@ -20,9 +20,8 @@ use crate::args::Args;
 use crate::callback::CallbackState;
 use crate::config_watcher::ConfigWatcher;
 use crate::dbus_lua::{
-    ConfigOutput, DbusConfigClient, eval_repl_chunk, load_config_files, outputs_from_infos,
-    prepare_repl_env, register_dbus_module, reload_config_file, set_default_keymaps,
-    watch_config_files,
+    DbusConfigClient, eval_repl_chunk, load_config_files, outputs_from_infos, prepare_repl_env,
+    register_dbus_module, reload_config_file, set_default_keymaps, watch_config_files,
 };
 use crate::repl::{ReplRequest, ReplResponse, start_repl_server};
 use crate::ui::{self, UiHost, UiHostEvent};
@@ -40,7 +39,6 @@ pub struct ExternalConfig {
     callback_state: CallbackState,
     on_startup: Rc<RefCell<Option<CallbackRef>>>,
     on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
-    on_drm_devices_change: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
     on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
@@ -61,7 +59,6 @@ impl ExternalConfig {
         let callback_state = CallbackState::default();
         let on_startup = Rc::new(RefCell::new(None));
         let on_connector_change = Rc::new(RefCell::new(None));
-        let on_drm_devices_change = Rc::new(RefCell::new(None));
         let on_cursor_move = Rc::new(RefCell::new(None));
         let on_cursor_click = Rc::new(RefCell::new(None));
         let on_cursor_scroll = Rc::new(RefCell::new(None));
@@ -76,7 +73,6 @@ impl ExternalConfig {
             callback_state.clone(),
             on_startup.clone(),
             on_connector_change.clone(),
-            on_drm_devices_change.clone(),
             on_cursor_move.clone(),
             on_cursor_click.clone(),
             on_cursor_scroll.clone(),
@@ -89,7 +85,6 @@ impl ExternalConfig {
             callback_state,
             on_startup,
             on_connector_change,
-            on_drm_devices_change,
             on_cursor_move,
             on_cursor_click,
             on_cursor_scroll,
@@ -341,26 +336,18 @@ impl ExternalConfig {
         if let Some(on_startup) = *self.on_startup.borrow() {
             self.callback_state.run_callback::<(), ()>(on_startup, ())?;
         }
+        // One-shot connector snapshot so configs can build outputs without waiting for hotplug.
+        self.on_connector_change_from_proxy()?;
         Ok(())
     }
 
     fn handle_output_changed(&mut self, outputs: Vec<OutputInfo>) -> anyhow::Result<()> {
         self.outputs = outputs_from_infos(outputs);
-        self.on_connector_change()?;
         Ok(())
     }
 
-    fn handle_drm_devices_changed(
-        &mut self,
-        devices: Vec<lumalla_ipc::DrmDeviceInfo>,
-    ) -> anyhow::Result<()> {
-        if let Some(on_drm_devices_change) = *self.on_drm_devices_change.borrow() {
-            let devices_lua = crate::dbus_lua::drm_devices_to_lua(&self.lua, devices)
-                .map_err(|err| anyhow::anyhow!("Unable to convert DRM devices for Lua: {err}"))?;
-            self.callback_state
-                .run_callback::<mlua::Value, ()>(on_drm_devices_change, devices_lua)?;
-        }
-        Ok(())
+    fn handle_drm_devices_changed(&mut self, devices: Vec<DrmDeviceInfo>) -> anyhow::Result<()> {
+        self.run_on_connector_change(devices)
     }
 
     fn handle_binding_activated(&mut self, binding_id: &str) -> anyhow::Result<()> {
@@ -426,12 +413,24 @@ impl ExternalConfig {
         Ok(())
     }
 
-    fn on_connector_change(&mut self) -> anyhow::Result<()> {
+    fn on_connector_change_from_proxy(&mut self) -> anyhow::Result<()> {
+        if self.on_connector_change.borrow().is_none() {
+            return Ok(());
+        }
+        let devices = self
+            .client
+            .proxy
+            .get_drm_devices()
+            .context("Failed to fetch DRM devices for on_connector_change")?;
+        self.run_on_connector_change(devices)
+    }
+
+    fn run_on_connector_change(&mut self, devices: Vec<DrmDeviceInfo>) -> anyhow::Result<()> {
         if let Some(on_connector_change) = *self.on_connector_change.borrow() {
-            let outputs: Vec<ConfigOutput> =
-                self.outputs.values().map(ConfigOutput::from).collect();
+            let devices_lua = crate::dbus_lua::drm_devices_to_lua(&self.lua, devices)
+                .map_err(|err| anyhow::anyhow!("Unable to convert DRM devices for Lua: {err}"))?;
             self.callback_state
-                .run_callback::<Vec<ConfigOutput>, ()>(on_connector_change, outputs)?;
+                .run_callback::<mlua::Value, ()>(on_connector_change, devices_lua)?;
         }
         Ok(())
     }
