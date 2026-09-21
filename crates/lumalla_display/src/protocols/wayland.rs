@@ -910,6 +910,11 @@ impl WlBuffer for DisplayState {
         ctx.registry.free_object(object_id, &mut ctx.writer);
         self.shm_manager.delete_buffer(ctx.client_id, object_id);
         self.dmabuf_manager.delete_buffer(ctx.client_id, object_id);
+        self.surface_updates
+            .push_back(SurfaceUpdate::BufferDestroyed {
+                client_id: ctx.client_id,
+                buffer_id: object_id,
+            });
     }
 }
 

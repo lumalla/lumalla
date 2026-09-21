@@ -144,7 +144,7 @@ pub struct GpuCompositor {
     _solid_vert_shader: ShaderModule,
     _solid_frag_shader: ShaderModule,
     descriptor_layout: DescriptorSetLayout,
-    descriptor_pool: DescriptorPool,
+    pub(crate) descriptor_pool: DescriptorPool,
     sampler: Sampler,
 }
 
@@ -331,26 +331,85 @@ impl TextureBacking {
 }
 
 pub struct SurfaceTextureCache {
+    /// Current texture bound for compositing, keyed by `(owner_id, surface_id)`.
     textures: HashMap<(u32, u32), SurfaceTexture>,
+    /// Parked DMA-BUF imports retained across buffer flips, keyed by `(owner_id, buffer_id)`.
+    dmabuf_by_buffer: HashMap<(u32, u32), SurfaceTexture>,
 }
+
+/// Soft cap on parked DMA-BUF imports per client (beyond the currently bound ones).
+const MAX_PARKED_DMABUFS_PER_CLIENT: usize = 8;
 
 impl SurfaceTextureCache {
     pub fn new() -> Self {
         Self {
             textures: HashMap::new(),
+            dmabuf_by_buffer: HashMap::new(),
         }
     }
 
     pub fn clear(&mut self) {
         self.textures.clear();
+        self.dmabuf_by_buffer.clear();
     }
 
     pub fn remove(&mut self, key: (u32, u32)) {
-        self.textures.remove(&key);
+        if let Some(tex) = self.textures.remove(&key)
+            && matches!(tex.backing, TextureBacking::Dmabuf(_))
+        {
+            let buf_key = (key.0, tex.buffer_id);
+            self.dmabuf_by_buffer.insert(buf_key, tex);
+        }
     }
 
     pub fn remove_client(&mut self, owner_id: u32) {
         self.textures.retain(|(owner, _), _| *owner != owner_id);
+        self.dmabuf_by_buffer
+            .retain(|(owner, _), _| *owner != owner_id);
+    }
+
+    /// Drop a parked or currently-bound DMA-BUF import when the `wl_buffer` is destroyed.
+    pub fn remove_dmabuf_buffer(
+        &mut self,
+        device: &Device,
+        pool: &DescriptorPool,
+        owner_id: u32,
+        buffer_id: u32,
+    ) -> anyhow::Result<()> {
+        let buf_key = (owner_id, buffer_id);
+        if let Some(tex) = self.dmabuf_by_buffer.remove(&buf_key) {
+            pool.free_set(device, tex.descriptor_set)?;
+        }
+        let doomed: Vec<(u32, u32)> = self
+            .textures
+            .iter()
+            .filter_map(|(&key, tex)| {
+                if key.0 == owner_id
+                    && tex.buffer_id == buffer_id
+                    && matches!(tex.backing, TextureBacking::Dmabuf(_))
+                {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for key in doomed {
+            if let Some(tex) = self.textures.remove(&key) {
+                pool.free_set(device, tex.descriptor_set)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop cached DMA-BUF entries without freeing descriptor sets (Vulkan already gone).
+    pub fn forget_dmabuf_buffer(&mut self, owner_id: u32, buffer_id: u32) {
+        self.dmabuf_by_buffer.remove(&(owner_id, buffer_id));
+        self.textures.retain(|key, tex| {
+            !(key.0 == owner_id
+                && tex.buffer_id == buffer_id
+                && matches!(tex.backing, TextureBacking::Dmabuf(_)))
+        });
     }
 
     fn texture(&self, key: (u32, u32)) -> Option<&SurfaceTexture> {
@@ -365,10 +424,51 @@ impl SurfaceTextureCache {
         texture: SurfaceTexture,
     ) -> anyhow::Result<()> {
         if let Some(old) = self.textures.remove(&key) {
-            pool.free_set(device, old.descriptor_set)?;
+            match old.backing {
+                TextureBacking::Dmabuf(_) => {
+                    let buf_key = (key.0, old.buffer_id);
+                    if let Some(dup) = self.dmabuf_by_buffer.insert(buf_key, old) {
+                        pool.free_set(device, dup.descriptor_set)?;
+                    }
+                    self.trim_parked_dmabufs(device, pool, key.0)?;
+                }
+                TextureBacking::Shm(_) => {
+                    pool.free_set(device, old.descriptor_set)?;
+                }
+            }
         }
         self.textures.insert(key, texture);
         Ok(())
+    }
+
+    fn trim_parked_dmabufs(
+        &mut self,
+        device: &Device,
+        pool: &DescriptorPool,
+        owner_id: u32,
+    ) -> anyhow::Result<()> {
+        let parked: Vec<(u32, u32)> = self
+            .dmabuf_by_buffer
+            .keys()
+            .copied()
+            .filter(|(owner, _)| *owner == owner_id)
+            .collect();
+        let excess = parked.len().saturating_sub(MAX_PARKED_DMABUFS_PER_CLIENT);
+        for buf_key in parked.into_iter().take(excess) {
+            if let Some(tex) = self.dmabuf_by_buffer.remove(&buf_key) {
+                pool.free_set(device, tex.descriptor_set)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn dmabuf_params_match(tex: &SurfaceTexture, frame: &SurfaceFrame, dmabuf: &DmabufAttachment) -> bool {
+        tex.wl_format == frame.format
+            && tex.dmabuf_modifier == dmabuf.modifier
+            && tex.dmabuf_stride == frame.stride as u32
+            && tex.dmabuf_offset == dmabuf.offset
+            && tex.dmabuf_width == frame.width as u32
+            && tex.dmabuf_height == frame.height as u32
     }
 
     fn sync_cursor(
@@ -573,18 +673,14 @@ impl SurfaceTextureCache {
         let width = frame.width as u32;
         let height = frame.height as u32;
         let stride = frame.stride as u32;
-        let can_reuse = self.textures.get(&key).is_some_and(|tex| {
+        let buf_key = (key.0, dmabuf.buffer_id);
+
+        let currently_bound = self.textures.get(&key).is_some_and(|tex| {
             matches!(tex.backing, TextureBacking::Dmabuf(_))
                 && tex.buffer_id == dmabuf.buffer_id
-                && tex.wl_format == frame.format
-                && tex.dmabuf_modifier == dmabuf.modifier
-                && tex.dmabuf_stride == stride
-                && tex.dmabuf_offset == dmabuf.offset
-                && tex.dmabuf_width == width
-                && tex.dmabuf_height == height
+                && Self::dmabuf_params_match(tex, frame, dmabuf)
         });
-
-        if can_reuse {
+        if currently_bound {
             let image = {
                 let tex = self
                     .textures
@@ -603,6 +699,38 @@ impl SurfaceTextureCache {
                 false,
             )?;
             return Ok(());
+        }
+
+        if let Some(cached) = self.dmabuf_by_buffer.remove(&buf_key) {
+            if Self::dmabuf_params_match(&cached, frame, dmabuf) {
+                self.replace_texture(
+                    vulkan.device(),
+                    &compositor.descriptor_pool,
+                    key,
+                    cached,
+                )?;
+                let image = {
+                    let tex = self
+                        .textures
+                        .get(&key)
+                        .context("Missing restored DMA-BUF texture")?;
+                    match &tex.backing {
+                        TextureBacking::Dmabuf(image) => image.image(),
+                        TextureBacking::Shm(_) => anyhow::bail!("Expected DMA-BUF backing"),
+                    }
+                };
+                acquire_dmabuf_for_sample(
+                    vulkan.device(),
+                    vulkan.graphics_command_pool(),
+                    batch,
+                    image,
+                    false,
+                )?;
+                return Ok(());
+            }
+            compositor
+                .descriptor_pool
+                .free_set(vulkan.device(), cached.descriptor_set)?;
         }
 
         let format = drm_fourcc_to_vulkan(dmabuf.drm_fourcc)
@@ -1788,29 +1916,17 @@ fn upload_bgra_texture(
         .context("Texture size overflows")?;
     anyhow::ensure!(pixels.len() >= full_size, "Texture pixel data is truncated");
 
-    let (staging_bytes, copy_stride, copy_height, image_offset, image_extent) = match region {
+    let (staging, copy_stride, copy_height, image_offset, image_extent) = match region {
         Some(region) => {
-            let region_row_bytes = usize::try_from(region.width)
-                .context("Region width overflows")?
-                .checked_mul(4)
-                .context("Region row bytes overflow")?;
-            let region_size = region_row_bytes
-                .checked_mul(region.height as usize)
-                .context("Region size overflows")?;
-            let mut staging_bytes = vec![0u8; region_size];
-            for row in 0..region.height {
-                let src_row = (region.y + row) as usize;
-                let src_start = src_row
-                    .checked_mul(row_bytes)
-                    .and_then(|offset| offset.checked_add(region.x as usize * 4))
-                    .context("Region source offset overflows")?;
-                let dst_start = row as usize * region_row_bytes;
-                let dst_end = dst_start + region_row_bytes;
-                staging_bytes[dst_start..dst_end]
-                    .copy_from_slice(&pixels[src_start..src_start + region_row_bytes]);
-            }
+            let staging = StagingBuffer::from_packed_region(
+                device,
+                physical_device,
+                pixels,
+                stride,
+                region,
+            )?;
             (
-                staging_bytes,
+                staging,
                 region.width,
                 region.height,
                 vk::Offset3D {
@@ -1825,20 +1941,23 @@ fn upload_bgra_texture(
                 },
             )
         }
-        None => (
-            pixels[..full_size].to_vec(),
-            width,
-            height,
-            vk::Offset3D { x: 0, y: 0, z: 0 },
-            vk::Extent3D {
+        None => {
+            let staging =
+                StagingBuffer::from_slice(device, physical_device, &pixels[..full_size])?;
+            (
+                staging,
                 width,
                 height,
-                depth: 1,
-            },
-        ),
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                },
+            )
+        }
     };
 
-    let staging = StagingBuffer::new(device, physical_device, &staging_bytes)?;
     let command_buffer = command_pool.allocate_command_buffer(device)?;
 
     let record_result = (|| -> anyhow::Result<()> {
@@ -2271,12 +2390,69 @@ struct StagingBuffer {
 }
 
 impl StagingBuffer {
-    fn new(
+    /// Copy `bytes` once into a newly allocated host-visible staging buffer.
+    fn from_slice(
         device: &Device,
         physical_device: &PhysicalDevice,
         bytes: &[u8],
     ) -> anyhow::Result<Self> {
-        let size = bytes.len() as vk::DeviceSize;
+        let (staging, mapped, coherent) =
+            Self::allocate_mapped(device, physical_device, bytes.len() as vk::DeviceSize)?;
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast(), bytes.len());
+        }
+        staging.finish_mapped(device, coherent)?;
+        Ok(staging)
+    }
+
+    /// Pack a damage region into tightly packed BGRA rows in staging (one GPU alloc).
+    fn from_packed_region(
+        device: &Device,
+        physical_device: &PhysicalDevice,
+        pixels: &[u8],
+        stride: u32,
+        region: UploadRect,
+    ) -> anyhow::Result<Self> {
+        let row_bytes = usize::try_from(stride).context("Stride overflows")?;
+        let region_row_bytes = usize::try_from(region.width)
+            .context("Region width overflows")?
+            .checked_mul(4)
+            .context("Region row bytes overflow")?;
+        let region_size = region_row_bytes
+            .checked_mul(region.height as usize)
+            .context("Region size overflows")?;
+        let (staging, mapped, coherent) =
+            Self::allocate_mapped(device, physical_device, region_size as vk::DeviceSize)?;
+        unsafe {
+            let dst_base = mapped.cast::<u8>();
+            for row in 0..region.height {
+                let src_row = (region.y + row) as usize;
+                let src_start = src_row
+                    .checked_mul(row_bytes)
+                    .and_then(|offset| offset.checked_add(region.x as usize * 4))
+                    .context("Region source offset overflows")?;
+                anyhow::ensure!(
+                    src_start + region_row_bytes <= pixels.len(),
+                    "Texture pixel data is truncated for damage region"
+                );
+                let dst_start = row as usize * region_row_bytes;
+                ptr::copy_nonoverlapping(
+                    pixels.as_ptr().add(src_start),
+                    dst_base.add(dst_start),
+                    region_row_bytes,
+                );
+            }
+        }
+        staging.finish_mapped(device, coherent)?;
+        Ok(staging)
+    }
+
+    fn allocate_mapped(
+        device: &Device,
+        physical_device: &PhysicalDevice,
+        size: vk::DeviceSize,
+    ) -> anyhow::Result<(Self, *mut std::ffi::c_void, bool)> {
+        anyhow::ensure!(size > 0, "Staging buffer size must be non-zero");
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC)
@@ -2327,12 +2503,22 @@ impl StagingBuffer {
                 return Err(error).context("Failed to map texture staging memory");
             }
         };
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast(), bytes.len());
-        }
+
+        Ok((
+            Self {
+                buffer,
+                memory,
+                device: device.handle().clone(),
+            },
+            mapped,
+            coherent,
+        ))
+    }
+
+    fn finish_mapped(&self, device: &Device, coherent: bool) -> anyhow::Result<()> {
         if !coherent {
             let range = vk::MappedMemoryRange::default()
-                .memory(memory)
+                .memory(self.memory)
                 .offset(0)
                 .size(vk::WHOLE_SIZE);
             unsafe {
@@ -2343,14 +2529,9 @@ impl StagingBuffer {
             }
         }
         unsafe {
-            device.handle().unmap_memory(memory);
+            device.handle().unmap_memory(self.memory);
         }
-
-        Ok(Self {
-            buffer,
-            memory,
-            device: device.handle().clone(),
-        })
+        Ok(())
     }
 }
 

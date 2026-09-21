@@ -1771,6 +1771,17 @@ impl AppData {
                         error!("Unable to clear unmapped Wayland surface: {err:#}");
                     }
                 }
+                SurfaceUpdate::BufferDestroyed {
+                    client_id,
+                    buffer_id,
+                } => {
+                    if let Err(err) = self
+                        .renderer_state
+                        .remove_dmabuf_buffer(client_id.get(), buffer_id.get())
+                    {
+                        error!("Unable to drop destroyed wl_buffer GPU import: {err:#}");
+                    }
+                }
             }
         }
         self.sync_renderer_scene(arena);

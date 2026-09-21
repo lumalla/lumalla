@@ -109,6 +109,11 @@ pub enum SurfaceUpdate {
         client_id: ClientId,
         surface_id: lumalla_wayland_protocol::ObjectId,
     },
+    /// A `wl_buffer` was destroyed; drop any cached GPU imports for it.
+    BufferDestroyed {
+        client_id: ClientId,
+        buffer_id: lumalla_wayland_protocol::ObjectId,
+    },
 }
 
 /// Renderer position update after a window move.
@@ -566,6 +571,9 @@ impl DisplayState {
                 frame.client_id != client_id
             }
             SurfaceUpdate::Unmapped {
+                client_id: owner, ..
+            }
+            | SurfaceUpdate::BufferDestroyed {
                 client_id: owner, ..
             } => *owner != client_id,
         });

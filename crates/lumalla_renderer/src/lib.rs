@@ -784,6 +784,24 @@ impl RendererState {
         Ok(())
     }
 
+    /// Drop a cached DMA-BUF import when the corresponding `wl_buffer` is destroyed.
+    pub fn remove_dmabuf_buffer(&mut self, owner_id: u32, buffer_id: u32) -> anyhow::Result<()> {
+        let (Some(vulkan), Some(compositor)) =
+            (self.vulkan.as_ref(), self.gpu.compositor.as_ref())
+        else {
+            self.gpu
+                .surface_textures
+                .forget_dmabuf_buffer(owner_id, buffer_id);
+            return Ok(());
+        };
+        self.gpu.surface_textures.remove_dmabuf_buffer(
+            vulkan.device(),
+            &compositor.descriptor_pool,
+            owner_id,
+            buffer_id,
+        )
+    }
+
     pub fn remove_client_frames(&mut self, owner_id: u32) -> anyhow::Result<()> {
         let before = self.surface_frames.len();
         self.surface_frames
@@ -2346,12 +2364,27 @@ impl RendererState {
             .get(&target.name)
             .cloned()
             .unwrap_or_default();
-        // View transforms invalidate global-space partial damage; force a full redraw.
+        // Non-identity / offset views need full redraws (global damage ≠ output-local,
+        // and cursor damage is already output-native). Identity views at the global
+        // origin can use partial damage directly.
+        let (views_force_full, output_local_damage) =
+            match identity_fullscreen_view_origin(&views, width, height) {
+                Some((0, 0)) => (false, _pending_damage),
+                Some((origin_x, origin_y))
+                    if !(pointer_damage || cursor_buffer_dirty) =>
+                {
+                    (
+                        false,
+                        translate_damage_list(&_pending_damage, -origin_x, -origin_y),
+                    )
+                }
+                _ => (true, Vec::new()),
+            };
         let mut composite_mode = prepare_gpu_composite(
             width,
             height,
-            &_pending_damage,
-            force_full || !views.is_empty(),
+            &output_local_damage,
+            force_full || views_force_full,
             buffer.fresh,
         );
 
@@ -2431,7 +2464,7 @@ impl RendererState {
                     &composite_mode,
                     &dirty_surfaces,
                     &pending_surface_buffer_damage,
-                    &_pending_damage,
+                    &output_local_damage,
                     pointer_damage || cursor_buffer_dirty,
                 )?;
 
@@ -2751,6 +2784,50 @@ impl RendererState {
 
         Ok(())
     }
+}
+
+/// Origin of a single identity fullscreen view, or `(0, 0)` when there are no views.
+///
+/// Returns `None` when views are non-identity (scaled, multi-view, or partial dest),
+/// which requires a full scanout redraw because global damage is not output-local.
+fn identity_fullscreen_view_origin(
+    views: &[View],
+    output_width: u32,
+    output_height: u32,
+) -> Option<(i32, i32)> {
+    if views.is_empty() {
+        return Some((0, 0));
+    }
+    if views.len() != 1 {
+        return None;
+    }
+    let view = &views[0];
+    let (sx, sy, sw, sh) = view.source;
+    let (dx, dy, dw, dh) = view.dest;
+    if dx == 0
+        && dy == 0
+        && dw == output_width as i32
+        && dh == output_height as i32
+        && sw == dw
+        && sh == dh
+    {
+        Some((sx, sy))
+    } else {
+        None
+    }
+}
+
+fn translate_damage_list(damage: &[DamageRect], dx: i32, dy: i32) -> Vec<DamageRect> {
+    damage
+        .iter()
+        .copied()
+        .map(|rect| DamageRect {
+            x: rect.x + dx,
+            y: rect.y + dy,
+            width: rect.width,
+            height: rect.height,
+        })
+        .collect()
 }
 
 struct CaptureRegion {
@@ -3093,5 +3170,43 @@ mod tests {
         let mut upload = composite_surface_full(&[], 2, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
         composite_cursor_into(&mut upload, 2, 1, &cursor, 1, 0).unwrap();
         assert_eq!(upload, vec![0, 0, 0, 255, 10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn identity_fullscreen_view_at_origin() {
+        let views = [View {
+            name: "main".into(),
+            source: (0, 0, 1920, 1080),
+            dest: (0, 0, 1920, 1080),
+        }];
+        assert_eq!(
+            identity_fullscreen_view_origin(&views, 1920, 1080),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn identity_fullscreen_view_rejects_scale() {
+        let views = [View {
+            name: "main".into(),
+            source: (0, 0, 3840, 2160),
+            dest: (0, 0, 1920, 1080),
+        }];
+        assert_eq!(identity_fullscreen_view_origin(&views, 1920, 1080), None);
+    }
+
+    #[test]
+    fn translate_damage_shifts_rects() {
+        let damage = [DamageRect {
+            x: 100,
+            y: 50,
+            width: 10,
+            height: 20,
+        }];
+        let shifted = translate_damage_list(&damage, -100, -50);
+        assert_eq!(shifted[0].x, 0);
+        assert_eq!(shifted[0].y, 0);
+        assert_eq!(shifted[0].width, 10);
+        assert_eq!(shifted[0].height, 20);
     }
 }
