@@ -24,8 +24,8 @@ pub mod scheduler;
 
 use crate::drm::{
     CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, FlipEventQueue, ModeBlob,
-    atomic_modeset, atomic_page_flip, atomic_set_plane_fb, dispatch_drm_events,
-    resolve_connected_output,
+    atomic_disable_output, atomic_modeset, atomic_page_flip, atomic_set_plane_fb,
+    dispatch_drm_events, resolve_connected_output,
 };
 use crate::present_control::{NamedFlipDispatchOutcome, OutputPresentControl};
 use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
@@ -1640,12 +1640,13 @@ impl RendererState {
     fn drain_scanouts(&mut self) {
         let scanouts: Vec<OutputScanout> = self.scanouts.drain().map(|(_, s)| s).collect();
         for scanout in scanouts {
-            self.release_output_scanout(scanout);
+            self.disable_and_release_output_scanout(scanout);
         }
         self.scanout_pool.clear();
         self.invalidate_surface_textures();
     }
 
+    /// Free scanout buffers without touching KMS state (e.g. remode of the same CRTC).
     fn release_output_scanout(&mut self, scanout: OutputScanout) {
         self.release_scanout_buffer(scanout.current);
         if let Some(pending) = scanout.pending {
@@ -1653,6 +1654,123 @@ impl RendererState {
         }
         if let Some(queued) = scanout.queued {
             self.release_scanout_buffer(queued);
+        }
+    }
+
+    /// Blank/power-down a physical output, then free its scanout buffers.
+    fn disable_and_release_output_scanout(&mut self, scanout: OutputScanout) {
+        if let Some(physical) = scanout.physical.as_ref() {
+            self.disable_physical_output(physical);
+        }
+        self.release_output_scanout(scanout);
+    }
+
+    fn disable_physical_output(&self, physical: &PhysicalScanout) {
+        let Some(device) = self.drm_devices.opened().get(&physical.drm_path) else {
+            warn!(
+                "Cannot disable {}: DRM device {} is not open",
+                physical.output.connector_name,
+                physical.drm_path.display()
+            );
+            return;
+        };
+        match atomic_disable_output(device.fd(), &physical.output) {
+            Ok(()) => info!(
+                "Disabled output {} (CRTC {})",
+                physical.output.connector_name, physical.output.crtc_id
+            ),
+            Err(err) => warn!(
+                "Failed to disable output {}: {err:#}",
+                physical.output.connector_name
+            ),
+        }
+    }
+
+    /// Wait for any in-flight flip, then disable CRTC and drop the scanout.
+    fn disable_and_release_named_scanout(&mut self, name: &str) {
+        if self
+            .scanouts
+            .get(name)
+            .is_some_and(|scanout| scanout.pending.is_some())
+        {
+            if let Err(err) = self.wait_for_connector_flip(name) {
+                warn!("Waiting for flip before disabling {name}: {err:#}");
+            }
+        }
+        if let Some(scanout) = self.scanouts.remove(name) {
+            self.disable_and_release_output_scanout(scanout);
+        }
+    }
+
+    /// Immediately modeset-off connectors that config marks disabled.
+    ///
+    /// Covers both scanouts we already own and connected connectors that were
+    /// never presented (e.g. left active by firmware / a previous compositor).
+    fn apply_output_config_disables(&mut self) {
+        let scanout_disable: Vec<String> = self
+            .scanouts
+            .keys()
+            .filter(|name| {
+                self.output_configs
+                    .get(*name)
+                    .is_some_and(|config| !config.enabled)
+            })
+            .cloned()
+            .collect();
+        for name in scanout_disable {
+            self.disable_and_release_named_scanout(&name);
+        }
+
+        let mut unresolved: Vec<(PathBuf, ConnectedOutput)> = Vec::new();
+        for (path, device) in self.drm_devices.opened() {
+            let mut used_crtcs = HashSet::new();
+            for scanout in self.scanouts.values() {
+                if let Some(physical) = scanout.physical.as_ref() {
+                    if &physical.drm_path == path {
+                        used_crtcs.insert(physical.output.crtc_id);
+                    }
+                }
+            }
+
+            for connector in device.connectors() {
+                let disabled = self
+                    .output_configs
+                    .get(&connector.name)
+                    .is_some_and(|config| !config.enabled);
+                if !disabled || !connector.connected || self.scanouts.contains_key(&connector.name)
+                {
+                    continue;
+                }
+                match resolve_connected_output(
+                    device.fd().as_raw_fd(),
+                    connector.connector_id,
+                    None,
+                    &mut used_crtcs,
+                ) {
+                    Ok(Some(output)) => unresolved.push((path.clone(), output)),
+                    Ok(None) => {}
+                    Err(err) => warn!(
+                        "Cannot resolve {} for disable: {err:#}",
+                        connector.name
+                    ),
+                }
+            }
+        }
+
+        for (path, output) in unresolved {
+            let Some(device) = self.drm_devices.opened().get(&path) else {
+                continue;
+            };
+            match atomic_disable_output(device.fd(), &output) {
+                Ok(()) => info!(
+                    "Disabled output {} (CRTC {})",
+                    output.connector_name, output.crtc_id
+                ),
+                Err(err) => warn!(
+                    "Failed to disable output {}: {err:#}",
+                    output.connector_name
+                ),
+            }
         }
     }
 
@@ -1682,6 +1800,7 @@ impl RendererState {
             self.output_configs.insert(config.name.clone(), config);
         }
         self.invalidate_present_targets();
+        self.apply_output_config_disables();
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -1866,9 +1985,7 @@ impl RendererState {
             .cloned()
             .collect();
         for stale_name in stale {
-            if let Some(scanout) = self.scanouts.remove(&stale_name) {
-                self.release_output_scanout(scanout);
-            }
+            self.disable_and_release_named_scanout(&stale_name);
         }
 
         Ok(presented)
@@ -1895,7 +2012,10 @@ impl RendererState {
         let targets = self.collect_present_targets();
         if targets.is_empty() {
             warn!("No enabled connected or virtual outputs to present");
-            self.scanouts.clear();
+            let stale: Vec<String> = self.scanouts.keys().cloned().collect();
+            for name in stale {
+                self.disable_and_release_named_scanout(&name);
+            }
             return Ok(self.present_status());
         }
 
@@ -1949,9 +2069,7 @@ impl RendererState {
             .cloned()
             .collect();
         for name in stale {
-            if let Some(scanout) = self.scanouts.remove(&name) {
-                self.release_output_scanout(scanout);
-            }
+            self.disable_and_release_named_scanout(&name);
         }
         debug!("Presented {presented} output(s)");
         Ok(self.present_status())

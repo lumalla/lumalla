@@ -365,6 +365,41 @@ pub fn atomic_modeset(
     Ok(())
 }
 
+/// Disable a connector/CRTC/primary-plane trio so the panel blanks and can power down.
+///
+/// Detaches the connector, clears the mode, deactivates the CRTC, and unhooks the
+/// primary plane. Requires `ALLOW_MODESET` (link may drop on DisplayPort).
+pub fn atomic_disable_output(
+    drm_fd: BorrowedFd<'_>,
+    output: &ConnectedOutput,
+) -> anyhow::Result<()> {
+    let fd = drm_fd.as_raw_fd();
+    let props = &output.props;
+
+    let req = AtomicRequest::new()?;
+    req.add(output.connector_id, props.connector_crtc_id, 0u64)?;
+    req.add(output.crtc_id, props.crtc_active, 0u64)?;
+    req.add(output.crtc_id, props.crtc_mode_id, 0u64)?;
+    req.add(output.plane_id, props.plane_fb_id, 0u64)?;
+    req.add(output.plane_id, props.plane_crtc_id, 0u64)?;
+    req.add(output.plane_id, props.plane_src_x, 0u64)?;
+    req.add(output.plane_id, props.plane_src_y, 0u64)?;
+    req.add(output.plane_id, props.plane_src_w, 0u64)?;
+    req.add(output.plane_id, props.plane_src_h, 0u64)?;
+    req.add(output.plane_id, props.plane_crtc_x, 0u64)?;
+    req.add(output.plane_id, props.plane_crtc_y, 0u64)?;
+    req.add(output.plane_id, props.plane_crtc_w, 0u64)?;
+    req.add(output.plane_id, props.plane_crtc_h, 0u64)?;
+
+    req.commit(fd, sys::DRM_MODE_ATOMIC_ALLOW_MODESET, ptr::null_mut())?;
+
+    debug!(
+        "Atomic disable: CRTC {} plane {} on {}",
+        output.crtc_id, output.plane_id, output.connector_name
+    );
+    Ok(())
+}
+
 /// Blocking primary-plane FB update without a modeset.
 ///
 /// Use this for subsequent frames once connector/CRTC/mode are already active.
