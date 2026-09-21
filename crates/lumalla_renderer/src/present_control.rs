@@ -88,6 +88,10 @@ pub struct PresentTickResult {
     pub presented_outputs: Vec<String>,
     pub status: PresentStatus,
     pub timings: Option<FrameTimings>,
+    /// At least one output finished presenting this tick with no outstanding
+    /// page-flip (virtual output or blocking KMS update). Async DRM flips are
+    /// excluded — wait for [`FlipSideEffects::completed`] instead.
+    pub presented_without_pending_flip: bool,
 }
 
 /// Page-flip side effects for the app (Wayland presentation feedback).
@@ -178,10 +182,14 @@ impl RendererState {
             }
         }
 
+        let presented_without_pending_flip = presented_outputs
+            .iter()
+            .any(|name| self.output_flip_idle(name));
         Ok(PresentTickResult {
             presented_outputs,
             status: self.present_status(),
             timings: last_timings,
+            presented_without_pending_flip,
         })
     }
 
@@ -203,6 +211,7 @@ impl RendererState {
                 presented_outputs: Vec::new(),
                 status: self.present_status(),
                 timings: None,
+                presented_without_pending_flip: false,
             });
         };
 
@@ -218,14 +227,19 @@ impl RendererState {
             seat_enabled,
         )?;
 
+        let presented_outputs = if tick.presented {
+            vec![name]
+        } else {
+            Vec::new()
+        };
+        let presented_without_pending_flip = presented_outputs
+            .iter()
+            .any(|name| self.output_flip_idle(name));
         Ok(PresentTickResult {
-            presented_outputs: if tick.presented {
-                vec![name]
-            } else {
-                Vec::new()
-            },
+            presented_outputs,
             status: self.present_status(),
             timings: tick.timings,
+            presented_without_pending_flip,
         })
     }
 

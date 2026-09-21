@@ -24,7 +24,7 @@ use lumalla_input::{
     BTN_LEFT, InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent, mods_is_subset,
 };
 use lumalla_renderer::{
-    CursorFrame, DmabufAttachment, OutputDamageRect, PresentStatus, RendererState, SurfaceFrame,
+    CursorFrame, DmabufAttachment, OutputDamageRect, RendererState, SurfaceFrame,
     is_present_wake_token,
 };
 use lumalla_screencast::{
@@ -1797,7 +1797,12 @@ impl AppData {
         ) {
             Ok(result) => {
                 self.maybe_complete_virtual_presentation_feedback(&result.presented_outputs);
-                self.maybe_complete_frame_callbacks(event_loop, result.status, arena);
+                self.maybe_complete_frame_callbacks(
+                    event_loop,
+                    result.presented_without_pending_flip,
+                    result.status.idle,
+                    arena,
+                );
                 if !result.presented_outputs.is_empty() && !self.screencast_push_active {
                     self.push_screencast_frames(event_loop, arena);
                 }
@@ -1829,7 +1834,15 @@ impl AppData {
                         },
                     );
                 }
-                self.maybe_complete_frame_callbacks(event_loop, effects.status, arena);
+                // A completed flip is enough even if another (or queued) flip is
+                // already in flight — requiring global idle starves wl_surface.frame
+                // under continuous cursor presents.
+                self.maybe_complete_frame_callbacks(
+                    event_loop,
+                    !effects.completed.is_empty(),
+                    effects.status.idle,
+                    arena,
+                );
                 self.flush_client_sends(event_loop, arena);
             }
             Err(err) => error!("Unable to handle DRM device events: {err}"),
@@ -1859,7 +1872,12 @@ impl AppData {
                         self.maybe_complete_virtual_presentation_feedback(
                             &result.presented_outputs,
                         );
-                        self.maybe_complete_frame_callbacks(event_loop, result.status, arena);
+                        self.maybe_complete_frame_callbacks(
+                            event_loop,
+                            result.presented_without_pending_flip,
+                            result.status.idle,
+                            arena,
+                        );
                         if !result.presented_outputs.is_empty() && !self.screencast_push_active {
                             self.push_screencast_frames(event_loop, arena);
                         }
@@ -1873,13 +1891,23 @@ impl AppData {
         }
     }
 
+    /// Complete deferred `wl_surface.frame` callbacks after presentation.
+    ///
+    /// `presentation_done` is true when content was shown this cycle (a DRM
+    /// page-flip completed, or a virtual/blocking present finished). `flip_idle`
+    /// covers the paced-wake case where nothing is in flight yet. Requiring only
+    /// global idle would block callbacks whenever cursor motion keeps a flip queued.
     fn maybe_complete_frame_callbacks(
         &mut self,
         event_loop: &mut EventLoop,
-        status: PresentStatus,
+        presentation_done: bool,
+        flip_idle: bool,
         arena: &Arena,
     ) {
-        if !status.idle || self.display_state.pending_frame_callback_count() == 0 {
+        if self.display_state.pending_frame_callback_count() == 0 {
+            return;
+        }
+        if !presentation_done && !flip_idle {
             return;
         }
         let time_msec = self
