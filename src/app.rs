@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io,
     num::NonZeroU32,
-    os::fd::{FromRawFd, OwnedFd, RawFd},
+    os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
     pin::Pin,
     sync::mpsc::Receiver,
@@ -1133,6 +1133,15 @@ impl AppData {
                             self.screencast.stop_stream(stream_id);
                             self.renderer_state.free_screencast_buffers(stream_id);
                         }
+                    }
+                }
+                MainMessage::InjectWaylandClient { fd } => {
+                    let raw = fd.into_raw_fd();
+                    if let Some(client) = self.wayland.client_from_accepted_fd(raw) {
+                        let client_id = client.client_id();
+                        info!("New service client connected with id {:?}", client_id);
+                        self.clients.insert(client);
+                        self.arm_client_recv(event_loop, client_id, arena);
                     }
                 }
                 MainMessage::PipewireStreamReady { stream_id, result } => {

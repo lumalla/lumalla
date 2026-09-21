@@ -7,6 +7,7 @@ use crate::WindowGeometryUpdate;
 use crate::WindowRule;
 use crate::XkbConfig;
 use crate::Zone;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 /// Synthetic input requested by profiling or automation configs.
@@ -205,6 +206,11 @@ pub enum MainMessage {
     StopMutterScreenCast {
         /// Mutter session id.
         session_id: u64,
+    },
+    /// Attach a socketpair peer as a Wayland client (Mutter ServiceChannel).
+    InjectWaylandClient {
+        /// Compositor end of the socketpair (client end returned over D-Bus).
+        fd: OwnedFd,
     },
     /// PipeWire finished creating a stream previously requested on the main thread.
     ///

@@ -29,7 +29,7 @@ use lumalla_ipc::{
 use lumalla_shared::{
     Comms, Completion, DbusMessage, DrmDeviceState, EventLoop, MainMessage, OpKind, Output,
 };
-use mutter::{DisplayConfig, ScreenCast, ShellIntrospect, complete_mutter_stream};
+use mutter::{DisplayConfig, ScreenCast, ServiceChannel, ShellIntrospect, complete_mutter_stream};
 use zbus::{Error as ZbusError, blocking::connection};
 
 use crate::iface::spawn_process_with_options;
@@ -102,7 +102,7 @@ impl DbusService {
         let (screen_cast, mutter_streams) = ScreenCast::new(
             Arc::clone(&outputs),
             Arc::clone(&state.windows),
-            comms,
+            comms.clone(),
             connection.clone(),
         );
         connection
@@ -130,6 +130,20 @@ impl DbusService {
             Ok(()) => info!("D-Bus service listening on org.gnome.Mutter.DisplayConfig"),
             Err(err) => warn!(
                 "Could not claim org.gnome.Mutter.DisplayConfig (portal monitor list may be empty): {err}"
+            ),
+        }
+
+        connection
+            .object_server()
+            .at(
+                "/org/gnome/Mutter/ServiceChannel",
+                ServiceChannel::new(comms),
+            )
+            .context("Failed to register Mutter ServiceChannel object")?;
+        match connection.request_name("org.gnome.Mutter.ServiceChannel") {
+            Ok(()) => info!("D-Bus service listening on org.gnome.Mutter.ServiceChannel"),
+            Err(err) => warn!(
+                "Could not claim org.gnome.Mutter.ServiceChannel (portal service clients may be unavailable): {err}"
             ),
         }
 
@@ -585,10 +599,14 @@ mod tests {
             return;
         }
 
-        let service = match DbusService::register(comms()) {
+        // Keep the main receiver alive so ServiceChannel can deliver InjectWaylandClient.
+        let (event_loop, main_rx, to_main) = message_loop_with_channel::<MainMessage>().unwrap();
+        let (_dbus_loop, _dbus_rx, to_dbus) = message_loop_with_channel::<DbusMessage>().unwrap();
+        let service = match DbusService::register(Comms::new(to_main, to_dbus)) {
             Ok(service) => service,
             Err(err) => {
                 eprintln!("skip mutter_bus_names_claimed: {err:#}");
+                drop(event_loop);
                 return;
             }
         };
@@ -598,6 +616,7 @@ mod tests {
         for name in [
             "org.gnome.Mutter.ScreenCast",
             "org.gnome.Mutter.DisplayConfig",
+            "org.gnome.Mutter.ServiceChannel",
         ] {
             let owner = dbus.get_name_owner(name.try_into().unwrap());
             assert!(
@@ -624,6 +643,35 @@ mod tests {
         );
         assert!(reply.is_ok(), "GetCurrentState should succeed: {reply:?}");
 
+        let reply = conn.call_method(
+            Some("org.gnome.Mutter.ServiceChannel"),
+            "/org/gnome/Mutter/ServiceChannel",
+            Some("org.gnome.Mutter.ServiceChannel"),
+            "OpenWaylandServiceConnection",
+            &(1u32,),
+        );
+        assert!(
+            reply.is_ok(),
+            "OpenWaylandServiceConnection should succeed: {reply:?}"
+        );
+        let fd: zbus::zvariant::OwnedFd = reply
+            .expect("call ok")
+            .body()
+            .deserialize()
+            .expect("deserialize OwnedFd");
+        assert!(
+            std::os::fd::AsRawFd::as_raw_fd(&fd) >= 0,
+            "ServiceChannel should return a valid fd"
+        );
+        assert!(
+            matches!(
+                main_rx.try_recv(),
+                Ok(MainMessage::InjectWaylandClient { .. })
+            ),
+            "compositor should receive InjectWaylandClient"
+        );
+
         drop(service);
+        drop(event_loop);
     }
 }

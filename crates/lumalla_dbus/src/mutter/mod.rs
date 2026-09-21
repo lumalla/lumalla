@@ -2,8 +2,10 @@
 
 mod display_config;
 pub(crate) mod screen_cast;
+mod service_channel;
 mod shell_introspect;
 
 pub(crate) use display_config::DisplayConfig;
 pub(crate) use screen_cast::{ScreenCast, complete_mutter_stream};
+pub(crate) use service_channel::ServiceChannel;
 pub(crate) use shell_introspect::ShellIntrospect;
