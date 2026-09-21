@@ -1021,8 +1021,15 @@ impl DisplayState {
         toplevel: ObjectId,
         title: String,
     ) {
-        self.window_manager
-            .set_toplevel_title(client_id, toplevel, title);
+        let surface_manager = &self.surface_manager;
+        let changes = self.window_manager.on_title_set(
+            client_id,
+            toplevel,
+            title,
+            surface_manager,
+            &mut self.xdg_manager,
+        );
+        self.pending_geometry_changes.extend(changes);
     }
 
     pub(crate) fn on_surface_focused(&mut self, client_id: ClientId, wl_surface: ObjectId) {

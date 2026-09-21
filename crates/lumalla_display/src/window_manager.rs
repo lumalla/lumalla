@@ -185,13 +185,24 @@ impl WindowManager {
             .retain(|pending| pending.client_id != client_id);
     }
 
-    pub fn set_toplevel_title(&mut self, client_id: ClientId, toplevel: ObjectId, title: String) {
+    pub fn on_title_set(
+        &mut self,
+        client_id: ClientId,
+        toplevel: ObjectId,
+        title: String,
+        surface_manager: &SurfaceManager,
+        xdg_manager: &mut XdgManager,
+    ) -> Vec<WindowGeometryChange> {
         let Some(id) = self.by_toplevel.get(&(client_id, toplevel)).copied() else {
-            return;
+            return Vec::new();
         };
-        if let Some(window) = self.windows.get_mut(&id) {
+        {
+            let Some(window) = self.windows.get_mut(&id) else {
+                return Vec::new();
+            };
             window.title = title;
         }
+        self.apply_matching_rule(id, surface_manager, xdg_manager)
     }
 
     pub fn on_app_id_set(
@@ -209,10 +220,18 @@ impl WindowManager {
             let Some(window) = self.windows.get_mut(&id) else {
                 return Vec::new();
             };
-            window.app_id = app_id.clone();
+            window.app_id = app_id;
         }
+        self.apply_matching_rule(id, surface_manager, xdg_manager)
+    }
 
-        let Some(rule) = self.matching_rule(&app_id).cloned() else {
+    fn apply_matching_rule(
+        &mut self,
+        id: u32,
+        surface_manager: &SurfaceManager,
+        xdg_manager: &mut XdgManager,
+    ) -> Vec<WindowGeometryChange> {
+        let Some(rule) = self.matching_rule_for_window(id).cloned() else {
             return Vec::new();
         };
 
@@ -473,12 +492,19 @@ impl WindowManager {
         }]
     }
 
-    fn matching_rule(&self, app_id: &str) -> Option<&WindowRule> {
-        self.rules.iter().find(|rule| rule.app_id == app_id)
+    fn matching_rule(&self, app_id: &str, title: &str) -> Option<&WindowRule> {
+        self.rules
+            .iter()
+            .find(|rule| rule.matches(app_id, title))
     }
 
-    fn matching_rule_geometry(&self, app_id: &str) -> WindowGeometryUpdate {
-        self.matching_rule(app_id)
+    fn matching_rule_for_window(&self, id: u32) -> Option<&WindowRule> {
+        let window = self.windows.get(&id)?;
+        self.matching_rule(&window.app_id, &window.title)
+    }
+
+    fn matching_rule_geometry(&self, app_id: &str, title: &str) -> WindowGeometryUpdate {
+        self.matching_rule(app_id, title)
             .map(WindowRule::geometry)
             .unwrap_or_default()
     }
@@ -591,14 +617,15 @@ mod tests {
     fn per_field_rule_merge_keeps_unspecified_fields() {
         let mut wm = WindowManager::default();
         wm.add_rule(WindowRule {
-            app_id: String::from("app"),
+            app_id: Some(String::from("app")),
+            title: None,
             zone: None,
             x: None,
             y: None,
             width: Some(640),
             height: Some(480),
         });
-        let geometry = wm.matching_rule_geometry("app");
+        let geometry = wm.matching_rule_geometry("app", "");
         assert_eq!(geometry.width, Some(640));
         assert_eq!(geometry.height, Some(480));
         assert!(geometry.x.is_none());
@@ -674,7 +701,8 @@ mod tests {
         let mut xdg = XdgManager::default();
         wm.add_zone(free_zone("main", 10, 20, true, 400, 300));
         wm.add_rule(WindowRule {
-            app_id: String::from("app"),
+            app_id: Some(String::from("app")),
+            title: None,
             zone: Some(String::from("main")),
             x: None,
             y: None,
@@ -691,5 +719,142 @@ mod tests {
         assert_eq!(wm.window_zone(1), Some("main"));
         assert!(changes.iter().any(|c| c.position == Some((10, 20))));
         assert!(changes.iter().any(|c| c.size == Some((640, 300))));
+    }
+
+    #[test]
+    fn title_contains_rule_applies_on_title_set() {
+        let mut wm = WindowManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let mut xdg = XdgManager::default();
+        wm.add_zone(free_zone("main", 10, 20, true, 400, 300));
+        wm.add_rule(WindowRule {
+            app_id: None,
+            title: Some(lumalla_shared::TitleMatcher {
+                kind: lumalla_shared::TitleMatchKind::Contains,
+                pattern: String::from("YouTube"),
+            }),
+            zone: Some(String::from("main")),
+            x: None,
+            y: None,
+            width: Some(800),
+            height: None,
+        });
+
+        let _ = register_with_surface(&mut wm, &mut surfaces, &mut xdg);
+        wm.windows.get_mut(&1).unwrap().zone = None;
+        let _ = surfaces.set_surface_layout(client(1), object(12), 0, 0);
+
+        let no_match = wm.on_title_set(
+            client(1),
+            object(10),
+            String::from("Other"),
+            &surfaces,
+            &mut xdg,
+        );
+        assert!(no_match.is_empty());
+        assert_eq!(wm.window_zone(1), None);
+
+        let changes = wm.on_title_set(
+            client(1),
+            object(10),
+            String::from("Watch YouTube"),
+            &surfaces,
+            &mut xdg,
+        );
+        assert_eq!(wm.window_zone(1), Some("main"));
+        assert!(changes.iter().any(|c| c.position == Some((10, 20))));
+        assert!(changes.iter().any(|c| c.size == Some((800, 300))));
+    }
+
+    #[test]
+    fn app_id_and_title_rule_requires_both() {
+        let mut wm = WindowManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let mut xdg = XdgManager::default();
+        wm.add_zone(free_zone("main", 10, 20, true, 400, 300));
+        wm.add_rule(WindowRule {
+            app_id: Some(String::from("firefox")),
+            title: Some(lumalla_shared::TitleMatcher {
+                kind: lumalla_shared::TitleMatchKind::StartsWith,
+                pattern: String::from("GitHub"),
+            }),
+            zone: Some(String::from("main")),
+            x: Some(50),
+            y: Some(60),
+            width: None,
+            height: None,
+        });
+
+        let _ = register_with_surface(&mut wm, &mut surfaces, &mut xdg);
+        wm.windows.get_mut(&1).unwrap().zone = None;
+        let _ = surfaces.set_surface_layout(client(1), object(12), 0, 0);
+
+        let only_app = wm.on_app_id_set(
+            client(1),
+            object(10),
+            String::from("firefox"),
+            &surfaces,
+            &mut xdg,
+        );
+        assert!(only_app.is_empty());
+        assert_eq!(wm.window_zone(1), None);
+
+        let wrong_title = wm.on_title_set(
+            client(1),
+            object(10),
+            String::from("GitLab"),
+            &surfaces,
+            &mut xdg,
+        );
+        assert!(wrong_title.is_empty());
+
+        let matched = wm.on_title_set(
+            client(1),
+            object(10),
+            String::from("GitHub - lumalla"),
+            &surfaces,
+            &mut xdg,
+        );
+        assert_eq!(wm.window_zone(1), Some("main"));
+        assert!(matched.iter().any(|c| c.position == Some((50, 60))));
+    }
+
+    #[test]
+    fn title_equals_starts_with_ends_with_matchers() {
+        let mut wm = WindowManager::default();
+        wm.add_rule(WindowRule {
+            app_id: None,
+            title: Some(lumalla_shared::TitleMatcher {
+                kind: lumalla_shared::TitleMatchKind::Equals,
+                pattern: String::from("Exact"),
+            }),
+            zone: None,
+            x: Some(1),
+            y: None,
+            width: None,
+            height: None,
+        });
+        wm.add_rule(WindowRule {
+            app_id: None,
+            title: Some(lumalla_shared::TitleMatcher {
+                kind: lumalla_shared::TitleMatchKind::EndsWith,
+                pattern: String::from(".rs"),
+            }),
+            zone: None,
+            x: Some(2),
+            y: None,
+            width: None,
+            height: None,
+        });
+
+        assert_eq!(
+            wm.matching_rule_geometry("any", "Exact").x,
+            Some(1)
+        );
+        assert_eq!(
+            wm.matching_rule_geometry("any", "main.rs").x,
+            Some(2)
+        );
+        assert!(wm.matching_rule("any", "nope").is_none());
     }
 }

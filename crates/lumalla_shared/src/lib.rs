@@ -38,7 +38,7 @@ pub use udev::{Udev, UdevDevice, UdevEnumerate, UdevMonitor};
 pub use window_geometry::{
     WINDOW_GEOMETRY_UNSET, WindowGeometryUpdate, geometry_field_from_dbus, geometry_field_to_dbus,
 };
-pub use window_rule::WindowRule;
+pub use window_rule::{TitleMatchKind, TitleMatcher, WindowRule};
 pub use window_state::WindowState;
 pub use xkb_config::XkbConfig;
 pub use zone::{CompositionStrategy, Zone};

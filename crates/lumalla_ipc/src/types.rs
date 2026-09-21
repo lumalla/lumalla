@@ -518,8 +518,12 @@ impl From<GuideInfo> for Guide {
 /// Window placement rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct WindowRuleInfo {
-    /// Application id to match.
+    /// Application id to match (`""` = unset). Exact equality when set.
     pub app_id: String,
+    /// Title pattern to match (`""` = unset).
+    pub title: String,
+    /// Title match kind (`""` = unset). One of `equals`, `contains`, `starts_with`, `ends_with`.
+    pub title_match: String,
     /// Zone name to join (`""` = unset).
     pub zone: String,
     /// Default x position (`WINDOW_GEOMETRY_UNSET` = unset).
@@ -535,8 +539,14 @@ pub struct WindowRuleInfo {
 impl From<WindowRule> for WindowRuleInfo {
     fn from(rule: WindowRule) -> Self {
         use lumalla_shared::geometry_field_to_dbus;
+        let (title, title_match) = match rule.title {
+            Some(matcher) => (matcher.pattern, String::from(matcher.kind.as_str())),
+            None => (String::new(), String::new()),
+        };
         Self {
-            app_id: rule.app_id,
+            app_id: rule.app_id.unwrap_or_default(),
+            title,
+            title_match,
             zone: rule.zone.unwrap_or_default(),
             x: geometry_field_to_dbus(rule.x),
             y: geometry_field_to_dbus(rule.y),
@@ -548,9 +558,22 @@ impl From<WindowRule> for WindowRuleInfo {
 
 impl From<WindowRuleInfo> for WindowRule {
     fn from(rule: WindowRuleInfo) -> Self {
-        use lumalla_shared::geometry_field_from_dbus;
+        use lumalla_shared::{TitleMatchKind, TitleMatcher, geometry_field_from_dbus};
+        let title = if rule.title.is_empty() || rule.title_match.is_empty() {
+            None
+        } else {
+            TitleMatchKind::parse(&rule.title_match).map(|kind| TitleMatcher {
+                kind,
+                pattern: rule.title,
+            })
+        };
         Self {
-            app_id: rule.app_id,
+            app_id: if rule.app_id.is_empty() {
+                None
+            } else {
+                Some(rule.app_id)
+            },
+            title,
             zone: if rule.zone.is_empty() {
                 None
             } else {

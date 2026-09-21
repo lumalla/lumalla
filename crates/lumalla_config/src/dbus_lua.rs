@@ -882,8 +882,14 @@ fn init_dbus_window(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
     module.set(
         "add_window_rule",
         lua.create_function(move |_, window_rule: ConfigWindowRule| {
+            let (title, title_match) = match window_rule.title {
+                Some(matcher) => (matcher.pattern, String::from(matcher.kind.as_str())),
+                None => (String::new(), String::new()),
+            };
             dbus_result(rules_client.proxy.add_window_rule(WindowRuleInfo {
-                app_id: window_rule.app_id,
+                app_id: window_rule.app_id.unwrap_or_default(),
+                title,
+                title_match,
                 zone: window_rule.zone.unwrap_or_default(),
                 x: geometry_field_to_dbus(window_rule.x),
                 y: geometry_field_to_dbus(window_rule.y),
@@ -1480,12 +1486,66 @@ impl IntoLua for ConfigWindow {
 }
 
 struct ConfigWindowRule {
-    app_id: String,
+    app_id: Option<String>,
+    title: Option<lumalla_shared::TitleMatcher>,
     zone: Option<String>,
     x: Option<i32>,
     y: Option<i32>,
     width: Option<i32>,
     height: Option<i32>,
+}
+
+fn parse_title_matcher(table: &mlua::Table) -> LuaResult<Option<lumalla_shared::TitleMatcher>> {
+    use lumalla_shared::{TitleMatchKind, TitleMatcher};
+
+    let title_value: Option<LuaValue> = table.get("title")?;
+    let Some(title_value) = title_value else {
+        return Ok(None);
+    };
+    let title_table =
+        title_value
+            .as_table()
+            .ok_or_else(|| LuaError::FromLuaConversionError {
+                from: "LuaTitleMatcher",
+                to: String::from("TitleMatcher"),
+                message: Some(String::from(
+                    "Expected title to be a table like { contains = \"...\" }",
+                )),
+            })?;
+
+    let mut found: Option<(TitleMatchKind, String)> = None;
+    for (kind, key) in [
+        (TitleMatchKind::Equals, "equals"),
+        (TitleMatchKind::Contains, "contains"),
+        (TitleMatchKind::StartsWith, "starts_with"),
+        (TitleMatchKind::EndsWith, "ends_with"),
+    ] {
+        let pattern: Option<String> = title_table.get(key)?;
+        if let Some(pattern) = pattern {
+            if found.is_some() {
+                return Err(LuaError::FromLuaConversionError {
+                    from: "LuaTitleMatcher",
+                    to: String::from("TitleMatcher"),
+                    message: Some(String::from(
+                        "title matcher must set exactly one of equals, contains, starts_with, ends_with",
+                    )),
+                });
+            }
+            found = Some((kind, pattern));
+        }
+    }
+
+    let Some((kind, pattern)) = found else {
+        return Err(LuaError::FromLuaConversionError {
+            from: "LuaTitleMatcher",
+            to: String::from("TitleMatcher"),
+            message: Some(String::from(
+                "title matcher must set exactly one of equals, contains, starts_with, ends_with",
+            )),
+        });
+    };
+
+    Ok(Some(TitleMatcher { kind, pattern }))
 }
 
 impl FromLua for ConfigWindowRule {
@@ -1499,8 +1559,21 @@ impl FromLua for ConfigWindowRule {
                     "Expected a Lua table for the ConfigWindowRule",
                 )),
             })?;
+        let app_id: Option<String> = table.get("app_id")?;
+        let app_id = app_id.filter(|id| !id.is_empty());
+        let title = parse_title_matcher(table)?;
+        if app_id.is_none() && title.is_none() {
+            return Err(LuaError::FromLuaConversionError {
+                from: "LuaWindowRule",
+                to: String::from("ConfigWindowRule"),
+                message: Some(String::from(
+                    "Window rule requires at least one of app_id or title",
+                )),
+            });
+        }
         Ok(Self {
-            app_id: table.get("app_id")?,
+            app_id,
+            title,
             zone: table.get("zone").unwrap_or(None),
             x: table.get("x").unwrap_or(None),
             y: table.get("y").unwrap_or(None),
