@@ -200,6 +200,10 @@ impl DisplayState {
         self.seat_manager.flush_pending_keyboard_leaves(clients);
     }
 
+    pub fn flush_pending_data_device(&mut self, clients: &mut ConnectedClients) {
+        self.data_device_manager.flush_pending(clients);
+    }
+
     pub fn flush_pending_activation_configures(
         &mut self,
         clients: &mut ConnectedClients,
@@ -389,6 +393,7 @@ impl DisplayState {
                     );
                 }
                 self.seat_manager.flush_pending_keyboard_leaves(clients);
+                self.data_device_manager.flush_pending(clients);
                 self.on_surface_focused(client_id, focus_surface);
                 if let Some(client) = clients.get_mut(&client_id) {
                     self.apply_activation(client_id, focus_surface, client.writer_mut());
@@ -520,40 +525,27 @@ impl DisplayState {
     /// Drive an active drag's motion for tests / compositor input.
     pub fn drag_motion(
         &mut self,
-        client_id: ClientId,
+        _client_id: ClientId,
         clients: &mut ConnectedClients,
         time_msec: u32,
         x: f64,
         y: f64,
     ) {
-        let target = self
-            .surface_manager
-            .global_pointer_target(Some(client_id), x, y)
-            .filter(|(owner, _)| *owner == client_id)
-            .map(|(_, surface)| surface);
-        let Some(client) = clients.get_mut(&client_id) else {
-            return;
-        };
-        let (registry, writer) = client.registry_and_writer_mut();
-        self.data_device_manager.drag_motion(
-            client_id, time_msec, x as f32, y as f32, target, registry, writer,
-        );
+        let target = self.surface_manager.global_pointer_target(None, x, y);
+        self.data_device_manager
+            .drag_motion(time_msec, x as f32, y as f32, target, clients);
     }
 
     /// Complete an active drag with a drop for tests / compositor input.
     pub fn drag_drop(
         &mut self,
-        client_id: ClientId,
+        _client_id: ClientId,
         clients: &mut ConnectedClients,
     ) {
-        let Some(client) = clients.get_mut(&client_id) else {
-            return;
-        };
-        self.data_device_manager
-            .drag_drop(client_id, client.writer_mut());
+        self.data_device_manager.drag_drop(clients);
     }
 
-    pub fn remove_client(&mut self, client_id: ClientId) {
+    pub fn remove_client(&mut self, client_id: ClientId, clients: &mut ConnectedClients) {
         self.shm_manager.delete_client(client_id);
         self.dmabuf_manager.delete_client(client_id);
         self.surface_manager.delete_client(client_id);
@@ -562,6 +554,7 @@ impl DisplayState {
         self.relative_pointer_manager.delete_client(client_id);
         self.output_manager.remove_client(client_id);
         self.data_device_manager.remove_client(client_id);
+        self.data_device_manager.flush_pending(clients);
         self.xdg_manager.delete_client(client_id);
         self.window_manager.delete_client(client_id);
         self.pending_frame_callbacks
@@ -881,6 +874,7 @@ impl DisplayState {
             );
         }
         self.seat_manager.flush_pending_keyboard_leaves(clients);
+        self.data_device_manager.flush_pending(clients);
         self.on_surface_focused(client_id, wl_surface);
         if let Some(client) = clients.get_mut(&client_id) {
             self.apply_activation(client_id, wl_surface, client.writer_mut());
@@ -1197,6 +1191,7 @@ impl DisplayState {
             self.apply_activation(client_id, parent_wl, client.writer_mut());
         }
         self.flush_pending_keyboard_leaves(clients);
+        self.flush_pending_data_device(clients);
         self.flush_pending_activation_configures(clients);
     }
 

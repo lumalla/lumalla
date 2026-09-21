@@ -997,10 +997,12 @@ impl WlDataSource for DisplayState {
     }
 
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlDataSourceDestroy<'_>) {
-        if let Err(error) =
-            self.data_device_manager
-                .destroy_source(ctx.client_id, object_id, ctx.writer)
-        {
+        if let Err(error) = self.data_device_manager.destroy_source(
+            ctx.client_id,
+            object_id,
+            ctx.registry,
+            ctx.writer,
+        ) {
             report_data_device_error(ctx, object_id, error);
             return;
         }
@@ -1071,17 +1073,20 @@ impl WlDataDevice for DisplayState {
             }
         }
 
-        let target = self
-            .seat_manager
-            .pointer_focus_for_client(ctx.client_id)
-            .or_else(|| self.surface_manager.pointer_target(ctx.client_id, 0.0, 0.0));
         let (px, py) = self.seat_manager.pointer_position();
         let views = self.pointer_views();
         let (scene_x, scene_y) = lumalla_shared::map_dest_to_source(&views, px, py);
+        let target = self
+            .seat_manager
+            .focused_pointer_surface()
+            .or_else(|| {
+                self.surface_manager
+                    .global_pointer_target(None, scene_x, scene_y)
+            });
         let (enter_x, enter_y) = match target {
-            Some(surface) => self
+            Some((tid, surface)) => self
                 .surface_manager
-                .surface_local_coords(ctx.client_id, surface, scene_x, scene_y)
+                .surface_local_coords(tid, surface, scene_x, scene_y)
                 .unwrap_or((scene_x as f32, scene_y as f32)),
             None => (scene_x as f32, scene_y as f32),
         };
@@ -1119,6 +1124,10 @@ impl WlDataDevice for DisplayState {
                 report_data_device_error(ctx, object_id, DataDeviceError::UnknownSource);
                 return;
             }
+        }
+        // Ignore selections without a recent seat event serial (set_cursor policy).
+        if !self.seat_manager.is_valid_grab_serial(params.serial()) {
+            return;
         }
         if let Err(error) = self.data_device_manager.set_selection(
             ctx.client_id,

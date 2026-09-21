@@ -444,6 +444,8 @@ impl AppData {
                     self.display_state
                         .flush_pending_keyboard_leaves(&mut self.clients);
                     self.display_state
+                        .flush_pending_data_device(&mut self.clients);
+                    self.display_state
                         .flush_pending_activation_configures(&mut self.clients);
                     self.submit_committed_frames(event_loop, arena);
                     // Mapping / get_pointer can change who should own the cursor
@@ -530,13 +532,15 @@ impl AppData {
         if let Err(err) = event_loop.cancel_fd_all(fd) {
             error!("Unable to cancel I/O for client {:?}: {err}", client_id);
         }
-        self.display_state.remove_client(client_id);
+        self.display_state.remove_client(client_id, &mut self.clients);
         if let Err(err) = self.renderer_state.remove_client_frames(client_id.get()) {
             error!("Unable to clear frames for disconnected client: {err:#}");
         } else if self.renderer_state.scene_dirty() {
             self.mark_present_dirty(event_loop, arena);
         }
         self.sync_windows_to_dbus();
+        // Selection/DnD cleanup may have written to remaining clients.
+        self.flush_client_sends(event_loop, arena);
         self.try_finalize_client(client_id);
     }
 
