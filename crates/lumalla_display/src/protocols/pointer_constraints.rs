@@ -51,7 +51,6 @@ fn report_constraint_error(ctx: &mut Ctx, object_id: ObjectId, error: Constraint
         ConstraintError::UnknownConstraint => {
             (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown constraint")
         }
-        ConstraintError::Defunct => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Constraint is defunct"),
     };
     ctx.writer
         .wl_display_error(DISPLAY_OBJECT_ID)

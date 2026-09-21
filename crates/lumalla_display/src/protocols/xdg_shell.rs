@@ -421,7 +421,10 @@ impl XdgSurface for DisplayState {
             .xdg_manager
             .destroy_xdg_surface(ctx.client_id, object_id)
         {
-            Ok(_wl_surface) => {
+            Ok(wl_surface) => {
+                let _ = self
+                    .surface_manager
+                    .clear_xdg_role(ctx.client_id, wl_surface);
                 ctx.registry.free_object(object_id, ctx.writer);
             }
             Err(error) => report_xdg_error(ctx, object_id, error),

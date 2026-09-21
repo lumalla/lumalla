@@ -81,7 +81,6 @@ pub enum ConstraintError {
     UnknownRegion,
     InvalidLifetime,
     UnknownConstraint,
-    Defunct,
 }
 
 impl PointerConstraintsManager {
@@ -127,8 +126,9 @@ impl PointerConstraintsManager {
             .constraints
             .get_mut(&(client_id, object_id))
             .ok_or(ConstraintError::UnknownConstraint)?;
+        // Defunct after surface destroy / oneshot unlock: ignore until client destroy.
         if constraint.phase == ConstraintPhase::Defunct {
-            return Err(ConstraintError::Defunct);
+            return Ok(());
         }
         constraint.pending_region = Some(region);
         Ok(())
@@ -146,7 +146,7 @@ impl PointerConstraintsManager {
             .get_mut(&(client_id, object_id))
             .ok_or(ConstraintError::UnknownConstraint)?;
         if constraint.phase == ConstraintPhase::Defunct {
-            return Err(ConstraintError::Defunct);
+            return Ok(());
         }
         if constraint.kind != ConstraintKind::Locked {
             return Err(ConstraintError::UnknownConstraint);
@@ -510,5 +510,33 @@ mod tests {
         let confined = manager.apply_surface_commit(client(1), object(2));
         assert_eq!(confined.len(), 1);
         assert!(manager.region_for(client(1), object(10)).is_some());
+    }
+
+    #[test]
+    fn defunct_constraint_ignores_set_region_and_hint() {
+        let mut manager = PointerConstraintsManager::default();
+        manager
+            .create_constraint(
+                client(1),
+                object(10),
+                ConstraintKind::Locked,
+                object(2),
+                object(3),
+                None,
+                ConstraintLifetime::Oneshot,
+            )
+            .unwrap();
+        // Simulate surface teardown marking the constraint defunct without a writer.
+        if let Some(constraint) = manager.constraints.get_mut(&(client(1), object(10))) {
+            constraint.phase = ConstraintPhase::Defunct;
+        }
+        manager
+            .set_pending_region(client(1), object(10), Some(Region::default()))
+            .unwrap();
+        manager
+            .set_pending_cursor_hint(client(1), object(10), 1.0, 2.0)
+            .unwrap();
+        // Destroy still works.
+        assert!(manager.destroy(client(1), object(10)).is_some());
     }
 }

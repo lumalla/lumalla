@@ -61,6 +61,10 @@ fn report_surface_error(ctx: &mut Ctx, object_id: ObjectId, error: SurfaceError)
         }
         SurfaceError::UnknownRegion => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown region"),
         SurfaceError::UnknownSubsurface => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown subsurface"),
+        SurfaceError::DefunctRoleObject => (
+            WL_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT,
+            "Surface destroyed before its role object",
+        ),
         SurfaceError::BadParent => (
             WL_SUBCOMPOSITOR_ERROR_BAD_PARENT,
             "Invalid subsurface parent",
@@ -1392,13 +1396,6 @@ impl WlShellSurface for DisplayState {
 
 impl WlSurface for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlSurfaceDestroy<'_>) {
-        if let Err(error) = self
-            .xdg_manager
-            .validate_wl_surface_destroy(ctx.client_id, object_id)
-        {
-            crate::protocols::xdg_shell::report_commit_error(ctx, object_id, error);
-            return;
-        }
         match self
             .surface_manager
             .destroy_surface(ctx.client_id, object_id)
@@ -1428,18 +1425,6 @@ impl WlSurface for DisplayState {
                 );
                 if let Some(shell_id) = destroyed.shell_id {
                     ctx.registry.free_object(shell_id, ctx.writer);
-                }
-                if let Some(xdg_surface_id) = destroyed.xdg_surface_id {
-                    let _ = self
-                        .xdg_manager
-                        .destroy_xdg_surface(ctx.client_id, xdg_surface_id);
-                    ctx.registry.free_object(xdg_surface_id, ctx.writer);
-                }
-                if let Some(subsurface_id) = destroyed.subsurface_id {
-                    ctx.registry.free_object(subsurface_id, ctx.writer);
-                }
-                for subsurface_id in destroyed.orphaned_subsurface_ids {
-                    ctx.registry.free_object(subsurface_id, ctx.writer);
                 }
                 if destroyed.was_mapped {
                     for output in self.output_manager.bound_outputs_for_client(ctx.client_id) {

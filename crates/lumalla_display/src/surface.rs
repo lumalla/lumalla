@@ -13,6 +13,8 @@ pub enum SurfaceError {
     UnknownRegion,
     UnknownSubsurface,
     RoleAlreadyAssigned,
+    /// `wl_surface` destroyed while a role object (e.g. `wl_subsurface`) is still alive.
+    DefunctRoleObject,
     BadParent,
     BadSurface,
     InvalidScale,
@@ -87,10 +89,8 @@ pub struct CommitResult {
 
 #[derive(Debug)]
 pub struct DestroyedSurface {
+    /// Legacy `wl_shell_surface` is auto-destroyed with the surface (protocol).
     pub shell_id: Option<ObjectId>,
-    pub subsurface_id: Option<ObjectId>,
-    pub xdg_surface_id: Option<ObjectId>,
-    pub orphaned_subsurface_ids: Vec<ObjectId>,
     pub callbacks: Vec<ObjectId>,
     pub presentation_feedbacks: Vec<ObjectId>,
     pub was_mapped: bool,
@@ -141,6 +141,20 @@ impl SurfaceManager {
             .into_iter()
             .filter(|child| *child != id)
             .collect();
+        // Reject before mutating: role objects must be destroyed first (except
+        // legacy wl_shell_surface, which the protocol auto-destroys).
+        {
+            let surface = self
+                .surfaces
+                .get(&(client_id, id))
+                .ok_or(SurfaceError::UnknownSurface)?;
+            if matches!(
+                surface.role,
+                Some(Role::Subsurface(_)) | Some(Role::Xdg(_))
+            ) {
+                return Err(SurfaceError::DefunctRoleObject);
+            }
+        }
         let surface = self
             .surfaces
             .remove(&(client_id, id))
@@ -156,7 +170,8 @@ impl SurfaceManager {
             }
         }
 
-        let mut orphaned_subsurface_ids = Vec::new();
+        // Parent destroy unmaps sub-surfaces but must not free their protocol
+        // objects; clients still need to call wl_subsurface.destroy.
         let children: Vec<ObjectId> = surface
             .pending_children
             .as_ref()
@@ -164,26 +179,27 @@ impl SurfaceManager {
             .clone();
         for child_surface_id in children {
             if let Some(child) = self.surfaces.get_mut(&(client_id, child_surface_id)) {
-                if let Some(Role::Subsurface(sub_id)) = child.role.take() {
-                    self.subsurfaces.remove(&(client_id, sub_id));
-                    orphaned_subsurface_ids.push(sub_id);
+                if let Some(Role::Subsurface(sub_id)) = child.role {
+                    if let Some(sub) = self.subsurfaces.get_mut(&(client_id, sub_id)) {
+                        sub.orphaned = true;
+                    }
+                    child.current.buffer = None;
                 }
             }
         }
 
-        let (shell_id, subsurface_id, xdg_surface_id) = match surface.role {
+        let shell_id = match surface.role {
             Some(Role::Shell(shell_id)) => {
                 self.shell_surfaces.remove(&(client_id, shell_id));
-                (Some(shell_id), None, None)
+                Some(shell_id)
             }
-            Some(Role::Subsurface(subsurface_id)) => {
-                if let Some(sub) = self.subsurfaces.remove(&(client_id, subsurface_id)) {
-                    self.remove_child_from_parent(client_id, sub.parent, id);
-                }
-                (None, Some(subsurface_id), None)
-            }
-            Some(Role::Xdg(xdg_surface_id)) => (None, None, Some(xdg_surface_id)),
-            Some(Role::Cursor) | Some(Role::DndIcon) | None => (None, None, None),
+            // Xdg role should already be cleared via xdg_surface.destroy;
+            // Subsurface is rejected above. Leave a no-op arm for safety.
+            Some(Role::Xdg(_))
+            | Some(Role::Subsurface(_))
+            | Some(Role::Cursor)
+            | Some(Role::DndIcon)
+            | None => None,
         };
 
         let mut callbacks = surface.pending.frame_callbacks;
@@ -203,9 +219,6 @@ impl SurfaceManager {
 
         Ok(DestroyedSurface {
             shell_id,
-            subsurface_id,
-            xdg_surface_id,
-            orphaned_subsurface_ids,
             callbacks,
             presentation_feedbacks,
             was_mapped,
@@ -1259,6 +1272,7 @@ impl SurfaceManager {
                 sync: true,
                 current_position: (0, 0),
                 pending_position: None,
+                orphaned: false,
             },
         );
 
@@ -1297,7 +1311,9 @@ impl SurfaceManager {
             .remove(&(client_id, subsurface_id))
             .ok_or(SurfaceError::UnknownSubsurface)?;
         let surface_id = sub.surface;
-        self.remove_child_from_parent(client_id, sub.parent, surface_id);
+        if !sub.orphaned {
+            self.remove_child_from_parent(client_id, sub.parent, surface_id);
+        }
         let was_mapped = self.is_mapped(client_id, surface_id).unwrap_or(false);
         if let Some(surface) = self.surfaces.get_mut(&(client_id, surface_id)) {
             if surface.role == Some(Role::Subsurface(subsurface_id)) {
@@ -1316,10 +1332,15 @@ impl SurfaceManager {
         x: i32,
         y: i32,
     ) -> Result<(), SurfaceError> {
-        self.subsurfaces
+        let sub = self
+            .subsurfaces
             .get_mut(&(client_id, subsurface_id))
-            .ok_or(SurfaceError::UnknownSubsurface)?
-            .pending_position = Some((x, y));
+            .ok_or(SurfaceError::UnknownSubsurface)?;
+        // Parent already destroyed: object is inert until client destroy.
+        if sub.orphaned {
+            return Ok(());
+        }
+        sub.pending_position = Some((x, y));
         Ok(())
     }
 
@@ -1346,10 +1367,14 @@ impl SurfaceManager {
         client_id: ClientId,
         subsurface_id: ObjectId,
     ) -> Result<(), SurfaceError> {
-        self.subsurfaces
+        let sub = self
+            .subsurfaces
             .get_mut(&(client_id, subsurface_id))
-            .ok_or(SurfaceError::UnknownSubsurface)?
-            .sync = true;
+            .ok_or(SurfaceError::UnknownSubsurface)?;
+        if sub.orphaned {
+            return Ok(());
+        }
+        sub.sync = true;
         Ok(())
     }
 
@@ -1358,10 +1383,14 @@ impl SurfaceManager {
         client_id: ClientId,
         subsurface_id: ObjectId,
     ) -> Result<(), SurfaceError> {
-        self.subsurfaces
+        let sub = self
+            .subsurfaces
             .get_mut(&(client_id, subsurface_id))
-            .ok_or(SurfaceError::UnknownSubsurface)?
-            .sync = false;
+            .ok_or(SurfaceError::UnknownSubsurface)?;
+        if sub.orphaned {
+            return Ok(());
+        }
+        sub.sync = false;
         Ok(())
     }
 
@@ -1866,6 +1895,9 @@ impl SurfaceManager {
             .subsurfaces
             .get(&(client_id, subsurface_id))
             .ok_or(SurfaceError::UnknownSubsurface)?;
+        if sub.orphaned {
+            return Ok(());
+        }
         let parent = sub.parent;
         let surface = sub.surface;
         if sibling != parent {
@@ -2244,6 +2276,8 @@ struct SubsurfaceState {
     sync: bool,
     current_position: (i32, i32),
     pending_position: Option<(i32, i32)>,
+    /// Parent `wl_surface` was destroyed; keep the object until client `destroy`.
+    orphaned: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3260,5 +3294,58 @@ mod tests {
                 .unwrap_err(),
             SurfaceError::NoSurface
         );
+    }
+
+    #[test]
+    fn surface_destroy_with_live_subsurface_role_is_defunct() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(3));
+        manager
+            .create_subsurface(client(1), object(5), object(3), object(2))
+            .unwrap();
+        assert_eq!(
+            manager.destroy_surface(client(1), object(3)).unwrap_err(),
+            SurfaceError::DefunctRoleObject
+        );
+        // Role object still alive and usable until the client destroys it.
+        manager
+            .destroy_subsurface(client(1), object(5))
+            .unwrap();
+        manager.destroy_surface(client(1), object(3)).unwrap();
+    }
+
+    #[test]
+    fn parent_surface_destroy_keeps_child_subsurface_inert() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.create_surface(client(1), object(3));
+        manager
+            .create_subsurface(client(1), object(5), object(3), object(2))
+            .unwrap();
+        manager.destroy_surface(client(1), object(2)).unwrap();
+        // Non-destroy requests no-op; destroy still succeeds (no unknown-object).
+        manager
+            .set_position(client(1), object(5), 10, 20)
+            .unwrap();
+        manager.set_sync(client(1), object(5)).unwrap();
+        let (surface_id, _) = manager.destroy_subsurface(client(1), object(5)).unwrap();
+        assert_eq!(surface_id, object(3));
+        manager.destroy_surface(client(1), object(3)).unwrap();
+    }
+
+    #[test]
+    fn surface_destroy_with_live_xdg_role_is_defunct() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .assign_xdg_role(client(1), object(2), object(10))
+            .unwrap();
+        assert_eq!(
+            manager.destroy_surface(client(1), object(2)).unwrap_err(),
+            SurfaceError::DefunctRoleObject
+        );
+        manager.clear_xdg_role(client(1), object(2)).unwrap();
+        manager.destroy_surface(client(1), object(2)).unwrap();
     }
 }

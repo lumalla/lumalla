@@ -458,24 +458,6 @@ impl XdgManager {
         self.surface_to_xdg.get(&(client_id, wl_surface)).copied()
     }
 
-    pub fn validate_wl_surface_destroy(
-        &self,
-        client_id: ClientId,
-        wl_surface: ObjectId,
-    ) -> Result<(), XdgError> {
-        let Some(xdg_surface) = self.surface_to_xdg.get(&(client_id, wl_surface)) else {
-            return Ok(());
-        };
-        let state = self
-            .xdg_surfaces
-            .get(&(client_id, *xdg_surface))
-            .ok_or(XdgError::UnknownXdgSurface)?;
-        if state.role_alive {
-            return Err(XdgError::DefunctRoleObject);
-        }
-        Ok(())
-    }
-
     pub fn create_toplevel(
         &mut self,
         client_id: ClientId,
