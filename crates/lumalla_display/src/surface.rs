@@ -148,10 +148,7 @@ impl SurfaceManager {
                 .surfaces
                 .get(&(client_id, id))
                 .ok_or(SurfaceError::UnknownSurface)?;
-            if matches!(
-                surface.role,
-                Some(Role::Subsurface(_)) | Some(Role::Xdg(_))
-            ) {
+            if matches!(surface.role, Some(Role::Subsurface(_)) | Some(Role::Xdg(_))) {
                 return Err(SurfaceError::DefunctRoleObject);
             }
         }
@@ -278,11 +275,7 @@ impl SurfaceManager {
     }
 
     /// Flatten one mapped surface tree (toplevel + subsurfaces + role children).
-    pub fn collect_surface_tree(
-        &self,
-        client_id: ClientId,
-        root: ObjectId,
-    ) -> Vec<SceneSurface> {
+    pub fn collect_surface_tree(&self, client_id: ClientId, root: ObjectId) -> Vec<SceneSurface> {
         let mut scene = allocator_api2::vec::Vec::new();
         if self.is_mapped(client_id, root).unwrap_or(false) {
             self.flatten_surface_tree(client_id, root, &mut scene);
@@ -341,7 +334,12 @@ impl SurfaceManager {
         if !any {
             return None;
         }
-        Some((min_x, min_y, max_x.saturating_sub(min_x), max_y.saturating_sub(min_y)))
+        Some((
+            min_x,
+            min_y,
+            max_x.saturating_sub(min_x),
+            max_y.saturating_sub(min_y),
+        ))
     }
 
     fn flatten_surface_tree<A: allocator_api2::alloc::Allocator>(
@@ -801,11 +799,7 @@ impl SurfaceManager {
             .is_some_and(|surface| surface.role == Some(Role::Cursor))
     }
 
-    pub fn surface_role_is_subsurface(
-        &self,
-        client_id: ClientId,
-        surface_id: ObjectId,
-    ) -> bool {
+    pub fn surface_role_is_subsurface(&self, client_id: ClientId, surface_id: ObjectId) -> bool {
         self.surfaces
             .get(&(client_id, surface_id))
             .is_some_and(|surface| matches!(surface.role, Some(Role::Subsurface(_))))
@@ -2020,10 +2014,7 @@ impl SurfaceManager {
     ) -> Option<(f64, f64)> {
         let (origin_x, origin_y) = self.surface_origin(client_id, surface_id)?;
         let surface = self.surfaces.get(&(client_id, surface_id))?;
-        let (sx, sy) = (
-            global_x - origin_x as f64,
-            global_y - origin_y as f64,
-        );
+        let (sx, sy) = (global_x - origin_x as f64, global_y - origin_y as f64);
 
         let size = effective_surface_size(
             surface.buffer_size,
@@ -2336,7 +2327,12 @@ impl Region {
             let bottom = rect.y.saturating_add(rect.height);
             bounds = Some(match bounds {
                 None => (rect.x, rect.y, right, bottom),
-                Some((x0, y0, x1, y1)) => (x0.min(rect.x), y0.min(rect.y), x1.max(right), y1.max(bottom)),
+                Some((x0, y0, x1, y1)) => (
+                    x0.min(rect.x),
+                    y0.min(rect.y),
+                    x1.max(right),
+                    y1.max(bottom),
+                ),
             });
         }
         bounds.map(|(x0, y0, x1, y1)| (x0, y0, x1 - x0, y1 - y0))
@@ -3309,9 +3305,7 @@ mod tests {
             SurfaceError::DefunctRoleObject
         );
         // Role object still alive and usable until the client destroys it.
-        manager
-            .destroy_subsurface(client(1), object(5))
-            .unwrap();
+        manager.destroy_subsurface(client(1), object(5)).unwrap();
         manager.destroy_surface(client(1), object(3)).unwrap();
     }
 
@@ -3325,9 +3319,7 @@ mod tests {
             .unwrap();
         manager.destroy_surface(client(1), object(2)).unwrap();
         // Non-destroy requests no-op; destroy still succeeds (no unknown-object).
-        manager
-            .set_position(client(1), object(5), 10, 20)
-            .unwrap();
+        manager.set_position(client(1), object(5), 10, 20).unwrap();
         manager.set_sync(client(1), object(5)).unwrap();
         let (surface_id, _) = manager.destroy_subsurface(client(1), object(5)).unwrap();
         assert_eq!(surface_id, object(3));

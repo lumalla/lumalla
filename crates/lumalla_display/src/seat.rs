@@ -353,11 +353,7 @@ impl SeatManager {
     }
 
     /// Focused pointer for a specific pointer object, if any.
-    pub fn pointer_focus(
-        &self,
-        client_id: ClientId,
-        pointer_id: ObjectId,
-    ) -> Option<ObjectId> {
+    pub fn pointer_focus(&self, client_id: ClientId, pointer_id: ObjectId) -> Option<ObjectId> {
         self.pointers
             .iter()
             .find(|p| p.client_id == client_id && p.id == pointer_id)
@@ -387,13 +383,6 @@ impl SeatManager {
         }
     }
 
-    pub fn pointer_focus_for_client(&self, client_id: ClientId) -> Option<ObjectId> {
-        self.pointers
-            .iter()
-            .find(|p| p.client_id == client_id && p.focus.is_some())
-            .and_then(|p| p.focus)
-    }
-
     pub fn focused_keyboard_surface(&self) -> Option<(ClientId, ObjectId)> {
         self.keyboards
             .iter()
@@ -408,9 +397,11 @@ impl SeatManager {
 
     /// First focused pointer as `(client, surface, pointer)`.
     pub fn focused_pointer(&self) -> Option<(ClientId, ObjectId, ObjectId)> {
-        self.pointers
-            .iter()
-            .find_map(|pointer| pointer.focus.map(|surface| (pointer.client_id, surface, pointer.id)))
+        self.pointers.iter().find_map(|pointer| {
+            pointer
+                .focus
+                .map(|surface| (pointer.client_id, surface, pointer.id))
+        })
     }
 
     pub fn set_cursor(
@@ -468,7 +459,9 @@ impl SeatManager {
 
         if let Some(old) = previous_cursor.surface_id() {
             let still_used = self.pointers.iter().enumerate().any(|(idx, p)| {
-                idx != pointer_index && p.client_id == client_id && p.cursor.surface_id() == Some(old)
+                idx != pointer_index
+                    && p.client_id == client_id
+                    && p.cursor.surface_id() == Some(old)
             });
             if !still_used {
                 let _ = surface_manager.clear_cursor_role(client_id, old);
@@ -620,10 +613,7 @@ impl SeatManager {
     }
 
     /// Deliver queued `wl_keyboard.leave` events to other clients.
-    pub fn flush_pending_keyboard_leaves(
-        &mut self,
-        clients: &mut ConnectedClients,
-    ) {
+    pub fn flush_pending_keyboard_leaves(&mut self, clients: &mut ConnectedClients) {
         let pending = std::mem::take(&mut self.pending_keyboard_leaves);
         for (client_id, keyboard_id, surface) in pending {
             let Some(client) = clients.get_mut(&client_id) else {
@@ -811,15 +801,8 @@ impl SeatManager {
                     .iter()
                     .filter_map(|p| p.focus.map(|_| (p.client_id, p.id))),
             );
-            relative_pointers.emit_relative_motion(
-                clients,
-                &focused,
-                time_msec,
-                dx,
-                dy,
-                dx_unaccel,
-                dy_unaccel,
-            );
+            relative_pointers
+                .emit_relative_motion(clients, &focused, time_msec, dx, dy, dx_unaccel, dy_unaccel);
         }
     }
 
@@ -1071,7 +1054,9 @@ impl SeatManager {
         arena: &Arena,
     ) {
         let (scene_x, scene_y) = map_dest_to_source(views, self.pointer_x, self.pointer_y);
-        let sticky = constraints.active_for_seat().map(|c| (c.client_id, c.surface));
+        let sticky = constraints
+            .active_for_seat()
+            .map(|c| (c.client_id, c.surface));
         let target = match sticky {
             Some((client_id, surface)) => Some((client_id, surface)),
             None => surface_manager.global_pointer_target(None, scene_x, scene_y),
@@ -1166,13 +1151,7 @@ impl SeatManager {
 
         // Activate pending constraints now that focus/position are current.
         let pointer_focus = self.focused_pointer();
-        constraints.try_activate(
-            clients,
-            surface_manager,
-            pointer_focus,
-            scene_x,
-            scene_y,
-        );
+        constraints.try_activate(clients, surface_manager, pointer_focus, scene_x, scene_y);
     }
 
     fn send_keymap(&self, writer: &mut Writer, keyboard_id: ObjectId) -> anyhow::Result<()> {
@@ -1292,7 +1271,6 @@ impl Serial {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
         num::NonZeroU32,
         os::{
             fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -1448,7 +1426,15 @@ mod tests {
             .unwrap();
         let _ = surfaces.commit(client_id, surface).unwrap();
 
-        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces, &[]);
+        seat.create_pointer(
+            client_id,
+            pointer,
+            5,
+            &mut writer,
+            Some(surface),
+            &surfaces,
+            &[],
+        );
         let enter_serial = seat.pointers[0].enter_serial.unwrap();
 
         seat.set_cursor(
@@ -1462,10 +1448,7 @@ mod tests {
         )
         .unwrap();
         assert!(surfaces.surface_role_is_cursor(client_id, cursor));
-        assert_eq!(
-            seat.pointers[0].cursor,
-            SeatPointerCursor::Surface(cursor)
-        );
+        assert_eq!(seat.pointers[0].cursor, SeatPointerCursor::Surface(cursor));
         assert_eq!(
             seat.pointer_cursor(),
             PointerCursor::Surface(ActiveCursor {
@@ -1501,7 +1484,15 @@ mod tests {
             .unwrap();
         let _ = surfaces.commit(client_id, surface).unwrap();
 
-        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces, &[]);
+        seat.create_pointer(
+            client_id,
+            pointer,
+            5,
+            &mut writer,
+            Some(surface),
+            &surfaces,
+            &[],
+        );
         let enter_serial = seat.pointers[0].enter_serial.unwrap();
         assert_eq!(seat.pointer_cursor(), PointerCursor::Default);
 
@@ -1537,7 +1528,15 @@ mod tests {
         surfaces
             .create_shell_surface(client_id, object(30), surface)
             .unwrap();
-        seat.create_pointer(client_id, pointer, 5, &mut writer, Some(surface), &surfaces, &[]);
+        seat.create_pointer(
+            client_id,
+            pointer,
+            5,
+            &mut writer,
+            Some(surface),
+            &surfaces,
+            &[],
+        );
         let enter_serial = seat.pointers[0].enter_serial.unwrap();
 
         let err = seat

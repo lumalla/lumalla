@@ -815,10 +815,7 @@ mod tests {
     #[test]
     fn export_buffer_accepts_abgr8888() {
         let mut manager = DmabufManager::default();
-        manager.set_supported_formats(
-            vec![(DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR)],
-            None,
-        );
+        manager.set_supported_formats(vec![(DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR)], None);
         let client_id = client(1);
         manager.create_params(client_id, object(2)).unwrap();
         // Little-endian ABGR memory: R G B A

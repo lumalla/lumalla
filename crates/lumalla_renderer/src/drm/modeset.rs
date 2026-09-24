@@ -314,22 +314,6 @@ pub fn resolve_connected_output(
     probe_connected_output(fd, &resources, connector_id, mode_name, used_crtcs)
 }
 
-/// Find the first connected connector with a usable CRTC, primary plane, and preferred mode.
-pub fn find_first_connected_output(fd: RawFd) -> anyhow::Result<Option<ConnectedOutput>> {
-    let resources = get_resources(fd)?;
-    let mut used_crtcs = HashSet::new();
-    for &connector_id in resources.connector_ids() {
-        match probe_connected_output(fd, &resources, connector_id, None, &mut used_crtcs) {
-            Ok(Some(output)) => return Ok(Some(output)),
-            Ok(None) => {}
-            Err(err) => {
-                log::warn!("Failed to probe connector {connector_id} for modeset: {err:#}");
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// Initial modeset: enable CRTC, attach connector, set mode, and assign primary plane FB.
 pub fn atomic_modeset(
     drm_fd: BorrowedFd<'_>,
@@ -849,15 +833,6 @@ struct DrmModeResources {
 }
 
 impl DrmModeResources {
-    fn connector_ids(&self) -> &[u32] {
-        let count = unsafe { (*self.ptr).count_connectors.max(0) as usize };
-        let ptr = unsafe { (*self.ptr).connectors };
-        if ptr.is_null() || count == 0 {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(ptr, count) }
-    }
-
     fn crtc_ids(&self) -> &[u32] {
         let count = unsafe { (*self.ptr).count_crtcs.max(0) as usize };
         let ptr = unsafe { (*self.ptr).crtcs };

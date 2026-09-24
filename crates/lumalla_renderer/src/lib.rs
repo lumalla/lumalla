@@ -27,13 +27,13 @@ use crate::drm::{
     atomic_disable_output, atomic_modeset, atomic_page_flip, atomic_set_plane_fb,
     dispatch_drm_events, resolve_connected_output,
 };
-use crate::present_control::{NamedFlipDispatchOutcome, OutputPresentControl};
-use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
-use crate::scene_backing::DamageRect;
 pub use crate::present_control::{
     CompletedFlipEffect, FlipSideEffects, PRESENT_WAKE_TOKEN_BASE, PRESENT_WAKE_TOKEN_COUNT,
     PresentTickResult, is_present_wake_token,
 };
+use crate::present_control::{NamedFlipDispatchOutcome, OutputPresentControl};
+use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
+use crate::scene_backing::DamageRect;
 pub use crate::scene_backing::{
     CompositeMode, DamageRect as OutputDamageRect, UploadRect, buffer_damage_to_upload_rect,
     clip_buffer_damage_list, clip_damage_list, cursor_damage_rects, cursor_damage_rects_default,
@@ -417,7 +417,11 @@ struct ScreencastDmaSlot {
 
 fn dup_owned_fd(fd: RawFd) -> anyhow::Result<OwnedFd> {
     let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    anyhow::ensure!(dup >= 0, "F_DUPFD_CLOEXEC failed: {}", std::io::Error::last_os_error());
+    anyhow::ensure!(
+        dup >= 0,
+        "F_DUPFD_CLOEXEC failed: {}",
+        std::io::Error::last_os_error()
+    );
     Ok(unsafe { OwnedFd::from_raw_fd(dup) })
 }
 
@@ -635,10 +639,7 @@ impl RendererState {
     }
 
     /// Drain DRM page-flip events, retire buffers, and schedule queued flips.
-    pub fn dispatch_page_flips(
-        &mut self,
-        arena: &Arena,
-    ) -> anyhow::Result<FlipDispatchOutcome> {
+    pub fn dispatch_page_flips(&mut self, arena: &Arena) -> anyhow::Result<FlipDispatchOutcome> {
         let named = self.dispatch_page_flips_named(arena)?;
         Ok(FlipDispatchOutcome {
             status: named.status,
@@ -786,8 +787,7 @@ impl RendererState {
 
     /// Drop a cached DMA-BUF import when the corresponding `wl_buffer` is destroyed.
     pub fn remove_dmabuf_buffer(&mut self, owner_id: u32, buffer_id: u32) -> anyhow::Result<()> {
-        let (Some(vulkan), Some(compositor)) =
-            (self.vulkan.as_ref(), self.gpu.compositor.as_ref())
+        let (Some(vulkan), Some(compositor)) = (self.vulkan.as_ref(), self.gpu.compositor.as_ref())
         else {
             self.gpu
                 .surface_textures
@@ -1024,7 +1024,10 @@ impl RendererState {
         height: u32,
         count: usize,
     ) -> anyhow::Result<Vec<ScreencastDmaExport>> {
-        anyhow::ensure!(width > 0 && height > 0, "screencast buffer size must be positive");
+        anyhow::ensure!(
+            width > 0 && height > 0,
+            "screencast buffer size must be positive"
+        );
         anyhow::ensure!(count > 0, "screencast buffer count must be positive");
         self.free_screencast_buffers(stream_id);
 
@@ -1110,7 +1113,10 @@ impl RendererState {
         outputs: &[Output],
     ) -> anyhow::Result<()> {
         anyhow::ensure!(width > 0 && height > 0, "capture region must be positive");
-        anyhow::ensure!(dest_width > 0 && dest_height > 0, "destination size must be positive");
+        anyhow::ensure!(
+            dest_width > 0 && dest_height > 0,
+            "destination size must be positive"
+        );
         let regions: Vec<CaptureRegion> = outputs
             .iter()
             .flat_map(|output| CaptureRegion::from_output_views(output, x, y, width, height))
@@ -1177,8 +1183,10 @@ impl RendererState {
                     .context("screencast buffer index out of range")?;
                 &slot.image as *const DmaBufImage
             };
-            let dest_x = (u64::from(region.dest_x) * u64::from(out_w) / u64::from(src_w.max(1))) as u32;
-            let dest_y = (u64::from(region.dest_y) * u64::from(out_h) / u64::from(src_h.max(1))) as u32;
+            let dest_x =
+                (u64::from(region.dest_x) * u64::from(out_w) / u64::from(src_w.max(1))) as u32;
+            let dest_y =
+                (u64::from(region.dest_y) * u64::from(out_h) / u64::from(src_h.max(1))) as u32;
             let dest_w = (u64::from(region.logical_w) * u64::from(out_w) / u64::from(src_w.max(1)))
                 .max(1) as u32;
             let dest_h = (u64::from(region.logical_h) * u64::from(out_h) / u64::from(src_h.max(1)))
@@ -1243,8 +1251,14 @@ impl RendererState {
         dest_width: u32,
         dest_height: u32,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(width > 0 && height > 0, "window capture size must be positive");
-        anyhow::ensure!(dest_width > 0 && dest_height > 0, "destination size must be positive");
+        anyhow::ensure!(
+            width > 0 && height > 0,
+            "window capture size must be positive"
+        );
+        anyhow::ensure!(
+            dest_width > 0 && dest_height > 0,
+            "destination size must be positive"
+        );
 
         let (buf_w, buf_h, fresh) = {
             let slots = self
@@ -1416,9 +1430,8 @@ impl RendererState {
                 .context("screencast buffer index out of range")?;
             &slot.image as *const DmaBufImage
         };
-        let bgra = unsafe {
-            download_bgra_region(vulkan, &*image_ptr, 0, 0, dest_width, dest_height)?
-        };
+        let bgra =
+            unsafe { download_bgra_region(vulkan, &*image_ptr, 0, 0, dest_width, dest_height)? };
 
         self.release_screencast_buffer(stream_id, index);
 
@@ -1499,9 +1512,8 @@ impl RendererState {
             &slot.image as *const DmaBufImage
         };
         // Safety: image is owned by self and lives for this call.
-        let bgra = unsafe {
-            download_bgra_region(vulkan, &*image_ptr, 0, 0, dest_width, dest_height)?
-        };
+        let bgra =
+            unsafe { download_bgra_region(vulkan, &*image_ptr, 0, 0, dest_width, dest_height)? };
 
         self.release_screencast_buffer(stream_id, index);
 
@@ -1767,10 +1779,7 @@ impl RendererState {
                 ) {
                     Ok(Some(output)) => unresolved.push((path.clone(), output)),
                     Ok(None) => {}
-                    Err(err) => warn!(
-                        "Cannot resolve {} for disable: {err:#}",
-                        connector.name
-                    ),
+                    Err(err) => warn!("Cannot resolve {} for disable: {err:#}", connector.name),
                 }
             }
         }
@@ -2370,14 +2379,10 @@ impl RendererState {
         let (views_force_full, output_local_damage) =
             match identity_fullscreen_view_origin(&views, width, height) {
                 Some((0, 0)) => (false, _pending_damage),
-                Some((origin_x, origin_y))
-                    if !(pointer_damage || cursor_buffer_dirty) =>
-                {
-                    (
-                        false,
-                        translate_damage_list(&_pending_damage, -origin_x, -origin_y),
-                    )
-                }
+                Some((origin_x, origin_y)) if !(pointer_damage || cursor_buffer_dirty) => (
+                    false,
+                    translate_damage_list(&_pending_damage, -origin_x, -origin_y),
+                ),
                 _ => (true, Vec::new()),
             };
         let mut composite_mode = prepare_gpu_composite(
@@ -2843,13 +2848,7 @@ struct CaptureRegion {
 }
 
 impl CaptureRegion {
-    fn from_output_views(
-        output: &Output,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-    ) -> Vec<Self> {
+    fn from_output_views(output: &Output, x: i32, y: i32, width: i32, height: i32) -> Vec<Self> {
         let scale = output.scale.max(1);
         let mut regions = Vec::new();
         for view in &output.views {
@@ -3123,7 +3122,7 @@ mod tests {
             full_surface: true,
         };
 
-        let mut upload = composite_surface_full(&[&frame], 3, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
+        let upload = composite_surface_full(&[&frame], 3, 1, [0.0, 0.0, 0.0, 1.0]).unwrap();
         assert_eq!(upload.len(), 3 * 1 * 4);
         assert_eq!(upload, vec![1, 2, 3, 255, 4, 5, 6, 255, 0, 0, 0, 255]);
     }
