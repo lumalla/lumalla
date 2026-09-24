@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, OsStr, c_int};
-use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -34,8 +33,6 @@ mod bindings {
     unsafe extern "C" {
         pub fn drmGetDevices2(flags: u32, devices: *mut drmDevicePtr, max_devices: c_int) -> c_int;
         pub fn drmFreeDevices(devices: *mut drmDevicePtr, count: c_int);
-        pub fn drmSetMaster(fd: c_int) -> c_int;
-        pub fn drmDropMaster(fd: c_int) -> c_int;
     }
 }
 
@@ -96,32 +93,6 @@ impl DrmDevice {
     /// Last probed connectors for this device.
     pub fn connectors(&self) -> &[DrmConnector] {
         &self.connectors
-    }
-
-    /// Become DRM master on this device.
-    pub fn set_master(&self) -> anyhow::Result<()> {
-        let result = unsafe { bindings::drmSetMaster(self.fd.as_raw_fd()) };
-        if result != 0 {
-            anyhow::bail!(
-                "drmSetMaster failed for {}: {}",
-                self.path.display(),
-                io::Error::last_os_error()
-            );
-        }
-        Ok(())
-    }
-
-    /// Drop DRM master on this device.
-    pub fn drop_master(&self) -> anyhow::Result<()> {
-        let result = unsafe { bindings::drmDropMaster(self.fd.as_raw_fd()) };
-        if result != 0 {
-            anyhow::bail!(
-                "drmDropMaster failed for {}: {}",
-                self.path.display(),
-                io::Error::last_os_error()
-            );
-        }
-        Ok(())
     }
 
     /// Probe connectors via libdrm; returns `true` if the list changed.
