@@ -48,9 +48,9 @@ pub use crate::scene_backing::{
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
     DRM_FORMAT_ARGB8888, DmaBufImage, Framebuffer, GpuCompositor, GpuWorkBatch,
-    SurfaceTextureCache, VulkanContext, blit_image_region, composite_layers_to_image,
-    composite_to_scanout, copy_scanout_frame, download_bgra_region, map_rect_through_view,
-    overlay_cursor_on_image, upload_bgra_to_image, vulkan_to_drm_fourcc,
+    SurfaceTextureCache, VulkanContext, blit_image_region, clear_dma_image_color,
+    composite_layers_to_image, composite_to_scanout, copy_scanout_frame, download_bgra_region,
+    map_rect_through_view, overlay_cursor_on_image, upload_bgra_to_image, vulkan_to_drm_fourcc,
 };
 
 struct GpuRenderResources {
@@ -373,6 +373,8 @@ pub struct RendererState {
     present_halted: Option<String>,
     /// PipeWire DMA-BUF capture buffers keyed by stream id.
     screencast_buffers: HashMap<u32, Vec<ScreencastDmaSlot>>,
+    /// Bumped when captured scene content may have changed (windows, cursor, guides…).
+    screencast_content_serial: u64,
 }
 
 /// DMA-BUF handle handed to the PipeWire thread for one capture slot.
@@ -406,6 +408,8 @@ struct ScreencastDmaSlot {
     fresh: bool,
     /// In-flight GPU fill; must complete before PipeWire queues the buffer.
     gpu_pending: Option<crate::vulkan::PendingGpuSubmit>,
+    /// Content serial last written into this slot (for unchanged-frame skip).
+    content_serial: Option<u64>,
 }
 
 fn dup_owned_fd(fd: RawFd) -> anyhow::Result<OwnedFd> {
@@ -450,6 +454,7 @@ impl RendererState {
             cursor_buffer_dirty: false,
             present_halted: None,
             screencast_buffers: HashMap::new(),
+            screencast_content_serial: 1,
         })
     }
 
@@ -526,11 +531,44 @@ impl RendererState {
 
     pub fn mark_scene_dirty(&mut self) {
         self.scene_dirty = true;
+        self.bump_screencast_content();
     }
 
     fn mark_dirty_if_active(&mut self) {
         if self.has_presentable_outputs() {
             self.scene_dirty = true;
+        }
+        // Screencast may capture even when presents are idle (PipeWire DRIVER wake).
+        self.bump_screencast_content();
+    }
+
+    fn bump_screencast_content(&mut self) {
+        self.screencast_content_serial = self.screencast_content_serial.wrapping_add(1).max(1);
+    }
+
+    /// Monotonic serial of compositor content relevant to screencast capture.
+    pub fn screencast_content_serial(&self) -> u64 {
+        self.screencast_content_serial
+    }
+
+    /// Content serial last written into screencast slot `(stream_id, index)`, if any.
+    pub fn screencast_slot_content_serial(
+        &self,
+        stream_id: u32,
+        index: usize,
+    ) -> Option<u64> {
+        self.screencast_buffers
+            .get(&stream_id)?
+            .get(index)?
+            .content_serial
+    }
+
+    /// Forget cached content on all slots for `stream_id` (geometry / size change).
+    pub fn invalidate_screencast_content(&mut self, stream_id: u32) {
+        if let Some(slots) = self.screencast_buffers.get_mut(&stream_id) {
+            for slot in slots {
+                slot.content_serial = None;
+            }
         }
     }
 
@@ -1178,6 +1216,7 @@ impl RendererState {
                     in_use: false,
                     fresh: true,
                     gpu_pending: None,
+                    content_serial: None,
                 });
             }
         }
@@ -1236,7 +1275,7 @@ impl RendererState {
             "screencast region does not intersect any presented scanout"
         );
 
-        let (buf_w, buf_h) = {
+        let (buf_w, buf_h, fresh) = {
             let slots = self
                 .screencast_buffers
                 .get(&stream_id)
@@ -1249,7 +1288,7 @@ impl RendererState {
                 "screencast buffer {index} still has pending GPU work"
             );
             let extent = slot.image.extent();
-            (extent.width, extent.height)
+            (extent.width, extent.height, slot.fresh)
         };
         anyhow::ensure!(
             dest_width <= buf_w && dest_height <= buf_h,
@@ -1280,7 +1319,28 @@ impl RendererState {
         }
 
         let mut batch = GpuWorkBatch::new();
-        let mut first = true;
+        // Clear so multi-region / partial coverage never leaves UNDEFINED garbage.
+        {
+            let dst_ptr = {
+                let slots = self
+                    .screencast_buffers
+                    .get(&stream_id)
+                    .context("screencast buffers missing")?;
+                let slot = slots
+                    .get(index)
+                    .context("screencast buffer index out of range")?;
+                &slot.image as *const DmaBufImage
+            };
+            let vulkan = self
+                .vulkan
+                .as_ref()
+                .context("Vulkan missing for screencast clear")?;
+            unsafe {
+                clear_dma_image_color(vulkan, &mut batch, &*dst_ptr, fresh, [0.0, 0.0, 0.0, 1.0])?;
+            }
+        }
+
+        let mut first = false; // dest already defined after clear
         let src_w = width as u32;
         let src_h = height as u32;
         for region in &regions {
@@ -1419,6 +1479,7 @@ impl RendererState {
             .as_ref()
             .context("Vulkan missing for screencast submit")?;
         let pending = batch.submit(vulkan.device())?;
+        let serial = self.screencast_content_serial;
 
         if let Some(slot) = self
             .screencast_buffers
@@ -1428,6 +1489,7 @@ impl RendererState {
             slot.gpu_pending = Some(pending);
             slot.in_use = true;
             slot.fresh = false;
+            slot.content_serial = Some(serial);
         }
         Ok(())
     }
@@ -1597,6 +1659,7 @@ impl RendererState {
             .as_ref()
             .context("Vulkan missing for window screencast submit")?;
         let pending = batch.submit(vulkan.device())?;
+        let serial = self.screencast_content_serial;
 
         if let Some(slot) = self
             .screencast_buffers
@@ -1606,6 +1669,7 @@ impl RendererState {
             slot.gpu_pending = Some(pending);
             slot.in_use = true;
             slot.fresh = false;
+            slot.content_serial = Some(serial);
         }
         Ok(())
     }

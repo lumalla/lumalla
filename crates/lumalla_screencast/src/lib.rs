@@ -408,6 +408,7 @@ impl ScreencastManager {
     /// Update live capture geometry (window move/resize). Does not resize PipeWire buffers.
     ///
     /// Frames are scaled into the existing `out_width`×`out_height` DMA pool.
+    /// Update capture region. Returns `true` when any field actually changed.
     pub fn update_capture_geometry(
         &mut self,
         stream_id: u32,
@@ -420,6 +421,9 @@ impl ScreencastManager {
             return false;
         }
         if let Some(stream) = self.streams.get_mut(&stream_id) {
+            if stream.x == x && stream.y == y && stream.width == width && stream.height == height {
+                return false;
+            }
             stream.x = x;
             stream.y = y;
             stream.width = width;
@@ -427,6 +431,13 @@ impl ScreencastManager {
             return true;
         }
         if let Some(starting) = self.starting.get_mut(&stream_id) {
+            if starting.x == x
+                && starting.y == y
+                && starting.width == width
+                && starting.height == height
+            {
+                return false;
+            }
             starting.x = x;
             starting.y = y;
             starting.width = width;

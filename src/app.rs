@@ -2231,8 +2231,13 @@ impl AppData {
             };
             match self.display_state.window_capture_layers(Some(window_id)) {
                 Some((_, x, y, width, height, _)) => {
-                    self.screencast
-                        .update_capture_geometry(stream_id, x, y, width, height);
+                    if self
+                        .screencast
+                        .update_capture_geometry(stream_id, x, y, width, height)
+                    {
+                        self.renderer_state
+                            .invalidate_screencast_content(stream_id);
+                    }
                 }
                 None => stop_ids.push(stream_id),
             }
@@ -2276,6 +2281,26 @@ impl AppData {
                 .streams()
                 .get(&stream_id)
                 .is_some_and(|s| s.embed_cursor());
+
+            // Re-queue without GPU when this slot already holds current content.
+            let content_serial = self.renderer_state.screencast_content_serial();
+            if self
+                .renderer_state
+                .screencast_slot_content_serial(stream_id, index)
+                == Some(content_serial)
+            {
+                if let Err(err) = self.screencast.queue_dma_buffer(stream_id, index) {
+                    warn!(
+                        "Unable to re-queue unchanged DMA-BUF for stream {stream_id}: {err:#}"
+                    );
+                    self.renderer_state
+                        .release_screencast_buffer(stream_id, index);
+                } else if let Some(stream) = self.screencast.streams_mut().get_mut(&stream_id)
+                {
+                    stream.last_capture = Some(now);
+                }
+                continue;
+            }
 
             let blit_result = match self.screencast.stream_source(stream_id) {
                 Some(ScreencastSource::Window { window_id }) => {

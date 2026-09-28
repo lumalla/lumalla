@@ -78,6 +78,7 @@ impl RendererState {
         if !self.outputs.is_empty() {
             self.scene_dirty = true;
         }
+        self.bump_screencast_content();
     }
 
     /// Bypass vblank alignment on every presentable output.
@@ -93,6 +94,7 @@ impl RendererState {
         if !self.outputs.is_empty() {
             self.scene_dirty = true;
         }
+        self.bump_screencast_content();
     }
 
     /// Cancel all per-output present-wake timeouts (e.g. shutdown).

@@ -2364,6 +2364,104 @@ pub fn blit_image_region(
     Ok(())
 }
 
+/// Clear a DMA image to `color` (records into `batch`, does not wait).
+///
+/// Used before partial/multi-region screencast blits so uncovered destination
+/// pixels are defined. Leaves the image in `GENERAL`.
+pub fn clear_dma_image_color(
+    vulkan: &VulkanContext,
+    batch: &mut GpuWorkBatch,
+    image: &DmaBufImage,
+    was_undefined: bool,
+    color: [f32; 4],
+) -> anyhow::Result<()> {
+    let device = vulkan.device();
+    let command_pool = vulkan.graphics_command_pool();
+    let command_buffer = command_pool.allocate_command_buffer(device)?;
+    let extent = image.extent();
+
+    let record_result = (|| -> anyhow::Result<()> {
+        let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
+        let cb = recorder.command_buffer();
+        let old_layout = if was_undefined {
+            vk::ImageLayout::UNDEFINED
+        } else {
+            vk::ImageLayout::GENERAL
+        };
+        let src_access = if was_undefined {
+            vk::AccessFlags::empty()
+        } else {
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+        };
+        let to_dst = vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(old_layout)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image.image())
+            .subresource_range(color_subresource_range());
+        unsafe {
+            device.handle().cmd_pipeline_barrier(
+                cb,
+                if was_undefined {
+                    vk::PipelineStageFlags::TOP_OF_PIPE
+                } else {
+                    vk::PipelineStageFlags::ALL_COMMANDS
+                },
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_dst],
+            );
+        }
+
+        let clear = vk::ClearColorValue { float32: color };
+        unsafe {
+            device.handle().cmd_clear_color_image(
+                cb,
+                image.image(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear,
+                &[color_subresource_range()],
+            );
+        }
+
+        let to_general = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image.image())
+            .subresource_range(color_subresource_range());
+        unsafe {
+            device.handle().cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_general],
+            );
+        }
+        let _ = extent; // documents full-image clear
+        recorder.end()?;
+        Ok(())
+    })();
+
+    if let Err(err) = record_result {
+        command_pool.free_command_buffers(device, &[command_buffer]);
+        return Err(err);
+    }
+    batch.push(command_buffer, None);
+    Ok(())
+}
+
 fn color_subresource_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
