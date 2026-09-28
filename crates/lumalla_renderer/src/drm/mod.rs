@@ -11,7 +11,7 @@ mod sys;
 pub use device::{DrmDevice, DrmDevices, DrmDispatchResult, find_drm_devices};
 pub use modeset::{
     CompletedPageFlip, ConnectedOutput, DrmFramebuffer, FlipEventQueue, ModeBlob, ModeInfo,
-    atomic_disable_output, atomic_modeset, atomic_page_flip, atomic_set_plane_fb,
-    dispatch_drm_events, enable_atomic_client_caps, probe_device_topology,
+    atomic_disable_output, atomic_modeset, atomic_page_flip, atomic_set_cursor_plane,
+    atomic_set_plane_fb, dispatch_drm_events, enable_atomic_client_caps, probe_device_topology,
     resolve_connected_output,
 };

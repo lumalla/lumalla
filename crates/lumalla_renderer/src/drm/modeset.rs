@@ -411,6 +411,61 @@ pub fn atomic_set_plane_fb(
     Ok(())
 }
 
+/// Program or disable a cursor plane (no page-flip event).
+///
+/// Pass `crtc_id == 0` and `fb_id == 0` to detach the plane. When `test_only` is
+/// set, the commit is validated without applying.
+pub fn atomic_set_cursor_plane(
+    drm_fd: BorrowedFd<'_>,
+    plane_id: u32,
+    props: &crate::output::PlaneAtomicProps,
+    crtc_id: u32,
+    fb_id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    test_only: bool,
+) -> anyhow::Result<()> {
+    let fd = drm_fd.as_raw_fd();
+    let req = AtomicRequest::new()?;
+    req.add(plane_id, props.fb_id, u64::from(fb_id))?;
+    req.add(plane_id, props.crtc_id, u64::from(crtc_id))?;
+    if crtc_id == 0 || fb_id == 0 {
+        req.add(plane_id, props.src_x, 0u64)?;
+        req.add(plane_id, props.src_y, 0u64)?;
+        req.add(plane_id, props.src_w, 0u64)?;
+        req.add(plane_id, props.src_h, 0u64)?;
+        req.add(plane_id, props.crtc_x, 0u64)?;
+        req.add(plane_id, props.crtc_y, 0u64)?;
+        req.add(plane_id, props.crtc_w, 0u64)?;
+        req.add(plane_id, props.crtc_h, 0u64)?;
+    } else {
+        req.add(plane_id, props.src_x, 0u64)?;
+        req.add(plane_id, props.src_y, 0u64)?;
+        req.add(plane_id, props.src_w, u64::from(width) << 16)?;
+        req.add(plane_id, props.src_h, u64::from(height) << 16)?;
+        req.add(plane_id, props.crtc_x, x as u64)?;
+        req.add(plane_id, props.crtc_y, y as u64)?;
+        req.add(plane_id, props.crtc_w, u64::from(width))?;
+        req.add(plane_id, props.crtc_h, u64::from(height))?;
+    }
+
+    let mut flags = sys::DRM_MODE_ATOMIC_NONBLOCK;
+    if test_only {
+        flags |= sys::DRM_MODE_ATOMIC_TEST_ONLY;
+    }
+    req.commit(fd, flags, ptr::null_mut())?;
+
+    if !test_only {
+        debug!(
+            "Atomic cursor plane {}: fb={} crtc={} pos=({x},{y}) {}x{}",
+            plane_id, fb_id, crtc_id, width, height
+        );
+    }
+    Ok(())
+}
+
 /// Non-blocking page-flip of the primary plane FB, requesting a flip event.
 ///
 /// Completions are delivered to `flip_events` via [`dispatch_drm_events`] using
@@ -965,6 +1020,15 @@ impl DrmModePlane {
     fn get(&self) -> &sys::drmModePlane {
         unsafe { &*self.ptr }
     }
+
+    fn formats(&self) -> &[u32] {
+        let count = unsafe { (*self.ptr).count_formats as usize };
+        let ptr = unsafe { (*self.ptr).formats };
+        if ptr.is_null() || count == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(ptr, count) }
+    }
 }
 
 impl Drop for DrmModePlane {
@@ -1090,6 +1154,8 @@ pub fn probe_device_topology(
             free_overlays.push(plane_id);
         }
 
+        let formats = plane.formats().to_vec();
+
         planes.push(DrmPlaneInfo {
             plane_id,
             kind,
@@ -1097,6 +1163,7 @@ pub fn probe_device_topology(
             zpos,
             zpos_mutable,
             props,
+            formats,
         });
     }
 

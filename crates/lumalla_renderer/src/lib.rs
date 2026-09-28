@@ -9,6 +9,7 @@ use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     BufferTransform, CapturedImage, DrmDeviceState, Guide, Output, OutputConfig, View,
+    view_at_source,
 };
 use stumpalo::Arena;
 
@@ -25,8 +26,8 @@ pub mod scheduler;
 
 use crate::drm::{
     CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, FlipEventQueue, ModeBlob,
-    atomic_disable_output, atomic_modeset, atomic_page_flip, atomic_set_plane_fb,
-    dispatch_drm_events, probe_device_topology, resolve_connected_output,
+    atomic_disable_output, atomic_modeset, atomic_page_flip, atomic_set_cursor_plane,
+    atomic_set_plane_fb, dispatch_drm_events, probe_device_topology, resolve_connected_output,
 };
 pub use crate::present_control::{
     CompletedFlipEffect, FlipSideEffects, PRESENT_WAKE_TOKEN_BASE, PRESENT_WAKE_TOKEN_COUNT,
@@ -34,7 +35,8 @@ pub use crate::present_control::{
 };
 use crate::present_control::NamedFlipDispatchOutcome;
 use crate::output::{
-    DrmDeviceTopology, OutputId, OutputPresentControl, OutputState, PhysicalOutput,
+    DrmDeviceTopology, DrmPlaneInfo, HW_CURSOR_MAX_SIZE, OutputId, OutputPresentControl,
+    OutputState, PhysicalOutput, PlaneGeometry,
 };
 use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
 use crate::scene_backing::DamageRect;
@@ -45,9 +47,10 @@ pub use crate::scene_backing::{
 };
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
-    DmaBufImage, Framebuffer, GpuCompositor, GpuWorkBatch, SurfaceTextureCache, VulkanContext,
-    blit_image_region, composite_layers_to_image, composite_to_scanout, copy_scanout_frame,
-    download_bgra_region, map_rect_through_view, vulkan_to_drm_fourcc,
+    DRM_FORMAT_ARGB8888, DmaBufImage, Framebuffer, GpuCompositor, GpuWorkBatch,
+    SurfaceTextureCache, VulkanContext, blit_image_region, composite_layers_to_image,
+    composite_to_scanout, copy_scanout_frame, download_bgra_region, map_rect_through_view,
+    upload_bgra_to_image, vulkan_to_drm_fourcc,
 };
 
 struct GpuRenderResources {
@@ -457,6 +460,14 @@ impl RendererState {
     }
 
     fn note_pointer_damage(&mut self, new_x: i32, new_y: i32) {
+        if self.any_hw_cursor_capable() {
+            for output in self.outputs.values_mut() {
+                if output.cursor().is_some_and(|c| c.plane_id != 0) {
+                    output.dirty.cursor_pos = true;
+                }
+            }
+            return;
+        }
         let old = (self.pointer_x, self.pointer_y);
         let damage = match self.cursor_state.draw_ref() {
             CursorDraw::Client(cursor) => cursor_damage_rects(cursor, old, (new_x, new_y)),
@@ -468,6 +479,27 @@ impl RendererState {
     }
 
     fn note_cursor_redraw(&mut self) {
+        if self.any_hw_cursor_capable() {
+            for output in self.outputs.values_mut() {
+                let mark = if let Some(cursor) = output.cursor_mut() {
+                    if cursor.plane_id != 0 {
+                        // Retry HW after image change.
+                        cursor.software = false;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if mark {
+                    output.dirty.cursor_image = true;
+                    output.dirty.cursor_pos = true;
+                }
+            }
+            self.cursor_buffer_dirty = true;
+            return;
+        }
         let pointer = (self.pointer_x, self.pointer_y);
         let rect = match self.cursor_state.draw_ref() {
             CursorDraw::Client(cursor) => cursor_damage_rects(cursor, pointer, pointer),
@@ -476,6 +508,12 @@ impl RendererState {
         };
         self.pending_damage.extend(rect);
         self.pending_pointer_damage = true;
+    }
+
+    fn any_hw_cursor_capable(&self) -> bool {
+        self.outputs
+            .values()
+            .any(|o| o.cursor().is_some_and(|c| c.plane_id != 0))
     }
 
     pub fn scene_dirty(&self) -> bool {
@@ -820,6 +858,18 @@ impl RendererState {
         self.cursor_state = CursorState::Client(frame);
         self.cursor_buffer_dirty = true;
         self.note_cursor_redraw();
+        if self.any_hw_cursor_capable() {
+            self.flush_hw_cursors()?;
+            if self
+                .outputs
+                .values()
+                .any(|o| o.cursor().is_some_and(|c| c.software && c.plane_id != 0))
+            {
+                self.pending_pointer_damage = true;
+                self.mark_dirty_if_active();
+            }
+            return Ok(());
+        }
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -832,6 +882,10 @@ impl RendererState {
         self.note_cursor_redraw();
         self.cursor_state = CursorState::Default;
         self.note_cursor_redraw();
+        if self.any_hw_cursor_capable() {
+            self.flush_hw_cursors()?;
+            return Ok(());
+        }
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -843,6 +897,10 @@ impl RendererState {
         }
         self.note_cursor_redraw();
         self.cursor_state = CursorState::Hidden;
+        if self.any_hw_cursor_capable() {
+            self.flush_hw_cursors()?;
+            return Ok(());
+        }
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -854,6 +912,10 @@ impl RendererState {
         self.note_pointer_damage(x, y);
         self.pointer_x = x;
         self.pointer_y = y;
+        if self.any_hw_cursor_capable() {
+            self.flush_hw_cursors()?;
+            return Ok(());
+        }
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -865,33 +927,45 @@ impl RendererState {
         if cursor.hotspot_x == hotspot_x && cursor.hotspot_y == hotspot_y {
             return Ok(());
         }
-        let old_hotspot = (cursor.hotspot_x, cursor.hotspot_y);
-        let pointer = (self.pointer_x, self.pointer_y);
-        let damage_for = |hotspot_x: i32, hotspot_y: i32| {
-            let scratch = CursorFrame {
-                owner_id: cursor.owner_id,
-                surface_id: cursor.surface_id,
-                buffer_id: cursor.buffer_id,
-                pixels: Vec::new(),
-                width: cursor.width,
-                height: cursor.height,
-                stride: cursor.stride,
-                format: cursor.format,
-                hotspot_x,
-                hotspot_y,
-                buffer_scale: cursor.buffer_scale,
-                buffer_transform: cursor.buffer_transform,
-                dmabuf: None,
+        let hw = self.any_hw_cursor_capable();
+        if !hw {
+            let old_hotspot = (cursor.hotspot_x, cursor.hotspot_y);
+            let pointer = (self.pointer_x, self.pointer_y);
+            let damage_for = |hotspot_x: i32, hotspot_y: i32| {
+                let scratch = CursorFrame {
+                    owner_id: cursor.owner_id,
+                    surface_id: cursor.surface_id,
+                    buffer_id: cursor.buffer_id,
+                    pixels: Vec::new(),
+                    width: cursor.width,
+                    height: cursor.height,
+                    stride: cursor.stride,
+                    format: cursor.format,
+                    hotspot_x,
+                    hotspot_y,
+                    buffer_scale: cursor.buffer_scale,
+                    buffer_transform: cursor.buffer_transform,
+                    dmabuf: None,
+                };
+                cursor_damage_rects(&scratch, pointer, pointer)
             };
-            cursor_damage_rects(&scratch, pointer, pointer)
-        };
-        self.pending_damage
-            .extend(damage_for(old_hotspot.0, old_hotspot.1));
-        self.pending_damage.extend(damage_for(hotspot_x, hotspot_y));
-        self.pending_pointer_damage = true;
+            self.pending_damage
+                .extend(damage_for(old_hotspot.0, old_hotspot.1));
+            self.pending_damage.extend(damage_for(hotspot_x, hotspot_y));
+            self.pending_pointer_damage = true;
+        }
         if let Some(cursor) = self.cursor_state.as_client_mut() {
             cursor.hotspot_x = hotspot_x;
             cursor.hotspot_y = hotspot_y;
+        }
+        if hw {
+            for output in self.outputs.values_mut() {
+                if output.cursor().is_some_and(|c| c.plane_id != 0) {
+                    output.dirty.cursor_pos = true;
+                }
+            }
+            self.flush_hw_cursors()?;
+            return Ok(());
         }
         self.mark_dirty_if_active();
         Ok(())
@@ -1716,9 +1790,46 @@ impl RendererState {
     /// Blank/power-down a physical output, then free its plane buffers.
     fn disable_and_release_output_state(&mut self, output: OutputState) {
         if let Some(physical) = output.physical.as_ref() {
+            self.disable_hw_cursor_plane(&output);
             self.disable_physical_output(physical);
         }
         self.release_output_state(output);
+    }
+
+    fn disable_hw_cursor_plane(&self, output: &OutputState) {
+        let Some(physical) = output.physical.as_ref() else {
+            return;
+        };
+        let Some(cursor) = output.cursor() else {
+            return;
+        };
+        if cursor.plane_id == 0 {
+            return;
+        }
+        let Some(props) = cursor.props.as_ref() else {
+            return;
+        };
+        let Some(device) = self.drm_devices.opened().get(&physical.drm_path) else {
+            return;
+        };
+        if let Err(err) = atomic_set_cursor_plane(
+            device.fd(),
+            cursor.plane_id,
+            props,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+        ) {
+            warn!(
+                "Failed to disable cursor plane {} on {}: {err:#}",
+                cursor.plane_id,
+                physical.output.connector_name
+            );
+        }
     }
 
     fn disable_physical_output(&self, physical: &PhysicalOutput) {
@@ -1936,6 +2047,7 @@ impl RendererState {
         if !self.ensure_vulkan_ready()? {
             return Ok(false);
         }
+        let _ = self.flush_hw_cursors();
 
         self.ensure_present_targets_cached();
         let Some(target) = self
@@ -2060,6 +2172,7 @@ impl RendererState {
         if !self.ensure_vulkan_ready()? {
             return Ok(self.present_status());
         }
+        let _ = self.flush_hw_cursors();
 
         self.ensure_present_targets_cached();
         let targets = self.collect_present_targets();
@@ -2284,18 +2397,57 @@ impl RendererState {
             .map(|p| p.zpos)
             .unwrap_or(0);
 
+        let cursor_plane: Option<DrmPlaneInfo> = self
+            .topologies
+            .get(&physical.drm_path)
+            .and_then(|topo| topo.cursor_for_crtc(physical.output.crtc_index))
+            .cloned();
+
         let physical_output = PhysicalOutput {
             drm_path: physical.drm_path.clone(),
             output: physical.output.clone(),
             mode_blob,
         };
 
-        let old_buffers = self
-            .outputs
-            .get_mut(&target.name)
-            .and_then(|output| output.planes.take())
-            .map(|planes| planes.drain_buffers())
-            .unwrap_or_default();
+        let old_buffers = {
+            let disable = self.outputs.get(&target.name).and_then(|output| {
+                let physical = output.physical.as_ref()?;
+                let cursor = output.cursor()?;
+                if cursor.plane_id == 0 {
+                    return None;
+                }
+                let props = cursor.props.clone()?;
+                Some((
+                    physical.drm_path.clone(),
+                    cursor.plane_id,
+                    props,
+                    physical.output.connector_name.clone(),
+                ))
+            });
+            if let Some((drm_path, plane_id, props, name)) = disable {
+                if let Some(device) = self.drm_devices.opened().get(&drm_path) {
+                    if let Err(err) = atomic_set_cursor_plane(
+                        device.fd(),
+                        plane_id,
+                        &props,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        false,
+                    ) {
+                        warn!("Failed to disable cursor plane {plane_id} on {name}: {err:#}");
+                    }
+                }
+            }
+            self.outputs
+                .get_mut(&target.name)
+                .and_then(|output| output.planes.take())
+                .map(|planes| planes.drain_buffers())
+                .unwrap_or_default()
+        };
         for old in old_buffers {
             self.release_scanout_buffer(old);
         }
@@ -2307,15 +2459,18 @@ impl RendererState {
                 target.name.clone(),
             );
             output.physical = Some(physical_output);
-            let planes = output.ensure_primary_planes(
+            let planes = output.ensure_planes(
                 physical.output.plane_id,
                 zpos,
                 target.width,
                 target.height,
+                cursor_plane.as_ref(),
             );
             planes.primary.current = Some(buffer);
             planes.primary.pending = None;
             planes.primary.queued = None;
+            output.dirty.cursor_image = true;
+            output.dirty.cursor_pos = true;
         } else {
             let token = match self.alloc_present_wake_token() {
                 Ok(token) => token,
@@ -2330,15 +2485,19 @@ impl RendererState {
                 OutputPresentControl::new(token, target.refresh_mhz),
             );
             output.physical = Some(physical_output);
-            let planes = output.ensure_primary_planes(
+            let planes = output.ensure_planes(
                 physical.output.plane_id,
                 zpos,
                 target.width,
                 target.height,
+                cursor_plane.as_ref(),
             );
             planes.primary.current = Some(buffer);
+            output.dirty.cursor_image = true;
+            output.dirty.cursor_pos = true;
             self.outputs.insert(target.name.clone(), output);
         }
+        let _ = self.flush_hw_cursors();
         Ok(())
     }
 
@@ -2428,12 +2587,28 @@ impl RendererState {
         let _pending_damage = std::mem::take(&mut self.pending_damage);
         let pending_surface_buffer_damage = std::mem::take(&mut self.pending_surface_buffer_damage);
         let force_full = self.pending_full_redraw;
-        let pointer_damage = self.pending_pointer_damage;
-        let cursor_buffer_dirty = self.cursor_buffer_dirty;
+        let hw_cursor = self
+            .outputs
+            .get(&target.name)
+            .is_some_and(|o| o.hw_cursor_active());
+        let pointer_damage = self.pending_pointer_damage && !hw_cursor;
+        let cursor_buffer_dirty = self.cursor_buffer_dirty && !hw_cursor;
         let dirty_surfaces = std::mem::take(&mut self.dirty_surface_keys);
         self.pending_full_redraw = false;
-        self.pending_pointer_damage = false;
-        self.cursor_buffer_dirty = false;
+        if !hw_cursor {
+            self.pending_pointer_damage = false;
+            self.cursor_buffer_dirty = false;
+        } else {
+            // Keep flags only if some software-cursor output still needs them.
+            if !self
+                .outputs
+                .values()
+                .any(|o| o.cursor().is_some_and(|c| c.software))
+            {
+                self.pending_pointer_damage = false;
+                self.cursor_buffer_dirty = false;
+            }
+        }
 
         let views = self
             .output_views
@@ -2465,7 +2640,11 @@ impl RendererState {
             .iter()
             .filter_map(|key| self.surface_frames.get(key))
             .collect();
-        let cursor = self.cursor_state.draw_ref();
+        let cursor = if hw_cursor {
+            CursorDraw::Hidden
+        } else {
+            self.cursor_state.draw_ref()
+        };
         let pointer_x = self.pointer_x;
         let pointer_y = self.pointer_y;
 
@@ -2743,6 +2922,291 @@ impl RendererState {
         Ok(Some(connector_name))
     }
 
+    /// Update HW cursor planes for all outputs (pos/image). Software fallbacks stay on primary.
+    pub(crate) fn flush_hw_cursors(&mut self) -> anyhow::Result<()> {
+        if !self.any_hw_cursor_capable() {
+            return Ok(());
+        }
+        if self.vulkan.is_none() && !matches!(self.cursor_state, CursorState::Hidden) {
+            // Defer until Vulkan is ready; dirty flags remain set.
+            return Ok(());
+        }
+
+        let pointer_x = self.pointer_x;
+        let pointer_y = self.pointer_y;
+        let hidden = matches!(self.cursor_state, CursorState::Hidden);
+        let names: Vec<String> = self.outputs.keys().cloned().collect();
+        let active_name = self.output_name_for_pointer(pointer_x, pointer_y);
+
+        for name in names {
+            let needs = self.outputs.get(&name).is_some_and(|o| {
+                o.cursor().is_some_and(|c| c.plane_id != 0)
+                    && (o.dirty.cursor_pos || o.dirty.cursor_image || hidden)
+            });
+            if !needs {
+                continue;
+            }
+
+            let show_here = active_name.as_ref() == Some(&name) && !hidden;
+            if let Err(err) = self.commit_hw_cursor_on_output(&name, show_here, pointer_x, pointer_y)
+            {
+                warn!("HW cursor update failed on {name}: {err:#}; falling back to software");
+                if let Some(cursor) = self
+                    .outputs
+                    .get_mut(&name)
+                    .and_then(|o| o.cursor_mut())
+                {
+                    cursor.software = true;
+                }
+                self.pending_pointer_damage = true;
+                self.cursor_buffer_dirty = true;
+                self.mark_dirty_if_active();
+            } else if let Some(output) = self.outputs.get_mut(&name) {
+                output.dirty.cursor_pos = false;
+                output.dirty.cursor_image = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn output_name_for_pointer(&self, pointer_x: i32, pointer_y: i32) -> Option<String> {
+        let mut fallback = None;
+        for (name, output) in &self.outputs {
+            if output.physical.is_none() {
+                continue;
+            }
+            let views = self.output_views.get(name).cloned().unwrap_or_default();
+            if views.is_empty() {
+                // No views yet: treat as covering global origin-sized mode if pointer in range.
+                if let Some(primary) = output.primary() {
+                    let w = primary.geometry.crtc_w as i32;
+                    let h = primary.geometry.crtc_h as i32;
+                    if pointer_x >= 0 && pointer_y >= 0 && pointer_x < w && pointer_y < h {
+                        return Some(name.clone());
+                    }
+                }
+                fallback = fallback.or(Some(name.clone()));
+                continue;
+            }
+            if view_at_source(&views, pointer_x as f64, pointer_y as f64).is_some() {
+                return Some(name.clone());
+            }
+            fallback = fallback.or(Some(name.clone()));
+        }
+        fallback
+    }
+
+    fn commit_hw_cursor_on_output(
+        &mut self,
+        name: &str,
+        show: bool,
+        pointer_x: i32,
+        pointer_y: i32,
+    ) -> anyhow::Result<()> {
+        let (drm_path, crtc_id, plane_id, props, need_image, mode_w, mode_h) = {
+            let output = self.outputs.get(name).context("missing output")?;
+            let physical = output
+                .physical
+                .as_ref()
+                .context("HW cursor requires physical output")?;
+            let cursor = output.cursor().context("missing cursor pipeline")?;
+            if cursor.software || cursor.plane_id == 0 {
+                anyhow::bail!("cursor plane not in HW mode");
+            }
+            let props = cursor
+                .props
+                .clone()
+                .context("cursor plane missing atomic props")?;
+            if let Some(info) = self
+                .topologies
+                .get(&physical.drm_path)
+                .and_then(|t| t.plane(cursor.plane_id))
+            {
+                if !info.formats.is_empty() && !info.formats.contains(&DRM_FORMAT_ARGB8888) {
+                    anyhow::bail!("cursor plane does not advertise AR24");
+                }
+            }
+            (
+                physical.drm_path.clone(),
+                physical.output.crtc_id,
+                cursor.plane_id,
+                props,
+                output.dirty.cursor_image || cursor.current.is_none(),
+                physical.output.mode.width(),
+                physical.output.mode.height(),
+            )
+        };
+
+        if !show {
+            let device = self
+                .drm_devices
+                .opened()
+                .get(&drm_path)
+                .with_context(|| format!("DRM device {} is not open", drm_path.display()))?;
+            atomic_set_cursor_plane(
+                device.fd(),
+                plane_id,
+                &props,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                false,
+            )?;
+            if let Some(cursor) = self.outputs.get_mut(name).and_then(|o| o.cursor_mut()) {
+                cursor.geometry = PlaneGeometry::cursor(0, 0, 0, 0);
+            }
+            return Ok(());
+        }
+
+        let (hotspot_x, hotspot_y, pixels, width, height) =
+            self.hw_cursor_image_pixels().context("cursor image not HW-compatible")?;
+
+        let views = self.output_views.get(name).cloned().unwrap_or_default();
+        let (local_x, local_y) = pointer_to_output_local(&views, pointer_x, pointer_y, mode_w, mode_h);
+        let crtc_x = local_x - hotspot_x;
+        let crtc_y = local_y - hotspot_y;
+
+        if need_image {
+            self.upload_hw_cursor_fb(name, &drm_path, &pixels, width, height)?;
+        }
+
+        let fb_id = self
+            .outputs
+            .get(name)
+            .and_then(|o| o.cursor())
+            .and_then(|c| c.current.as_ref())
+            .and_then(|b| b.drm_fb_id())
+            .context("cursor plane has no FB")?;
+
+        // Probe once when uploading a new image.
+        if need_image {
+            let device = self
+                .drm_devices
+                .opened()
+                .get(&drm_path)
+                .with_context(|| format!("DRM device {} is not open", drm_path.display()))?;
+            atomic_set_cursor_plane(
+                device.fd(),
+                plane_id,
+                &props,
+                crtc_id,
+                fb_id,
+                crtc_x,
+                crtc_y,
+                width,
+                height,
+                true,
+            )
+            .context("cursor plane TEST_ONLY rejected")?;
+        }
+
+        let device = self
+            .drm_devices
+            .opened()
+            .get(&drm_path)
+            .with_context(|| format!("DRM device {} is not open", drm_path.display()))?;
+        atomic_set_cursor_plane(
+            device.fd(),
+            plane_id,
+            &props,
+            crtc_id,
+            fb_id,
+            crtc_x,
+            crtc_y,
+            width,
+            height,
+            false,
+        )?;
+
+        if let Some(cursor) = self.outputs.get_mut(name).and_then(|o| o.cursor_mut()) {
+            cursor.geometry = PlaneGeometry::cursor(crtc_x, crtc_y, width, height);
+        }
+        Ok(())
+    }
+
+    fn hw_cursor_image_pixels(&self) -> Option<(i32, i32, Vec<u8>, u32, u32)> {
+        let frame = match self.cursor_state.draw_ref() {
+            CursorDraw::Hidden => return None,
+            CursorDraw::Default => crate::default_cursor::default_cursor_frame(),
+            CursorDraw::Client(frame) => frame,
+        };
+        if frame.dmabuf.is_some() {
+            return None;
+        }
+        if frame.buffer_scale.max(1) != 1 {
+            return None;
+        }
+        if BufferTransform::from_raw(frame.buffer_transform)
+            != Some(BufferTransform::Normal)
+        {
+            return None;
+        }
+        let width = frame.width as u32;
+        let height = frame.height as u32;
+        if width == 0 || height == 0 || width > HW_CURSOR_MAX_SIZE || height > HW_CURSOR_MAX_SIZE {
+            return None;
+        }
+        let pixels = prepare_cursor_argb_pixels(frame)?;
+        Some((frame.hotspot_x, frame.hotspot_y, pixels, width, height))
+    }
+
+    fn upload_hw_cursor_fb(
+        &mut self,
+        output_name: &str,
+        drm_path: &Path,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        let fourcc = DRM_FORMAT_ARGB8888;
+        let format = vk::Format::B8G8R8A8_UNORM;
+        let drm_device = self
+            .drm_devices
+            .opened()
+            .get(drm_path)
+            .with_context(|| format!("DRM device {} is not open", drm_path.display()))?;
+        let vulkan = self
+            .vulkan
+            .as_mut()
+            .context("Vulkan missing for cursor FB upload")?;
+
+        let mut buffer = self.scanout_pool.acquire(
+            vulkan,
+            &drm_path.to_path_buf(),
+            drm_device.fd(),
+            width,
+            height,
+            format,
+            fourcc,
+        )?;
+        upload_bgra_to_image(
+            vulkan.device(),
+            vulkan.physical_device(),
+            vulkan.graphics_command_pool(),
+            &buffer.dma_image,
+            pixels,
+            width,
+            height,
+        )?;
+        buffer.fresh = false;
+
+        let old = {
+            let cursor = self
+                .outputs
+                .get_mut(output_name)
+                .and_then(|o| o.cursor_mut())
+                .context("missing cursor pipeline for upload")?;
+            cursor.current.replace(buffer)
+        };
+        if let Some(old) = old {
+            self.release_scanout_buffer(old);
+        }
+        Ok(())
+    }
+
     fn wait_for_connector_flip(&mut self, connector_name: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.outputs.contains_key(connector_name),
@@ -2890,6 +3354,54 @@ fn identity_fullscreen_view_origin(
     } else {
         None
     }
+}
+
+fn pointer_to_output_local(
+    views: &[View],
+    pointer_x: i32,
+    pointer_y: i32,
+    mode_w: u32,
+    mode_h: u32,
+) -> (i32, i32) {
+    if let Some((sx, sy)) = identity_fullscreen_view_origin(views, mode_w, mode_h) {
+        return (pointer_x - sx, pointer_y - sy);
+    }
+    if views.is_empty() {
+        return (pointer_x, pointer_y);
+    }
+    let (x, y) = lumalla_shared::map_source_to_dest(views, pointer_x as f64, pointer_y as f64);
+    (x.round() as i32, y.round() as i32)
+}
+
+/// Convert cursor SHM pixels to opaque-capable BGRA for DRM AR24 / Vulkan B8G8R8A8.
+fn prepare_cursor_argb_pixels(frame: &CursorFrame) -> Option<Vec<u8>> {
+    let row_bytes = frame.width.checked_mul(4)?;
+    if frame.stride < row_bytes {
+        return None;
+    }
+    let needed = frame.stride.checked_mul(frame.height)?;
+    if frame.pixels.len() < needed {
+        return None;
+    }
+    let force_opaque = frame.format == WL_SHM_FORMAT_XRGB8888;
+    let mut out = Vec::with_capacity(frame.width * frame.height * 4);
+    for y in 0..frame.height {
+        let row = y * frame.stride;
+        for x in 0..frame.width {
+            let i = row + x * 4;
+            let mut px = [
+                frame.pixels[i],
+                frame.pixels[i + 1],
+                frame.pixels[i + 2],
+                frame.pixels[i + 3],
+            ];
+            if force_opaque {
+                px[3] = 255;
+            }
+            out.extend_from_slice(&px);
+        }
+    }
+    Some(out)
 }
 
 fn translate_damage_list(damage: &[DamageRect], dx: i32, dy: i32) -> Vec<DamageRect> {
@@ -3277,5 +3789,99 @@ mod tests {
         assert_eq!(shifted[0].y, 0);
         assert_eq!(shifted[0].width, 10);
         assert_eq!(shifted[0].height, 20);
+    }
+
+    #[test]
+    fn prepare_cursor_argb_forces_xrgb_opaque() {
+        let frame = CursorFrame {
+            owner_id: 1,
+            surface_id: 1,
+            buffer_id: 1,
+            pixels: vec![10, 20, 30, 0, 40, 50, 60, 128],
+            width: 2,
+            height: 1,
+            stride: 8,
+            format: WL_SHM_FORMAT_XRGB8888,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            buffer_scale: 1,
+            buffer_transform: 0,
+            dmabuf: None,
+        };
+        let pixels = prepare_cursor_argb_pixels(&frame).unwrap();
+        assert_eq!(pixels, vec![10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn prepare_cursor_argb_rejects_truncated_pixels() {
+        let frame = CursorFrame {
+            owner_id: 1,
+            surface_id: 1,
+            buffer_id: 1,
+            pixels: vec![0; 4],
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: WL_SHM_FORMAT_ARGB8888,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            buffer_scale: 1,
+            buffer_transform: 0,
+            dmabuf: None,
+        };
+        assert!(prepare_cursor_argb_pixels(&frame).is_none());
+    }
+
+    #[test]
+    fn pointer_to_output_local_subtracts_view_origin() {
+        let views = [View {
+            name: "main".into(),
+            source: (100, 200, 1920, 1080),
+            dest: (0, 0, 1920, 1080),
+        }];
+        assert_eq!(
+            pointer_to_output_local(&views, 150, 250, 1920, 1080),
+            (50, 50)
+        );
+    }
+
+    #[test]
+    fn hw_cursor_pipeline_from_plane_info() {
+        use crate::output::{DrmPlaneInfo, PlaneAtomicProps, PlaneKind, PlanePipeline};
+        let info = DrmPlaneInfo {
+            plane_id: 77,
+            kind: PlaneKind::Cursor,
+            possible_crtcs: 1,
+            zpos: 255,
+            zpos_mutable: false,
+            props: PlaneAtomicProps {
+                fb_id: 1,
+                crtc_id: 2,
+                src_x: 3,
+                src_y: 4,
+                src_w: 5,
+                src_h: 6,
+                crtc_x: 7,
+                crtc_y: 8,
+                crtc_w: 9,
+                crtc_h: 10,
+                zpos: Some(11),
+            },
+            formats: vec![DRM_FORMAT_ARGB8888],
+        };
+        let pipe = PlanePipeline::hw_cursor(&info);
+        assert!(pipe.is_hw_cursor());
+        assert_eq!(pipe.plane_id, 77);
+        assert!(!PlanePipeline::software_cursor().is_hw_cursor());
+    }
+
+    #[test]
+    fn cursor_crtc_position_applies_hotspot() {
+        let hotspot_x = 4;
+        let hotspot_y = 6;
+        let local = (100, 200);
+        let crtc_x = local.0 - hotspot_x;
+        let crtc_y = local.1 - hotspot_y;
+        assert_eq!((crtc_x, crtc_y), (96, 194));
     }
 }

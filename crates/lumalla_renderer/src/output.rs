@@ -50,7 +50,6 @@ pub enum PlaneKind {
 
 /// Cached plane property IDs for atomic commits.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // used when multi-plane atomic commits are wired up
 pub struct PlaneAtomicProps {
     pub fb_id: u32,
     pub crtc_id: u32,
@@ -75,6 +74,8 @@ pub struct DrmPlaneInfo {
     pub zpos: u32,
     pub zpos_mutable: bool,
     pub props: PlaneAtomicProps,
+    /// DRM fourccs advertised on the plane.
+    pub formats: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +114,7 @@ impl DrmDeviceTopology {
 
 /// Where a plane is placed on its CRTC.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // programmed into atomic commits when multi-plane presents land
+#[allow(dead_code)] // geometry is written for introspection / future atomic bundling
 pub struct PlaneGeometry {
     pub crtc_x: i32,
     pub crtc_y: i32,
@@ -139,7 +140,23 @@ impl PlaneGeometry {
             src_h: height << 16,
         }
     }
+
+    pub fn cursor(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self {
+            crtc_x: x,
+            crtc_y: y,
+            crtc_w: width,
+            crtc_h: height,
+            src_x: 0,
+            src_y: 0,
+            src_w: width << 16,
+            src_h: height << 16,
+        }
+    }
 }
+
+/// Soft upper bound for HW cursor bitmaps (common amdgpu/i915 limit).
+pub const HW_CURSOR_MAX_SIZE: u32 = 256;
 
 /// Per-plane FB pipeline (`current` / `pending` / `queued`).
 pub struct PlanePipeline {
@@ -152,6 +169,8 @@ pub struct PlanePipeline {
     pub queued: Option<ScanoutBuffer>,
     /// Soft path: content is composited into another plane (e.g. cursor into primary).
     pub software: bool,
+    /// Property IDs when this plane is a real KMS object.
+    pub props: Option<PlaneAtomicProps>,
 }
 
 impl PlanePipeline {
@@ -165,6 +184,7 @@ impl PlanePipeline {
             pending: None,
             queued: None,
             software: false,
+            props: None,
         }
     }
 
@@ -178,7 +198,26 @@ impl PlanePipeline {
             pending: None,
             queued: None,
             software: true,
+            props: None,
         }
+    }
+
+    pub fn hw_cursor(info: &DrmPlaneInfo) -> Self {
+        Self {
+            plane_id: info.plane_id,
+            kind: PlaneKind::Cursor,
+            zpos: info.zpos,
+            geometry: PlaneGeometry::cursor(0, 0, 0, 0),
+            current: None,
+            pending: None,
+            queued: None,
+            software: false,
+            props: Some(info.props.clone()),
+        }
+    }
+
+    pub fn is_hw_cursor(&self) -> bool {
+        matches!(self.kind, PlaneKind::Cursor) && !self.software && self.plane_id != 0
     }
 
     pub fn flip_busy(&self) -> bool {
@@ -202,12 +241,26 @@ pub struct OutputPlanes {
 }
 
 impl OutputPlanes {
-    pub fn primary_only(plane_id: u32, zpos: u32, width: u32, height: u32) -> Self {
+    pub fn with_primary_and_cursor(
+        plane_id: u32,
+        zpos: u32,
+        width: u32,
+        height: u32,
+        cursor: Option<&DrmPlaneInfo>,
+    ) -> Self {
+        let cursor = match cursor {
+            Some(info) => PlanePipeline::hw_cursor(info),
+            None => PlanePipeline::software_cursor(),
+        };
         Self {
             primary: PlanePipeline::primary(plane_id, zpos, PlaneGeometry::fullscreen(width, height)),
-            cursor: Some(PlanePipeline::software_cursor()),
+            cursor: Some(cursor),
             overlays: Vec::new(),
         }
+    }
+
+    pub fn hw_cursor_active(&self) -> bool {
+        self.cursor.as_ref().is_some_and(|c| c.is_hw_cursor())
     }
 
     pub fn drain_buffers(self) -> Vec<ScanoutBuffer> {
@@ -359,11 +412,42 @@ impl OutputState {
         self.planes.as_mut().map(|p| &mut p.primary)
     }
 
+    pub fn cursor(&self) -> Option<&PlanePipeline> {
+        self.planes.as_ref().and_then(|p| p.cursor.as_ref())
+    }
+
+    pub fn cursor_mut(&mut self) -> Option<&mut PlanePipeline> {
+        self.planes.as_mut().and_then(|p| p.cursor.as_mut())
+    }
+
+    pub fn hw_cursor_active(&self) -> bool {
+        self.planes
+            .as_ref()
+            .is_some_and(|p| p.hw_cursor_active())
+    }
+
     pub fn is_virtual(&self) -> bool {
         self.physical.is_none()
             && (self.id.connector_id == 0 || self.id.drm_path.as_os_str() == "virtual")
     }
 
+    pub fn ensure_planes(
+        &mut self,
+        plane_id: u32,
+        zpos: u32,
+        width: u32,
+        height: u32,
+        cursor: Option<&DrmPlaneInfo>,
+    ) -> &mut OutputPlanes {
+        if self.planes.is_none() {
+            self.planes = Some(OutputPlanes::with_primary_and_cursor(
+                plane_id, zpos, width, height, cursor,
+            ));
+        }
+        self.planes.as_mut().unwrap()
+    }
+
+    /// Backward-compatible helper: primary + software cursor.
     pub fn ensure_primary_planes(
         &mut self,
         plane_id: u32,
@@ -371,10 +455,7 @@ impl OutputState {
         width: u32,
         height: u32,
     ) -> &mut OutputPlanes {
-        if self.planes.is_none() {
-            self.planes = Some(OutputPlanes::primary_only(plane_id, zpos, width, height));
-        }
-        self.planes.as_mut().unwrap()
+        self.ensure_planes(plane_id, zpos, width, height, None)
     }
 }
 
