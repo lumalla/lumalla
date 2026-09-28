@@ -69,9 +69,9 @@ pub struct SurfaceCommit {
     pub offset: (i32, i32),
     pub layout: (i32, i32),
     #[allow(dead_code)]
-    pub damage: Vec<Rectangle>,
+    pub damage: Option<Rectangle>,
     #[allow(dead_code)]
-    pub buffer_damage: Vec<Rectangle>,
+    pub buffer_damage: Option<Rectangle>,
     pub viewport: ViewportState,
     #[allow(dead_code)]
     pub viewport_id: Option<ObjectId>,
@@ -1075,7 +1075,8 @@ impl SurfaceManager {
             .get_mut(&(client_id, id))
             .ok_or(SurfaceError::UnknownSurface)?;
         if rectangle.width > 0 && rectangle.height > 0 {
-            surface.pending.buffer_damage.push(rectangle);
+            surface.pending.buffer_damage =
+                union_rectangle(surface.pending.buffer_damage, rectangle);
         }
         Ok(())
     }
@@ -1106,7 +1107,7 @@ impl SurfaceManager {
             .get_mut(&(client_id, id))
             .ok_or(SurfaceError::UnknownSurface)?;
         if rectangle.width > 0 && rectangle.height > 0 {
-            surface.pending.damage.push(rectangle);
+            surface.pending.damage = union_rectangle(surface.pending.damage, rectangle);
         }
         Ok(())
     }
@@ -1598,8 +1599,8 @@ impl SurfaceManager {
             buffer_transform: surface.current.buffer_transform,
             offset,
             layout,
-            damage: surface.current.damage.clone(),
-            buffer_damage: surface.current.buffer_damage.clone(),
+            damage: surface.current.damage,
+            buffer_damage: surface.current.buffer_damage,
             viewport: surface.current.viewport,
             viewport_id: surface.viewport_id,
             viewport_changed: false,
@@ -1666,8 +1667,9 @@ impl SurfaceManager {
         let buffer_transform = surface.current.buffer_transform;
         let viewport = surface.current.viewport;
         let viewport_id = surface.viewport_id;
-        let damage = surface.current.damage.clone();
-        let buffer_damage = surface.current.buffer_damage.clone();
+        // Damage is consumed by this commit (Wayland clears it after commit).
+        let damage = std::mem::take(&mut surface.current.damage);
+        let buffer_damage = std::mem::take(&mut surface.current.buffer_damage);
         let offset = surface.current.offset;
 
         let mapped = self.is_mapped(client_id, id)?;
@@ -2110,8 +2112,12 @@ fn merge_pending(cache: &mut PendingState, mut pending: PendingState) {
     if let Some(destination) = pending.viewport_destination.take() {
         cache.viewport_destination = Some(destination);
     }
-    cache.damage.append(&mut pending.damage);
-    cache.buffer_damage.append(&mut pending.buffer_damage);
+    if let Some(rect) = pending.damage.take() {
+        cache.damage = union_rectangle(cache.damage, rect);
+    }
+    if let Some(rect) = pending.buffer_damage.take() {
+        cache.buffer_damage = union_rectangle(cache.buffer_damage, rect);
+    }
     cache.frame_callbacks.append(&mut pending.frame_callbacks);
     cache
         .presentation_feedbacks
@@ -2219,8 +2225,8 @@ impl Default for ShellState {
 struct SurfaceState {
     buffer: Option<ObjectId>,
     offset: (i32, i32),
-    damage: Vec<Rectangle>,
-    buffer_damage: Vec<Rectangle>,
+    damage: Option<Rectangle>,
+    buffer_damage: Option<Rectangle>,
     buffer_scale: i32,
     buffer_transform: u32,
     opaque_region: Option<Region>,
@@ -2233,8 +2239,8 @@ impl Default for SurfaceState {
         Self {
             buffer: None,
             offset: (0, 0),
-            damage: Vec::new(),
-            buffer_damage: Vec::new(),
+            damage: None,
+            buffer_damage: None,
             buffer_scale: 1,
             buffer_transform: 0, // WL_OUTPUT_TRANSFORM_NORMAL
             opaque_region: None,
@@ -2248,8 +2254,8 @@ impl Default for SurfaceState {
 struct PendingState {
     buffer: Option<Option<ObjectId>>,
     offset: Option<(i32, i32)>,
-    damage: Vec<Rectangle>,
-    buffer_damage: Vec<Rectangle>,
+    damage: Option<Rectangle>,
+    buffer_damage: Option<Rectangle>,
     buffer_scale: Option<i32>,
     buffer_transform: Option<u32>,
     frame_callbacks: Vec<ObjectId>,
@@ -2283,6 +2289,32 @@ pub struct Rectangle {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+}
+
+/// Expand `existing` to cover `next`, or return `next` when there is no prior damage.
+fn union_rectangle(existing: Option<Rectangle>, next: Rectangle) -> Option<Rectangle> {
+    if next.width <= 0 || next.height <= 0 {
+        return existing;
+    }
+    Some(match existing {
+        Some(a) => {
+            let x0 = a.x.min(next.x);
+            let y0 = a.y.min(next.y);
+            let x1 =
+                a.x.saturating_add(a.width)
+                    .max(next.x.saturating_add(next.width));
+            let y1 =
+                a.y.saturating_add(a.height)
+                    .max(next.y.saturating_add(next.height));
+            Rectangle {
+                x: x0,
+                y: y0,
+                width: x1.saturating_sub(x0),
+                height: y1.saturating_sub(y0),
+            }
+        }
+        None => next,
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2411,12 +2443,12 @@ mod tests {
         assert_eq!(commit.offset, (5, 6));
         assert_eq!(
             commit.buffer_damage,
-            [Rectangle {
+            Some(Rectangle {
                 x: 0,
                 y: 0,
                 width: 1,
                 height: 1,
-            }]
+            })
         );
         let second = manager.commit(client(1), object(2)).unwrap().primary;
         assert_eq!(second.buffer, Some(object(4)));
@@ -2424,6 +2456,80 @@ mod tests {
         assert!(!second.newly_mapped);
         assert!(second.frame_callbacks.is_empty());
         assert_eq!(second.buffer_scale, 2);
+    }
+
+    #[test]
+    fn damage_rects_are_unioned_into_one() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .damage(
+                client(1),
+                object(2),
+                Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+            )
+            .unwrap();
+        manager
+            .damage(
+                client(1),
+                object(2),
+                Rectangle {
+                    x: 8,
+                    y: 2,
+                    width: 4,
+                    height: 4,
+                },
+            )
+            .unwrap();
+        manager
+            .damage_buffer(
+                client(1),
+                object(2),
+                Rectangle {
+                    x: 1,
+                    y: 1,
+                    width: 2,
+                    height: 2,
+                },
+            )
+            .unwrap();
+        manager
+            .damage_buffer(
+                client(1),
+                object(2),
+                Rectangle {
+                    x: 10,
+                    y: 0,
+                    width: 2,
+                    height: 3,
+                },
+            )
+            .unwrap();
+
+        let commit = manager.commit(client(1), object(2)).unwrap().primary;
+        assert_eq!(
+            commit.damage,
+            Some(Rectangle {
+                x: 0,
+                y: 0,
+                width: 12,
+                height: 6,
+            })
+        );
+        assert_eq!(
+            commit.buffer_damage,
+            Some(Rectangle {
+                x: 1,
+                y: 0,
+                width: 11,
+                height: 3,
+            })
+        );
     }
 
     #[test]

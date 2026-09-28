@@ -1103,8 +1103,8 @@ fn cursor_surface_view(cursor: &CursorFrame) -> SurfaceFrame {
         surface_height,
         viewport_src: None,
         dmabuf: None,
-        damage: Vec::new(),
-        buffer_damage: Vec::new(),
+        damage: None,
+        buffer_damage: None,
         full_surface: true,
     }
 }
@@ -2719,8 +2719,8 @@ mod tests {
                 surface_height: surface_height as i32,
                 viewport_src: None,
                 dmabuf: None,
-                damage: Vec::new(),
-                buffer_damage: Vec::new(),
+                damage: None,
+                buffer_damage: None,
                 full_surface: false,
             };
             let upload = output_damage_to_buffer_rect(

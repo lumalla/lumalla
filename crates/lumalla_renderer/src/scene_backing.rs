@@ -254,7 +254,9 @@ pub fn union_upload_rects(a: UploadRect, b: UploadRect) -> UploadRect {
     let x0 = a.x.min(b.x);
     let y0 = a.y.min(b.y);
     let x1 = a.x.saturating_add(a.width).max(b.x.saturating_add(b.width));
-    let y1 = a.y.saturating_add(a.height).max(b.y.saturating_add(b.height));
+    let y1 =
+        a.y.saturating_add(a.height)
+            .max(b.y.saturating_add(b.height));
     UploadRect {
         x: x0,
         y: y0,
@@ -788,8 +790,8 @@ mod tests {
             surface_height: 2,
             viewport_src: None,
             dmabuf: None,
-            damage: Vec::new(),
-            buffer_damage: Vec::new(),
+            damage: None,
+            buffer_damage: None,
             full_surface: true,
         }
     }
@@ -808,12 +810,12 @@ mod tests {
             buffer_scale: 1,
             surface_width: 2,
             surface_height: 1,
-            damage: vec![DamageRect {
+            damage: Some(DamageRect {
                 x: 0,
                 y: 0,
                 width: 1,
                 height: 1,
-            }],
+            }),
             full_surface: false,
             ..frame()
         };

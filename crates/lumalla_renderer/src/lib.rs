@@ -175,10 +175,10 @@ pub struct SurfaceFrame {
     /// Source crop in post-scale surface coordinates, if set.
     pub viewport_src: Option<(f32, f32, f32, f32)>,
     pub dmabuf: Option<DmabufAttachment>,
-    /// Output-space regions updated by this commit.
-    pub damage: Vec<DamageRect>,
-    /// Buffer-space regions updated by this commit.
-    pub buffer_damage: Vec<DamageRect>,
+    /// Output-space region updated by this commit.
+    pub damage: Option<DamageRect>,
+    /// Buffer-space region updated by this commit.
+    pub buffer_damage: Option<DamageRect>,
     /// When true, the entire output backing must be recomposited.
     pub full_surface: bool,
 }
@@ -757,8 +757,10 @@ impl RendererState {
             self.pending_damage.clear();
             self.pending_surface_buffer_damage.remove(&key);
         } else {
-            self.pending_damage.extend(frame.damage.iter().copied());
-            if let Some(commit_rect) = union_damage_rects(frame.buffer_damage.iter().copied()) {
+            if let Some(rect) = frame.damage {
+                self.pending_damage.push(rect);
+            }
+            if let Some(commit_rect) = frame.buffer_damage {
                 match self.pending_surface_buffer_damage.get_mut(&key) {
                     Some(existing) => {
                         if let Some(merged) = rect_union(*existing, commit_rect) {
@@ -3971,8 +3973,8 @@ mod tests {
             surface_height: 2,
             viewport_src: None,
             dmabuf: None,
-            damage: Vec::new(),
-            buffer_damage: Vec::new(),
+            damage: None,
+            buffer_damage: None,
             full_surface: true,
         }
     }
@@ -3983,23 +3985,23 @@ mod tests {
         let key = (1, 2);
         let mut first = frame();
         first.full_surface = false;
-        first.buffer_damage = vec![DamageRect {
+        first.buffer_damage = Some(DamageRect {
             x: 0,
             y: 0,
             width: 4,
             height: 4,
-        }];
+        });
         state.set_surface_frame(first).unwrap();
 
         let mut second = frame();
         second.buffer_id = 4;
         second.full_surface = false;
-        second.buffer_damage = vec![DamageRect {
+        second.buffer_damage = Some(DamageRect {
             x: 8,
             y: 0,
             width: 4,
             height: 4,
-        }];
+        });
         state.set_surface_frame(second).unwrap();
 
         let accumulated = state
@@ -4087,8 +4089,8 @@ mod tests {
             surface_height: 1,
             viewport_src: None,
             dmabuf: None,
-            damage: Vec::new(),
-            buffer_damage: Vec::new(),
+            damage: None,
+            buffer_damage: None,
             full_surface: true,
         };
 
@@ -4111,7 +4113,7 @@ mod tests {
             buffer_transform: 0,
             surface_width: 1,
             surface_height: 1,
-            damage: Vec::new(),
+            damage: None,
             full_surface: true,
             ..frame()
         };

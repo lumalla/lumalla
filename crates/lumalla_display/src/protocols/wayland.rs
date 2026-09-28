@@ -173,11 +173,11 @@ fn commit_damage(
     buffer_height: usize,
     surface_width: i32,
     surface_height: i32,
-) -> (Vec<Rectangle>, Vec<Rectangle>, bool) {
+) -> (Option<Rectangle>, Option<Rectangle>, bool) {
     let full_surface =
-        commit.newly_mapped || (commit.damage.is_empty() && commit.buffer_damage.is_empty());
+        commit.newly_mapped || (commit.damage.is_none() && commit.buffer_damage.is_none());
     if full_surface {
-        return (Vec::new(), Vec::new(), true);
+        return (None, None, true);
     }
 
     let scale = commit.buffer_scale.max(1);
@@ -188,94 +188,88 @@ fn commit_damage(
         scale,
         commit.viewport.source,
     );
-    let mut output_damage = Vec::new();
-    let mut buffer_damage = Vec::new();
-    if !commit.buffer_damage.is_empty() {
-        for rect in &commit.buffer_damage {
-            if rect.width <= 0 || rect.height <= 0 {
-                continue;
-            }
-            buffer_damage.push(*rect);
-            let (tx, ty, tw, th) = transform.buffer_rect_to_transformed(
-                rect.x.max(0) as u32,
-                rect.y.max(0) as u32,
-                rect.width as u32,
-                rect.height as u32,
-                buffer_width as u32,
-                buffer_height as u32,
-            );
-            let src_w = source[2].max(1.0);
-            let src_h = source[3].max(1.0);
-            let out_x_off =
-                (((tx as f64 - source[0]) * surface_width as f64) / src_w).floor() as i32;
-            let out_y_off =
-                (((ty as f64 - source[1]) * surface_height as f64) / src_h).floor() as i32;
-            let out_w = ((tw as f64 * surface_width as f64) / src_w).ceil() as i32;
-            let out_h = ((th as f64 * surface_height as f64) / src_h).ceil() as i32;
-            output_damage.push(Rectangle {
+
+    let (mut output_damage, mut buffer_damage) = if let Some(rect) = commit
+        .buffer_damage
+        .filter(|r| r.width > 0 && r.height > 0)
+    {
+        let (tx, ty, tw, th) = transform.buffer_rect_to_transformed(
+            rect.x.max(0) as u32,
+            rect.y.max(0) as u32,
+            rect.width as u32,
+            rect.height as u32,
+            buffer_width as u32,
+            buffer_height as u32,
+        );
+        let src_w = source[2].max(1.0);
+        let src_h = source[3].max(1.0);
+        let out_x_off = (((tx as f64 - source[0]) * surface_width as f64) / src_w).floor() as i32;
+        let out_y_off = (((ty as f64 - source[1]) * surface_height as f64) / src_h).floor() as i32;
+        let out_w = ((tw as f64 * surface_width as f64) / src_w).ceil() as i32;
+        let out_h = ((th as f64 * surface_height as f64) / src_h).ceil() as i32;
+        (
+            Some(Rectangle {
                 x: output_x + out_x_off,
                 y: output_y + out_y_off,
                 width: out_w,
                 height: out_h,
-            });
-        }
-    } else {
-        for rect in &commit.damage {
-            if rect.width <= 0 || rect.height <= 0 {
-                continue;
-            }
-            output_damage.push(Rectangle {
-                x: output_x + rect.x,
-                y: output_y + rect.y,
-                width: rect.width,
-                height: rect.height,
-            });
-            let transformed_x = source[0] + rect.x as f64 * source[2] / surface_width.max(1) as f64;
-            let transformed_y =
-                source[1] + rect.y as f64 * source[3] / surface_height.max(1) as f64;
-            let transformed_w =
-                (rect.width as f64 * source[2] / surface_width.max(1) as f64).ceil();
-            let transformed_h =
-                (rect.height as f64 * source[3] / surface_height.max(1) as f64).ceil();
-            let (bx, by, bw, bh) = transform.transformed_rect_to_buffer(
-                transformed_x.floor().max(0.0) as u32,
-                transformed_y.floor().max(0.0) as u32,
-                transformed_w.max(1.0) as u32,
-                transformed_h.max(1.0) as u32,
-                buffer_width as u32,
-                buffer_height as u32,
-            );
-            buffer_damage.push(Rectangle {
+            }),
+            Some(rect),
+        )
+    } else if let Some(rect) = commit.damage.filter(|r| r.width > 0 && r.height > 0) {
+        let output = Rectangle {
+            x: output_x + rect.x,
+            y: output_y + rect.y,
+            width: rect.width,
+            height: rect.height,
+        };
+        let transformed_x = source[0] + rect.x as f64 * source[2] / surface_width.max(1) as f64;
+        let transformed_y = source[1] + rect.y as f64 * source[3] / surface_height.max(1) as f64;
+        let transformed_w = (rect.width as f64 * source[2] / surface_width.max(1) as f64).ceil();
+        let transformed_h = (rect.height as f64 * source[3] / surface_height.max(1) as f64).ceil();
+        let (bx, by, bw, bh) = transform.transformed_rect_to_buffer(
+            transformed_x.floor().max(0.0) as u32,
+            transformed_y.floor().max(0.0) as u32,
+            transformed_w.max(1.0) as u32,
+            transformed_h.max(1.0) as u32,
+            buffer_width as u32,
+            buffer_height as u32,
+        );
+        (
+            Some(output),
+            Some(Rectangle {
                 x: bx as i32,
                 y: by as i32,
                 width: bw as i32,
                 height: bh as i32,
-            });
-        }
-    }
+            }),
+        )
+    } else {
+        (None, None)
+    };
 
-    if output_damage.is_empty() {
-        output_damage.push(Rectangle {
+    if output_damage.is_none() {
+        output_damage = Some(Rectangle {
             x: output_x,
             y: output_y,
             width: surface_width,
             height: surface_height,
         });
-        if let Some((sx, sy, sw, sh)) = commit.viewport.source {
-            buffer_damage.push(Rectangle {
+        buffer_damage = if let Some((sx, sy, sw, sh)) = commit.viewport.source {
+            Some(Rectangle {
                 x: (sx * scale as f32) as i32,
                 y: (sy * scale as f32) as i32,
                 width: (sw * scale as f32).ceil() as i32,
                 height: (sh * scale as f32).ceil() as i32,
-            });
+            })
         } else {
-            buffer_damage.push(Rectangle {
+            Some(Rectangle {
                 x: 0,
                 y: 0,
                 width: buffer_width as i32,
                 height: buffer_height as i32,
-            });
-        }
+            })
+        };
     }
 
     (output_damage, buffer_damage, false)
@@ -504,7 +498,7 @@ fn process_surface_commit_body(
                     viewport_src: commit.viewport.source,
                     dmabuf,
                     damage,
-                    buffer_damage: if is_cursor { Vec::new() } else { buffer_damage },
+                    buffer_damage: if is_cursor { None } else { buffer_damage },
                     full_surface: is_cursor || full_surface,
                 };
                 if is_cursor {
@@ -589,8 +583,8 @@ fn process_surface_commit_body(
                 return Err(());
             }
             let visual_change = commit.viewport_changed
-                || !commit.damage.is_empty()
-                || !commit.buffer_damage.is_empty();
+                || commit.damage.is_some()
+                || commit.buffer_damage.is_some();
             if visual_change
                 && commit.mapped
                 && let Some(buffer_id) = commit.buffer
@@ -640,7 +634,7 @@ fn process_surface_commit_body(
                 let output_x = commit.layout.0 + commit.offset.0;
                 let output_y = commit.layout.1 + commit.offset.1;
                 let (damage, buffer_damage, full_surface) = if commit.viewport_changed {
-                    (Vec::new(), Vec::new(), true)
+                    (None, None, true)
                 } else {
                     commit_damage(
                         commit,

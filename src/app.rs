@@ -1726,26 +1726,18 @@ impl AppData {
                         surface_height: frame.surface_height,
                         viewport_src: frame.viewport_src,
                         dmabuf,
-                        damage: frame
-                            .damage
-                            .into_iter()
-                            .map(|rect| OutputDamageRect {
-                                x: rect.x,
-                                y: rect.y,
-                                width: rect.width,
-                                height: rect.height,
-                            })
-                            .collect(),
-                        buffer_damage: frame
-                            .buffer_damage
-                            .into_iter()
-                            .map(|rect| OutputDamageRect {
-                                x: rect.x,
-                                y: rect.y,
-                                width: rect.width,
-                                height: rect.height,
-                            })
-                            .collect(),
+                        damage: frame.damage.map(|rect| OutputDamageRect {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
+                        }),
+                        buffer_damage: frame.buffer_damage.map(|rect| OutputDamageRect {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
+                        }),
                         full_surface: frame.full_surface,
                     };
                     if let Err(err) = self.renderer_state.set_surface_frame(surface) {

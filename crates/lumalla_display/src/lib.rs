@@ -93,10 +93,10 @@ pub struct CommittedFrame {
     pub viewport_src: Option<(f32, f32, f32, f32)>,
     /// Populated for linux-dmabuf commits; renderer imports this FD on the GPU.
     pub dmabuf: Option<ExportedDmabuf>,
-    /// Output-space regions that changed this commit.
-    pub damage: Vec<Rectangle>,
-    /// Buffer-space regions that changed this commit (for GPU texture uploads).
-    pub buffer_damage: Vec<Rectangle>,
+    /// Output-space region that changed this commit.
+    pub damage: Option<Rectangle>,
+    /// Buffer-space region that changed this commit (for GPU texture uploads).
+    pub buffer_damage: Option<Rectangle>,
     /// When true, the entire surface area must be recomposited.
     pub full_surface: bool,
 }
