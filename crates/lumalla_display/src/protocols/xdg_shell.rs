@@ -561,6 +561,8 @@ impl XdgToplevel for DisplayState {
                     let _ =
                         self.surface_manager
                             .set_xdg_map_ready(ctx.client_id, wl_surface, false);
+                    self.shm_manager
+                        .clear_surface_backing(ctx.client_id, wl_surface);
                     self.surface_updates
                         .push_back(crate::SurfaceUpdate::Unmapped {
                             client_id: ctx.client_id,
@@ -779,6 +781,8 @@ impl XdgPopup for DisplayState {
                             .set_xdg_map_ready(ctx.client_id, wl_surface, false);
                     self.surface_manager
                         .clear_role_parent(ctx.client_id, wl_surface);
+                    self.shm_manager
+                        .clear_surface_backing(ctx.client_id, wl_surface);
                     self.surface_updates
                         .push_back(crate::SurfaceUpdate::Unmapped {
                             client_id: ctx.client_id,

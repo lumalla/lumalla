@@ -9,9 +9,10 @@ use lumalla_wayland_protocol::{
 use crate::{
     CommittedFrame, DisplayState, GlobalId, SurfaceUpdate,
     data_device::DataDeviceError,
-    shm::{ShmError, ShmErrorKind},
+    shm::{ShmDamageRect, ShmError, ShmErrorKind},
     surface::{Rectangle, ShellMode, SurfaceCommit, SurfaceError, effective_surface_size},
 };
+use std::rc::Rc;
 
 impl WaylandProtocol for DisplayState {}
 
@@ -408,7 +409,7 @@ fn process_surface_commit_body(
                 .surface_manager
                 .surface_role_is_cursor(ctx.client_id, commit.surface_id);
             if is_cursor || commit.mapped {
-                let (pixels, width, height, stride, format, dmabuf) =
+                let (width, height, stride, format, dmabuf) =
                     if state.dmabuf_manager.has_buffer(ctx.client_id, buffer_id) {
                         match state.dmabuf_manager.export_buffer(ctx.client_id, buffer_id) {
                             Ok(exported) => {
@@ -416,7 +417,7 @@ fn process_surface_commit_body(
                                 let height = exported.height as usize;
                                 let stride = exported.stride as usize;
                                 let format = exported.wl_format;
-                                (Vec::new(), width, height, stride, format, Some(exported))
+                                (width, height, stride, format, Some(exported))
                             }
                             Err(error) => {
                                 debug!("dmabuf export failed: {error}");
@@ -430,15 +431,10 @@ fn process_surface_commit_body(
                             }
                         }
                     } else {
-                        match state.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
-                            Ok(snapshot) => (
-                                snapshot.pixels,
-                                snapshot.width,
-                                snapshot.height,
-                                snapshot.stride,
-                                snapshot.format,
-                                None,
-                            ),
+                        match state.shm_manager.buffer_meta(ctx.client_id, buffer_id) {
+                            Ok((width, height, stride, format)) => {
+                                (width, height, stride, format, None)
+                            }
                             Err(error) => {
                                 report_shm_error(ctx, buffer_id, &error);
                                 return Err(());
@@ -478,6 +474,33 @@ fn process_surface_commit_body(
                     surface_width,
                     surface_height,
                 );
+                let full_surface = is_cursor || full_surface;
+                let pixels = if dmabuf.is_some() {
+                    Rc::new(Vec::new())
+                } else {
+                    let shm_damage = if full_surface {
+                        None
+                    } else {
+                        buffer_damage.map(|rect| ShmDamageRect {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
+                        })
+                    };
+                    match state.shm_manager.capture_surface_buffer(
+                        ctx.client_id,
+                        commit.surface_id,
+                        buffer_id,
+                        shm_damage,
+                    ) {
+                        Ok(snapshot) => snapshot.pixels,
+                        Err(error) => {
+                            report_shm_error(ctx, buffer_id, &error);
+                            return Err(());
+                        }
+                    }
+                };
                 let frame = CommittedFrame {
                     client_id: ctx.client_id,
                     surface_id: commit.surface_id,
@@ -499,7 +522,7 @@ fn process_surface_commit_body(
                     dmabuf,
                     damage,
                     buffer_damage: if is_cursor { None } else { buffer_damage },
-                    full_surface: is_cursor || full_surface,
+                    full_surface,
                 };
                 if is_cursor {
                     state
@@ -556,6 +579,9 @@ fn process_surface_commit_body(
                 client_id: ctx.client_id,
                 surface_id: commit.surface_id,
             });
+            state
+                .shm_manager
+                .clear_surface_backing(ctx.client_id, commit.surface_id);
             for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
                 ctx.writer
                     .wl_surface_leave(commit.surface_id)
@@ -592,11 +618,10 @@ fn process_surface_commit_body(
                 let is_cursor = state
                     .surface_manager
                     .surface_role_is_cursor(ctx.client_id, commit.surface_id);
-                let (pixels, width, height, stride, format, dmabuf) =
+                let (width, height, stride, format, dmabuf) =
                     if state.dmabuf_manager.has_buffer(ctx.client_id, buffer_id) {
                         match state.dmabuf_manager.export_buffer(ctx.client_id, buffer_id) {
                             Ok(exported) => (
-                                Vec::new(),
                                 exported.width as usize,
                                 exported.height as usize,
                                 exported.stride as usize,
@@ -609,17 +634,12 @@ fn process_surface_commit_body(
                             }
                         }
                     } else {
-                        match state.shm_manager.snapshot_buffer(ctx.client_id, buffer_id) {
-                            Ok(snapshot) => (
-                                snapshot.pixels,
-                                snapshot.width,
-                                snapshot.height,
-                                snapshot.stride,
-                                snapshot.format,
-                                None,
-                            ),
+                        match state.shm_manager.buffer_meta(ctx.client_id, buffer_id) {
+                            Ok((width, height, stride, format)) => {
+                                (width, height, stride, format, None)
+                            }
                             Err(error) => {
-                                debug!("shm snapshot failed on viewport update: {error}");
+                                debug!("shm meta failed on viewport update: {error}");
                                 return Err(());
                             }
                         }
@@ -645,6 +665,32 @@ fn process_surface_commit_body(
                         surface_width,
                         surface_height,
                     )
+                };
+                let pixels = if dmabuf.is_some() {
+                    Rc::new(Vec::new())
+                } else {
+                    let shm_damage = if full_surface {
+                        None
+                    } else {
+                        buffer_damage.map(|rect| ShmDamageRect {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
+                        })
+                    };
+                    match state.shm_manager.capture_surface_buffer(
+                        ctx.client_id,
+                        commit.surface_id,
+                        buffer_id,
+                        shm_damage,
+                    ) {
+                        Ok(snapshot) => snapshot.pixels,
+                        Err(error) => {
+                            debug!("shm capture failed on viewport update: {error}");
+                            return Err(());
+                        }
+                    }
                 };
                 let frame = CommittedFrame {
                     client_id: ctx.client_id,
@@ -1434,6 +1480,8 @@ impl WlSurface for DisplayState {
                         surface_id: object_id,
                     });
                 }
+                self.shm_manager
+                    .clear_surface_backing(ctx.client_id, object_id);
                 for child in destroyed.unmapped_descendants {
                     self.pointer_constraints_manager.mark_surface_destroyed(
                         ctx.writer,
@@ -1443,6 +1491,8 @@ impl WlSurface for DisplayState {
                     self.release_keyboard_focus_from_surface(ctx.client_id, child, ctx.writer);
                     self.seat_manager
                         .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
+                    self.shm_manager
+                        .clear_surface_backing(ctx.client_id, child);
                     self.surface_updates.push_back(SurfaceUpdate::Unmapped {
                         client_id: ctx.client_id,
                         surface_id: child,
@@ -1603,6 +1653,8 @@ impl WlSurface for DisplayState {
             self.release_keyboard_focus_from_surface(ctx.client_id, child, ctx.writer);
             self.seat_manager
                 .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
+            self.shm_manager
+                .clear_surface_backing(ctx.client_id, child);
             self.surface_updates.push_back(SurfaceUpdate::Unmapped {
                 client_id: ctx.client_id,
                 surface_id: child,
@@ -1889,6 +1941,8 @@ impl WlSubsurface for DisplayState {
                         surface_id,
                         ctx.writer,
                     );
+                    self.shm_manager
+                        .clear_surface_backing(ctx.client_id, surface_id);
                     self.surface_updates.push_back(SurfaceUpdate::Unmapped {
                         client_id: ctx.client_id,
                         surface_id,
@@ -2481,7 +2535,7 @@ mod tests {
         };
         assert_eq!(frame.surface_id, surface_id);
         assert_eq!(frame.buffer_id, buffer_id);
-        assert_eq!(frame.pixels, [1, 2, 3, 4]);
+        assert_eq!(frame.pixels.as_slice(), [1, 2, 3, 4]);
         assert_eq!(frame.buffer_scale, 1);
         assert_eq!(frame.buffer_transform, 0);
         assert_eq!((frame.offset_x, frame.offset_y), (0, 0));
@@ -2743,7 +2797,7 @@ mod tests {
         assert_eq!(frame.client_id, client.client_id());
         assert_eq!(frame.surface_id, object_id(6));
         assert_eq!(frame.buffer_id, object_id(8));
-        assert_eq!(frame.pixels, [1, 2, 3, 0xff]);
+        assert_eq!(frame.pixels.as_slice(), [1, 2, 3, 0xff]);
         assert_eq!((frame.width, frame.height, frame.stride), (1, 1, 4));
         assert_eq!(frame.format, WL_SHM_FORMAT_XRGB8888);
     }
@@ -2822,7 +2876,7 @@ mod tests {
             panic!("expected one committed xdg frame, got {updates:?}");
         };
         assert_eq!(frame.surface_id, object_id(6));
-        assert_eq!(frame.pixels, [1, 2, 3, 0xff]);
+        assert_eq!(frame.pixels.as_slice(), [1, 2, 3, 0xff]);
     }
 
     #[test]

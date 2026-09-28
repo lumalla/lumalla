@@ -1,5 +1,7 @@
 //! Persistent CPU backing store and incremental compositing.
 
+use std::rc::Rc;
+
 use anyhow::Context;
 use lumalla_shared::BufferTransform;
 
@@ -76,7 +78,7 @@ pub fn cursor_damage_rects_default(
     old_pointer: (i32, i32),
     new_pointer: (i32, i32),
 ) -> Vec<DamageRect> {
-    cursor_damage_rects(default_cursor_frame(), old_pointer, new_pointer)
+    cursor_damage_rects(&default_cursor_frame(), old_pointer, new_pointer)
 }
 
 pub fn prepare_composite(
@@ -288,7 +290,7 @@ fn composite_scene_full(
             &mut upload,
             output_width as usize,
             output_height as usize,
-            default_cursor_frame(),
+            &default_cursor_frame(),
             pointer_x,
             pointer_y,
         )?,
@@ -361,7 +363,7 @@ fn composite_region(
             pixels,
             width,
             height,
-            default_cursor_frame(),
+            &default_cursor_frame(),
             pointer_x,
             pointer_y,
             cursor_rect,
@@ -777,7 +779,7 @@ mod tests {
             owner_id: 1,
             surface_id: 2,
             buffer_id: 3,
-            pixels: vec![0; 16],
+            pixels: Rc::new(vec![0; 16]),
             width: 2,
             height: 2,
             stride: 8,
@@ -800,7 +802,7 @@ mod tests {
     fn partial_update_changes_only_damaged_pixel() {
         let clear = [0.0, 0.0, 0.0, 1.0];
         let frame = SurfaceFrame {
-            pixels: vec![1, 2, 3, 0, 4, 5, 6, 0],
+            pixels: Rc::new(vec![1, 2, 3, 0, 4, 5, 6, 0]),
             width: 2,
             height: 1,
             stride: 8,
@@ -849,7 +851,7 @@ mod tests {
     #[test]
     fn argb_surface_uses_premultiplied_alpha_blending() {
         let frame = SurfaceFrame {
-            pixels: vec![0, 0, 128, 128],
+            pixels: Rc::new(vec![0, 0, 128, 128]),
             width: 1,
             height: 1,
             stride: 4,
@@ -868,7 +870,7 @@ mod tests {
             owner_id: 1,
             surface_id: 3,
             buffer_id: 4,
-            pixels: vec![10; 4],
+            pixels: Rc::new(vec![10; 4]),
             width: 1,
             height: 1,
             stride: 4,
@@ -891,7 +893,7 @@ mod tests {
             owner_id: 1,
             surface_id: 3,
             buffer_id: 4,
-            pixels: vec![10; 4],
+            pixels: Rc::new(vec![10; 4]),
             width: 1,
             height: 1,
             stride: 4,
@@ -1078,7 +1080,7 @@ mod tests {
         }
         let (surface_width, surface_height) = transform.transformed_size(3, 2);
         SurfaceFrame {
-            pixels,
+            pixels: Rc::new(pixels),
             width: 3,
             height: 2,
             stride: 12,

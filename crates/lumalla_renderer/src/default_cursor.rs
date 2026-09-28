@@ -1,4 +1,5 @@
-use std::sync::OnceLock;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use super::{CursorFrame, WL_SHM_FORMAT_ARGB8888};
 
@@ -29,10 +30,20 @@ fn build_default_cursor_pixels() -> Vec<u8> {
     let mut pixels = vec![0u8; SIZE * SIZE * 4];
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let idx = (y * SIZE + x) * 4;
+            let i = (y * SIZE + x) * 4;
             match MASK[y][x] {
-                1 => pixels[idx..idx + 4].copy_from_slice(&[0, 0, 0, 255]),
-                2 => pixels[idx..idx + 4].copy_from_slice(&[255, 255, 255, 255]),
+                1 => {
+                    pixels[i] = 0;
+                    pixels[i + 1] = 0;
+                    pixels[i + 2] = 0;
+                    pixels[i + 3] = 255;
+                }
+                2 => {
+                    pixels[i] = 255;
+                    pixels[i + 1] = 255;
+                    pixels[i + 2] = 255;
+                    pixels[i + 3] = 255;
+                }
                 _ => {}
             }
         }
@@ -40,13 +51,12 @@ fn build_default_cursor_pixels() -> Vec<u8> {
     pixels
 }
 
-pub fn default_cursor_frame() -> &'static CursorFrame {
-    static CURSOR: OnceLock<CursorFrame> = OnceLock::new();
-    CURSOR.get_or_init(|| CursorFrame {
+fn build_default_cursor_frame() -> CursorFrame {
+    CursorFrame {
         owner_id: 0,
         surface_id: 0,
         buffer_id: 0,
-        pixels: build_default_cursor_pixels(),
+        pixels: Rc::new(build_default_cursor_pixels()),
         width: SIZE,
         height: SIZE,
         stride: SIZE * 4,
@@ -56,5 +66,35 @@ pub fn default_cursor_frame() -> &'static CursorFrame {
         buffer_scale: 1,
         buffer_transform: 0,
         dmabuf: None,
+    }
+}
+
+thread_local! {
+    static CURSOR: RefCell<Option<CursorFrame>> = const { RefCell::new(None) };
+}
+
+/// Default compositor cursor. Cheap to call: clones an `Rc` to the shared pixels.
+pub fn default_cursor_frame() -> CursorFrame {
+    CURSOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(build_default_cursor_frame());
+        }
+        let cursor = slot.as_ref().expect("default cursor initialized");
+        CursorFrame {
+            owner_id: cursor.owner_id,
+            surface_id: cursor.surface_id,
+            buffer_id: cursor.buffer_id,
+            pixels: Rc::clone(&cursor.pixels),
+            width: cursor.width,
+            height: cursor.height,
+            stride: cursor.stride,
+            format: cursor.format,
+            hotspot_x: cursor.hotspot_x,
+            hotspot_y: cursor.hotspot_y,
+            buffer_scale: cursor.buffer_scale,
+            buffer_transform: cursor.buffer_transform,
+            dmabuf: None,
+        }
     })
 }

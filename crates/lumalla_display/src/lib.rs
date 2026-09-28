@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::Context;
 use lumalla_shared::{View, WindowGeometryUpdate, WindowRule, WindowState, map_source_to_dest};
@@ -75,7 +76,7 @@ pub struct CommittedFrame {
     pub client_id: ClientId,
     pub surface_id: lumalla_wayland_protocol::ObjectId,
     pub buffer_id: lumalla_wayland_protocol::ObjectId,
-    pub pixels: Vec<u8>,
+    pub pixels: Rc<Vec<u8>>,
     pub width: usize,
     pub height: usize,
     pub stride: usize,

@@ -4,6 +4,7 @@ use std::{
     fmt,
     mem::ManuallyDrop,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+    rc::Rc,
 };
 
 use libc::{
@@ -52,13 +53,36 @@ impl std::error::Error for ShmError {}
 type Result<T> = std::result::Result<T, ShmError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct ShmBufferSnapshot {
-    pub pixels: Vec<u8>,
+    pub pixels: Rc<Vec<u8>>,
     pub width: usize,
     pub height: usize,
     pub stride: usize,
     pub format: u32,
+}
+
+/// Buffer-space rectangle used for damage-aware SHM captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShmDamageRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Per-surface retained double-buffer for SHM pixel captures.
+///
+/// `front` is the last published frame (may still be held by the renderer via
+/// `Arc`). `back` is scratch for the next commit; when `front` is uniquely owned
+/// after publish it is recycled into `back`.
+#[derive(Debug, Default)]
+struct SurfaceShmBacking {
+    front: Rc<Vec<u8>>,
+    back: Vec<u8>,
+    width: usize,
+    height: usize,
+    stride: usize,
+    format: u32,
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +91,8 @@ pub struct ShmManager {
     pools: Vec<Option<ShmPool>>,
     free_pool_indexes: Vec<usize>,
     buffers: HashMap<ResourceKey, ShmBuffer>,
+    /// Retained CPU pixels keyed by wl_surface.
+    surface_backing: HashMap<ResourceKey, SurfaceShmBacking>,
 }
 
 impl ShmManager {
@@ -239,7 +265,127 @@ impl ShmManager {
         }
     }
 
-    #[allow(dead_code)]
+    /// Lookup SHM buffer dimensions without copying pixels.
+    pub fn buffer_meta(
+        &self,
+        client_id: ClientId,
+        buffer_id: ObjectId,
+    ) -> Result<(usize, usize, usize, u32)> {
+        let buffer = self.buffers.get(&(client_id, buffer_id)).ok_or_else(|| {
+            ShmError::new(ShmErrorKind::InvalidObject, "Unknown shared-memory buffer")
+        })?;
+        Ok((
+            buffer.width,
+            buffer.height,
+            buffer.width * 4,
+            buffer.format,
+        ))
+    }
+
+    /// Capture SHM pixels into a per-surface double-buffer.
+    ///
+    /// When `damage` is `Some` and the surface backing already matches this
+    /// buffer's size/format, only the damaged region is read from the pool;
+    /// undamaged pixels are copied from the previous front buffer. `damage:
+    /// None` forces a full capture (also used on size/format changes).
+    pub fn capture_surface_buffer(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        buffer_id: ObjectId,
+        damage: Option<ShmDamageRect>,
+    ) -> Result<ShmBufferSnapshot> {
+        let buffer = *self.buffers.get(&(client_id, buffer_id)).ok_or_else(|| {
+            ShmError::new(ShmErrorKind::InvalidObject, "Unknown shared-memory buffer")
+        })?;
+        let pool_index = buffer.pool_index;
+        let packed_stride = buffer.width * 4;
+        let needed = packed_stride
+            .checked_mul(buffer.height)
+            .ok_or_else(|| {
+                ShmError::new(
+                    ShmErrorKind::InvalidStride,
+                    "Shared-memory buffer size overflows",
+                )
+            })?;
+
+        let key = (client_id, surface_id);
+        let mut backing = self.surface_backing.remove(&key).unwrap_or_default();
+        let size_changed = backing.width != buffer.width
+            || backing.height != buffer.height
+            || backing.stride != packed_stride
+            || backing.format != buffer.format
+            || backing.front.len() != needed;
+        let use_damage = match damage {
+            Some(rect) if !size_changed && rect.width > 0 && rect.height > 0 => Some(rect),
+            _ => None,
+        };
+
+        if backing.back.capacity() < needed {
+            backing.back = Vec::with_capacity(needed);
+        }
+        backing.back.clear();
+
+        let pool_bytes = self.pool(pool_index)?.bytes();
+        if let Some(rect) = use_damage {
+            backing.back.extend_from_slice(backing.front.as_slice());
+            if backing.back.len() != needed {
+                // Front was empty/mismatched despite size_changed check — fall back.
+                backing.back.clear();
+                copy_shm_rows(
+                    &mut backing.back,
+                    pool_bytes,
+                    &buffer,
+                    packed_stride,
+                );
+            } else {
+                blit_shm_damage(
+                    &mut backing.back,
+                    packed_stride,
+                    pool_bytes,
+                    &buffer,
+                    rect,
+                );
+            }
+        } else {
+            copy_shm_rows(
+                &mut backing.back,
+                pool_bytes,
+                &buffer,
+                packed_stride,
+            );
+        }
+
+        debug_assert_eq!(backing.back.len(), needed);
+        backing.width = buffer.width;
+        backing.height = buffer.height;
+        backing.stride = packed_stride;
+        backing.format = buffer.format;
+
+        let mut old_front = std::mem::replace(&mut backing.front, Rc::new(std::mem::take(&mut backing.back)));
+        if let Some(unique) = Rc::get_mut(&mut old_front) {
+            backing.back = std::mem::take(unique);
+        } else {
+            backing.back = Vec::with_capacity(needed);
+        }
+
+        let snapshot = ShmBufferSnapshot {
+            pixels: Rc::clone(&backing.front),
+            width: backing.width,
+            height: backing.height,
+            stride: backing.stride,
+            format: backing.format,
+        };
+        self.surface_backing.insert(key, backing);
+        Ok(snapshot)
+    }
+
+    /// Drop retained pixels for a surface (unmap / destroy).
+    pub fn clear_surface_backing(&mut self, client_id: ClientId, surface_id: ObjectId) {
+        self.surface_backing.remove(&(client_id, surface_id));
+    }
+
+    /// Full one-shot snapshot without updating per-surface backing (tests / debug).
     pub fn snapshot_buffer(
         &self,
         client_id: ClientId,
@@ -251,13 +397,9 @@ impl ShmManager {
         let pool = self.pool(buffer.pool_index)?;
         let packed_stride = buffer.width * 4;
         let mut pixels = Vec::with_capacity(packed_stride * buffer.height);
-        let bytes = pool.bytes();
-        for row in 0..buffer.height {
-            let start = buffer.offset + row * buffer.stride;
-            pixels.extend_from_slice(&bytes[start..start + packed_stride]);
-        }
+        copy_shm_rows(&mut pixels, pool.bytes(), buffer, packed_stride);
         Ok(ShmBufferSnapshot {
-            pixels,
+            pixels: Rc::new(pixels),
             width: buffer.width,
             height: buffer.height,
             stride: packed_stride,
@@ -282,6 +424,8 @@ impl ShmManager {
         for pool in pools {
             self.delete_pool(client_id, pool);
         }
+        self.surface_backing
+            .retain(|(owner, _), _| *owner != client_id);
     }
 
     fn pool(&self, index: usize) -> Result<&ShmPool> {
@@ -394,8 +538,7 @@ fn close_owned_fd(fd: OwnedFd) {
     }
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
 struct ShmBuffer {
     pool_index: usize,
     offset: usize,
@@ -403,6 +546,38 @@ struct ShmBuffer {
     height: usize,
     stride: usize,
     format: u32,
+}
+
+fn copy_shm_rows(dst: &mut Vec<u8>, pool_bytes: &[u8], buffer: &ShmBuffer, packed_stride: usize) {
+    dst.clear();
+    dst.reserve(packed_stride * buffer.height);
+    for row in 0..buffer.height {
+        let start = buffer.offset + row * buffer.stride;
+        dst.extend_from_slice(&pool_bytes[start..start + packed_stride]);
+    }
+}
+
+fn blit_shm_damage(
+    dst: &mut [u8],
+    dst_stride: usize,
+    pool_bytes: &[u8],
+    buffer: &ShmBuffer,
+    rect: ShmDamageRect,
+) {
+    let x0 = rect.x.max(0) as usize;
+    let y0 = rect.y.max(0) as usize;
+    let x1 = (rect.x.saturating_add(rect.width).max(0) as usize).min(buffer.width);
+    let y1 = (rect.y.saturating_add(rect.height).max(0) as usize).min(buffer.height);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let row_bytes = (x1 - x0) * 4;
+    for y in y0..y1 {
+        let dst_start = y * dst_stride + x0 * 4;
+        let src_start = buffer.offset + y * buffer.stride + x0 * 4;
+        dst[dst_start..dst_start + row_bytes]
+            .copy_from_slice(&pool_bytes[src_start..src_start + row_bytes]);
+    }
 }
 
 fn ensure_file_size(fd: &OwnedFd, size: usize) -> Result<()> {
@@ -525,7 +700,7 @@ mod tests {
         assert_eq!(snapshot.height, 2);
         assert_eq!(snapshot.stride, 8);
         assert_eq!(
-            snapshot.pixels,
+            snapshot.pixels.as_slice(),
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
     }
@@ -555,11 +730,93 @@ mod tests {
             manager
                 .snapshot_buffer(client(1), object(3))
                 .unwrap()
-                .pixels,
+                .pixels
+                .as_slice(),
             [1, 2, 3, 4]
         );
         manager.delete_buffer(client(1), object(3));
         assert!(manager.pools.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn capture_reuses_front_and_applies_damage() {
+        let mut manager = ShmManager::default();
+        // 2x2 buffer, stride 12 (4 bytes padding per row).
+        let mut bytes = vec![0u8; 24];
+        bytes[0..8].copy_from_slice(&[1, 1, 1, 1, 2, 2, 2, 2]);
+        bytes[12..20].copy_from_slice(&[3, 3, 3, 3, 4, 4, 4, 4]);
+        manager
+            .create_pool(client(1), object(2), memory_file(&bytes, 24), 24)
+            .unwrap();
+        manager
+            .create_buffer(
+                client(1),
+                object(2),
+                object(3),
+                0,
+                2,
+                2,
+                12,
+                WL_SHM_FORMAT_ARGB8888,
+            )
+            .unwrap();
+
+        let first = manager
+            .capture_surface_buffer(client(1), object(10), object(3), None)
+            .unwrap();
+        assert_eq!(
+            first.pixels.as_slice(),
+            [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4]
+        );
+        let first_ptr = first.pixels.as_ptr();
+
+        // New pool/buffer with only the top-left pixel changed.
+        let mut updated = bytes.clone();
+        updated[0..4].copy_from_slice(&[9, 9, 9, 9]);
+        manager
+            .create_pool(client(1), object(4), memory_file(&updated, 24), 24)
+            .unwrap();
+        manager
+            .create_buffer(
+                client(1),
+                object(4),
+                object(5),
+                0,
+                2,
+                2,
+                12,
+                WL_SHM_FORMAT_ARGB8888,
+            )
+            .unwrap();
+
+        // Keep `first` alive so the front Arc is shared (forces a second allocation).
+        let second = manager
+            .capture_surface_buffer(
+                client(1),
+                object(10),
+                object(5),
+                Some(ShmDamageRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            second.pixels.as_slice(),
+            [9, 9, 9, 9, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4]
+        );
+        assert_ne!(second.pixels.as_ptr(), first_ptr);
+        drop(first);
+
+        let third = manager
+            .capture_surface_buffer(client(1), object(10), object(5), None)
+            .unwrap();
+        assert_eq!(third.pixels.as_slice()[..4], [9, 9, 9, 9]);
+        assert!(manager.surface_backing.contains_key(&(client(1), object(10))));
+        manager.clear_surface_backing(client(1), object(10));
+        assert!(!manager.surface_backing.contains_key(&(client(1), object(10))));
     }
 
     #[test]

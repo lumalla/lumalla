@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -160,7 +161,7 @@ pub struct SurfaceFrame {
     pub owner_id: u32,
     pub surface_id: u32,
     pub buffer_id: u32,
-    pub pixels: Vec<u8>,
+    pub pixels: Rc<Vec<u8>>,
     pub width: usize,
     pub height: usize,
     pub stride: usize,
@@ -226,7 +227,7 @@ pub struct CursorFrame {
     pub owner_id: u32,
     pub surface_id: u32,
     pub buffer_id: u32,
-    pub pixels: Vec<u8>,
+    pub pixels: Rc<Vec<u8>>,
     pub width: usize,
     pub height: usize,
     pub stride: usize,
@@ -984,7 +985,7 @@ impl RendererState {
                     owner_id: cursor.owner_id,
                     surface_id: cursor.surface_id,
                     buffer_id: cursor.buffer_id,
-                    pixels: Vec::new(),
+                    pixels: Rc::new(Vec::new()),
                     width: cursor.width,
                     height: cursor.height,
                     stride: cursor.stride,
@@ -3526,9 +3527,13 @@ impl RendererState {
     }
 
     fn hw_cursor_image_pixels(&self) -> Option<(i32, i32, Vec<u8>, u32, u32)> {
+        let default_owned;
         let frame = match self.cursor_state.draw_ref() {
             CursorDraw::Hidden => return None,
-            CursorDraw::Default => crate::default_cursor::default_cursor_frame(),
+            CursorDraw::Default => {
+                default_owned = crate::default_cursor::default_cursor_frame();
+                &default_owned
+            }
             CursorDraw::Client(frame) => frame,
         };
         if frame.dmabuf.is_some() {
@@ -3960,7 +3965,7 @@ mod tests {
             owner_id: 1,
             surface_id: 2,
             buffer_id: 3,
-            pixels: vec![0; 16],
+            pixels: Rc::new(vec![0; 16]),
             width: 2,
             height: 2,
             stride: 8,
@@ -4058,7 +4063,7 @@ mod tests {
         assert!(frame().validate().is_ok());
 
         let mut truncated = frame();
-        truncated.pixels.pop();
+        Rc::make_mut(&mut truncated.pixels).pop();
         assert!(truncated.validate().is_err());
 
         let mut short_stride = frame();
@@ -4076,7 +4081,7 @@ mod tests {
             owner_id: 1,
             surface_id: 2,
             buffer_id: 3,
-            pixels: vec![1, 2, 3, 0, 4, 5, 6, 0],
+            pixels: Rc::new(vec![1, 2, 3, 0, 4, 5, 6, 0]),
             width: 2,
             height: 1,
             stride: 8,
@@ -4102,7 +4107,7 @@ mod tests {
     #[test]
     fn composites_frame_at_offset() {
         let frame = SurfaceFrame {
-            pixels: vec![9, 8, 7, 6],
+            pixels: Rc::new(vec![9, 8, 7, 6]),
             width: 1,
             height: 1,
             stride: 4,
@@ -4127,7 +4132,7 @@ mod tests {
             owner_id: 1,
             surface_id: 3,
             buffer_id: 4,
-            pixels: vec![10, 20, 30, 255],
+            pixels: Rc::new(vec![10, 20, 30, 255]),
             width: 1,
             height: 1,
             stride: 4,
@@ -4187,7 +4192,7 @@ mod tests {
             owner_id: 1,
             surface_id: 1,
             buffer_id: 1,
-            pixels: vec![10, 20, 30, 0, 40, 50, 60, 128],
+            pixels: Rc::new(vec![10, 20, 30, 0, 40, 50, 60, 128]),
             width: 2,
             height: 1,
             stride: 8,
@@ -4208,7 +4213,7 @@ mod tests {
             owner_id: 1,
             surface_id: 1,
             buffer_id: 1,
-            pixels: vec![0; 4],
+            pixels: Rc::new(vec![0; 4]),
             width: 2,
             height: 2,
             stride: 8,

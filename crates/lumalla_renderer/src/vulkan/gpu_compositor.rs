@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::rc::Rc;
 
 use anyhow::Context;
 use ash::vk;
@@ -1090,7 +1091,7 @@ fn cursor_surface_view(cursor: &CursorFrame) -> SurfaceFrame {
         owner_id: cursor.owner_id,
         surface_id: cursor.surface_id,
         buffer_id: cursor.buffer_id,
-        pixels: Vec::new(),
+        pixels: Rc::new(Vec::new()),
         width: cursor.width,
         height: cursor.height,
         stride: cursor.stride,
@@ -1913,9 +1914,13 @@ fn draw_cursor_layer(
     output_height: u32,
     clip: Option<&vk::Rect2D>,
 ) {
+    let default_owned;
     let (cursor_key, cursor_frame) = match cursor {
         CursorDraw::Client(frame) => ((frame.owner_id, frame.surface_id), frame),
-        CursorDraw::Default => (CURSOR_TEXTURE_KEY, default_cursor_frame()),
+        CursorDraw::Default => {
+            default_owned = default_cursor_frame();
+            (CURSOR_TEXTURE_KEY, &default_owned)
+        }
         CursorDraw::Hidden => return,
     };
     let Some(texture) = cache.texture(cursor_key) else {
@@ -2706,7 +2711,7 @@ mod tests {
                 owner_id: 1,
                 surface_id: 2,
                 buffer_id: 3,
-                pixels: vec![0; 4 * 3 * 4],
+                pixels: Rc::new(vec![0; 4 * 3 * 4]),
                 width: 4,
                 height: 3,
                 stride: 16,
