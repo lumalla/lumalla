@@ -1317,7 +1317,8 @@ pub fn composite_to_scanout(
 
 /// Composite scene layers into an arbitrary DMA image (e.g. screencast buffer).
 ///
-/// Uses a single view mapping (no guides/cursor). Leaves the image in `GENERAL`.
+/// `cursor` / `pointer_*` are in destination (buffer) pixel space. Leaves the
+/// image in `GENERAL`.
 pub fn composite_layers_to_image(
     vulkan: &VulkanContext,
     batch: &mut GpuWorkBatch,
@@ -1332,6 +1333,9 @@ pub fn composite_layers_to_image(
     clear_color: [f32; 4],
     view: &View,
     layers: &[&SurfaceFrame],
+    cursor: CursorDraw<'_>,
+    pointer_x: i32,
+    pointer_y: i32,
 ) -> anyhow::Result<()> {
     let clear_value = vk::ClearValue {
         color: vk::ClearColorValue {
@@ -1363,9 +1367,104 @@ pub fn composite_layers_to_image(
             output_height,
             None,
         );
+        draw_cursor_layer(
+            compositor,
+            device,
+            &mut recorder,
+            cache,
+            cursor,
+            pointer_x,
+            pointer_y,
+            output_width,
+            output_height,
+            None,
+        );
         recorder.end_render_pass();
 
         // Transition to GENERAL for PipeWire export / CPU readback.
+        let barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image.image())
+            .subresource_range(color_subresource_range());
+        unsafe {
+            device.handle().cmd_pipeline_barrier(
+                recorder.command_buffer(),
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+
+        recorder.end()?;
+        Ok(())
+    })();
+
+    if let Err(error) = record_result {
+        command_pool.free_command_buffers(device, &[command_buffer]);
+        return Err(error);
+    }
+    batch.push(command_buffer, None);
+    Ok(())
+}
+
+/// Draw the cursor onto an existing screencast image without clearing it.
+///
+/// `pointer_*` are in destination (buffer) pixel space. Image must be in
+/// `GENERAL` (typical after a blit). Leaves the image in `GENERAL`.
+pub fn overlay_cursor_on_image(
+    vulkan: &VulkanContext,
+    batch: &mut GpuWorkBatch,
+    compositor: &GpuCompositor,
+    cache: &SurfaceTextureCache,
+    render_pass_load: &RenderPass,
+    image: &DmaBufImage,
+    framebuffer: &Framebuffer,
+    output_width: u32,
+    output_height: u32,
+    cursor: CursorDraw<'_>,
+    pointer_x: i32,
+    pointer_y: i32,
+) -> anyhow::Result<()> {
+    if matches!(cursor, CursorDraw::Hidden) {
+        return Ok(());
+    }
+
+    let device = vulkan.device();
+    let command_pool = vulkan.graphics_command_pool();
+    let command_buffer = command_pool.allocate_command_buffer(device)?;
+
+    let record_result = (|| -> anyhow::Result<()> {
+        let mut recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
+        transition_scanout_for_render(
+            device,
+            recorder.command_buffer(),
+            image,
+            vk::ImageLayout::GENERAL,
+        )?;
+        // LOAD render pass — preserve the blit contents.
+        recorder.begin_render_pass_default(render_pass_load, framebuffer)?;
+        draw_cursor_layer(
+            compositor,
+            device,
+            &mut recorder,
+            cache,
+            cursor,
+            pointer_x,
+            pointer_y,
+            output_width,
+            output_height,
+            None,
+        );
+        recorder.end_render_pass();
+
         let barrier = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)

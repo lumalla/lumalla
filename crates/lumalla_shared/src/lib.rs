@@ -9,6 +9,7 @@ mod main_message;
 mod mods;
 mod output;
 pub mod ring;
+mod screencast_cursor;
 mod screencast_size;
 mod surface_geometry;
 pub mod udev;
@@ -34,6 +35,7 @@ pub use ring::{
     Completion, EventLoop, Interest, OpKind, SharedWaker, Waker, decode_user_data,
     encode_user_data, monotonic_deadline_after, monotonic_now,
 };
+pub use screencast_cursor::ScreencastCursorMode;
 pub use screencast_size::{
     SCREENCAST_DMA_MAX_EDGE, SCREENCAST_MEMFD_MAX_EDGE, fit_screencast_dma_size,
     fit_screencast_memfd_size, fit_screencast_portal_size,

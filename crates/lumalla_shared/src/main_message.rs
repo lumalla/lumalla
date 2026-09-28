@@ -2,6 +2,7 @@ use crate::Guide;
 use crate::Mods;
 use crate::Output;
 use crate::OutputConfig;
+use crate::ScreencastCursorMode;
 use crate::View;
 use crate::WindowGeometryUpdate;
 use crate::WindowRule;
@@ -201,6 +202,8 @@ pub enum MainMessage {
         session_id: u64,
         /// Capture target.
         target: MutterScreenCastTarget,
+        /// Portal `cursor-mode` (hidden / embedded).
+        cursor_mode: ScreencastCursorMode,
     },
     /// Stop all PipeWire streams belonging to a Mutter ScreenCast session.
     StopMutterScreenCast {

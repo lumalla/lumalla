@@ -268,6 +268,7 @@ fn memfd_source_delivers_frames_to_consumer() {
             30,
             exports,
             FormatOffer::PreferMemFd,
+            lumalla_shared::ScreencastCursorMode::Hidden,
         )
         .expect("start_stream");
 

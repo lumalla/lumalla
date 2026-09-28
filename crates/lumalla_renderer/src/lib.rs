@@ -50,7 +50,7 @@ use crate::vulkan::{
     DRM_FORMAT_ARGB8888, DmaBufImage, Framebuffer, GpuCompositor, GpuWorkBatch,
     SurfaceTextureCache, VulkanContext, blit_image_region, composite_layers_to_image,
     composite_to_scanout, copy_scanout_frame, download_bgra_region, map_rect_through_view,
-    upload_bgra_to_image, vulkan_to_drm_fourcc,
+    overlay_cursor_on_image, upload_bgra_to_image, vulkan_to_drm_fourcc,
 };
 
 struct GpuRenderResources {
@@ -1204,6 +1204,9 @@ impl RendererState {
     /// Completion is tracked on the slot; call [`Self::poll_screencast_gpu`] or
     /// [`Self::wait_screencast_buffer_gpu`] before exporting/reading the buffer.
     ///
+    /// When `embed_cursor` is true and hardware cursor planes omit the cursor from
+    /// scanout, the software cursor is composited into the capture buffer.
+    ///
     /// `width`/`height` are the capture rectangle in compositor space.
     /// `dest_width`/`dest_height` are the blit destination size (must fit in the buffer).
     pub fn blit_region_to_screencast_buffer(
@@ -1217,6 +1220,7 @@ impl RendererState {
         dest_width: u32,
         dest_height: u32,
         outputs: &[Output],
+        embed_cursor: bool,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(width > 0 && height > 0, "capture region must be positive");
         anyhow::ensure!(
@@ -1332,6 +1336,84 @@ impl RendererState {
             first = false;
         }
 
+        // HW cursor is not in the scanout FB — overlay a software cursor when requested.
+        let needs_cursor_overlay = embed_cursor
+            && regions.iter().any(|region| {
+                self.outputs
+                    .get(&region.name)
+                    .is_some_and(|o| o.hw_cursor_active())
+            })
+            && !matches!(self.cursor_state, CursorState::Hidden);
+
+        if needs_cursor_overlay {
+            let pointer_x = self.pointer_x;
+            let pointer_y = self.pointer_y;
+            let dest_px = ((i64::from(pointer_x) - i64::from(x)) * i64::from(out_w)
+                / i64::from(width.max(1))) as i32;
+            let dest_py = ((i64::from(pointer_y) - i64::from(y)) * i64::from(out_h)
+                / i64::from(height.max(1))) as i32;
+
+            let vulkan = self
+                .vulkan
+                .as_mut()
+                .context("Vulkan missing for screencast cursor overlay")?;
+            self.gpu.ensure_compositor(vulkan)?;
+            vulkan.ensure_scanout_render_pass_load()?;
+            let compositor = self
+                .gpu
+                .compositor
+                .take()
+                .context("GPU compositor missing")?;
+            let result = (|| -> anyhow::Result<()> {
+                self.gpu.surface_textures.sync_scene(
+                    vulkan,
+                    &compositor,
+                    &mut batch,
+                    &[],
+                    self.cursor_state.draw_ref(),
+                    &CompositeMode::Full,
+                    &HashSet::new(),
+                    &HashMap::new(),
+                    &[],
+                    false,
+                )?;
+                let render_pass = vulkan.scanout_render_pass_load()?;
+                let (image_ptr, fb_ptr) = {
+                    let slots = self
+                        .screencast_buffers
+                        .get(&stream_id)
+                        .context("screencast buffers missing")?;
+                    let slot = slots
+                        .get(index)
+                        .context("screencast buffer index out of range")?;
+                    (
+                        &slot.image as *const DmaBufImage,
+                        &slot.framebuffer as *const Framebuffer,
+                    )
+                };
+                // Safety: owned by self for this call.
+                unsafe {
+                    overlay_cursor_on_image(
+                        vulkan,
+                        &mut batch,
+                        &compositor,
+                        &self.gpu.surface_textures,
+                        render_pass,
+                        &*image_ptr,
+                        &*fb_ptr,
+                        out_w,
+                        out_h,
+                        self.cursor_state.draw_ref(),
+                        dest_px,
+                        dest_py,
+                    )?;
+                }
+                Ok(())
+            })();
+            self.gpu.compositor = Some(compositor);
+            result?;
+        }
+
         let vulkan = self
             .vulkan
             .as_ref()
@@ -1357,7 +1439,8 @@ impl RendererState {
     ///
     /// `origin`/`width`/`height` are the window AABB in compositor space. Layers are
     /// drawn with a view that maps that AABB onto `dest_width`×`dest_height`.
-    /// Clear is transparent; guides and cursor are omitted.
+    /// Clear is transparent. When `embed_cursor` is true the pointer is drawn if it
+    /// intersects the window.
     pub fn composite_window_to_screencast_buffer(
         &mut self,
         stream_id: u32,
@@ -1369,6 +1452,7 @@ impl RendererState {
         height: i32,
         dest_width: u32,
         dest_height: u32,
+        embed_cursor: bool,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             width > 0 && height > 0,
@@ -1410,6 +1494,18 @@ impl RendererState {
             dest: (0, 0, dest_width as i32, dest_height as i32),
         };
 
+        let draw_cursor = embed_cursor && !matches!(self.cursor_state, CursorState::Hidden);
+        let (dest_px, dest_py) = if draw_cursor {
+            let (x, y) = lumalla_shared::map_source_to_dest(
+                std::slice::from_ref(&view),
+                self.pointer_x as f64,
+                self.pointer_y as f64,
+            );
+            (x.round() as i32, y.round() as i32)
+        } else {
+            (0, 0)
+        };
+
         let mut batch = GpuWorkBatch::new();
         {
             let vulkan = self
@@ -1424,12 +1520,17 @@ impl RendererState {
                 .context("GPU compositor missing")?;
 
             let result = (|| -> anyhow::Result<()> {
+                let cursor = if draw_cursor {
+                    self.cursor_state.draw_ref()
+                } else {
+                    CursorDraw::Hidden
+                };
                 self.gpu.surface_textures.sync_scene(
                     vulkan,
                     &compositor,
                     &mut batch,
                     &frame_layers,
-                    CursorDraw::Hidden,
+                    cursor,
                     &CompositeMode::Full,
                     &HashSet::new(),
                     &HashMap::new(),
@@ -1459,6 +1560,11 @@ impl RendererState {
                     )
                 };
 
+                let cursor = if draw_cursor {
+                    self.cursor_state.draw_ref()
+                } else {
+                    CursorDraw::Hidden
+                };
                 // Safety: both are owned by self for this call.
                 unsafe {
                     composite_layers_to_image(
@@ -1475,6 +1581,9 @@ impl RendererState {
                         [0.0, 0.0, 0.0, 0.0],
                         &view,
                         &frame_layers,
+                        cursor,
+                        dest_px,
+                        dest_py,
                     )?;
                 }
                 Ok(())
@@ -1512,6 +1621,7 @@ impl RendererState {
         height: i32,
         dest_width: u32,
         dest_height: u32,
+        embed_cursor: bool,
     ) -> anyhow::Result<CapturedImage> {
         let index = self
             .next_free_screencast_buffer(stream_id)
@@ -1526,6 +1636,7 @@ impl RendererState {
             height,
             dest_width,
             dest_height,
+            embed_cursor,
         )?;
         self.wait_screencast_buffer_gpu(stream_id, index)?;
 
@@ -1594,6 +1705,7 @@ impl RendererState {
         dest_width: u32,
         dest_height: u32,
         outputs: &[Output],
+        embed_cursor: bool,
     ) -> anyhow::Result<CapturedImage> {
         let index = self
             .next_free_screencast_buffer(stream_id)
@@ -1608,6 +1720,7 @@ impl RendererState {
             dest_width,
             dest_height,
             outputs,
+            embed_cursor,
         )?;
         self.wait_screencast_buffer_gpu(stream_id, index)?;
 

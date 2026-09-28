@@ -34,8 +34,8 @@ use lumalla_screencast::{
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
-    Mods, MutterScreenCastTarget, OpKind, encode_user_data, message_loop_with_channel,
-    monotonic_deadline_after, ring::MESSAGE_CHANNEL_TOKEN,
+    Mods, MutterScreenCastTarget, OpKind, ScreencastCursorMode, encode_user_data,
+    message_loop_with_channel, monotonic_deadline_after, ring::MESSAGE_CHANNEL_TOKEN,
 };
 
 use crate::args::Args;
@@ -975,6 +975,7 @@ impl AppData {
                                 max_fps,
                                 dma_exports,
                                 FormatOffer::PreferMemFd,
+                                ScreencastCursorMode::Embedded,
                             )
                             .map_err(|err| {
                                 self.renderer_state.free_screencast_buffers(stream_id);
@@ -1008,6 +1009,7 @@ impl AppData {
                         name,
                         max_fps,
                         FormatOffer::PreferMemFd,
+                        ScreencastCursorMode::Embedded,
                     );
                     match start_result {
                         Ok(stream_id) => {
@@ -1041,6 +1043,7 @@ impl AppData {
                     mutter_stream_id,
                     session_id,
                     target,
+                    cursor_mode,
                 } => {
                     let start_result = (|| -> Result<u32, String> {
                         match target {
@@ -1101,6 +1104,7 @@ impl AppData {
                                         max_fps,
                                         dma_exports,
                                         FormatOffer::DmaOnly,
+                                        cursor_mode,
                                     )
                                     .map_err(|err| {
                                         self.renderer_state.free_screencast_buffers(stream_id);
@@ -1114,6 +1118,7 @@ impl AppData {
                                     name,
                                     30,
                                     FormatOffer::DmaOnly,
+                                    cursor_mode,
                                 )
                             }
                         }
@@ -2080,6 +2085,7 @@ impl AppData {
         name: String,
         max_fps: u32,
         format_offer: FormatOffer,
+        cursor_mode: ScreencastCursorMode,
     ) -> Result<u32, String> {
         let id = if window_id == 0 { None } else { Some(window_id) };
         let (resolved_id, x, y, width, height, _layers) = self
@@ -2129,6 +2135,7 @@ impl AppData {
                 max_fps,
                 dma_exports,
                 format_offer,
+                cursor_mode,
             )
             .map_err(|err| {
                 self.renderer_state.free_screencast_buffers(stream_id);
@@ -2264,6 +2271,12 @@ impl AppData {
                 continue;
             }
 
+            let embed_cursor = self
+                .screencast
+                .streams()
+                .get(&stream_id)
+                .is_some_and(|s| s.embed_cursor());
+
             let blit_result = match self.screencast.stream_source(stream_id) {
                 Some(ScreencastSource::Window { window_id }) => {
                     match self.display_state.window_capture_layers(Some(window_id)) {
@@ -2273,14 +2286,14 @@ impl AppData {
                                 .map(|s| (s.client_id.get(), s.surface_id.get()))
                                 .collect();
                             self.renderer_state.composite_window_to_screencast_buffer(
-                                stream_id, index, &keys, ox, oy, w, h, out_w, out_h,
+                                stream_id, index, &keys, ox, oy, w, h, out_w, out_h, embed_cursor,
                             )
                         }
                         None => Err(anyhow::anyhow!("window {window_id} gone")),
                     }
                 }
                 _ => self.renderer_state.blit_region_to_screencast_buffer(
-                    stream_id, index, x, y, width, height, out_w, out_h, &outputs,
+                    stream_id, index, x, y, width, height, out_w, out_h, &outputs, embed_cursor,
                 ),
             };
 
@@ -2313,7 +2326,7 @@ impl AppData {
 
         // MemFd path: GPU-scale into the small screencast buffer, then read that back.
         // Readback still waits on the GPU (capped to ≤5 fps / ≤1280).
-        let due: Vec<(u32, ScreencastSource, i32, i32, i32, i32)> = self
+        let due: Vec<(u32, ScreencastSource, i32, i32, i32, i32, bool)> = self
             .screencast
             .streams()
             .values()
@@ -2326,11 +2339,12 @@ impl AppData {
                     stream.y,
                     stream.width,
                     stream.height,
+                    stream.embed_cursor(),
                 )
             })
             .collect();
 
-        for (stream_id, source, x, y, width, height) in due {
+        for (stream_id, source, x, y, width, height, embed_cursor) in due {
             let (memfd_w, memfd_h) = fit_memfd_output_size(width as u32, height as u32);
             let capture_result = match source {
                 ScreencastSource::Window { window_id } => {
@@ -2342,14 +2356,14 @@ impl AppData {
                                 .collect();
                             let (mw, mh) = fit_memfd_output_size(w as u32, h as u32);
                             self.renderer_state.capture_window_for_screencast(
-                                stream_id, &keys, ox, oy, w, h, mw, mh,
+                                stream_id, &keys, ox, oy, w, h, mw, mh, embed_cursor,
                             )
                         }
                         None => Err(anyhow::anyhow!("window {window_id} gone")),
                     }
                 }
                 ScreencastSource::Region { .. } => self.renderer_state.capture_region_for_screencast(
-                    stream_id, x, y, width, height, memfd_w, memfd_h, &outputs,
+                    stream_id, x, y, width, height, memfd_w, memfd_h, &outputs, embed_cursor,
                 ),
             };
             match capture_result {

@@ -20,7 +20,7 @@ use anyhow::{Context, anyhow};
 use log::{debug, error, info, warn};
 use once_cell::sync::OnceCell;
 use lumalla_shared::{
-    fit_screencast_dma_size, fit_screencast_memfd_size,
+    ScreencastCursorMode, fit_screencast_dma_size, fit_screencast_memfd_size,
 };
 use pipewire::{
     self as pw,
@@ -142,6 +142,7 @@ struct StartingStream {
     out_width: u32,
     out_height: u32,
     max_fps: u32,
+    cursor_mode: ScreencastCursorMode,
     dma_negotiated: Arc<AtomicBool>,
 }
 
@@ -259,6 +260,8 @@ pub struct ActiveStream {
     pub out_height: u32,
     /// Maximum capture rate.
     pub max_fps: u32,
+    /// Whether to composite the cursor into captured frames.
+    pub cursor_mode: ScreencastCursorMode,
     /// Last successful capture time.
     pub last_capture: Option<Instant>,
     /// Set by the PipeWire thread when DMA-BUF format is negotiated.
@@ -283,6 +286,11 @@ impl ActiveStream {
     /// Whether the consumer negotiated DMA-BUF.
     pub fn uses_dmabuf(&self) -> bool {
         self.dma_negotiated.load(Ordering::Acquire)
+    }
+
+    /// Whether the cursor should be composited into capture buffers.
+    pub fn embed_cursor(&self) -> bool {
+        self.cursor_mode.embed()
     }
 }
 
@@ -498,6 +506,7 @@ impl ScreencastManager {
         max_fps: u32,
         dma_exports: Vec<DmaBufferExport>,
         format_offer: FormatOffer,
+        cursor_mode: ScreencastCursorMode,
     ) -> anyhow::Result<u32> {
         anyhow::ensure!(width > 0 && height > 0, "stream region must be positive");
         anyhow::ensure!(
@@ -549,12 +558,13 @@ impl ScreencastManager {
                 out_width,
                 out_height,
                 max_fps: max_fps.max(1).min(SCREENCAST_DMA_MAX_FPS),
+                cursor_mode,
                 dma_negotiated,
             },
         );
 
         info!(
-            "Starting PipeWire stream id={stream_id} source={source:?} capture={width}x{height} out={out_width}x{out_height} offer={format_offer:?}"
+            "Starting PipeWire stream id={stream_id} source={source:?} capture={width}x{height} out={out_width}x{out_height} offer={format_offer:?} cursor={cursor_mode:?}"
         );
         Ok(stream_id)
     }
@@ -591,6 +601,7 @@ impl ScreencastManager {
                         out_width: starting.out_width,
                         out_height: starting.out_height,
                         max_fps: starting.max_fps,
+                        cursor_mode: starting.cursor_mode,
                         last_capture: None,
                         dma_negotiated: starting.dma_negotiated,
                     },

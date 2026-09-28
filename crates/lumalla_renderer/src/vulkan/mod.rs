@@ -35,6 +35,7 @@ pub use framebuffer::Framebuffer;
 pub use gpu_compositor::{
     GpuCompositor, GpuWorkBatch, PendingGpuSubmit, SurfaceTextureCache, blit_image_region,
     composite_layers_to_image, composite_to_scanout, copy_scanout_frame, map_rect_through_view,
+    overlay_cursor_on_image,
 };
 pub use image::Image;
 pub use instance::VulkanContext;

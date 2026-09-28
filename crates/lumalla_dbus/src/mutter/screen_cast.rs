@@ -11,7 +11,10 @@ use std::{
 
 use log::{debug, warn};
 use lumalla_ipc::types::OutputInfo;
-use lumalla_shared::{Comms, MainMessage, MutterScreenCastTarget, WindowState, fit_screencast_portal_size};
+use lumalla_shared::{
+    Comms, MainMessage, MutterScreenCastTarget, ScreencastCursorMode, WindowState,
+    fit_screencast_portal_size,
+};
 use zbus::{
     fdo,
     interface,
@@ -117,7 +120,7 @@ impl ScreenCast {
 #[zvariant(signature = "dict")]
 struct RecordMonitorProperties {
     #[zvariant(rename = "cursor-mode")]
-    _cursor_mode: Option<u32>,
+    cursor_mode: Option<u32>,
     #[zvariant(rename = "is-recording")]
     _is_recording: Option<bool>,
 }
@@ -128,7 +131,7 @@ struct RecordWindowProperties {
     #[zvariant(rename = "window-id")]
     window_id: Option<u64>,
     #[zvariant(rename = "cursor-mode")]
-    _cursor_mode: Option<u32>,
+    cursor_mode: Option<u32>,
     #[zvariant(rename = "is-recording")]
     _is_recording: Option<bool>,
 }
@@ -167,6 +170,7 @@ struct Stream {
     target: StreamTarget,
     position: (i32, i32),
     size: (i32, i32),
+    cursor_mode: ScreencastCursorMode,
     was_started: Arc<AtomicBool>,
     comms: Comms,
 }
@@ -259,7 +263,7 @@ impl Session {
     fn record_monitor(
         &mut self,
         connector: &str,
-        _properties: RecordMonitorProperties,
+        properties: RecordMonitorProperties,
     ) -> fdo::Result<OwnedObjectPath> {
         debug!("Mutter RecordMonitor connector={connector}");
 
@@ -280,6 +284,7 @@ impl Session {
             .map_err(|err| fdo::Error::Failed(format!("invalid stream path: {err}")))?;
 
         let (out_w, out_h) = fit_screencast_portal_size(output.width, output.height);
+        let cursor_mode = ScreencastCursorMode::from_mutter(properties.cursor_mode.unwrap_or(0));
 
         let stream = Stream {
             id: stream_id,
@@ -289,6 +294,7 @@ impl Session {
             },
             position: (output.x, output.y),
             size: (out_w, out_h),
+            cursor_mode,
             was_started: Arc::new(AtomicBool::new(false)),
             comms: self.comms.clone(),
         };
@@ -354,6 +360,7 @@ impl Session {
             .map_err(|err| fdo::Error::Failed(format!("invalid stream path: {err}")))?;
 
         let (out_w, out_h) = fit_screencast_portal_size(width, height);
+        let cursor_mode = ScreencastCursorMode::from_mutter(properties.cursor_mode.unwrap_or(0));
 
         let stream = Stream {
             id: stream_id,
@@ -361,6 +368,7 @@ impl Session {
             target: StreamTarget::Window { window_id },
             position: (x, y),
             size: (out_w, out_h),
+            cursor_mode,
             was_started: Arc::new(AtomicBool::new(false)),
             comms: self.comms.clone(),
         };
@@ -438,6 +446,7 @@ impl Stream {
             mutter_stream_id: self.id,
             session_id: self.session_id,
             target,
+            cursor_mode: self.cursor_mode,
         });
     }
 }
@@ -460,7 +469,7 @@ mod tests {
     fn record_window_properties_parse_window_id() {
         let props = RecordWindowProperties {
             window_id: Some(42),
-            _cursor_mode: None,
+            cursor_mode: None,
             _is_recording: Some(true),
         };
         assert_eq!(props.window_id, Some(42));
