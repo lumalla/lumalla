@@ -56,6 +56,7 @@ use crate::vulkan::{
 struct GpuRenderResources {
     compositor: Option<GpuCompositor>,
     surface_textures: SurfaceTextureCache,
+    guide_labels: crate::bitmap_font::GuideLabelCache,
 }
 
 impl GpuRenderResources {
@@ -63,12 +64,14 @@ impl GpuRenderResources {
         Self {
             compositor: None,
             surface_textures: SurfaceTextureCache::new(),
+            guide_labels: crate::bitmap_font::GuideLabelCache::new(),
         }
     }
 
     fn clear(&mut self) {
         self.compositor = None;
         self.surface_textures.clear();
+        self.guide_labels.clear();
     }
 
     fn ensure_compositor(&mut self, vulkan: &mut VulkanContext) -> anyhow::Result<()> {
@@ -3050,19 +3053,21 @@ impl RendererState {
                 .compositor
                 .take()
                 .context("GPU compositor missing after init")?;
-            let label_uploads: Vec<(u32, Vec<u8>, u32, u32)> = self
-                .guides
-                .iter()
-                .enumerate()
-                .filter(|(_, guide)| !guide.label.is_empty())
-                .map(|(index, guide)| {
-                    let (pixels, width, height) = crate::bitmap_font::rasterize_label(
-                        &guide.label,
-                        guide.effective_label_color(),
-                    );
-                    (index as u32, pixels, width, height)
-                })
-                .collect();
+            // Drop CPU rasters no longer referenced by current guides.
+            {
+                let live: std::collections::HashSet<_> = self
+                    .guides
+                    .iter()
+                    .filter(|guide| !guide.label.is_empty())
+                    .map(|guide| {
+                        crate::bitmap_font::GuideLabelKey::new(
+                            guide.label.clone(),
+                            guide.effective_label_color(),
+                        )
+                    })
+                    .collect();
+                self.gpu.guide_labels.retain(|key| live.contains(key));
+            }
             let gpu_result = (|| -> anyhow::Result<()> {
                 self.gpu.surface_textures.sync_scene(
                     vulkan,
@@ -3077,16 +3082,37 @@ impl RendererState {
                     pointer_damage || cursor_buffer_dirty,
                 )?;
 
-                for (index, pixels, width, height) in &label_uploads {
-                    self.gpu.surface_textures.sync_guide_label(
-                        vulkan,
-                        &compositor,
-                        &mut batch,
-                        *index,
-                        pixels,
-                        *width,
-                        *height,
-                    )?;
+                self.gpu.surface_textures.prune_guide_labels(
+                    vulkan.device(),
+                    &compositor.descriptor_pool,
+                    self.guides.len() as u32,
+                )?;
+
+                {
+                    let GpuRenderResources {
+                        guide_labels,
+                        surface_textures,
+                        ..
+                    } = &mut self.gpu;
+                    for (index, guide) in self.guides.iter().enumerate() {
+                        if guide.label.is_empty() {
+                            continue;
+                        }
+                        let color = guide.effective_label_color();
+                        let key =
+                            crate::bitmap_font::GuideLabelKey::new(guide.label.clone(), color);
+                        let raster = guide_labels.get_or_rasterize(&guide.label, color);
+                        surface_textures.sync_guide_label(
+                            vulkan,
+                            &compositor,
+                            &mut batch,
+                            index as u32,
+                            &key,
+                            &raster.pixels,
+                            raster.width,
+                            raster.height,
+                        )?;
+                    }
                 }
 
                 vulkan.ensure_scanout_render_pass()?;

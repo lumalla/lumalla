@@ -1,5 +1,5 @@
 /// Premultiplied-friendly RGBA color (channels 0–255, straight alpha).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColorRgba {
     /// Red channel.
     pub r: u8,

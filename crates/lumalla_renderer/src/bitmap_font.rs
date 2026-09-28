@@ -4,6 +4,8 @@
 //! pixels). Glyphs: `A–Z`, `a–z`, `0–9`. Any other character (including space)
 //! advances one blank cell.
 
+use std::collections::HashMap;
+
 use lumalla_shared::ColorRgba;
 
 const GLYPH_SIZE: u32 = 8;
@@ -142,6 +144,64 @@ pub fn rasterize_label(text: &str, color: ColorRgba) -> (Vec<u8>, u32, u32) {
     (pixels, width, height)
 }
 
+/// Cache key for a rasterized guide label.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GuideLabelKey {
+    pub text: String,
+    pub color: ColorRgba,
+}
+
+impl GuideLabelKey {
+    pub fn new(text: impl Into<String>, color: ColorRgba) -> Self {
+        Self {
+            text: text.into(),
+            color,
+        }
+    }
+}
+
+/// Premultiplied BGRA8 raster of a guide label.
+#[derive(Debug, Clone)]
+pub struct RasterizedLabel {
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// CPU-side cache of rasterized guide labels keyed by text + color.
+#[derive(Debug, Default)]
+pub struct GuideLabelCache {
+    rasters: HashMap<GuideLabelKey, RasterizedLabel>,
+}
+
+impl GuideLabelCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.rasters.clear();
+    }
+
+    /// Return a cached raster, creating it on first use.
+    pub fn get_or_rasterize(&mut self, text: &str, color: ColorRgba) -> &RasterizedLabel {
+        let key = GuideLabelKey::new(text, color);
+        self.rasters.entry(key).or_insert_with(|| {
+            let (pixels, width, height) = rasterize_label(text, color);
+            RasterizedLabel {
+                pixels,
+                width,
+                height,
+            }
+        })
+    }
+
+    /// Drop rasters that are not in `keep`.
+    pub fn retain(&mut self, mut keep: impl FnMut(&GuideLabelKey) -> bool) {
+        self.rasters.retain(|key, _| keep(key));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +214,20 @@ mod tests {
         let cell_bytes = (CELL_WIDTH as usize) * 4;
         let mid = cell_bytes;
         assert!(pixels[mid..mid + cell_bytes].iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn label_cache_reuses_raster() {
+        let mut cache = GuideLabelCache::new();
+        let first = cache.get_or_rasterize("Hi", ColorRgba::WHITE).pixels.as_ptr();
+        let second = cache.get_or_rasterize("Hi", ColorRgba::WHITE).pixels.as_ptr();
+        assert_eq!(first, second);
+        assert_ne!(
+            first,
+            cache
+                .get_or_rasterize("Hi", ColorRgba::DEFAULT_STROKE)
+                .pixels
+                .as_ptr()
+        );
     }
 }

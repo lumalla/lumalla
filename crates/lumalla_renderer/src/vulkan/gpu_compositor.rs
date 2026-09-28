@@ -9,7 +9,7 @@ use anyhow::Context;
 use ash::vk;
 use lumalla_shared::{BufferTransform, Guide, GuideKind, GuideLayer, View};
 
-use crate::bitmap_font;
+use crate::bitmap_font::{self, GuideLabelKey};
 use crate::default_cursor::default_cursor_frame;
 use crate::scene_backing::{CompositeMode, DamageRect, UploadRect, buffer_damage_to_upload_rect};
 use crate::{CursorDraw, CursorFrame, DmabufAttachment, SurfaceFrame};
@@ -412,6 +412,8 @@ pub struct SurfaceTextureCache {
     textures: HashMap<(u32, u32), SurfaceTexture>,
     /// Parked DMA-BUF imports retained across buffer flips, keyed by `(owner_id, buffer_id)`.
     dmabuf_by_buffer: HashMap<(u32, u32), SurfaceTexture>,
+    /// Content last uploaded for each guide-label texture index.
+    guide_label_uploaded: HashMap<u32, GuideLabelKey>,
 }
 
 /// Soft cap on parked DMA-BUF imports per client (beyond the currently bound ones).
@@ -422,12 +424,14 @@ impl SurfaceTextureCache {
         Self {
             textures: HashMap::new(),
             dmabuf_by_buffer: HashMap::new(),
+            guide_label_uploaded: HashMap::new(),
         }
     }
 
     pub fn clear(&mut self) {
         self.textures.clear();
         self.dmabuf_by_buffer.clear();
+        self.guide_label_uploaded.clear();
     }
 
     pub fn remove(&mut self, key: (u32, u32)) {
@@ -919,17 +923,32 @@ impl SurfaceTextureCache {
     }
 
     /// Upload or replace a guide label texture keyed by guide list index.
+    ///
+    /// Skips the GPU upload when `content_key` matches the last successful upload
+    /// for this index and the texture still exists at the expected size.
     pub fn sync_guide_label(
         &mut self,
         vulkan: &mut VulkanContext,
         compositor: &GpuCompositor,
         batch: &mut GpuWorkBatch,
         guide_index: u32,
+        content_key: &GuideLabelKey,
         pixels: &[u8],
         width: u32,
         height: u32,
     ) -> anyhow::Result<()> {
         let key = (GUIDE_LABEL_OWNER, guide_index);
+        if self.guide_label_uploaded.get(&guide_index) == Some(content_key)
+            && self.textures.get(&key).is_some_and(|tex| {
+                matches!(tex.backing, TextureBacking::Shm(_))
+                    && tex.extent().is_some_and(|extent| {
+                        extent.width == width && extent.height == height
+                    })
+            })
+        {
+            return Ok(());
+        }
+
         self.sync_shm_pixels(
             vulkan,
             compositor,
@@ -941,7 +960,34 @@ impl SurfaceTextureCache {
             height,
             width.saturating_mul(4),
             WL_SHM_FORMAT_ARGB8888,
-        )
+        )?;
+        self.guide_label_uploaded
+            .insert(guide_index, content_key.clone());
+        Ok(())
+    }
+
+    /// Drop guide-label textures (and upload tracking) for indices ≥ `live_count`.
+    pub fn prune_guide_labels(
+        &mut self,
+        device: &Device,
+        pool: &DescriptorPool,
+        live_count: u32,
+    ) -> anyhow::Result<()> {
+        let doomed: Vec<(u32, u32)> = self
+            .textures
+            .keys()
+            .copied()
+            .filter(|(owner, index)| *owner == GUIDE_LABEL_OWNER && *index >= live_count)
+            .collect();
+        for key in doomed {
+            if let Some(tex) = self.textures.remove(&key) {
+                pool.free_set(device, tex.descriptor_set)?;
+            }
+            self.guide_label_uploaded.remove(&key.1);
+        }
+        self.guide_label_uploaded
+            .retain(|index, _| *index < live_count);
+        Ok(())
     }
 
     pub fn sync_scene(
