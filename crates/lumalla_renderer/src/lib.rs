@@ -926,6 +926,7 @@ impl RendererState {
         }
         self.note_cursor_redraw();
         self.cursor_state = CursorState::Default;
+        self.cursor_buffer_dirty = true;
         self.note_cursor_redraw();
         if self.any_hw_cursor_capable() {
             self.flush_hw_cursors()?;
@@ -3079,7 +3080,7 @@ impl RendererState {
                     &dirty_surfaces,
                     &pending_surface_buffer_damage,
                     &output_local_damage,
-                    pointer_damage || cursor_buffer_dirty,
+                    cursor_buffer_dirty,
                 )?;
 
                 self.gpu.surface_textures.prune_guide_labels(

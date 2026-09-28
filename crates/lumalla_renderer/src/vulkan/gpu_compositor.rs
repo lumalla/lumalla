@@ -864,6 +864,15 @@ impl SurfaceTextureCache {
                     .is_none_or(|extent| extent.width != width || extent.height != height)
         });
 
+        // Same SHM buffer already on the GPU — skip staging upload (e.g. pointer moves).
+        if !needs_create
+            && self.textures.get(&key).is_some_and(|tex| {
+                tex.uploaded && tex.buffer_id == buffer_id && tex.wl_format == wl_format
+            })
+        {
+            return Ok(());
+        }
+
         if needs_create {
             let image = vulkan.create_sampled_image(width, height)?;
             let descriptor_set = compositor
