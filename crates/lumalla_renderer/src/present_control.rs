@@ -1,11 +1,10 @@
 //! Per-output present wake timers and scheduling glue owned by [`RendererState`].
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::io;
-use std::pin::Pin;
 use std::time::Instant;
 
-use io_uring::types::Timespec;
 use log::{debug, error, warn};
 use lumalla_shared::{
     EventLoop, monotonic_deadline_after,
@@ -13,7 +12,8 @@ use lumalla_shared::{
 use stumpalo::Arena;
 
 use crate::drm::CompletedPageFlip;
-use crate::scheduler::{FrameTimings, RenderScheduler};
+use crate::output::{OutputId, OutputPresentControl, OutputState};
+use crate::scheduler::FrameTimings;
 use crate::{
     PresentStatus, RendererState, SOLID_CLEAR_COLOR,
 };
@@ -30,56 +30,6 @@ pub const PRESENT_WAKE_TOKEN_COUNT: u64 = 1024;
 /// Returns true when `token` is in the present-wake timeout range.
 pub fn is_present_wake_token(token: u64) -> bool {
     (PRESENT_WAKE_TOKEN_BASE..PRESENT_WAKE_TOKEN_BASE + PRESENT_WAKE_TOKEN_COUNT).contains(&token)
-}
-
-/// Per-output adaptive schedule + absolute wake timer state.
-pub(crate) struct OutputPresentControl {
-    pub(crate) scheduler: RenderScheduler,
-    pub(crate) wake_token: u64,
-    pub(crate) wake_ts: Box<Timespec>,
-    pub(crate) wake_deadline: Option<(u64, u32)>,
-    pub(crate) wake_armed: bool,
-    /// Scene content not yet presented on this output.
-    pub(crate) content_dirty: bool,
-}
-
-impl OutputPresentControl {
-    fn new(wake_token: u64, refresh_mhz: i32) -> Self {
-        Self {
-            scheduler: RenderScheduler::new(refresh_mhz),
-            wake_token,
-            wake_ts: Box::new(Timespec::new()),
-            wake_deadline: None,
-            wake_armed: false,
-            content_dirty: false,
-        }
-    }
-
-    fn clear_wake(&mut self, event_loop: &mut EventLoop) -> io::Result<()> {
-        if !self.wake_armed {
-            self.wake_deadline = None;
-            return Ok(());
-        }
-        event_loop.cancel_timeout(self.wake_token)?;
-        self.wake_armed = false;
-        self.wake_deadline = None;
-        Ok(())
-    }
-
-    fn set_wake(&mut self, event_loop: &mut EventLoop, sec: u64, nsec: u32) -> io::Result<()> {
-        if self.wake_armed && self.wake_deadline == Some((sec, nsec)) {
-            return Ok(());
-        }
-        if self.wake_armed {
-            event_loop.cancel_timeout(self.wake_token)?;
-            self.wake_armed = false;
-        }
-        *self.wake_ts = Timespec::new().sec(sec).nsec(nsec);
-        event_loop.submit_timeout_absolute(Pin::new(self.wake_ts.as_ref()), self.wake_token)?;
-        self.wake_armed = true;
-        self.wake_deadline = Some((sec, nsec));
-        Ok(())
-    }
 }
 
 /// Result of arming/ticking one or more outputs.
@@ -121,11 +71,11 @@ impl RendererState {
             warn!("Unable to sync output present controls: {err}");
             return;
         }
-        for control in self.output_presents.values_mut() {
+        for control in self.outputs.values_mut().map(|o| &mut o.present) {
             control.content_dirty = true;
             control.scheduler.mark_dirty(now);
         }
-        if !self.output_presents.is_empty() {
+        if !self.outputs.is_empty() {
             self.scene_dirty = true;
         }
     }
@@ -136,18 +86,18 @@ impl RendererState {
             warn!("Unable to sync output present controls: {err}");
             return;
         }
-        for control in self.output_presents.values_mut() {
+        for control in self.outputs.values_mut().map(|o| &mut o.present) {
             control.content_dirty = true;
             control.scheduler.request_immediate();
         }
-        if !self.output_presents.is_empty() {
+        if !self.outputs.is_empty() {
             self.scene_dirty = true;
         }
     }
 
     /// Cancel all per-output present-wake timeouts (e.g. shutdown).
     pub fn clear_all_present_wakes(&mut self, event_loop: &mut EventLoop) -> io::Result<()> {
-        for control in self.output_presents.values_mut() {
+        for control in self.outputs.values_mut().map(|o| &mut o.present) {
             control.clear_wake(event_loop)?;
         }
         Ok(())
@@ -163,7 +113,7 @@ impl RendererState {
     ) -> io::Result<PresentTickResult> {
         self.sync_output_present_controls(Some(event_loop), arena)?;
         let mut names = allocator_api2::vec::Vec::new_in(arena);
-        names.extend(self.output_presents.keys().cloned());
+        names.extend(self.outputs.keys().cloned());
         let mut presented_outputs = Vec::new();
         let mut last_timings = None;
 
@@ -202,9 +152,9 @@ impl RendererState {
         seat_enabled: bool,
     ) -> io::Result<PresentTickResult> {
         let Some(name) = self
-            .output_presents
+            .outputs
             .iter()
-            .find_map(|(name, control)| (control.wake_token == wake_token).then(|| name.clone()))
+            .find_map(|(name, output)| (output.present.wake_token == wake_token).then(|| name.clone()))
         else {
             warn!("Ignoring present wake for unknown token {wake_token}");
             return Ok(PresentTickResult {
@@ -215,7 +165,7 @@ impl RendererState {
             });
         };
 
-        if let Some(control) = self.output_presents.get_mut(&name) {
+        if let Some(control) = self.outputs.get_mut(&name).map(|o| &mut o.present) {
             control.wake_armed = false;
             control.wake_deadline = None;
         }
@@ -268,17 +218,17 @@ impl RendererState {
 
         for (output_name, flip) in outcome.completed {
             let refresh_ns = self
-                .output_presents
+                .outputs
                 .get(&output_name)
-                .map(|c| {
-                    c.scheduler
+                .map(|o| {
+                    o.present.scheduler
                         .frame_period()
                         .as_nanos()
                         .min(u128::from(u32::MAX)) as u32
                 })
                 .unwrap_or(16_666_666);
 
-            if let Some(control) = self.output_presents.get_mut(&output_name) {
+            if let Some(control) = self.outputs.get_mut(&output_name).map(|o| &mut o.present) {
                 let content_dirty = control.content_dirty;
                 control.scheduler.after_flip(
                     now,
@@ -323,13 +273,13 @@ impl RendererState {
         let now = Instant::now();
         let flip_idle = self.output_flip_idle(name);
         let content_dirty = self
-            .output_presents
+            .outputs
             .get(name)
-            .is_some_and(|c| c.content_dirty);
+            .is_some_and(|o| o.present.content_dirty);
         let scene_or_content = content_dirty || self.scene_dirty;
 
         let wake_at = {
-            let Some(control) = self.output_presents.get_mut(name) else {
+            let Some(control) = self.outputs.get_mut(name).map(|o| &mut o.present) else {
                 return Ok(OutputTick {
                     presented: false,
                     timings: None,
@@ -345,7 +295,7 @@ impl RendererState {
 
         match wake_at {
             None => {
-                if let Some(control) = self.output_presents.get_mut(name) {
+                if let Some(control) = self.outputs.get_mut(name).map(|o| &mut o.present) {
                     control.clear_wake(event_loop)?;
                 }
                 Ok(OutputTick {
@@ -354,7 +304,7 @@ impl RendererState {
                 })
             }
             Some(at) if at <= now => {
-                if let Some(control) = self.output_presents.get_mut(name) {
+                if let Some(control) = self.outputs.get_mut(name).map(|o| &mut o.present) {
                     control.clear_wake(event_loop)?;
                 }
                 let tick = self.tick_output(name, pending_protocol_work, seat_enabled);
@@ -362,11 +312,11 @@ impl RendererState {
                 let now = Instant::now();
                 let flip_idle = self.output_flip_idle(name);
                 let content_dirty = self
-                    .output_presents
+                    .outputs
                     .get(name)
-                    .is_some_and(|c| c.content_dirty);
+                    .is_some_and(|o| o.present.content_dirty);
                 let scene_or_content = content_dirty || self.scene_dirty;
-                let wake_at = self.output_presents.get_mut(name).and_then(|control| {
+                let wake_at = self.outputs.get_mut(name).map(|o| &mut o.present).and_then(|control| {
                     control.scheduler.next_wake_at(
                         now,
                         scene_or_content,
@@ -377,7 +327,7 @@ impl RendererState {
                 if let Some(at) = wake_at.filter(|at| *at > now) {
                     let remaining = at.saturating_duration_since(now);
                     let (sec, nsec) = monotonic_deadline_after(remaining)?;
-                    if let Some(control) = self.output_presents.get_mut(name) {
+                    if let Some(control) = self.outputs.get_mut(name).map(|o| &mut o.present) {
                         control.set_wake(event_loop, sec, nsec)?;
                     }
                 }
@@ -387,7 +337,7 @@ impl RendererState {
                 let remaining = at.saturating_duration_since(now);
                 debug_assert!(!remaining.is_zero());
                 let (sec, nsec) = monotonic_deadline_after(remaining)?;
-                if let Some(control) = self.output_presents.get_mut(name) {
+                if let Some(control) = self.outputs.get_mut(name).map(|o| &mut o.present) {
                     control.set_wake(event_loop, sec, nsec)?;
                 }
                 Ok(OutputTick {
@@ -414,16 +364,16 @@ impl RendererState {
         let now = Instant::now();
         let flip_idle = self.output_flip_idle(name);
         let content_dirty = self
-            .output_presents
+            .outputs
             .get(name)
-            .is_some_and(|c| c.content_dirty);
+            .is_some_and(|o| o.present.content_dirty);
         let scene_or_content = content_dirty || self.scene_dirty;
 
         let should = self
-            .output_presents
+            .outputs
             .get(name)
-            .is_some_and(|c| {
-                c.scheduler.should_present(
+            .is_some_and(|o| {
+                o.present.scheduler.should_present(
                     now,
                     scene_or_content,
                     pending_protocol_work,
@@ -441,7 +391,7 @@ impl RendererState {
         match self.present_named(name, SOLID_CLEAR_COLOR, force) {
             Ok(outcome) => {
                 if outcome.presented {
-                    if let Some(control) = self.output_presents.get_mut(name) {
+                    if let Some(control) = self.outputs.get_mut(name).map(|o| &mut o.present) {
                         control.content_dirty = false;
                         control.scheduler.on_present_started(now);
                         if let Some(timings) = outcome.timings {
@@ -453,11 +403,11 @@ impl RendererState {
                     // global scene_dirty (it still reflects pre-recompute state and
                     // would force another immediate present on every cursor move).
                     if self
-                        .scanouts
+                        .outputs
                         .get(name)
-                        .is_some_and(|s| s.physical.is_none() && s.pending.is_none())
+                        .is_some_and(|s| s.physical.is_none() && !s.primary_flip_busy())
                     {
-                        if let Some(control) = self.output_presents.get_mut(name) {
+                        if let Some(control) = self.outputs.get_mut(name).map(|o| &mut o.present) {
                             control.scheduler.after_flip(
                                 now,
                                 false,
@@ -473,7 +423,7 @@ impl RendererState {
                 }
             }
             Err(err) => {
-                if let Some(control) = self.output_presents.get_mut(name) {
+                if let Some(control) = self.outputs.get_mut(name).map(|o| &mut o.present) {
                     control.scheduler.on_present_started(now);
                 }
                 error!("Unable to present output {name}: {err:#}");
@@ -486,17 +436,17 @@ impl RendererState {
     }
 
     fn recompute_scene_dirty(&mut self) {
-        self.scene_dirty = self.output_presents.values().any(|c| c.content_dirty);
+        self.scene_dirty = self.outputs.values().any(|o| o.present.content_dirty);
     }
 
     pub(crate) fn output_flip_idle(&self, name: &str) -> bool {
-        self.scanouts
+        self.outputs
             .get(name)
-            .map(|scanout| scanout.pending.is_none())
+            .map(|output| !output.primary_flip_busy())
             .unwrap_or(true)
     }
 
-    /// Ensure `output_presents` matches currently presentable outputs.
+    /// Ensure `outputs` present controls match currently presentable outputs.
     ///
     /// Removed outputs are only dropped when `event_loop` is provided so their
     /// armed timeouts can be cancelled.
@@ -511,27 +461,34 @@ impl RendererState {
             let mut desired_names = allocator_api2::vec::Vec::new_in(arena);
             desired_names.extend(desired.keys().cloned());
             let mut stale = allocator_api2::vec::Vec::new_in(arena);
-            for name in self.output_presents.keys() {
+            for name in self.outputs.keys() {
                 if !desired_names.iter().any(|desired| desired == name) {
                     stale.push(name.clone());
                 }
             }
             for name in stale {
-                if let Some(mut control) = self.output_presents.remove(&name) {
-                    control.clear_wake(event_loop)?;
-                    self.free_present_wake_tokens.push(control.wake_token);
+                if let Some(mut output) = self.outputs.remove(&name) {
+                    output.present.clear_wake(event_loop)?;
+                    self.free_present_wake_tokens.push(output.present.wake_token);
                     debug!("Removed present control for output {name}");
                 }
             }
         }
 
         for (name, refresh_mhz) in desired {
-            if let Some(control) = self.output_presents.get_mut(&name) {
-                control.scheduler.set_refresh_rate(refresh_mhz);
+            if let Some(output) = self.outputs.get_mut(&name) {
+                output.present.scheduler.set_refresh_rate(refresh_mhz);
             } else {
                 let token = self.alloc_present_wake_token()?;
-                self.output_presents
-                    .insert(name.clone(), OutputPresentControl::new(token, refresh_mhz));
+                let id = if self.virtual_outputs.contains_key(&name) {
+                    OutputId::virtual_output(name.clone())
+                } else {
+                    OutputId::physical(PathBuf::new(), 0, name.clone())
+                };
+                self.outputs.insert(
+                    name.clone(),
+                    OutputState::new(id, OutputPresentControl::new(token, refresh_mhz)),
+                );
                 debug!("Added present control for output {name} token={token}");
             }
         }
@@ -552,7 +509,7 @@ impl RendererState {
                     continue;
                 }
                 let refresh_mhz = self
-                    .scanouts
+                    .outputs
                     .get(&connector.name)
                     .and_then(|s| s.physical.as_ref())
                     .map(|p| (p.output.mode.refresh_hz() as i32).saturating_mul(1000).max(1))
@@ -570,7 +527,7 @@ impl RendererState {
         desired
     }
 
-    fn alloc_present_wake_token(&mut self) -> io::Result<u64> {
+    pub(crate) fn alloc_present_wake_token(&mut self) -> io::Result<u64> {
         if let Some(token) = self.free_present_wake_tokens.pop() {
             return Ok(token);
         }
@@ -599,6 +556,7 @@ pub(crate) struct NamedFlipDispatchOutcome<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::RenderScheduler;
     use std::time::Duration;
 
     #[test]

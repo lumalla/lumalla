@@ -17,6 +17,7 @@ pub mod vulkan;
 
 mod bitmap_font;
 mod default_cursor;
+mod output;
 mod present_control;
 mod scanout_pool;
 mod scene_backing;
@@ -25,13 +26,16 @@ pub mod scheduler;
 use crate::drm::{
     CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, FlipEventQueue, ModeBlob,
     atomic_disable_output, atomic_modeset, atomic_page_flip, atomic_set_plane_fb,
-    dispatch_drm_events, resolve_connected_output,
+    dispatch_drm_events, probe_device_topology, resolve_connected_output,
 };
 pub use crate::present_control::{
     CompletedFlipEffect, FlipSideEffects, PRESENT_WAKE_TOKEN_BASE, PRESENT_WAKE_TOKEN_COUNT,
     PresentTickResult, is_present_wake_token,
 };
-use crate::present_control::{NamedFlipDispatchOutcome, OutputPresentControl};
+use crate::present_control::NamedFlipDispatchOutcome;
+use crate::output::{
+    DrmDeviceTopology, OutputId, OutputPresentControl, OutputState, PhysicalOutput,
+};
 use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
 use crate::scene_backing::DamageRect;
 pub use crate::scene_backing::{
@@ -314,25 +318,6 @@ impl CursorFrame {
     }
 }
 
-struct PhysicalScanout {
-    drm_path: PathBuf,
-    output: ConnectedOutput,
-    /// Owned so the CRTC's MODE_ID blob is not destroyed while still active.
-    #[allow(dead_code)]
-    mode_blob: ModeBlob,
-}
-
-struct OutputScanout {
-    /// `None` for virtual (non-KMS) outputs.
-    physical: Option<PhysicalScanout>,
-    /// Buffer currently owned by the CRTC (or last committed / completed virtual present).
-    current: ScanoutBuffer,
-    /// Buffer waiting for page-flip completion; must not be dropped yet.
-    pending: Option<ScanoutBuffer>,
-    /// Newest buffer to flip after `pending` completes.
-    queued: Option<ScanoutBuffer>,
-}
-
 /// Config-created output that presents without KMS export/modeset.
 #[derive(Debug, Clone)]
 struct VirtualOutput {
@@ -343,8 +328,10 @@ struct VirtualOutput {
 }
 
 pub struct RendererState {
-    // Drop order: scanouts → scanout_pool → vulkan → drm_devices.
+    // Drop order: outputs → scanout_pool → vulkan → drm_devices.
     drm_devices: DrmDevices,
+    /// CRTC/plane inventory per open DRM card.
+    topologies: HashMap<PathBuf, DrmDeviceTopology>,
     vulkan: Option<VulkanContext>,
     scanout_pool: ScanoutBufferPool,
     /// Configured render device (`None` = auto).
@@ -357,9 +344,8 @@ pub struct RendererState {
     output_views: HashMap<String, Vec<View>>,
     /// Compositor-drawn guides (scene space), back-to-front within each layer.
     guides: Vec<Guide>,
-    scanouts: HashMap<String, OutputScanout>,
-    /// Per-output schedule + present-wake timeout state.
-    output_presents: HashMap<String, OutputPresentControl>,
+    /// Per-output plane pipelines + present pacing.
+    outputs: HashMap<String, OutputState>,
     next_present_wake_token: u64,
     free_present_wake_tokens: Vec<u64>,
     /// Cached modeset-resolved present targets; invalidated on hotplug/config.
@@ -429,6 +415,7 @@ impl RendererState {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
             drm_devices: DrmDevices::new()?,
+            topologies: HashMap::new(),
             vulkan: None,
             scanout_pool: ScanoutBufferPool::new(),
             render_device: None,
@@ -436,8 +423,7 @@ impl RendererState {
             virtual_outputs: HashMap::new(),
             output_views: HashMap::new(),
             guides: Vec::new(),
-            scanouts: HashMap::new(),
-            output_presents: HashMap::new(),
+            outputs: HashMap::new(),
             next_present_wake_token: 0,
             free_present_wake_tokens: Vec::new(),
             cached_present_targets: None,
@@ -549,8 +535,8 @@ impl RendererState {
             info!("Removed virtual output {name}");
             self.output_views.remove(name);
             self.invalidate_present_targets();
-            if let Some(scanout) = self.scanouts.remove(name) {
-                self.release_output_scanout(scanout);
+            if let Some(output) = self.outputs.remove(name) {
+                self.release_output_state(output);
             }
         }
     }
@@ -950,14 +936,16 @@ impl RendererState {
             .collect();
 
         for region in regions {
-            if !self.scanouts.contains_key(&region.name) {
+            if !self.outputs.contains_key(&region.name) {
                 continue;
             }
 
             if let Some(pending) = self
-                .scanouts
+                .outputs
                 .get_mut(&region.name)
-                .and_then(|scanout| scanout.current.gpu_pending.take())
+                .and_then(|o| o.primary_mut())
+                .and_then(|p| p.current.as_mut())
+                .and_then(|b| b.gpu_pending.take())
             {
                 let vulkan = self
                     .vulkan
@@ -970,14 +958,21 @@ impl RendererState {
                 .vulkan
                 .as_ref()
                 .context("Vulkan is not initialized for screenshot capture")?;
-            let scanout = self
-                .scanouts
-                .get(&region.name)
-                .context("scanout disappeared during capture")?;
-            let format = scanout.current.dma_image.format();
+            let (format, image_ptr) = {
+                let current = self
+                    .outputs
+                    .get(&region.name)
+                    .and_then(|o| o.primary())
+                    .and_then(|p| p.current.as_ref())
+                    .context("primary buffer missing during capture")?;
+                (
+                    current.dma_image.format(),
+                    &current.dma_image as *const DmaBufImage,
+                )
+            };
             let bgra = download_bgra_region(
                 vulkan,
-                &scanout.current.dma_image,
+                unsafe { &*image_ptr },
                 region.fb_x,
                 region.fb_y,
                 region.fb_w,
@@ -1150,14 +1145,18 @@ impl RendererState {
             source_names.insert(region.name.clone());
         }
         for name in source_names {
-            if let Some(scanout) = self.scanouts.get_mut(&name) {
-                if let Some(pending) = scanout.current.gpu_pending.take() {
-                    let vulkan = self
-                        .vulkan
-                        .as_mut()
-                        .context("Vulkan missing while waiting for scanout")?;
-                    pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
-                }
+            if let Some(pending) = self
+                .outputs
+                .get_mut(&name)
+                .and_then(|o| o.primary_mut())
+                .and_then(|p| p.current.as_mut())
+                .and_then(|b| b.gpu_pending.take())
+            {
+                let vulkan = self
+                    .vulkan
+                    .as_mut()
+                    .context("Vulkan missing while waiting for scanout")?;
+                pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
             }
         }
 
@@ -1167,11 +1166,13 @@ impl RendererState {
         let src_h = height as u32;
         for region in &regions {
             let src_ptr = {
-                let scanout = self
-                    .scanouts
+                let current = self
+                    .outputs
                     .get(&region.name)
-                    .with_context(|| format!("missing scanout {}", region.name))?;
-                &scanout.current.dma_image as *const DmaBufImage
+                    .and_then(|o| o.primary())
+                    .and_then(|p| p.current.as_ref())
+                    .with_context(|| format!("missing primary buffer {}", region.name))?;
+                &current.dma_image as *const DmaBufImage
             };
             let dst_ptr = {
                 let slots = self
@@ -1601,15 +1602,16 @@ impl RendererState {
     pub fn output_is_virtual(&self, name: &str) -> bool {
         self.virtual_outputs.contains_key(name)
             || self
-                .scanouts
+                .outputs
                 .get(name)
-                .is_some_and(|scanout| scanout.physical.is_none())
+                .is_some_and(|output| output.physical.is_none())
     }
 
     /// Nominal refresh period for an output present control, in nanoseconds.
     pub fn output_refresh_ns(&self, name: &str) -> Option<u32> {
-        self.output_presents.get(name).map(|control| {
-            control
+        self.outputs.get(name).map(|output| {
+            output
+                .present
                 .scheduler
                 .frame_period()
                 .as_nanos()
@@ -1625,6 +1627,7 @@ impl RendererState {
             return Ok(());
         }
         self.drm_devices.activate(seat)?;
+        self.refresh_topologies()?;
         self.invalidate_present_targets();
         if self.present_halted.take().is_some() {
             info!("Resuming presents after DRM activate");
@@ -1664,38 +1667,61 @@ impl RendererState {
         self.drain_scanouts();
         let _ = self.flip_events.drain();
         self.invalidate_present_targets();
-        self.drm_devices.reconcile(seat)
+        self.drm_devices.reconcile(seat)?;
+        self.refresh_topologies()
+    }
+
+    fn refresh_topologies(&mut self) -> anyhow::Result<()> {
+        self.topologies.clear();
+        for (path, device) in self.drm_devices.opened() {
+            match probe_device_topology(device.fd().as_raw_fd(), path.clone()) {
+                Ok(topo) => {
+                    info!(
+                        "DRM topology on {}: {} CRTCs, {} planes ({} overlays free)",
+                        path.display(),
+                        topo.crtcs.len(),
+                        topo.planes.len(),
+                        topo.free_overlays.len()
+                    );
+                    self.topologies.insert(path.clone(), topo);
+                }
+                Err(err) => warn!(
+                    "Failed to probe DRM topology on {}: {err:#}",
+                    path.display()
+                ),
+            }
+        }
+        Ok(())
     }
 
     fn drain_scanouts(&mut self) {
-        let scanouts: Vec<OutputScanout> = self.scanouts.drain().map(|(_, s)| s).collect();
-        for scanout in scanouts {
-            self.disable_and_release_output_scanout(scanout);
+        let outputs: Vec<OutputState> = self.outputs.drain().map(|(_, s)| s).collect();
+        for output in outputs {
+            self.disable_and_release_output_state(output);
         }
         self.scanout_pool.clear();
+        self.topologies.clear();
         self.invalidate_surface_textures();
     }
 
-    /// Free scanout buffers without touching KMS state (e.g. remode of the same CRTC).
-    fn release_output_scanout(&mut self, scanout: OutputScanout) {
-        self.release_scanout_buffer(scanout.current);
-        if let Some(pending) = scanout.pending {
-            self.release_scanout_buffer(pending);
-        }
-        if let Some(queued) = scanout.queued {
-            self.release_scanout_buffer(queued);
+    /// Free plane buffers without touching KMS state (e.g. remode of the same CRTC).
+    fn release_output_state(&mut self, output: OutputState) {
+        if let Some(planes) = output.planes {
+            for buffer in planes.drain_buffers() {
+                self.release_scanout_buffer(buffer);
+            }
         }
     }
 
-    /// Blank/power-down a physical output, then free its scanout buffers.
-    fn disable_and_release_output_scanout(&mut self, scanout: OutputScanout) {
-        if let Some(physical) = scanout.physical.as_ref() {
+    /// Blank/power-down a physical output, then free its plane buffers.
+    fn disable_and_release_output_state(&mut self, output: OutputState) {
+        if let Some(physical) = output.physical.as_ref() {
             self.disable_physical_output(physical);
         }
-        self.release_output_scanout(scanout);
+        self.release_output_state(output);
     }
 
-    fn disable_physical_output(&self, physical: &PhysicalScanout) {
+    fn disable_physical_output(&self, physical: &PhysicalOutput) {
         let Some(device) = self.drm_devices.opened().get(&physical.drm_path) else {
             warn!(
                 "Cannot disable {}: DRM device {} is not open",
@@ -1716,19 +1742,19 @@ impl RendererState {
         }
     }
 
-    /// Wait for any in-flight flip, then disable CRTC and drop the scanout.
+    /// Wait for any in-flight flip, then disable CRTC and drop the output planes.
     fn disable_and_release_named_scanout(&mut self, name: &str) {
         if self
-            .scanouts
+            .outputs
             .get(name)
-            .is_some_and(|scanout| scanout.pending.is_some())
+            .is_some_and(|output| output.primary_flip_busy())
         {
             if let Err(err) = self.wait_for_connector_flip(name) {
                 warn!("Waiting for flip before disabling {name}: {err:#}");
             }
         }
-        if let Some(scanout) = self.scanouts.remove(name) {
-            self.disable_and_release_output_scanout(scanout);
+        if let Some(output) = self.outputs.remove(name) {
+            self.disable_and_release_output_state(output);
         }
     }
 
@@ -1738,7 +1764,7 @@ impl RendererState {
     /// never presented (e.g. left active by firmware / a previous compositor).
     fn apply_output_config_disables(&mut self) {
         let scanout_disable: Vec<String> = self
-            .scanouts
+            .outputs
             .keys()
             .filter(|name| {
                 self.output_configs
@@ -1754,7 +1780,7 @@ impl RendererState {
         let mut unresolved: Vec<(PathBuf, ConnectedOutput)> = Vec::new();
         for (path, device) in self.drm_devices.opened() {
             let mut used_crtcs = HashSet::new();
-            for scanout in self.scanouts.values() {
+            for scanout in self.outputs.values() {
                 if let Some(physical) = scanout.physical.as_ref() {
                     if &physical.drm_path == path {
                         used_crtcs.insert(physical.output.crtc_id);
@@ -1767,7 +1793,7 @@ impl RendererState {
                     .output_configs
                     .get(&connector.name)
                     .is_some_and(|config| !config.enabled);
-                if !disabled || !connector.connected || self.scanouts.contains_key(&connector.name)
+                if !disabled || !connector.connected || self.outputs.contains_key(&connector.name)
                 {
                     continue;
                 }
@@ -1852,8 +1878,8 @@ impl RendererState {
             });
         }
         self.scene_dirty = false;
-        for control in self.output_presents.values_mut() {
-            control.content_dirty = false;
+        for output in self.outputs.values_mut() {
+            output.present.content_dirty = false;
         }
         let started = Instant::now();
         let status = self.present_enabled_outputs(color)?;
@@ -1881,9 +1907,9 @@ impl RendererState {
             });
         }
         let content_dirty = self
-            .output_presents
+            .outputs
             .get(name)
-            .is_some_and(|c| c.content_dirty);
+            .is_some_and(|o| o.present.content_dirty);
         if !force && !content_dirty && !self.scene_dirty {
             return Ok(PresentOutcome {
                 presented: false,
@@ -1923,9 +1949,9 @@ impl RendererState {
 
         // Preserve global damage until every content-dirty output has presented.
         let other_dirty = self
-            .output_presents
+            .outputs
             .iter()
-            .any(|(n, c)| n != name && c.content_dirty);
+            .any(|(n, o)| n != name && o.present.content_dirty);
         let damage_snapshot = if other_dirty {
             Some((
                 self.pending_damage.clone(),
@@ -1947,7 +1973,7 @@ impl RendererState {
         match self.present_one_output(&target, color) {
             Ok(()) => {
                 presented = true;
-                if let Some(scanout) = self.scanouts.get(&target.name) {
+                if let Some(scanout) = self.outputs.get(&target.name) {
                     if let Some(physical) = scanout.physical.as_ref() {
                         debug!(
                             "Presented {} on {} (CRTC {}, {}x{}@{}Hz)",
@@ -2006,7 +2032,7 @@ impl RendererState {
             .map(|targets| targets.iter().map(|t| t.name.clone()).collect())
             .unwrap_or_default();
         let stale: Vec<String> = self
-            .scanouts
+            .outputs
             .keys()
             .filter(|n| !keep.contains(*n))
             .cloned()
@@ -2039,7 +2065,7 @@ impl RendererState {
         let targets = self.collect_present_targets();
         if targets.is_empty() {
             warn!("No enabled connected or virtual outputs to present");
-            let stale: Vec<String> = self.scanouts.keys().cloned().collect();
+            let stale: Vec<String> = self.outputs.keys().cloned().collect();
             for name in stale {
                 self.disable_and_release_named_scanout(&name);
             }
@@ -2051,7 +2077,7 @@ impl RendererState {
         for target in targets {
             match self.present_one_output(&target, color) {
                 Ok(()) => {
-                    if let Some(scanout) = self.scanouts.get(&target.name) {
+                    if let Some(scanout) = self.outputs.get(&target.name) {
                         if let Some(physical) = scanout.physical.as_ref() {
                             debug!(
                                 "Presented {} on {} (CRTC {}, {}x{}@{}Hz)",
@@ -2090,7 +2116,7 @@ impl RendererState {
         }
 
         let stale: Vec<String> = self
-            .scanouts
+            .outputs
             .keys()
             .filter(|name| !keep.contains(*name))
             .cloned()
@@ -2197,9 +2223,7 @@ impl RendererState {
     }
 
     fn has_pending_flips(&self) -> bool {
-        self.scanouts
-            .values()
-            .any(|scanout| scanout.pending.is_some())
+        self.outputs.values().any(|output| output.primary_flip_busy())
     }
 
     fn present_one_output(
@@ -2213,14 +2237,10 @@ impl RendererState {
             return self.complete_virtual_present(&target.name, buffer);
         };
 
-        let reuse_mode = self.scanouts.get(&target.name).is_some_and(|prev| {
-            prev.physical.as_ref().is_some_and(|p| {
-                p.drm_path == physical.drm_path
-                    && p.output.connector_id == physical.output.connector_id
-                    && p.output.crtc_id == physical.output.crtc_id
-                    && p.output.plane_id == physical.output.plane_id
-                    && p.output.mode == physical.output.mode
-            })
+        let reuse_mode = self.outputs.get(&target.name).is_some_and(|prev| {
+            prev.physical
+                .as_ref()
+                .is_some_and(|p| p.matches_target(&physical.drm_path, &physical.output))
         });
 
         if reuse_mode {
@@ -2228,9 +2248,9 @@ impl RendererState {
         }
 
         if self
-            .scanouts
+            .outputs
             .get(&target.name)
-            .is_some_and(|scanout| scanout.pending.is_some())
+            .is_some_and(|output| output.primary_flip_busy())
         {
             self.wait_for_connector_flip(&target.name)?;
         }
@@ -2257,22 +2277,68 @@ impl RendererState {
         atomic_modeset(drm_device.fd(), &physical.output, mode_blob.id(), fb_id)
             .context("Failed atomic modeset")?;
 
-        if let Some(old) = self.scanouts.remove(&target.name) {
-            self.release_output_scanout(old);
+        let zpos = self
+            .topologies
+            .get(&physical.drm_path)
+            .and_then(|topo| topo.plane(physical.output.plane_id))
+            .map(|p| p.zpos)
+            .unwrap_or(0);
+
+        let physical_output = PhysicalOutput {
+            drm_path: physical.drm_path.clone(),
+            output: physical.output.clone(),
+            mode_blob,
+        };
+
+        let old_buffers = self
+            .outputs
+            .get_mut(&target.name)
+            .and_then(|output| output.planes.take())
+            .map(|planes| planes.drain_buffers())
+            .unwrap_or_default();
+        for old in old_buffers {
+            self.release_scanout_buffer(old);
         }
-        self.scanouts.insert(
-            target.name.clone(),
-            OutputScanout {
-                physical: Some(PhysicalScanout {
-                    drm_path: physical.drm_path.clone(),
-                    output: physical.output.clone(),
-                    mode_blob,
-                }),
-                current: buffer,
-                pending: None,
-                queued: None,
-            },
-        );
+
+        if let Some(output) = self.outputs.get_mut(&target.name) {
+            output.id = OutputId::physical(
+                physical.drm_path.clone(),
+                physical.output.connector_id,
+                target.name.clone(),
+            );
+            output.physical = Some(physical_output);
+            let planes = output.ensure_primary_planes(
+                physical.output.plane_id,
+                zpos,
+                target.width,
+                target.height,
+            );
+            planes.primary.current = Some(buffer);
+            planes.primary.pending = None;
+            planes.primary.queued = None;
+        } else {
+            let token = match self.alloc_present_wake_token() {
+                Ok(token) => token,
+                Err(_) => PRESENT_WAKE_TOKEN_BASE,
+            };
+            let mut output = OutputState::new(
+                OutputId::physical(
+                    physical.drm_path.clone(),
+                    physical.output.connector_id,
+                    target.name.clone(),
+                ),
+                OutputPresentControl::new(token, target.refresh_mhz),
+            );
+            output.physical = Some(physical_output);
+            let planes = output.ensure_primary_planes(
+                physical.output.plane_id,
+                zpos,
+                target.width,
+                target.height,
+            );
+            planes.primary.current = Some(buffer);
+            self.outputs.insert(target.name.clone(), output);
+        }
         Ok(())
     }
 
@@ -2284,33 +2350,34 @@ impl RendererState {
     ) -> anyhow::Result<()> {
         self.wait_scanout_gpu(&mut buffer)?;
 
-        let (old_current, old_pending, old_queued) =
-            if let Some(scanout) = self.scanouts.get_mut(name) {
-                let pending = scanout.pending.take();
-                let queued = scanout.queued.take();
-                let current = std::mem::replace(&mut scanout.current, buffer);
-                scanout.physical = None;
-                (Some(current), pending, queued)
-            } else {
-                self.scanouts.insert(
-                    name.to_string(),
-                    OutputScanout {
-                        physical: None,
-                        current: buffer,
-                        pending: None,
-                        queued: None,
-                    },
-                );
-                (None, None, None)
-            };
+        let width = buffer.key.width;
+        let height = buffer.key.height;
 
-        if let Some(old) = old_current {
-            self.release_scanout_buffer(old);
-        }
-        if let Some(old) = old_pending {
-            self.release_scanout_buffer(old);
-        }
-        if let Some(old) = old_queued {
+        let old_buffers = if let Some(output) = self.outputs.get_mut(name) {
+            output.physical = None;
+            output.id = OutputId::virtual_output(name.to_string());
+            let planes = output.ensure_primary_planes(0, 0, width, height);
+            planes.primary.software = false;
+            let old_current = planes.primary.current.replace(buffer);
+            let old_pending = planes.primary.pending.take();
+            let old_queued = planes.primary.queued.take();
+            [old_current, old_pending, old_queued]
+        } else {
+            let token = match self.alloc_present_wake_token() {
+                Ok(token) => token,
+                Err(_) => PRESENT_WAKE_TOKEN_BASE,
+            };
+            let mut output = OutputState::new(
+                OutputId::virtual_output(name.to_string()),
+                OutputPresentControl::new(token, 60_000),
+            );
+            let planes = output.ensure_primary_planes(0, 0, width, height);
+            planes.primary.current = Some(buffer);
+            self.outputs.insert(name.to_string(), output);
+            [None, None, None]
+        };
+
+        for old in old_buffers.into_iter().flatten() {
             self.release_scanout_buffer(old);
         }
         Ok(())
@@ -2405,13 +2472,9 @@ impl RendererState {
         let mut batch = GpuWorkBatch::new();
 
         if matches!(composite_mode, CompositeMode::Partial(_)) {
-            let src_ptr = self.scanouts.get(&target.name).map(|scanout| {
-                let image = scanout
-                    .queued
-                    .as_ref()
-                    .or(scanout.pending.as_ref())
-                    .unwrap_or(&scanout.current);
-                &image.dma_image as *const DmaBufImage
+            let src_ptr = self.outputs.get(&target.name).and_then(|output| {
+                let image = output.primary()?.newest_buffer()?;
+                Some(&image.dma_image as *const DmaBufImage)
             });
             let dst_ptr = &buffer.dma_image as *const DmaBufImage;
             let dst_fresh = buffer.fresh;
@@ -2541,27 +2604,28 @@ impl RendererState {
         mut buffer: ScanoutBuffer,
     ) -> anyhow::Result<()> {
         let (drm_path, output, flip_busy) = {
-            let scanout = self
-                .scanouts
+            let state = self
+                .outputs
                 .get(connector_name)
-                .context("Missing scanout for page-flip")?;
-            let physical = scanout
+                .context("Missing output for page-flip")?;
+            let physical = state
                 .physical
                 .as_ref()
-                .context("Page-flip requires a physical scanout")?;
+                .context("Page-flip requires a physical output")?;
             (
                 physical.drm_path.clone(),
                 physical.output.clone(),
-                scanout.pending.is_some(),
+                state.primary_flip_busy(),
             )
         };
 
         if flip_busy {
-            let scanout = self
-                .scanouts
+            let primary = self
+                .outputs
                 .get_mut(connector_name)
-                .context("Missing scanout while queueing flip")?;
-            if let Some(old) = scanout.queued.replace(buffer) {
+                .and_then(|o| o.primary_mut())
+                .context("Missing primary plane while queueing flip")?;
+            if let Some(old) = primary.queued.replace(buffer) {
                 self.release_scanout_buffer(old);
             }
             return Ok(());
@@ -2583,11 +2647,12 @@ impl RendererState {
 
         match flip_result {
             Ok(()) => {
-                let scanout = self
-                    .scanouts
+                let primary = self
+                    .outputs
                     .get_mut(connector_name)
-                    .context("Missing scanout after scheduling flip")?;
-                scanout.pending = Some(buffer);
+                    .and_then(|o| o.primary_mut())
+                    .context("Missing primary plane after scheduling flip")?;
+                primary.pending = Some(buffer);
                 Ok(())
             }
             Err(err) => {
@@ -2612,17 +2677,20 @@ impl RendererState {
                             .context("Failed blocking plane FB update after page-flip error");
                     }
                 }
-                let (old, _) = {
-                    let scanout = self
-                        .scanouts
+                let old = {
+                    let primary = self
+                        .outputs
                         .get_mut(connector_name)
-                        .context("Missing scanout after blocking flip fallback")?;
-                    let old = std::mem::replace(&mut scanout.current, buffer);
-                    scanout.pending = None;
-                    scanout.queued = None;
-                    (old, ())
+                        .and_then(|o| o.primary_mut())
+                        .context("Missing primary plane after blocking flip fallback")?;
+                    let old = primary.current.replace(buffer);
+                    primary.pending = None;
+                    primary.queued = None;
+                    old
                 };
-                self.release_scanout_buffer(old);
+                if let Some(old) = old {
+                    self.release_scanout_buffer(old);
+                }
                 Ok(())
             }
         }
@@ -2640,8 +2708,8 @@ impl RendererState {
     }
 
     fn retire_page_flip(&mut self, crtc_id: u32) -> anyhow::Result<Option<String>> {
-        let Some(connector_name) = self.scanouts.iter().find_map(|(name, scanout)| {
-            scanout
+        let Some(connector_name) = self.outputs.iter().find_map(|(name, output)| {
+            output
                 .physical
                 .as_ref()
                 .is_some_and(|p| p.output.crtc_id == crtc_id)
@@ -2651,21 +2719,23 @@ impl RendererState {
             return Ok(None);
         };
 
-        let queued = {
-            let scanout = self
-                .scanouts
+        let (old, queued) = {
+            let primary = self
+                .outputs
                 .get_mut(&connector_name)
-                .context("Missing scanout during flip retirement")?;
-            let Some(new_current) = scanout.pending.take() else {
+                .and_then(|o| o.primary_mut())
+                .context("Missing primary plane during flip retirement")?;
+            let Some(new_current) = primary.pending.take() else {
                 warn!("Page-flip completion without pending buffer on {connector_name}");
                 return Ok(Some(connector_name));
             };
-            let old = std::mem::replace(&mut scanout.current, new_current);
-            let queued = scanout.queued.take();
+            let old = primary.current.replace(new_current);
+            let queued = primary.queued.take();
             (old, queued)
         };
-        let (old, queued) = queued;
-        self.release_scanout_buffer(old);
+        if let Some(old) = old {
+            self.release_scanout_buffer(old);
+        }
 
         if let Some(queued) = queued {
             self.schedule_or_queue_flip(&connector_name, queued)?;
@@ -2675,15 +2745,15 @@ impl RendererState {
 
     fn wait_for_connector_flip(&mut self, connector_name: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.scanouts.contains_key(connector_name),
-            "Missing scanout while waiting for flip"
+            self.outputs.contains_key(connector_name),
+            "Missing output while waiting for flip"
         );
 
         for _ in 0..1_000 {
             if !self
-                .scanouts
+                .outputs
                 .get(connector_name)
-                .is_some_and(|scanout| scanout.pending.is_some())
+                .is_some_and(|output| output.primary_flip_busy())
             {
                 return Ok(());
             }

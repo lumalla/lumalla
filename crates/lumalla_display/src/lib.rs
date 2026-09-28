@@ -3,13 +3,13 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use lumalla_shared::{View, WindowGeometryUpdate, WindowRule, WindowState, map_source_to_dest};
-use stumpalo::Arena;
 use lumalla_wayland_protocol::protocols::presentation_time::{
     WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK, WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION,
     WP_PRESENTATION_FEEDBACK_KIND_VSYNC,
 };
 use lumalla_wayland_protocol::registry::InterfaceIndex;
 use lumalla_wayland_protocol::{ObjectId, buffer::Writer, registry::Registry};
+use stumpalo::Arena;
 
 use crate::{
     data_device::DataDeviceManager,
@@ -198,10 +198,7 @@ impl DisplayState {
         self.dmabuf_manager.send_all_feedback(clients.values_mut());
     }
 
-    pub fn flush_pending_keyboard_leaves(
-        &mut self,
-        clients: &mut ConnectedClients,
-    ) {
+    pub fn flush_pending_keyboard_leaves(&mut self, clients: &mut ConnectedClients) {
         self.seat_manager.flush_pending_keyboard_leaves(clients);
     }
 
@@ -209,10 +206,7 @@ impl DisplayState {
         self.data_device_manager.flush_pending(clients);
     }
 
-    pub fn flush_pending_activation_configures(
-        &mut self,
-        clients: &mut ConnectedClients,
-    ) {
+    pub fn flush_pending_activation_configures(&mut self, clients: &mut ConnectedClients) {
         let pending = std::mem::take(&mut self.pending_activation_configures);
         for configure in pending {
             let Some(client) = clients.get_mut(&configure.client_id) else {
@@ -297,11 +291,7 @@ impl DisplayState {
     /// Recompute pointer enter/leave from current coordinates and stacking.
     ///
     /// Call after client dispatch or when mapping changes under a stationary cursor.
-    pub fn refresh_pointer_focus(
-        &mut self,
-        clients: &mut ConnectedClients,
-        arena: &Arena,
-    ) {
+    pub fn refresh_pointer_focus(&mut self, clients: &mut ConnectedClients, arena: &Arena) {
         let views = self.pointer_views();
         self.seat_manager.update_pointer_focus_and_motion(
             clients,
@@ -511,19 +501,11 @@ impl DisplayState {
         );
     }
 
-    pub fn handle_touch_frame(
-        &mut self,
-        clients: &mut ConnectedClients,
-        arena: &Arena,
-    ) {
+    pub fn handle_touch_frame(&mut self, clients: &mut ConnectedClients, arena: &Arena) {
         self.seat_manager.handle_touch_frame(clients, arena);
     }
 
-    pub fn handle_touch_cancel(
-        &mut self,
-        clients: &mut ConnectedClients,
-        arena: &Arena,
-    ) {
+    pub fn handle_touch_cancel(&mut self, clients: &mut ConnectedClients, arena: &Arena) {
         self.seat_manager.handle_touch_cancel(clients, arena);
     }
 
@@ -542,11 +524,7 @@ impl DisplayState {
     }
 
     /// Complete an active drag with a drop for tests / compositor input.
-    pub fn drag_drop(
-        &mut self,
-        _client_id: ClientId,
-        clients: &mut ConnectedClients,
-    ) {
+    pub fn drag_drop(&mut self, _client_id: ClientId, clients: &mut ConnectedClients) {
         self.data_device_manager.drag_drop(clients);
     }
 
@@ -727,11 +705,7 @@ impl DisplayState {
     }
 
     /// Completes deferred `wl_surface.frame` callbacks after presentation.
-    pub fn complete_frame_callbacks(
-        &mut self,
-        clients: &mut ConnectedClients,
-        time_msec: u32,
-    ) {
+    pub fn complete_frame_callbacks(&mut self, clients: &mut ConnectedClients, time_msec: u32) {
         while let Some(pending) = self.pending_frame_callbacks.pop_front() {
             let Some(client) = clients.get_mut(&pending.client_id) else {
                 continue;
@@ -784,11 +758,7 @@ impl DisplayState {
     }
 
     /// Updates the primary `wl_output` geometry (e.g. from DRM mode) and notifies binders.
-    pub fn update_primary_output(
-        &mut self,
-        info: OutputInfo,
-        clients: &mut ConnectedClients,
-    ) {
+    pub fn update_primary_output(&mut self, info: OutputInfo, clients: &mut ConnectedClients) {
         if let Some(global_id) = self.output_manager.primary_global_id() {
             self.output_manager.update_output(global_id, info, clients);
         }
@@ -818,8 +788,7 @@ impl DisplayState {
         view: lumalla_shared::View,
         clients: &mut ConnectedClients,
     ) -> anyhow::Result<bool> {
-        self.output_manager
-            .add_view(output_name, view, clients)
+        self.output_manager.add_view(output_name, view, clients)
     }
 
     pub fn remove_view(
@@ -1095,12 +1064,11 @@ impl DisplayState {
         surface_id: ObjectId,
         writer: &mut Writer,
     ) {
-        let had_focus = self
-            .seat_manager
-            .focused_keyboard_surface()
-            .is_some_and(|(focus_client, focus_surface)| {
+        let had_focus = self.seat_manager.focused_keyboard_surface().is_some_and(
+            |(focus_client, focus_surface)| {
                 focus_client == client_id && focus_surface == surface_id
-            });
+            },
+        );
         let restore = had_focus
             .then(|| self.keyboard_focus_restore_target(client_id, surface_id))
             .flatten();
@@ -1126,7 +1094,9 @@ impl DisplayState {
             // Non-grabbed popups are not keyboard targets; keep walking up.
             if let Some(popup) = self.xdg_manager.popup_info_for_wl(client_id, current) {
                 if !popup.grabbed {
-                    current = self.xdg_manager.popup_parent_wl(client_id, popup.popup_id)?;
+                    current = self
+                        .xdg_manager
+                        .popup_parent_wl(client_id, popup.popup_id)?;
                     continue;
                 }
             }
@@ -1210,10 +1180,7 @@ impl DisplayState {
         self.flush_pending_activation_configures(clients);
     }
 
-    pub(crate) fn flush_pending_window_configures(
-        &mut self,
-        clients: &mut ConnectedClients,
-    ) {
+    pub(crate) fn flush_pending_window_configures(&mut self, clients: &mut ConnectedClients) {
         let pending = self.window_manager.take_pending_configures();
         for configure in pending {
             let Some(client) = clients.get_mut(&configure.client_id) else {
@@ -1332,7 +1299,11 @@ impl Default for Globals {
         globals.register_version(InterfaceIndex::WpPresentation, 2, [].into_iter());
         globals.register_version(InterfaceIndex::WpViewporter, 1, [].into_iter());
         globals.register_version(InterfaceIndex::ZwpPointerConstraintsV1, 1, [].into_iter());
-        globals.register_version(InterfaceIndex::ZwpRelativePointerManagerV1, 1, [].into_iter());
+        globals.register_version(
+            InterfaceIndex::ZwpRelativePointerManagerV1,
+            1,
+            [].into_iter(),
+        );
         globals
     }
 }

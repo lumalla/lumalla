@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, c_void};
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::path::PathBuf;
 use std::ptr;
 
 use anyhow::Context;
@@ -1020,6 +1021,113 @@ impl Drop for DrmProperty {
             self.ptr = ptr::null_mut();
         }
     }
+}
+
+/// Enumerate CRTCs and planes for a DRM primary node (call after universal planes).
+pub fn probe_device_topology(
+    fd: RawFd,
+    path: PathBuf,
+) -> anyhow::Result<crate::output::DrmDeviceTopology> {
+    use crate::output::{
+        DrmCrtcInfo, DrmDeviceTopology, DrmPlaneInfo, PlaneAtomicProps, PlaneKind,
+    };
+
+    let resources = get_resources(fd)?;
+    let crtcs: Vec<DrmCrtcInfo> = resources
+        .crtc_ids()
+        .iter()
+        .enumerate()
+        .map(|(index, &crtc_id)| DrmCrtcInfo {
+            crtc_id,
+            index: index as u32,
+        })
+        .collect();
+
+    let plane_resources = get_plane_resources(fd)?;
+    let mut planes = Vec::new();
+    let mut free_overlays = Vec::new();
+
+    for &plane_id in plane_resources.plane_ids() {
+        let plane = get_plane(fd, plane_id)?;
+        let possible_crtcs = plane.get().possible_crtcs;
+        let props_map = object_props(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE)?;
+        let type_val = props_map.get("type").copied().unwrap_or(u64::MAX);
+        let kind = match type_val {
+            v if v == sys::DRM_PLANE_TYPE_OVERLAY => PlaneKind::Overlay,
+            v if v == sys::DRM_PLANE_TYPE_PRIMARY => PlaneKind::Primary,
+            v if v == sys::DRM_PLANE_TYPE_CURSOR => PlaneKind::Cursor,
+            _ => continue,
+        };
+
+        let (zpos, zpos_mutable) = match plane_zpos(fd, plane_id)? {
+            Some(z) => z,
+            None => {
+                // Historical default: cursor on top, then overlays, then primary.
+                let fallback = match kind {
+                    PlaneKind::Cursor => 255,
+                    PlaneKind::Overlay => 1,
+                    PlaneKind::Primary => 0,
+                };
+                (fallback, false)
+            }
+        };
+
+        let props = PlaneAtomicProps {
+            fb_id: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "FB_ID")?,
+            crtc_id: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "CRTC_ID")?,
+            src_x: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "SRC_X")?,
+            src_y: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "SRC_Y")?,
+            src_w: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "SRC_W")?,
+            src_h: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "SRC_H")?,
+            crtc_x: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "CRTC_X")?,
+            crtc_y: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "CRTC_Y")?,
+            crtc_w: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "CRTC_W")?,
+            crtc_h: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "CRTC_H")?,
+            zpos: find_prop_id(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE, "zpos").ok(),
+        };
+
+        if matches!(kind, PlaneKind::Overlay) {
+            free_overlays.push(plane_id);
+        }
+
+        planes.push(DrmPlaneInfo {
+            plane_id,
+            kind,
+            possible_crtcs,
+            zpos,
+            zpos_mutable,
+            props,
+        });
+    }
+
+    Ok(DrmDeviceTopology {
+        path,
+        crtcs,
+        planes,
+        free_overlays,
+    })
+}
+
+fn plane_zpos(fd: RawFd, plane_id: u32) -> anyhow::Result<Option<(u32, bool)>> {
+    let prop_ids = object_prop_ids(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE)?;
+    for prop_id in prop_ids {
+        let prop = get_property(fd, prop_id)?;
+        if prop.name() != "zpos" {
+            continue;
+        }
+        let raw = get_object_properties(fd, plane_id, sys::DRM_MODE_OBJECT_PLANE)?;
+        let count = raw.count() as usize;
+        let mut value = 0u64;
+        for i in 0..count {
+            if raw.prop_id(i) == prop_id {
+                value = raw.prop_value(i);
+                break;
+            }
+        }
+        let immutable = unsafe { (*prop.ptr).flags & sys::DRM_MODE_PROP_IMMUTABLE != 0 };
+        return Ok(Some((value as u32, !immutable)));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
