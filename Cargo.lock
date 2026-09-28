@@ -1927,6 +1927,7 @@ dependencies = [
  "anyhow",
  "libc",
  "log",
+ "lumalla_shared",
  "once_cell",
  "pipewire",
 ]

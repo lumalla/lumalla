@@ -28,7 +28,7 @@ use lumalla_renderer::{
     is_present_wake_token,
 };
 use lumalla_screencast::{
-    DmaBufferExport, ScreencastManager, ScreencastSource, ScreencastWake, VideoFrame,
+    DmaBufferExport, FormatOffer, ScreencastManager, ScreencastSource, ScreencastWake, VideoFrame,
     fit_memfd_output_size, fit_output_size,
 };
 use lumalla_seat::SeatState;
@@ -974,6 +974,7 @@ impl AppData {
                                 name,
                                 max_fps,
                                 dma_exports,
+                                FormatOffer::PreferMemFd,
                             )
                             .map_err(|err| {
                                 self.renderer_state.free_screencast_buffers(stream_id);
@@ -1002,7 +1003,12 @@ impl AppData {
                     name,
                     max_fps,
                 } => {
-                    let start_result = self.start_window_screencast(window_id, name, max_fps);
+                    let start_result = self.start_window_screencast(
+                        window_id,
+                        name,
+                        max_fps,
+                        FormatOffer::PreferMemFd,
+                    );
                     match start_result {
                         Ok(stream_id) => {
                             self.pending_screencast_replies.insert(
@@ -1094,6 +1100,7 @@ impl AppData {
                                         name,
                                         max_fps,
                                         dma_exports,
+                                        FormatOffer::DmaOnly,
                                     )
                                     .map_err(|err| {
                                         self.renderer_state.free_screencast_buffers(stream_id);
@@ -1102,7 +1109,12 @@ impl AppData {
                             }
                             MutterScreenCastTarget::Window { window_id } => {
                                 let name = format!("Lumalla ScreenCast (window {window_id})");
-                                self.start_window_screencast(window_id, name, 30)
+                                self.start_window_screencast(
+                                    window_id,
+                                    name,
+                                    30,
+                                    FormatOffer::DmaOnly,
+                                )
                             }
                         }
                     })();
@@ -2067,6 +2079,7 @@ impl AppData {
         window_id: u32,
         name: String,
         max_fps: u32,
+        format_offer: FormatOffer,
     ) -> Result<u32, String> {
         let id = if window_id == 0 { None } else { Some(window_id) };
         let (resolved_id, x, y, width, height, _layers) = self
@@ -2115,6 +2128,7 @@ impl AppData {
                 name,
                 max_fps,
                 dma_exports,
+                format_offer,
             )
             .map_err(|err| {
                 self.renderer_state.free_screencast_buffers(stream_id);

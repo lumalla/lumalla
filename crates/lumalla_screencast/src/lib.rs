@@ -19,6 +19,9 @@ use std::{
 use anyhow::{Context, anyhow};
 use log::{debug, error, info, warn};
 use once_cell::sync::OnceCell;
+use lumalla_shared::{
+    fit_screencast_dma_size, fit_screencast_memfd_size,
+};
 use pipewire::{
     self as pw,
     context::ContextRc,
@@ -55,32 +58,24 @@ const SCREENCAST_DMA_MAX_FPS: u32 = 30;
 /// Hard cap for MemFd capture rate (GPU blit + CPU readback).
 const SCREENCAST_MEMFD_MAX_FPS: u32 = 5;
 
-/// Longest edge for DMA-BUF PipeWire buffers (native 5K fits).
-const SCREENCAST_DMA_MAX_EDGE: u32 = 7680;
-
-/// Longest edge for MemFd frames — full-res CPU readback freezes the session.
-const SCREENCAST_MEMFD_MAX_EDGE: u32 = 1280;
-
-fn fit_edge(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
-    let width = width.max(1);
-    let height = height.max(1);
-    let longest = width.max(height);
-    if longest <= max_edge {
-        return (width, height);
-    }
-    let w = (u64::from(width) * u64::from(max_edge) / u64::from(longest)).max(1) as u32;
-    let h = (u64::from(height) * u64::from(max_edge) / u64::from(longest)).max(1) as u32;
-    (w, h)
-}
-
 /// Shrink for DMA-BUF / portal size (high cap — typically native).
 pub fn fit_output_size(width: u32, height: u32) -> (u32, u32) {
-    fit_edge(width, height, SCREENCAST_DMA_MAX_EDGE)
+    fit_screencast_dma_size(width, height)
 }
 
 /// Shrink for MemFd RGBA frames (low cap — avoids 5K CPU readback).
 pub fn fit_memfd_output_size(width: u32, height: u32) -> (u32, u32) {
-    fit_edge(width, height, SCREENCAST_MEMFD_MAX_EDGE)
+    fit_screencast_memfd_size(width, height)
+}
+
+/// Which PipeWire enum formats to offer when connecting a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FormatOffer {
+    /// MemFd RGBA (downscaled) first, then DMA-BUF — cheap for browsers / Lua.
+    #[default]
+    PreferMemFd,
+    /// DMA-BUF only at the portal/DMA size — keeps Mutter `parameters.size` aligned.
+    DmaOnly,
 }
 
 /// RGBA8 frame pushed from the compositor main thread (MemFd path).
@@ -159,6 +154,7 @@ enum PwCommand {
         dma_exports: Vec<DmaBufferExport>,
         pending: Arc<PendingStart>,
         dma_negotiated: Arc<AtomicBool>,
+        format_offer: FormatOffer,
     },
     PushMemFdFrame {
         stream_id: u32,
@@ -207,6 +203,8 @@ struct StreamInner {
     pending_start: Option<Arc<PendingStart>>,
     started: bool,
     use_dmabuf: bool,
+    /// Portal streams force DMA so size cannot drift to MemFd.
+    force_dmabuf: bool,
     dma_negotiated: Arc<AtomicBool>,
     dma_slots: Vec<DmaSlot>,
 }
@@ -486,6 +484,9 @@ impl ScreencastManager {
     /// capture rectangle may be larger; the compositor scales into the export size.
     /// Returns the local stream id immediately; the PipeWire node id is delivered
     /// later via [`ScreencastWake::StreamReady`].
+    ///
+    /// `format_offer` controls enum format preference. Use [`FormatOffer::DmaOnly`]
+    /// for portal/Mutter streams so advertised size matches the DMA-BUF pool.
     pub fn start_stream(
         &mut self,
         source: ScreencastSource,
@@ -496,6 +497,7 @@ impl ScreencastManager {
         name: String,
         max_fps: u32,
         dma_exports: Vec<DmaBufferExport>,
+        format_offer: FormatOffer,
     ) -> anyhow::Result<u32> {
         anyhow::ensure!(width > 0 && height > 0, "stream region must be positive");
         anyhow::ensure!(
@@ -532,6 +534,7 @@ impl ScreencastManager {
                 dma_exports,
                 pending,
                 dma_negotiated: Arc::clone(&dma_negotiated),
+                format_offer,
             })
             .map_err(|_| anyhow!("PipeWire thread is not accepting commands"))?;
 
@@ -551,7 +554,7 @@ impl ScreencastManager {
         );
 
         info!(
-            "Starting PipeWire stream id={stream_id} source={source:?} capture={width}x{height} out={out_width}x{out_height}"
+            "Starting PipeWire stream id={stream_id} source={source:?} capture={width}x{height} out={out_width}x{out_height} offer={format_offer:?}"
         );
         Ok(stream_id)
     }
@@ -715,6 +718,7 @@ fn run_pipewire_thread(
                 dma_exports,
                 pending,
                 dma_negotiated,
+                format_offer,
             } => match create_stream(
                 &core_for_cmds,
                 stream_id,
@@ -724,6 +728,7 @@ fn run_pipewire_thread(
                 dma_exports,
                 Arc::clone(&pending),
                 dma_negotiated,
+                format_offer,
                 Arc::clone(&pending_blits_cmds),
                 Arc::clone(&on_wake_cmds),
             ) {
@@ -865,6 +870,7 @@ fn create_stream(
     dma_exports: Vec<DmaBufferExport>,
     pending: Arc<PendingStart>,
     dma_negotiated: Arc<AtomicBool>,
+    format_offer: FormatOffer,
     pending_blits: Arc<Mutex<Vec<(u32, usize)>>>,
     on_wake: ScreencastWakeNotify,
 ) -> anyhow::Result<StreamSlot> {
@@ -909,6 +915,7 @@ fn create_stream(
         );
     }
 
+    let force_dmabuf = matches!(format_offer, FormatOffer::DmaOnly);
     let inner = Rc::new(RefCell::new(StreamInner {
         latest_memfd: None,
         width,
@@ -916,10 +923,14 @@ fn create_stream(
         format: VideoInfoRaw::default(),
         pending_start: Some(Arc::clone(&pending)),
         started: false,
-        use_dmabuf: false,
+        use_dmabuf: force_dmabuf,
+        force_dmabuf,
         dma_negotiated: Arc::clone(&dma_negotiated),
         dma_slots,
     }));
+    if force_dmabuf {
+        dma_negotiated.store(true, Ordering::Release);
+    }
 
     let listener = stream
         .add_local_listener_with_user_data(Rc::clone(&inner))
@@ -979,12 +990,15 @@ fn create_stream(
                 inner.width = width;
                 inner.height = height;
 
-                let use_dmabuf = inner.format.flags().contains(VideoFlags::MODIFIER);
+                let use_dmabuf = inner.force_dmabuf
+                    || inner.format.flags().contains(VideoFlags::MODIFIER);
                 inner.use_dmabuf = use_dmabuf;
                 inner.dma_negotiated.store(use_dmabuf, Ordering::Release);
                 info!(
-                    "PipeWire stream {stream_id} negotiated {} path",
-                    if use_dmabuf { "DMA-BUF" } else { "MemFd" }
+                    "PipeWire stream {stream_id} negotiated {} path ({}x{})",
+                    if use_dmabuf { "DMA-BUF" } else { "MemFd" },
+                    width,
+                    height
                 );
 
                 let datatype = if use_dmabuf {
@@ -1186,23 +1200,34 @@ fn create_stream(
         .register()
         .context("failed to register PipeWire stream listener")?;
 
-    // Prefer MemFd RGBA at a downscaled size so browsers stay cheap; offer
-    // BGRx DMA-BUF at the full export size with the allocated DRM modifier
-    // (tiled when the GPU supports it, otherwise LINEAR) for OBS-class consumers.
-    let (memfd_w, memfd_h) = fit_memfd_output_size(width, height);
+    // Portal/Mutter streams offer DMA-BUF only so `parameters.size` matches the
+    // buffer pool. Lua/browser streams prefer MemFd first (cheap downscaled path).
     let mut params_bytes: Vec<Vec<u8>> = Vec::new();
-    params_bytes.push(serialize_enum_format(
-        memfd_w,
-        memfd_h,
-        VideoFormat::RGBA,
-        None,
-    )?);
-    params_bytes.push(serialize_enum_format(
-        width,
-        height,
-        VideoFormat::BGRx,
-        Some(dma_modifier),
-    )?);
+    match format_offer {
+        FormatOffer::PreferMemFd => {
+            let (memfd_w, memfd_h) = fit_memfd_output_size(width, height);
+            params_bytes.push(serialize_enum_format(
+                memfd_w,
+                memfd_h,
+                VideoFormat::RGBA,
+                None,
+            )?);
+            params_bytes.push(serialize_enum_format(
+                width,
+                height,
+                VideoFormat::BGRx,
+                Some(dma_modifier),
+            )?);
+        }
+        FormatOffer::DmaOnly => {
+            params_bytes.push(serialize_enum_format(
+                width,
+                height,
+                VideoFormat::BGRx,
+                Some(dma_modifier),
+            )?);
+        }
+    }
 
     let mut params: Vec<&Pod> = params_bytes
         .iter()

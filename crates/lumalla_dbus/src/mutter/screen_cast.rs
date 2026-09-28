@@ -11,7 +11,7 @@ use std::{
 
 use log::{debug, warn};
 use lumalla_ipc::types::OutputInfo;
-use lumalla_shared::{Comms, MainMessage, MutterScreenCastTarget, WindowState};
+use lumalla_shared::{Comms, MainMessage, MutterScreenCastTarget, WindowState, fit_screencast_portal_size};
 use zbus::{
     fdo,
     interface,
@@ -22,21 +22,6 @@ use zbus::{
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Keep portal stream `size` aligned with DMA-BUF PipeWire buffers.
-fn fit_portal_size(width: i32, height: i32) -> (i32, i32) {
-    // Match lumalla_screencast::fit_output_size (DMA max edge 7680).
-    const MAX_EDGE: i32 = 7680;
-    let width = width.max(1);
-    let height = height.max(1);
-    let longest = width.max(height);
-    if longest <= MAX_EDGE {
-        return (width, height);
-    }
-    let w = ((width as i64) * (MAX_EDGE as i64) / (longest as i64)).max(1) as i32;
-    let h = ((height as i64) * (MAX_EDGE as i64) / (longest as i64)).max(1) as i32;
-    (w, h)
-}
 
 /// Shared handles so the D-Bus thread can emit `PipeWireStreamAdded`.
 #[derive(Clone)]
@@ -294,7 +279,7 @@ impl Session {
         let path = OwnedObjectPath::try_from(path)
             .map_err(|err| fdo::Error::Failed(format!("invalid stream path: {err}")))?;
 
-        let (out_w, out_h) = fit_portal_size(output.width, output.height);
+        let (out_w, out_h) = fit_screencast_portal_size(output.width, output.height);
 
         let stream = Stream {
             id: stream_id,
@@ -368,7 +353,7 @@ impl Session {
         let path = OwnedObjectPath::try_from(path)
             .map_err(|err| fdo::Error::Failed(format!("invalid stream path: {err}")))?;
 
-        let (out_w, out_h) = fit_portal_size(width, height);
+        let (out_w, out_h) = fit_screencast_portal_size(width, height);
 
         let stream = Stream {
             id: stream_id,

@@ -14,7 +14,7 @@ use std::{
 };
 
 use lumalla_screencast::{
-    DmaBufferExport, ScreencastManager, ScreencastSource, ScreencastWake, VideoFrame,
+    DmaBufferExport, FormatOffer, ScreencastManager, ScreencastSource, ScreencastWake, VideoFrame,
 };
 use pipewire::{
     self as pw,
@@ -267,6 +267,7 @@ fn memfd_source_delivers_frames_to_consumer() {
             String::from("LumallaFrameTest"),
             30,
             exports,
+            FormatOffer::PreferMemFd,
         )
         .expect("start_stream");
 
