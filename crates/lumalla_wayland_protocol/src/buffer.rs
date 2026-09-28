@@ -257,6 +257,12 @@ impl SendChunk {
         }
     }
 
+    fn reset(&mut self) {
+        self.len = 0;
+        self.send_offset = 0;
+        self.fds.clear();
+    }
+
     fn remaining(&self) -> usize {
         SEND_CHUNK_SIZE - self.len
     }
@@ -268,6 +274,8 @@ pub struct Writer {
     active: SendChunk,
     queue: VecDeque<SendChunk>,
     in_flight: Option<SendChunk>,
+    /// Completed chunks available for reuse (avoids reallocating 4 KiB boxes).
+    free: Vec<SendChunk>,
     message_start_offset: usize,
     last_err: Option<anyhow::Error>,
     send_buffer_limit_exceeded: bool,
@@ -285,6 +293,7 @@ impl Writer {
             active: SendChunk::new(),
             queue: VecDeque::new(),
             in_flight: None,
+            free: Vec::with_capacity(MAX_SEND_BUFFERS),
             message_start_offset: 0,
             last_err: None,
             send_buffer_limit_exceeded: false,
@@ -295,6 +304,23 @@ impl Writer {
                 iov_len: 0,
             },
             send_msghdr: unsafe { mem::zeroed() },
+        }
+    }
+
+    fn take_chunk(&mut self) -> SendChunk {
+        match self.free.pop() {
+            Some(mut chunk) => {
+                chunk.reset();
+                chunk
+            }
+            None => SendChunk::new(),
+        }
+    }
+
+    fn recycle_chunk(&mut self, mut chunk: SendChunk) {
+        if self.free.len() < MAX_SEND_BUFFERS {
+            chunk.reset();
+            self.free.push(chunk);
         }
     }
 
@@ -340,8 +366,9 @@ impl Writer {
             return false;
         }
         if self.active.len > 0 {
+            let next = self.take_chunk();
             self.queue
-                .push_back(mem::replace(&mut self.active, SendChunk::new()));
+                .push_back(mem::replace(&mut self.active, next));
         }
         true
     }
@@ -550,8 +577,9 @@ impl Writer {
             self.set_send_buffer_limit_exceeded();
             return false;
         }
+        let next = self.take_chunk();
         self.queue
-            .push_back(mem::replace(&mut self.active, SendChunk::new()));
+            .push_back(mem::replace(&mut self.active, next));
         true
     }
 
@@ -632,18 +660,24 @@ impl Writer {
             if err == EWOULDBLOCK || err == EAGAIN {
                 return Ok(true);
             }
-            self.in_flight = None;
+            if let Some(chunk) = self.in_flight.take() {
+                self.recycle_chunk(chunk);
+            }
             return Err(io::Error::from_raw_os_error(err).into());
         }
         if result == 0 {
-            self.in_flight = None;
+            if let Some(chunk) = self.in_flight.take() {
+                self.recycle_chunk(chunk);
+            }
             anyhow::bail!("Wayland socket write returned zero");
         }
         let written = result as usize;
         chunk.fds.clear();
         chunk.send_offset += written;
         if chunk.send_offset >= chunk.len {
-            self.in_flight = None;
+            if let Some(chunk) = self.in_flight.take() {
+                self.recycle_chunk(chunk);
+            }
             Ok(false)
         } else {
             self.build_send_msghdr();
@@ -744,6 +778,7 @@ impl Writer {
                 self.queue.push_front(chunk);
                 break;
             }
+            self.recycle_chunk(chunk);
         }
         Ok(())
     }
@@ -924,6 +959,39 @@ mod tests {
         assert_eq!(second as usize, total - SEND_CHUNK_SIZE);
         assert!(!writer.apply_send_result(second as i32).unwrap());
         assert!(!writer.has_pending_output());
+    }
+
+    #[test]
+    fn writer_recycles_send_chunks() {
+        let socket = UnixStream::pair().unwrap();
+        let mut writer = Writer::new(socket.1.as_raw_fd());
+
+        let write_spanning_two_chunks = |writer: &mut Writer| {
+            writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 1);
+            let words = (SEND_CHUNK_SIZE - HEADER_SIZE) / mem::size_of::<u32>();
+            for _ in 0..words {
+                writer.write_u32(0);
+            }
+            // Force a rotate into a second chunk, then finish the message.
+            writer.write_u32(7);
+            writer.write_message_length();
+        };
+
+        write_spanning_two_chunks(&mut writer);
+        assert_eq!(writer.queue.len(), 1);
+        let first_ptr = writer.queue[0].data.as_ptr();
+
+        while writer.has_pending_output() {
+            let msg = writer.prepare_send_msghdr().unwrap();
+            let written = unsafe { sendmsg(socket.1.as_raw_fd(), &*msg, MSG_NOSIGNAL) };
+            assert!(written > 0);
+            let _ = writer.apply_send_result(written as i32).unwrap();
+        }
+        assert!(!writer.free.is_empty());
+
+        // The next rotate should reuse the original first chunk from the freelist.
+        write_spanning_two_chunks(&mut writer);
+        assert_eq!(writer.queue[0].data.as_ptr(), first_ptr);
     }
 
     #[test]
