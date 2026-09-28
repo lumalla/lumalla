@@ -11,6 +11,9 @@ use super::{
     StagingBufferPool,
 };
 
+/// Cap free-list length so in-flight frames cannot retain unbounded command buffers.
+const MAX_FREE_COMMAND_BUFFERS: usize = 8;
+
 /// Holds the core Vulkan objects needed for rendering.
 ///
 /// This struct manages the Vulkan entry point (loader) and instance,
@@ -26,6 +29,8 @@ pub struct VulkanContext {
     device: Option<Device>,
     /// Command pool for graphics operations (must be destroyed before device)
     graphics_command_pool: Option<CommandPool>,
+    /// Reusable primary command buffers (returned after GPU work completes).
+    command_buffer_free: Vec<vk::CommandBuffer>,
     /// Memory allocator (must be destroyed before device)
     memory_allocator: Option<MemoryAllocator>,
     /// Reused host-visible staging buffers for SHM / label uploads (dropped before device).
@@ -186,6 +191,7 @@ impl VulkanContext {
             physical_device,
             device: Some(device),
             graphics_command_pool: Some(graphics_command_pool),
+            command_buffer_free: Vec::new(),
             memory_allocator: Some(memory_allocator),
             staging_pool: Some(StagingBufferPool::new()),
             scanout_render_pass: None,
@@ -343,13 +349,51 @@ impl VulkanContext {
             .release_many(buffers);
     }
 
-    /// Free command buffers allocated from the graphics pool.
+    /// Free command buffers allocated from the graphics pool (not returned to the reuse list).
     pub fn free_command_buffers(&self, buffers: &[vk::CommandBuffer]) {
         if buffers.is_empty() {
             return;
         }
         self.graphics_command_pool()
             .free_command_buffers(self.device(), buffers);
+    }
+
+    /// Acquire a reusable primary command buffer (reset if recycled).
+    pub fn acquire_command_buffer(&mut self) -> anyhow::Result<vk::CommandBuffer> {
+        let device = self
+            .device
+            .as_ref()
+            .expect("Device should always be present while VulkanContext is alive");
+        if let Some(command_buffer) = self.command_buffer_free.pop() {
+            unsafe {
+                device
+                    .handle()
+                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+            }
+            .context("Failed to reset recycled command buffer")?;
+            return Ok(command_buffer);
+        }
+        self.graphics_command_pool()
+            .allocate_command_buffer(device)
+            .context("Failed to allocate command buffer")
+    }
+
+    /// Return command buffers to the reuse list after GPU work that referenced them completed.
+    pub fn release_command_buffers(
+        &mut self,
+        buffers: impl IntoIterator<Item = vk::CommandBuffer>,
+    ) {
+        let mut overflow = Vec::new();
+        for command_buffer in buffers {
+            if self.command_buffer_free.len() < MAX_FREE_COMMAND_BUFFERS {
+                self.command_buffer_free.push(command_buffer);
+            } else {
+                overflow.push(command_buffer);
+            }
+        }
+        if !overflow.is_empty() {
+            self.free_command_buffers(&overflow);
+        }
     }
 
     /// Returns a reference to the Vulkan entry (function loader).
@@ -370,6 +414,12 @@ impl Drop for VulkanContext {
     fn drop(&mut self) {
         drop(self.scanout_render_pass_load.take());
         drop(self.scanout_render_pass.take());
+
+        // Return pooled command buffers to the Vulkan pool before destroying it.
+        if !self.command_buffer_free.is_empty() {
+            let free = std::mem::take(&mut self.command_buffer_free);
+            self.free_command_buffers(&free);
+        }
 
         // Command pool must be destroyed before device
         if let (Some(command_pool), Some(device)) = (&mut self.graphics_command_pool, &self.device)

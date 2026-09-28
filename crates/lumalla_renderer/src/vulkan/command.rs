@@ -170,6 +170,16 @@ impl<'a> CommandBufferRecorder<'a> {
         )
     }
 
+    /// Continues recording into an already-begun command buffer (no begin/end).
+    ///
+    /// Used when multiple GPU ops append into a single frame command buffer.
+    pub fn continue_recording(device: &'a Device, command_buffer: vk::CommandBuffer) -> Self {
+        Self {
+            device,
+            command_buffer,
+        }
+    }
+
     /// Returns the command buffer being recorded.
     pub fn command_buffer(&self) -> vk::CommandBuffer {
         self.command_buffer

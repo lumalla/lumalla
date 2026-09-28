@@ -1333,7 +1333,7 @@ impl RendererState {
             };
             let vulkan = self
                 .vulkan
-                .as_ref()
+                .as_mut()
                 .context("Vulkan missing for screencast clear")?;
             unsafe {
                 clear_dma_image_color(vulkan, &mut batch, &*dst_ptr, fresh, [0.0, 0.0, 0.0, 1.0])?;
@@ -1373,7 +1373,7 @@ impl RendererState {
                 .max(1) as u32;
             let vulkan = self
                 .vulkan
-                .as_ref()
+                .as_mut()
                 .context("Vulkan missing for screencast blit")?;
             // Safety: both images are owned by self and live for this call.
             unsafe {
@@ -1437,6 +1437,7 @@ impl RendererState {
                     &[],
                     false,
                 )?;
+                batch.ensure_recording(vulkan)?;
                 let render_pass = vulkan.scanout_render_pass_load()?;
                 let (image_ptr, fb_ptr) = {
                     let slots = self
@@ -1471,14 +1472,19 @@ impl RendererState {
                 Ok(())
             })();
             self.gpu.compositor = Some(compositor);
-            result?;
+            if let Err(error) = result {
+                if let Some(vulkan) = self.vulkan.as_mut() {
+                    batch.abandon(vulkan);
+                }
+                return Err(error);
+            }
         }
 
         let vulkan = self
             .vulkan
-            .as_ref()
+            .as_mut()
             .context("Vulkan missing for screencast submit")?;
-        let pending = batch.submit(vulkan.device())?;
+        let pending = batch.submit(vulkan)?;
         let serial = self.screencast_content_serial;
 
         if let Some(slot) = self
@@ -1601,6 +1607,7 @@ impl RendererState {
                 )?;
 
                 vulkan.ensure_scanout_render_pass()?;
+                batch.ensure_recording(vulkan)?;
                 let render_pass = vulkan.scanout_render_pass()?;
                 let image_old_layout = if fresh {
                     vk::ImageLayout::UNDEFINED
@@ -1651,14 +1658,19 @@ impl RendererState {
                 Ok(())
             })();
             self.gpu.compositor = Some(compositor);
-            result?;
+            if let Err(error) = result {
+                if let Some(vulkan) = self.vulkan.as_mut() {
+                    batch.abandon(vulkan);
+                }
+                return Err(error);
+            }
         }
 
         let vulkan = self
             .vulkan
-            .as_ref()
+            .as_mut()
             .context("Vulkan missing for window screencast submit")?;
-        let pending = batch.submit(vulkan.device())?;
+        let pending = batch.submit(vulkan)?;
         let serial = self.screencast_content_serial;
 
         if let Some(slot) = self
@@ -3046,6 +3058,7 @@ impl RendererState {
                 }
 
                 vulkan.ensure_scanout_render_pass()?;
+                batch.ensure_recording(vulkan)?;
                 let render_pass = match &composite_mode {
                     CompositeMode::Full => vulkan.scanout_render_pass()?,
                     CompositeMode::Partial(_) => {
@@ -3082,13 +3095,14 @@ impl RendererState {
                 Ok(())
             })();
             if let Err(error) = gpu_result {
+                batch.abandon(vulkan);
                 self.gpu.surface_textures.clear();
                 self.gpu.compositor = Some(compositor);
                 return Err(error);
             }
             self.gpu.compositor = Some(compositor);
 
-            buffer.gpu_pending = Some(batch.submit(vulkan.device())?);
+            buffer.gpu_pending = Some(batch.submit(vulkan)?);
             buffer.fresh = false;
         }
 

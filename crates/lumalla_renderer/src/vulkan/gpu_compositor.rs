@@ -18,8 +18,8 @@ const WL_SHM_FORMAT_XRGB8888: u32 = 1;
 const WL_SHM_FORMAT_ARGB8888: u32 = 0;
 
 use super::{
-    CommandBufferRecorder, CommandPool, DescriptorPool, DescriptorSetLayout, Device, DmaBufImage,
-    Fence, Framebuffer, GraphicsPipeline, GraphicsPipelineBuilder, Image, RenderPass, Sampler,
+    CommandBufferRecorder, DescriptorPool, DescriptorSetLayout, Device, DmaBufImage, Fence,
+    Framebuffer, GraphicsPipeline, GraphicsPipelineBuilder, Image, RenderPass, Sampler,
     ShaderModule, StagingBuffer, VulkanContext, drm_fourcc_to_vulkan,
 };
 
@@ -28,44 +28,100 @@ const CURSOR_TEXTURE_KEY: (u32, u32) = (u32::MAX, u32::MAX);
 /// Synthetic owner id for guide label textures (`surface_id` = guide index).
 const GUIDE_LABEL_OWNER: u32 = u32::MAX - 1;
 
-/// Batched GPU command buffers for one present, submitted together.
+/// Batched GPU work for one present/screencast submit: one reusable command buffer.
 pub struct GpuWorkBatch {
-    command_buffers: Vec<vk::CommandBuffer>,
+    /// Begun primary command buffer; ended on [`Self::submit`].
+    command_buffer: Option<vk::CommandBuffer>,
     staging: Vec<StagingBuffer>,
 }
 
 impl GpuWorkBatch {
     pub fn new() -> Self {
         Self {
-            command_buffers: Vec::new(),
+            command_buffer: None,
             staging: Vec::new(),
         }
     }
 
-    fn push(&mut self, command_buffer: vk::CommandBuffer, staging: Option<StagingBuffer>) {
-        self.command_buffers.push(command_buffer);
-        if let Some(staging) = staging {
-            self.staging.push(staging);
+    /// Ensure a one-time primary command buffer is begun and return its handle.
+    pub fn ensure_recording(
+        &mut self,
+        vulkan: &mut VulkanContext,
+    ) -> anyhow::Result<vk::CommandBuffer> {
+        if let Some(command_buffer) = self.command_buffer {
+            return Ok(command_buffer);
         }
+        let command_buffer = vulkan.acquire_command_buffer()?;
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        if let Err(error) = unsafe {
+            vulkan
+                .device()
+                .handle()
+                .begin_command_buffer(command_buffer, &begin_info)
+        } {
+            vulkan.release_command_buffers([command_buffer]);
+            return Err(error).context("Failed to begin frame command buffer");
+        }
+        self.command_buffer = Some(command_buffer);
+        Ok(command_buffer)
     }
 
-    fn is_empty(&self) -> bool {
-        self.command_buffers.is_empty()
+    pub fn push_staging(&mut self, staging: StagingBuffer) {
+        self.staging.push(staging);
     }
 
-    /// Submits all recorded work with a single fence (does not wait).
-    pub fn submit(self, device: &Device) -> anyhow::Result<PendingGpuSubmit> {
-        if self.command_buffers.is_empty() {
+    /// Command buffer handle while recording (after [`Self::ensure_recording`]).
+    pub fn recording_buffer(&self) -> anyhow::Result<vk::CommandBuffer> {
+        self.command_buffer
+            .context("GPU work batch is not recording")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.command_buffer.is_none()
+    }
+
+    /// End recording without submitting and return resources to their pools.
+    pub fn abandon(&mut self, vulkan: &mut VulkanContext) {
+        if let Some(command_buffer) = self.command_buffer.take() {
+            let _ = unsafe { vulkan.device().handle().end_command_buffer(command_buffer) };
+            vulkan.release_command_buffers([command_buffer]);
+        }
+        vulkan.release_staging_many(self.staging.drain(..));
+    }
+
+    /// Ends recording and submits all work with a single fence (does not wait).
+    pub fn submit(mut self, vulkan: &mut VulkanContext) -> anyhow::Result<PendingGpuSubmit> {
+        let Some(command_buffer) = self.command_buffer.take() else {
+            vulkan.release_staging_many(self.staging.drain(..));
             return Ok(PendingGpuSubmit::empty());
+        };
+        if let Err(error) = unsafe { vulkan.device().handle().end_command_buffer(command_buffer) } {
+            vulkan.release_command_buffers([command_buffer]);
+            vulkan.release_staging_many(self.staging.drain(..));
+            return Err(error).context("Failed to end frame command buffer");
         }
-        let fence = Fence::new(device, false).context("Failed to create frame GPU fence")?;
-        device
-            .submit_graphics(&self.command_buffers, &[], &[], &[], fence.handle())
-            .context("Failed to submit frame GPU work")?;
+        let fence = match Fence::new(vulkan.device(), false) {
+            Ok(fence) => fence,
+            Err(error) => {
+                vulkan.release_command_buffers([command_buffer]);
+                vulkan.release_staging_many(self.staging.drain(..));
+                return Err(error).context("Failed to create frame GPU fence");
+            }
+        };
+        if let Err(error) =
+            vulkan
+                .device()
+                .submit_graphics(&[command_buffer], &[], &[], &[], fence.handle())
+        {
+            vulkan.release_command_buffers([command_buffer]);
+            vulkan.release_staging_many(self.staging.drain(..));
+            return Err(error).context("Failed to submit frame GPU work");
+        }
         Ok(PendingGpuSubmit {
             fence: Some(fence),
-            command_buffers: self.command_buffers,
-            staging: self.staging,
+            command_buffers: vec![command_buffer],
+            staging: std::mem::take(&mut self.staging),
         })
     }
 }
@@ -92,8 +148,7 @@ impl PendingGpuSubmit {
 
     /// Recycle command buffers and return staging to the pool after the fence has signaled.
     fn recycle(&mut self, vulkan: &mut VulkanContext) {
-        vulkan.free_command_buffers(&self.command_buffers);
-        self.command_buffers.clear();
+        vulkan.release_command_buffers(self.command_buffers.drain(..));
         vulkan.release_staging_many(self.staging.drain(..));
         let _ = self.fence.take();
     }
@@ -106,8 +161,7 @@ impl PendingGpuSubmit {
                 .context("Timed out waiting for GPU frame work")
             {
                 let _ = vulkan.device().wait_idle();
-                vulkan.free_command_buffers(&self.command_buffers);
-                self.command_buffers.clear();
+                vulkan.release_command_buffers(self.command_buffers.drain(..));
                 vulkan.release_staging_many(self.staging.drain(..));
                 return Err(error);
             }
@@ -710,13 +764,7 @@ impl SurfaceTextureCache {
                     TextureBacking::Shm(_) => anyhow::bail!("Expected DMA-BUF backing"),
                 }
             };
-            acquire_dmabuf_for_sample(
-                vulkan.device(),
-                vulkan.graphics_command_pool(),
-                batch,
-                image,
-                false,
-            )?;
+            acquire_dmabuf_for_sample(vulkan, batch, image, false)?;
             return Ok(());
         }
 
@@ -738,13 +786,7 @@ impl SurfaceTextureCache {
                         TextureBacking::Shm(_) => anyhow::bail!("Expected DMA-BUF backing"),
                     }
                 };
-                acquire_dmabuf_for_sample(
-                    vulkan.device(),
-                    vulkan.graphics_command_pool(),
-                    batch,
-                    image,
-                    false,
-                )?;
+                acquire_dmabuf_for_sample(vulkan, batch, image, false)?;
                 return Ok(());
             }
             compositor
@@ -766,13 +808,7 @@ impl SurfaceTextureCache {
             dmabuf.offset as u64,
             stride,
         )?;
-        acquire_dmabuf_for_sample(
-            vulkan.device(),
-            vulkan.graphics_command_pool(),
-            batch,
-            imported.image(),
-            true,
-        )?;
+        acquire_dmabuf_for_sample(vulkan, batch, imported.image(), true)?;
 
         let descriptor_set = compositor
             .descriptor_pool
@@ -1020,71 +1056,60 @@ fn dup_fd(fd: std::os::fd::RawFd) -> anyhow::Result<std::os::fd::OwnedFd> {
 }
 
 fn acquire_dmabuf_for_sample(
-    device: &Device,
-    command_pool: &CommandPool,
+    vulkan: &mut VulkanContext,
     batch: &mut GpuWorkBatch,
     image: vk::Image,
     first_import: bool,
 ) -> anyhow::Result<()> {
-    let command_buffer = command_pool.allocate_command_buffer(device)?;
+    let command_buffer = batch.ensure_recording(vulkan)?;
+    let device = vulkan.device();
     let graphics_family = device.graphics_queue_family();
-    let record_result = (|| -> anyhow::Result<()> {
-        let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
-        let (old_layout, src_access, src_stage) = if first_import {
-            (
-                vk::ImageLayout::UNDEFINED,
-                vk::AccessFlags::empty(),
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-            )
-        } else {
-            (
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::AccessFlags::SHADER_READ,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-            )
-        };
-        let barrier = vk::ImageMemoryBarrier::default()
-            .src_access_mask(src_access)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(old_layout)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-            .dst_queue_family_index(graphics_family)
-            .image(image)
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                recorder.command_buffer(),
-                src_stage,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
-        recorder.end()?;
-        Ok(())
-    })();
-    if let Err(error) = record_result {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
+    let (old_layout, src_access, src_stage) = if first_import {
+        (
+            vk::ImageLayout::UNDEFINED,
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+        )
+    } else {
+        (
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        )
+    };
+    let barrier = vk::ImageMemoryBarrier::default()
+        .src_access_mask(src_access)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .old_layout(old_layout)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+        .dst_queue_family_index(graphics_family)
+        .image(image)
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            command_buffer,
+            src_stage,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
     }
-    batch.push(command_buffer, None);
     Ok(())
 }
 
 /// Copies the displayed scanout image into a back buffer before incremental compositing.
 pub fn copy_scanout_frame(
-    vulkan: &VulkanContext,
+    vulkan: &mut VulkanContext,
     batch: &mut GpuWorkBatch,
     src: &DmaBufImage,
     dst: &DmaBufImage,
     dst_was_fresh: bool,
 ) -> anyhow::Result<()> {
+    let command_buffer = batch.ensure_recording(vulkan)?;
     let device = vulkan.device();
-    let command_pool = vulkan.graphics_command_pool();
-    let command_buffer = command_pool.allocate_command_buffer(device)?;
     let extent = src.extent();
 
     let dst_old_layout = if dst_was_fresh {
@@ -1093,119 +1118,99 @@ pub fn copy_scanout_frame(
         vk::ImageLayout::GENERAL
     };
 
-    let record_result = (|| -> anyhow::Result<()> {
-        let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
-        let cb = recorder.command_buffer();
-
-        let src_barrier = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(src.image())
-            .subresource_range(color_subresource_range());
-        let (dst_src_access, _dst_src_stage) = if dst_was_fresh {
-            (
-                vk::AccessFlags::empty(),
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-            )
-        } else {
-            (
-                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-            )
-        };
-        let dst_barrier = vk::ImageMemoryBarrier::default()
-            .src_access_mask(dst_src_access)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(dst_old_layout)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(dst.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[src_barrier, dst_barrier],
-            );
-        }
-
-        let copy_region = vk::ImageCopy::default()
-            .src_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .dst_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            });
-        unsafe {
-            device.handle().cmd_copy_image(
-                cb,
-                src.image(),
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                dst.image(),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[copy_region],
-            );
-        }
-
-        let src_back = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(src.image())
-            .subresource_range(color_subresource_range());
-        let dst_back = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(dst.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[src_back, dst_back],
-            );
-        }
-
-        recorder.end()?;
-        Ok(())
-    })();
-
-    if let Err(error) = record_result {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
+    let src_barrier = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::GENERAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(src.image())
+        .subresource_range(color_subresource_range());
+    let dst_src_access = if dst_was_fresh {
+        vk::AccessFlags::empty()
+    } else {
+        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+    };
+    let dst_barrier = vk::ImageMemoryBarrier::default()
+        .src_access_mask(dst_src_access)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(dst_old_layout)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(dst.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[src_barrier, dst_barrier],
+        );
     }
-    batch.push(command_buffer, None);
+
+    let copy_region = vk::ImageCopy::default()
+        .src_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .dst_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        });
+    unsafe {
+        device.handle().cmd_copy_image(
+            command_buffer,
+            src.image(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            dst.image(),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[copy_region],
+        );
+    }
+
+    let src_back = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(src.image())
+        .subresource_range(color_subresource_range());
+    let dst_back = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(dst.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[src_back, dst_back],
+        );
+    }
     Ok(())
 }
 
@@ -1235,22 +1240,41 @@ pub fn composite_to_scanout(
         },
     };
 
+    let command_buffer = batch.recording_buffer()?;
     let device = vulkan.device();
-    let command_pool = vulkan.graphics_command_pool();
-    let command_buffer = command_pool.allocate_command_buffer(device)?;
+    let mut recorder = CommandBufferRecorder::continue_recording(device, command_buffer);
+    transition_scanout_for_render(
+        device,
+        recorder.command_buffer(),
+        scanout_image,
+        scanout_old_layout,
+    )?;
+    recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
 
-    let record_result = (|| -> anyhow::Result<()> {
-        let mut recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
-        transition_scanout_for_render(
-            device,
-            recorder.command_buffer(),
-            scanout_image,
-            scanout_old_layout,
-        )?;
-        recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
-
-        match composite_mode {
-            CompositeMode::Full => {
+    match composite_mode {
+        CompositeMode::Full => {
+            draw_views(
+                compositor,
+                device,
+                &mut recorder,
+                cache,
+                views,
+                layers,
+                guides,
+                cursor,
+                pointer_x,
+                pointer_y,
+                output_width,
+                output_height,
+                None,
+            );
+        }
+        CompositeMode::Partial(regions) => {
+            for region in regions {
+                let clip = upload_rect_to_vk(region);
+                // ClearAttachments is clipped by the dynamic scissor.
+                recorder.set_scissor(&clip);
+                recorder.clear_color_rects(clear_color, &[clip]);
                 draw_views(
                     compositor,
                     device,
@@ -1264,44 +1288,13 @@ pub fn composite_to_scanout(
                     pointer_y,
                     output_width,
                     output_height,
-                    None,
+                    Some(&clip),
                 );
             }
-            CompositeMode::Partial(regions) => {
-                for region in regions {
-                    let clip = upload_rect_to_vk(region);
-                    // ClearAttachments is clipped by the dynamic scissor.
-                    recorder.set_scissor(&clip);
-                    recorder.clear_color_rects(clear_color, &[clip]);
-                    draw_views(
-                        compositor,
-                        device,
-                        &mut recorder,
-                        cache,
-                        views,
-                        layers,
-                        guides,
-                        cursor,
-                        pointer_x,
-                        pointer_y,
-                        output_width,
-                        output_height,
-                        Some(&clip),
-                    );
-                }
-            }
         }
-
-        recorder.end_render_pass();
-        recorder.end()?;
-        Ok(())
-    })();
-
-    if let Err(error) = record_result {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
     }
-    batch.push(command_buffer, None);
+
+    recorder.end_render_pass();
     Ok(())
 }
 
@@ -1333,75 +1326,62 @@ pub fn composite_layers_to_image(
         },
     };
 
+    let command_buffer = batch.recording_buffer()?;
     let device = vulkan.device();
-    let command_pool = vulkan.graphics_command_pool();
-    let command_buffer = command_pool.allocate_command_buffer(device)?;
+    let mut recorder = CommandBufferRecorder::continue_recording(device, command_buffer);
+    transition_scanout_for_render(
+        device,
+        recorder.command_buffer(),
+        image,
+        image_old_layout,
+    )?;
+    recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
+    draw_scene_layers(
+        compositor,
+        device,
+        &mut recorder,
+        cache,
+        view,
+        layers,
+        output_width,
+        output_height,
+        None,
+    );
+    draw_cursor_layer(
+        compositor,
+        device,
+        &mut recorder,
+        cache,
+        cursor,
+        pointer_x,
+        pointer_y,
+        output_width,
+        output_height,
+        None,
+    );
+    recorder.end_render_pass();
 
-    let record_result = (|| -> anyhow::Result<()> {
-        let mut recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
-        transition_scanout_for_render(
-            device,
+    // Transition to GENERAL for PipeWire export / CPU readback.
+    let barrier = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
             recorder.command_buffer(),
-            image,
-            image_old_layout,
-        )?;
-        recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
-        draw_scene_layers(
-            compositor,
-            device,
-            &mut recorder,
-            cache,
-            view,
-            layers,
-            output_width,
-            output_height,
-            None,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
         );
-        draw_cursor_layer(
-            compositor,
-            device,
-            &mut recorder,
-            cache,
-            cursor,
-            pointer_x,
-            pointer_y,
-            output_width,
-            output_height,
-            None,
-        );
-        recorder.end_render_pass();
-
-        // Transition to GENERAL for PipeWire export / CPU readback.
-        let barrier = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                recorder.command_buffer(),
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
-
-        recorder.end()?;
-        Ok(())
-    })();
-
-    if let Err(error) = record_result {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
     }
-    batch.push(command_buffer, None);
     Ok(())
 }
 
@@ -1427,64 +1407,51 @@ pub fn overlay_cursor_on_image(
         return Ok(());
     }
 
+    let command_buffer = batch.recording_buffer()?;
     let device = vulkan.device();
-    let command_pool = vulkan.graphics_command_pool();
-    let command_buffer = command_pool.allocate_command_buffer(device)?;
+    let mut recorder = CommandBufferRecorder::continue_recording(device, command_buffer);
+    transition_scanout_for_render(
+        device,
+        recorder.command_buffer(),
+        image,
+        vk::ImageLayout::GENERAL,
+    )?;
+    // LOAD render pass — preserve the blit contents.
+    recorder.begin_render_pass_default(render_pass_load, framebuffer)?;
+    draw_cursor_layer(
+        compositor,
+        device,
+        &mut recorder,
+        cache,
+        cursor,
+        pointer_x,
+        pointer_y,
+        output_width,
+        output_height,
+        None,
+    );
+    recorder.end_render_pass();
 
-    let record_result = (|| -> anyhow::Result<()> {
-        let mut recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
-        transition_scanout_for_render(
-            device,
+    let barrier = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
             recorder.command_buffer(),
-            image,
-            vk::ImageLayout::GENERAL,
-        )?;
-        // LOAD render pass — preserve the blit contents.
-        recorder.begin_render_pass_default(render_pass_load, framebuffer)?;
-        draw_cursor_layer(
-            compositor,
-            device,
-            &mut recorder,
-            cache,
-            cursor,
-            pointer_x,
-            pointer_y,
-            output_width,
-            output_height,
-            None,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
         );
-        recorder.end_render_pass();
-
-        let barrier = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                recorder.command_buffer(),
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
-
-        recorder.end()?;
-        Ok(())
-    })();
-
-    if let Err(error) = record_result {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(error);
     }
-    batch.push(command_buffer, None);
     Ok(())
 }
 
@@ -2082,14 +2049,15 @@ fn upload_bgra_texture(
         }
     };
 
-    let command_buffer = {
-        let device = vulkan.device();
-        vulkan
-            .graphics_command_pool()
-            .allocate_command_buffer(device)?
+    let command_buffer = match batch.ensure_recording(vulkan) {
+        Ok(command_buffer) => command_buffer,
+        Err(error) => {
+            vulkan.release_staging_many([staging]);
+            return Err(error);
+        }
     };
 
-    let record_result = record_bgra_texture_upload(
+    if let Err(error) = record_bgra_texture_upload(
         vulkan,
         image,
         &staging,
@@ -2099,14 +2067,12 @@ fn upload_bgra_texture(
         image_offset,
         image_extent,
         command_buffer,
-    );
-
-    if let Err(error) = record_result {
-        vulkan.free_command_buffers(&[command_buffer]);
+    ) {
         vulkan.release_staging_many([staging]);
+        batch.abandon(vulkan);
         return Err(error);
     }
-    batch.push(command_buffer, Some(staging));
+    batch.push_staging(staging);
     Ok(())
 }
 
@@ -2122,7 +2088,6 @@ fn record_bgra_texture_upload(
     command_buffer: vk::CommandBuffer,
 ) -> anyhow::Result<()> {
     let device = vulkan.device();
-    let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
     let old_layout = if previously_uploaded {
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
     } else {
@@ -2139,7 +2104,7 @@ fn record_bgra_texture_upload(
         .subresource_range(color_subresource_range());
     unsafe {
         device.handle().cmd_pipeline_barrier(
-            recorder.command_buffer(),
+            command_buffer,
             vk::PipelineStageFlags::TOP_OF_PIPE,
             vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
@@ -2163,7 +2128,7 @@ fn record_bgra_texture_upload(
         .image_extent(image_extent);
     unsafe {
         device.handle().cmd_copy_buffer_to_image(
-            recorder.command_buffer(),
+            command_buffer,
             staging.buffer(),
             image.image(),
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -2182,7 +2147,7 @@ fn record_bgra_texture_upload(
         .subresource_range(color_subresource_range());
     unsafe {
         device.handle().cmd_pipeline_barrier(
-            recorder.command_buffer(),
+            command_buffer,
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::DependencyFlags::empty(),
@@ -2191,7 +2156,6 @@ fn record_bgra_texture_upload(
             &[to_sample],
         );
     }
-    recorder.end()?;
     Ok(())
 }
 
@@ -2224,7 +2188,7 @@ fn write_texture_descriptor(
 
 /// Copies (with optional scale) a rectangular region from `src` into `dst`.
 pub fn blit_image_region(
-    vulkan: &VulkanContext,
+    vulkan: &mut VulkanContext,
     batch: &mut GpuWorkBatch,
     src: &DmaBufImage,
     dst: &DmaBufImage,
@@ -2252,142 +2216,127 @@ pub fn blit_image_region(
         "destination blit rect out of bounds"
     );
 
+    let command_buffer = batch.ensure_recording(vulkan)?;
     let device = vulkan.device();
-    let command_pool = vulkan.graphics_command_pool();
-    let command_buffer = command_pool.allocate_command_buffer(device)?;
-
     let dst_old_layout = if dst_was_undefined {
         vk::ImageLayout::UNDEFINED
     } else {
         vk::ImageLayout::GENERAL
     };
 
-    let record_result = (|| -> anyhow::Result<()> {
-        let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
-        let cb = recorder.command_buffer();
-
-        let src_barrier = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(src.image())
-            .subresource_range(color_subresource_range());
-        let dst_src_access = if dst_was_undefined {
-            vk::AccessFlags::empty()
-        } else {
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
-        };
-        let dst_barrier = vk::ImageMemoryBarrier::default()
-            .src_access_mask(dst_src_access)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(dst_old_layout)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(dst.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[src_barrier, dst_barrier],
-            );
-        }
-
-        let regions = [vk::ImageBlit::default()
-            .src_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .src_offsets([
-                vk::Offset3D {
-                    x: src_x as i32,
-                    y: src_y as i32,
-                    z: 0,
-                },
-                vk::Offset3D {
-                    x: (src_x + src_w) as i32,
-                    y: (src_y + src_h) as i32,
-                    z: 1,
-                },
-            ])
-            .dst_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .dst_offsets([
-                vk::Offset3D {
-                    x: dst_x as i32,
-                    y: dst_y as i32,
-                    z: 0,
-                },
-                vk::Offset3D {
-                    x: (dst_x + dst_w) as i32,
-                    y: (dst_y + dst_h) as i32,
-                    z: 1,
-                },
-            ])];
-        unsafe {
-            device.handle().cmd_blit_image(
-                cb,
-                src.image(),
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                dst.image(),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &regions,
-                vk::Filter::NEAREST,
-            );
-        }
-
-        let src_back = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(src.image())
-            .subresource_range(color_subresource_range());
-        let dst_back = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(dst.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[src_back, dst_back],
-            );
-        }
-        recorder.end()?;
-        Ok(())
-    })();
-
-    if let Err(err) = record_result {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(err);
+    let src_barrier = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .old_layout(vk::ImageLayout::GENERAL)
+        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(src.image())
+        .subresource_range(color_subresource_range());
+    let dst_src_access = if dst_was_undefined {
+        vk::AccessFlags::empty()
+    } else {
+        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+    };
+    let dst_barrier = vk::ImageMemoryBarrier::default()
+        .src_access_mask(dst_src_access)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(dst_old_layout)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(dst.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[src_barrier, dst_barrier],
+        );
     }
-    batch.push(command_buffer, None);
+
+    let regions = [vk::ImageBlit::default()
+        .src_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .src_offsets([
+            vk::Offset3D {
+                x: src_x as i32,
+                y: src_y as i32,
+                z: 0,
+            },
+            vk::Offset3D {
+                x: (src_x + src_w) as i32,
+                y: (src_y + src_h) as i32,
+                z: 1,
+            },
+        ])
+        .dst_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .dst_offsets([
+            vk::Offset3D {
+                x: dst_x as i32,
+                y: dst_y as i32,
+                z: 0,
+            },
+            vk::Offset3D {
+                x: (dst_x + dst_w) as i32,
+                y: (dst_y + dst_h) as i32,
+                z: 1,
+            },
+        ])];
+    unsafe {
+        device.handle().cmd_blit_image(
+            command_buffer,
+            src.image(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            dst.image(),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+            vk::Filter::NEAREST,
+        );
+    }
+
+    let src_back = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(src.image())
+        .subresource_range(color_subresource_range());
+    let dst_back = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(dst.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[src_back, dst_back],
+        );
+    }
     Ok(())
 }
 
@@ -2396,96 +2345,80 @@ pub fn blit_image_region(
 /// Used before partial/multi-region screencast blits so uncovered destination
 /// pixels are defined. Leaves the image in `GENERAL`.
 pub fn clear_dma_image_color(
-    vulkan: &VulkanContext,
+    vulkan: &mut VulkanContext,
     batch: &mut GpuWorkBatch,
     image: &DmaBufImage,
     was_undefined: bool,
     color: [f32; 4],
 ) -> anyhow::Result<()> {
+    let command_buffer = batch.ensure_recording(vulkan)?;
     let device = vulkan.device();
-    let command_pool = vulkan.graphics_command_pool();
-    let command_buffer = command_pool.allocate_command_buffer(device)?;
-    let extent = image.extent();
-
-    let record_result = (|| -> anyhow::Result<()> {
-        let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
-        let cb = recorder.command_buffer();
-        let old_layout = if was_undefined {
-            vk::ImageLayout::UNDEFINED
-        } else {
-            vk::ImageLayout::GENERAL
-        };
-        let src_access = if was_undefined {
-            vk::AccessFlags::empty()
-        } else {
-            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
-        };
-        let to_dst = vk::ImageMemoryBarrier::default()
-            .src_access_mask(src_access)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(old_layout)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                cb,
-                if was_undefined {
-                    vk::PipelineStageFlags::TOP_OF_PIPE
-                } else {
-                    vk::PipelineStageFlags::ALL_COMMANDS
-                },
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_dst],
-            );
-        }
-
-        let clear = vk::ClearColorValue { float32: color };
-        unsafe {
-            device.handle().cmd_clear_color_image(
-                cb,
-                image.image(),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &clear,
-                &[color_subresource_range()],
-            );
-        }
-
-        let to_general = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                cb,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_general],
-            );
-        }
-        let _ = extent; // documents full-image clear
-        recorder.end()?;
-        Ok(())
-    })();
-
-    if let Err(err) = record_result {
-        command_pool.free_command_buffers(device, &[command_buffer]);
-        return Err(err);
+    let old_layout = if was_undefined {
+        vk::ImageLayout::UNDEFINED
+    } else {
+        vk::ImageLayout::GENERAL
+    };
+    let src_access = if was_undefined {
+        vk::AccessFlags::empty()
+    } else {
+        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+    };
+    let to_dst = vk::ImageMemoryBarrier::default()
+        .src_access_mask(src_access)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(old_layout)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            command_buffer,
+            if was_undefined {
+                vk::PipelineStageFlags::TOP_OF_PIPE
+            } else {
+                vk::PipelineStageFlags::ALL_COMMANDS
+            },
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_dst],
+        );
     }
-    batch.push(command_buffer, None);
+
+    let clear = vk::ClearColorValue { float32: color };
+    unsafe {
+        device.handle().cmd_clear_color_image(
+            command_buffer,
+            image.image(),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &clear,
+            &[color_subresource_range()],
+        );
+    }
+
+    let to_general = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_general],
+        );
+    }
     Ok(())
 }
 

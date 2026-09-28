@@ -123,17 +123,17 @@ pub fn upload_bgra_regions_from_backing(
         return Err(error);
     }
 
-    let command_buffer = {
-        let device = vulkan.device();
-        vulkan
-            .graphics_command_pool()
-            .allocate_command_buffer(device)
-            .context("Failed to allocate upload command buffer")?
+    let command_buffer = match vulkan.acquire_command_buffer() {
+        Ok(command_buffer) => command_buffer,
+        Err(error) => {
+            vulkan.release_staging_many([staging]);
+            return Err(error);
+        }
     };
 
     let record_result = record_upload(vulkan, image, &staging, &copies, command_buffer);
     if let Err(error) = record_result {
-        vulkan.free_command_buffers(&[command_buffer]);
+        vulkan.release_command_buffers([command_buffer]);
         vulkan.release_staging_many([staging]);
         return Err(error);
     }
@@ -141,7 +141,7 @@ pub fn upload_bgra_regions_from_backing(
     let fence = match Fence::new(vulkan.device(), false) {
         Ok(fence) => fence,
         Err(error) => {
-            vulkan.free_command_buffers(&[command_buffer]);
+            vulkan.release_command_buffers([command_buffer]);
             vulkan.release_staging_many([staging]);
             return Err(error);
         }
@@ -151,7 +151,7 @@ pub fn upload_bgra_regions_from_backing(
             .device()
             .submit_graphics(&[command_buffer], &[], &[], &[], fence.handle())
     {
-        vulkan.free_command_buffers(&[command_buffer]);
+        vulkan.release_command_buffers([command_buffer]);
         vulkan.release_staging_many([staging]);
         return Err(error);
     }
@@ -161,11 +161,11 @@ pub fn upload_bgra_regions_from_backing(
     {
         // Do not release staging memory while submitted work may still reference it.
         let _ = vulkan.device().wait_idle();
-        vulkan.free_command_buffers(&[command_buffer]);
+        vulkan.release_command_buffers([command_buffer]);
         vulkan.release_staging_many([staging]);
         return Err(error);
     }
-    vulkan.free_command_buffers(&[command_buffer]);
+    vulkan.release_command_buffers([command_buffer]);
     vulkan.release_staging_many([staging]);
     Ok(())
 }
