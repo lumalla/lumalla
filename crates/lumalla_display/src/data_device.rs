@@ -1531,6 +1531,11 @@ fn negotiate_action(source_actions: u32, dest_actions: u32, preferred: u32) -> u
 }
 
 /// Forward a client-provided receive FD to the data source via `wl_data_source.send`.
+///
+/// Takes ownership of `fd`: the writer duplicates it into the send queue, then this
+/// closes the caller's copy. The queued duplicate is closed after send (or on drop).
+/// Attempts a sync flush so same-client transfers are delivered promptly; under async
+/// send the message may remain pending and is drained by the normal write path.
 pub fn forward_receive_to_source(
     writer: &mut Writer,
     source_id: ObjectId,
@@ -1541,11 +1546,10 @@ pub fn forward_receive_to_source(
         .wl_data_source_send(source_id)
         .mime_type(mime_type)
         .fd(fd);
-    if writer.flush().is_ok() && !writer.has_pending_output() {
-        unsafe {
-            libc::close(fd);
-        }
+    unsafe {
+        libc::close(fd);
     }
+    let _ = writer.flush();
 }
 
 #[cfg(test)]

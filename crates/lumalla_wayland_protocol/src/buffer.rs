@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     io, mem,
-    os::fd::{FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     ptr, slice,
 };
 
@@ -244,7 +244,9 @@ struct SendChunk {
     data: Box<[u8; SEND_CHUNK_SIZE]>,
     len: usize,
     send_offset: usize,
-    fds: Vec<RawFd>,
+    /// Owned duplicates queued for SCM_RIGHTS. Closed after a successful send
+    /// (or when the chunk is dropped / recycled without sending).
+    fds: Vec<OwnedFd>,
 }
 
 impl SendChunk {
@@ -266,6 +268,27 @@ impl SendChunk {
     fn remaining(&self) -> usize {
         SEND_CHUNK_SIZE - self.len
     }
+}
+
+/// Copy owned FD numbers into an SCM_RIGHTS cmsg payload.
+///
+/// `sendmsg` only needs the integer values; ownership stays with `fds` until
+/// the caller clears/drops them after a successful send.
+fn fill_scm_rights_cmsg(fds: &[OwnedFd], cmsg: &mut CmsgBuffer) -> (*mut libc::c_void, usize) {
+    let payload_len = fds.len() * mem::size_of::<RawFd>();
+    let header = cmsg.as_mut_ptr().cast::<cmsghdr>();
+    unsafe {
+        (*header).cmsg_level = SOL_SOCKET;
+        (*header).cmsg_type = SCM_RIGHTS;
+        (*header).cmsg_len = CMSG_LEN(payload_len as u32) as usize;
+        let dst = CMSG_DATA(header).cast::<RawFd>();
+        for (i, fd) in fds.iter().enumerate() {
+            ptr::write(dst.add(i), fd.as_raw_fd());
+        }
+    }
+    (cmsg.as_mut_ptr().cast(), unsafe {
+        CMSG_SPACE(payload_len as u32) as usize
+    })
 }
 
 #[derive(Debug)]
@@ -558,15 +581,26 @@ impl Writer {
         }
     }
 
+    /// Queue an FD for SCM_RIGHTS. Duplicates `fd` with `F_DUPFD_CLOEXEC` so the
+    /// caller may keep or close their original independently; the writer owns the
+    /// duplicate until send completes (or the chunk is dropped).
     #[inline]
     pub fn write_fd(&mut self, fd: RawFd) {
+        if self.last_err.is_some() {
+            return;
+        }
         if self.active.fds.len() == MAX_FDS_IN_CMSG {
             self.last_err = Some(anyhow::anyhow!(
                 "Too many file descriptors in Wayland message"
             ));
             return;
         }
-        self.active.fds.push(fd);
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            self.last_err = Some(io::Error::last_os_error().into());
+            return;
+        }
+        self.active.fds.push(unsafe { OwnedFd::from_raw_fd(dup) });
     }
 
     fn seal_active_to_queue(&mut self) -> bool {
@@ -613,21 +647,7 @@ impl Writer {
         let (control_ptr, control_len) = if chunk.fds.is_empty() {
             (ptr::null_mut(), 0)
         } else {
-            let payload_len = chunk.fds.len() * mem::size_of::<RawFd>();
-            let cmsg = self.send_cmsg.as_mut_ptr().cast::<cmsghdr>();
-            unsafe {
-                (*cmsg).cmsg_level = SOL_SOCKET;
-                (*cmsg).cmsg_type = SCM_RIGHTS;
-                (*cmsg).cmsg_len = CMSG_LEN(payload_len as u32) as usize;
-                ptr::copy_nonoverlapping(
-                    chunk.fds.as_ptr().cast::<u8>(),
-                    CMSG_DATA(cmsg),
-                    payload_len,
-                );
-            }
-            (self.send_cmsg.as_mut_ptr().cast(), unsafe {
-                CMSG_SPACE(payload_len as u32) as usize
-            })
+            fill_scm_rights_cmsg(&chunk.fds, &mut self.send_cmsg)
         };
         self.send_msghdr = msghdr {
             msg_name: ptr::null_mut(),
@@ -672,6 +692,7 @@ impl Writer {
             anyhow::bail!("Wayland socket write returned zero");
         }
         let written = result as usize;
+        // SCM_RIGHTS went out with this sendmsg; drop closes our duplicates.
         chunk.fds.clear();
         chunk.send_offset += written;
         if chunk.send_offset >= chunk.len {
@@ -714,21 +735,7 @@ impl Writer {
             let (control_ptr, control_len) = if chunk.fds.is_empty() {
                 (ptr::null_mut(), 0)
             } else {
-                let payload_len = chunk.fds.len() * mem::size_of::<RawFd>();
-                let cmsg = self.send_cmsg.as_mut_ptr().cast::<cmsghdr>();
-                unsafe {
-                    (*cmsg).cmsg_level = SOL_SOCKET;
-                    (*cmsg).cmsg_type = SCM_RIGHTS;
-                    (*cmsg).cmsg_len = CMSG_LEN(payload_len as u32) as usize;
-                    ptr::copy_nonoverlapping(
-                        chunk.fds.as_ptr().cast::<u8>(),
-                        CMSG_DATA(cmsg),
-                        payload_len,
-                    );
-                }
-                (self.send_cmsg.as_mut_ptr().cast(), unsafe {
-                    CMSG_SPACE(payload_len as u32) as usize
-                })
+                fill_scm_rights_cmsg(&chunk.fds, &mut self.send_cmsg)
             };
             self.send_msghdr = msghdr {
                 msg_name: ptr::null_mut(),
@@ -748,12 +755,14 @@ impl Writer {
                 {
                     return Ok(());
                 }
+                // Drop queued FDs on hard error; peer never received them.
                 chunk.fds.clear();
                 return Err(err.into());
             }
             if result == 0 {
                 anyhow::bail!("Wayland socket write returned zero");
             }
+            // SCM_RIGHTS went out with this sendmsg; close our duplicates.
             chunk.fds.clear();
             chunk.send_offset += result as usize;
         }
@@ -864,6 +873,44 @@ mod tests {
         let end_index = start_index + array.len();
         assert_eq!(&data[start_index..end_index], array);
         assert_eq!(fds.len(), 1);
+    }
+
+    #[test]
+    fn write_fd_dups_so_caller_retains_original() {
+        let socket = UnixStream::pair().unwrap();
+        let memfd = unsafe { libc::memfd_create(c"lumalla-writer-fd".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(memfd >= 0);
+        let original = unsafe { OwnedFd::from_raw_fd(memfd) };
+        let raw = original.as_raw_fd();
+
+        {
+            let mut writer = Writer::new(socket.1.as_raw_fd());
+            writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 0);
+            writer.write_fd(raw);
+            writer.write_message_length();
+            // Drop without flush: queued duplicate must close, original stays open.
+        }
+
+        assert!(
+            unsafe { libc::fcntl(raw, libc::F_GETFD) } >= 0,
+            "caller must retain the original FD after Writer drops a queued duplicate"
+        );
+
+        let mut writer = Writer::new(socket.1.as_raw_fd());
+        let mut reader = Reader::new(socket.0.as_raw_fd());
+        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 0);
+        writer.write_fd(raw);
+        writer.write_message_length();
+        writer.flush().unwrap();
+
+        assert_eq!(reader.read(), ReadResult::ReadData);
+        let (_header, _data, fds) = reader.next().unwrap().unwrap();
+        assert_eq!(fds.len(), 1);
+        assert!(
+            unsafe { libc::fcntl(raw, libc::F_GETFD) } >= 0,
+            "caller must retain the original FD after a successful SCM_RIGHTS send"
+        );
+        assert_ne!(fds[0].as_raw_fd(), raw);
     }
 
     #[test]

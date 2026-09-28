@@ -83,8 +83,8 @@ fn rust_type_from_wayland_type_for_method(
             }
         }
         "array" => quote! { &[u8] },
-        // Event builders take RawFd: callers typically pass as_raw_fd() and retain ownership
-        // (SCM_RIGHTS duplicates the descriptor into the message).
+        // Event builders take RawFd: Writer::write_fd duplicates with F_DUPFD_CLOEXEC,
+        // so callers may keep or close their original independently.
         "fd" => quote! { std::os::unix::io::RawFd },
         _ => quote! { () }, // Unknown type
     };
