@@ -175,13 +175,14 @@ pub fn prepare_gpu_composite(
     output_height: u32,
     pending_damage: &[DamageRect],
     force_full: bool,
-    _fresh_scanout: bool,
+    fresh_scanout: bool,
 ) -> CompositeMode {
     if output_width == 0 || output_height == 0 {
         return CompositeMode::Full;
     }
 
-    if force_full || pending_damage.is_empty() {
+    // A never-filled back buffer has no undamaged pixels to preserve.
+    if force_full || fresh_scanout || pending_damage.is_empty() {
         return CompositeMode::Full;
     }
 
@@ -205,9 +206,60 @@ pub fn prepare_gpu_composite(
         height: bounds.height.max(0) as u32,
     };
     if upload.width == 0 || upload.height == 0 {
-        CompositeMode::Full
-    } else {
-        CompositeMode::Partial(vec![upload])
+        return CompositeMode::Full;
+    }
+
+    // Partial+seed-copy is pointless when damage already covers most of the FB.
+    let damage_pixels = u64::from(upload.width).saturating_mul(u64::from(upload.height));
+    let output_pixels = u64::from(output_width).saturating_mul(u64::from(output_height));
+    if damage_pixels.saturating_mul(2) > output_pixels {
+        return CompositeMode::Full;
+    }
+
+    CompositeMode::Partial(vec![upload])
+}
+
+/// Maximum scanout buffer age (in presents) that can be repaired from damage history
+/// without seeding from the front buffer. Matches the scanout pool depth.
+pub const MAX_SCANOUT_BUFFER_AGE: u64 = 3;
+
+/// Expand `current` damage by the `age - 1` most recent history entries.
+///
+/// `history` is newest-last; each `None` means that present was a full redraw.
+/// Returns `None` when age is out of range, history is too short, or a prior
+/// present was full (caller should seed-copy or fully redraw).
+pub fn expand_damage_for_buffer_age(
+    current: UploadRect,
+    history: &[Option<UploadRect>],
+    age: u64,
+) -> Option<UploadRect> {
+    if age == 0 || age > MAX_SCANOUT_BUFFER_AGE {
+        return None;
+    }
+    let need = (age - 1) as usize;
+    if history.len() < need {
+        return None;
+    }
+    let mut bounds = current;
+    for entry in history.iter().rev().take(need) {
+        match entry {
+            None => return None,
+            Some(rect) => bounds = union_upload_rects(bounds, *rect),
+        }
+    }
+    Some(bounds)
+}
+
+pub fn union_upload_rects(a: UploadRect, b: UploadRect) -> UploadRect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = a.x.saturating_add(a.width).max(b.x.saturating_add(b.width));
+    let y1 = a.y.saturating_add(a.height).max(b.y.saturating_add(b.height));
+    UploadRect {
+        x: x0,
+        y: y0,
+        width: x1.saturating_sub(x0),
+        height: y1.saturating_sub(y0),
     }
 }
 
@@ -937,7 +989,84 @@ mod tests {
             false,
             true,
         );
-        assert!(matches!(mode, CompositeMode::Partial(_)));
+        assert!(matches!(mode, CompositeMode::Full));
+    }
+
+    #[test]
+    fn prepare_gpu_composite_falls_back_for_large_damage() {
+        let mode = prepare_gpu_composite(
+            100,
+            100,
+            &[DamageRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 80,
+            }],
+            false,
+            false,
+        );
+        assert!(matches!(mode, CompositeMode::Full));
+    }
+
+    #[test]
+    fn expand_damage_for_buffer_age_unions_history() {
+        let current = UploadRect {
+            x: 10,
+            y: 10,
+            width: 5,
+            height: 5,
+        };
+        let history = [
+            Some(UploadRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }),
+            Some(UploadRect {
+                x: 20,
+                y: 20,
+                width: 2,
+                height: 2,
+            }),
+        ];
+        // age 1: current only
+        assert_eq!(
+            expand_damage_for_buffer_age(current, &history, 1),
+            Some(current)
+        );
+        // age 2: union with newest history entry
+        assert_eq!(
+            expand_damage_for_buffer_age(current, &history, 2),
+            Some(UploadRect {
+                x: 10,
+                y: 10,
+                width: 12,
+                height: 12,
+            })
+        );
+        // age 3: union with both
+        assert_eq!(
+            expand_damage_for_buffer_age(current, &history, 3),
+            Some(UploadRect {
+                x: 0,
+                y: 0,
+                width: 22,
+                height: 22,
+            })
+        );
+        // prior full present forces fallback
+        let with_full = [
+            Some(UploadRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }),
+            None,
+        ];
+        assert_eq!(expand_damage_for_buffer_age(current, &with_full, 2), None);
     }
 
     fn indexed_frame(transform: BufferTransform) -> SurfaceFrame {

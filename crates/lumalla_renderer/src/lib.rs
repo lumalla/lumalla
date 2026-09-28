@@ -43,7 +43,7 @@ use crate::scene_backing::DamageRect;
 pub use crate::scene_backing::{
     CompositeMode, DamageRect as OutputDamageRect, UploadRect, buffer_damage_to_upload_rect,
     clip_buffer_damage_list, clip_damage_list, cursor_damage_rects, cursor_damage_rects_default,
-    prepare_gpu_composite, rect_union, union_damage_rects,
+    expand_damage_for_buffer_age, prepare_gpu_composite, rect_union, union_damage_rects,
 };
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
@@ -2980,7 +2980,34 @@ impl RendererState {
 
         let mut batch = GpuWorkBatch::new();
 
-        if matches!(composite_mode, CompositeMode::Partial(_)) {
+        // Buffer-age path: when the back buffer still holds a recent frame, expand
+        // damage across the missed presents and skip the full FB seed copy.
+        let next_serial = self
+            .outputs
+            .get(&target.name)
+            .map(|o| o.present_serial.wrapping_add(1))
+            .unwrap_or(1);
+        let mut skip_scanout_copy = false;
+        if let CompositeMode::Partial(regions) = &composite_mode {
+            let age = if buffer.fresh || buffer.content_serial == 0 {
+                None
+            } else {
+                Some(next_serial.wrapping_sub(buffer.content_serial))
+            };
+            if let (Some(age), Some(current)) = (age, regions.first().copied()) {
+                let history = self
+                    .outputs
+                    .get(&target.name)
+                    .map(|o| o.damage_history.entries())
+                    .unwrap_or_default();
+                if let Some(expanded) = expand_damage_for_buffer_age(current, &history, age) {
+                    composite_mode = CompositeMode::Partial(vec![expanded]);
+                    skip_scanout_copy = true;
+                }
+            }
+        }
+
+        if matches!(composite_mode, CompositeMode::Partial(_)) && !skip_scanout_copy {
             let src_ptr = self.outputs.get(&target.name).and_then(|output| {
                 let image = output.primary()?.newest_buffer()?;
                 Some(&image.dma_image as *const DmaBufImage)
@@ -3005,6 +3032,11 @@ impl RendererState {
                 composite_mode = CompositeMode::Full;
             }
         }
+
+        let history_damage = match &composite_mode {
+            CompositeMode::Full => None,
+            CompositeMode::Partial(regions) => regions.first().copied(),
+        };
 
         {
             let vulkan = self
@@ -3104,6 +3136,11 @@ impl RendererState {
 
             buffer.gpu_pending = Some(batch.submit(vulkan)?);
             buffer.fresh = false;
+            buffer.content_serial = next_serial;
+        }
+        if let Some(output) = self.outputs.get_mut(&target.name) {
+            output.present_serial = next_serial;
+            output.damage_history.push(history_damage);
         }
 
         Ok(buffer)

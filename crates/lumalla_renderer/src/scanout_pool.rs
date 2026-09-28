@@ -33,6 +33,8 @@ pub(crate) struct ScanoutBuffer {
     pub framebuffer: Framebuffer,
     /// True until the first GPU upload fills the buffer.
     pub fresh: bool,
+    /// Present serial last written into this buffer (`0` = never filled).
+    pub content_serial: u64,
     /// GPU work that must finish before flip or reuse.
     pub gpu_pending: Option<crate::vulkan::PendingGpuSubmit>,
 }
@@ -178,6 +180,7 @@ fn create_kms_scanout_buffer(
         dma_image,
         framebuffer,
         fresh: true,
+        content_serial: 0,
         gpu_pending: None,
     })
 }
@@ -201,6 +204,7 @@ fn create_virtual_scanout_buffer(
         dma_image,
         framebuffer,
         fresh: true,
+        content_serial: 0,
         gpu_pending: None,
     })
 }

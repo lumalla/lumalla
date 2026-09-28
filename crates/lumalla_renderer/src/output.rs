@@ -3,6 +3,7 @@
 //! Hierarchy: DRM device topology (CRTCs/planes) → output (connector+CRTC) →
 //! plane pipelines (primary / cursor / overlays), each with its own FB triple.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -13,6 +14,7 @@ use lumalla_shared::EventLoop;
 use crate::drm::{ConnectedOutput, ModeBlob};
 use crate::scanout_pool::ScanoutBuffer;
 use crate::scheduler::RenderScheduler;
+use crate::scene_backing::{MAX_SCANOUT_BUFFER_AGE, UploadRect};
 
 /// Stable output identity. Names alone can collide across GPUs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -385,6 +387,34 @@ pub struct OutputState {
     pub planes: Option<OutputPlanes>,
     pub present: OutputPresentControl,
     pub dirty: OutputDirty,
+    /// Monotonic serial of the last successful GPU fill for this output.
+    pub present_serial: u64,
+    /// Coalesced damage from recent presents (for buffer-age partial repair).
+    pub damage_history: OutputDamageHistory,
+}
+
+/// Recent per-output present damage for buffer-age partial repairs.
+#[derive(Debug, Default, Clone)]
+pub struct OutputDamageHistory {
+    /// Newest at the back. `None` means that present was a full redraw.
+    entries: VecDeque<Option<UploadRect>>,
+}
+
+impl OutputDamageHistory {
+    pub fn push(&mut self, damage: Option<UploadRect>) {
+        self.entries.push_back(damage);
+        while self.entries.len() > MAX_SCANOUT_BUFFER_AGE as usize {
+            self.entries.pop_front();
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn entries(&self) -> Vec<Option<UploadRect>> {
+        self.entries.iter().copied().collect()
+    }
 }
 
 impl OutputState {
@@ -395,6 +425,8 @@ impl OutputState {
             planes: None,
             present,
             dirty: OutputDirty::default(),
+            present_serial: 0,
+            damage_history: OutputDamageHistory::default(),
         }
     }
 
