@@ -1,25 +1,21 @@
 //! One-shot CPU upload into a Vulkan scanout image.
 
-use std::ptr;
-
 use anyhow::Context;
 use ash::vk;
 
-use super::{CommandBufferRecorder, CommandPool, Device, DmaBufImage, Fence, PhysicalDevice};
+use super::{
+    CommandBufferRecorder, DmaBufImage, Fence, StagingBuffer, VulkanContext,
+};
 
 pub fn upload_bgra_to_image(
-    device: &Device,
-    physical_device: &PhysicalDevice,
-    command_pool: &CommandPool,
+    vulkan: &mut VulkanContext,
     image: &DmaBufImage,
     pixels: &[u8],
     width: u32,
     height: u32,
 ) -> anyhow::Result<()> {
     upload_bgra_regions_from_backing(
-        device,
-        physical_device,
-        command_pool,
+        vulkan,
         image,
         pixels,
         width,
@@ -42,9 +38,7 @@ pub struct UploadRegion {
 
 /// Uploads one or more sub-rectangles from a full output backing store.
 pub fn upload_bgra_regions_from_backing(
-    device: &Device,
-    physical_device: &PhysicalDevice,
-    command_pool: &CommandPool,
+    vulkan: &mut VulkanContext,
     image: &DmaBufImage,
     backing: &[u8],
     backing_width: u32,
@@ -81,7 +75,7 @@ pub fn upload_bgra_regions_from_backing(
         let region_row_bytes = usize::try_from(region.width)
             .context("Region width overflows")?
             .checked_mul(4)
-            .context("Region row size overflows")?;
+            .context("Region row bytes overflow")?;
         let region_size = region_row_bytes
             .checked_mul(region.height as usize)
             .context("Region size overflows")?;
@@ -123,82 +117,42 @@ pub fn upload_bgra_regions_from_backing(
         );
     }
 
-    let staging = StagingBuffer::new(device, physical_device, &staging_bytes)?;
-    let command_buffer = command_pool
-        .allocate_command_buffer(device)
-        .context("Failed to allocate upload command buffer")?;
-
-    let record_result = (|| -> anyhow::Result<()> {
-        let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
-        let to_transfer = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                recorder.command_buffer(),
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_transfer],
-            );
-        }
-
-        let copy = copies.as_slice();
-        unsafe {
-            device.handle().cmd_copy_buffer_to_image(
-                recorder.command_buffer(),
-                staging.buffer,
-                image.image(),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                copy,
-            );
-        }
-
-        let to_general = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                recorder.command_buffer(),
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_general],
-            );
-        }
-        recorder.end()?;
-        Ok(())
-    })();
-    if let Err(error) = record_result {
-        command_pool.free_command_buffers(device, &[command_buffer]);
+    let staging = vulkan.acquire_staging(staging_bytes.len() as vk::DeviceSize)?;
+    if let Err(error) = staging.write_slice(vulkan.device(), &staging_bytes) {
+        vulkan.release_staging_many([staging]);
         return Err(error);
     }
 
-    let fence = match Fence::new(device, false) {
+    let command_buffer = {
+        let device = vulkan.device();
+        vulkan
+            .graphics_command_pool()
+            .allocate_command_buffer(device)
+            .context("Failed to allocate upload command buffer")?
+    };
+
+    let record_result = record_upload(vulkan, image, &staging, &copies, command_buffer);
+    if let Err(error) = record_result {
+        vulkan.free_command_buffers(&[command_buffer]);
+        vulkan.release_staging_many([staging]);
+        return Err(error);
+    }
+
+    let fence = match Fence::new(vulkan.device(), false) {
         Ok(fence) => fence,
         Err(error) => {
-            command_pool.free_command_buffers(device, &[command_buffer]);
+            vulkan.free_command_buffers(&[command_buffer]);
+            vulkan.release_staging_many([staging]);
             return Err(error);
         }
     };
-    if let Err(error) = device.submit_graphics(&[command_buffer], &[], &[], &[], fence.handle()) {
-        command_pool.free_command_buffers(device, &[command_buffer]);
+    if let Err(error) =
+        vulkan
+            .device()
+            .submit_graphics(&[command_buffer], &[], &[], &[], fence.handle())
+    {
+        vulkan.free_command_buffers(&[command_buffer]);
+        vulkan.release_staging_many([staging]);
         return Err(error);
     }
     if let Err(error) = fence
@@ -206,11 +160,77 @@ pub fn upload_bgra_regions_from_backing(
         .context("Timed out waiting for SHM upload to complete")
     {
         // Do not release staging memory while submitted work may still reference it.
-        let _ = device.wait_idle();
-        command_pool.free_command_buffers(device, &[command_buffer]);
+        let _ = vulkan.device().wait_idle();
+        vulkan.free_command_buffers(&[command_buffer]);
+        vulkan.release_staging_many([staging]);
         return Err(error);
     }
-    command_pool.free_command_buffers(device, &[command_buffer]);
+    vulkan.free_command_buffers(&[command_buffer]);
+    vulkan.release_staging_many([staging]);
+    Ok(())
+}
+
+fn record_upload(
+    vulkan: &VulkanContext,
+    image: &DmaBufImage,
+    staging: &StagingBuffer,
+    copies: &[vk::BufferImageCopy],
+    command_buffer: vk::CommandBuffer,
+) -> anyhow::Result<()> {
+    let device = vulkan.device();
+    let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
+    let to_transfer = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(vk::ImageLayout::GENERAL)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            recorder.command_buffer(),
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_transfer],
+        );
+    }
+
+    unsafe {
+        device.handle().cmd_copy_buffer_to_image(
+            recorder.command_buffer(),
+            staging.buffer(),
+            image.image(),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            copies,
+        );
+    }
+
+    let to_general = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            recorder.command_buffer(),
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_general],
+        );
+    }
+    recorder.end()?;
     Ok(())
 }
 
@@ -224,141 +244,15 @@ fn color_subresource_range() -> vk::ImageSubresourceRange {
     }
 }
 
-struct StagingBuffer {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    device: ash::Device,
-}
-
-impl StagingBuffer {
-    fn new(
-        device: &Device,
-        physical_device: &PhysicalDevice,
-        bytes: &[u8],
-    ) -> anyhow::Result<Self> {
-        let size = bytes.len() as vk::DeviceSize;
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { device.handle().create_buffer(&buffer_info, None) }
-            .context("Failed to create SHM staging buffer")?;
-        let requirements = unsafe { device.handle().get_buffer_memory_requirements(buffer) };
-        let Some((memory_type_index, coherent)) = find_host_memory_type(
-            physical_device.memory_properties(),
-            requirements.memory_type_bits,
-        ) else {
-            unsafe {
-                device.handle().destroy_buffer(buffer, None);
-            }
-            anyhow::bail!("No host-visible Vulkan memory for SHM staging");
-        };
-        let allocate_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type_index);
-        let memory = match unsafe { device.handle().allocate_memory(&allocate_info, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                unsafe {
-                    device.handle().destroy_buffer(buffer, None);
-                }
-                return Err(error).context("Failed to allocate SHM staging memory");
-            }
-        };
-        if let Err(error) = unsafe { device.handle().bind_buffer_memory(buffer, memory, 0) } {
-            unsafe {
-                device.handle().free_memory(memory, None);
-                device.handle().destroy_buffer(buffer, None);
-            }
-            return Err(error).context("Failed to bind SHM staging memory");
-        }
-
-        let mapped = match unsafe {
-            device
-                .handle()
-                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-        } {
-            Ok(mapped) => mapped,
-            Err(error) => {
-                unsafe {
-                    device.handle().free_memory(memory, None);
-                    device.handle().destroy_buffer(buffer, None);
-                }
-                return Err(error).context("Failed to map SHM staging memory");
-            }
-        };
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast(), bytes.len());
-        }
-        let flush_result = if !coherent {
-            let range = vk::MappedMemoryRange::default()
-                .memory(memory)
-                .offset(0)
-                .size(vk::WHOLE_SIZE);
-            unsafe { device.handle().flush_mapped_memory_ranges(&[range]) }
-                .context("Failed to flush SHM staging memory")
-        } else {
-            Ok(())
-        };
-        unsafe {
-            device.handle().unmap_memory(memory);
-        }
-        if let Err(error) = flush_result {
-            unsafe {
-                device.handle().free_memory(memory, None);
-                device.handle().destroy_buffer(buffer, None);
-            }
-            return Err(error);
-        }
-
-        Ok(Self {
-            buffer,
-            memory,
-            device: device.handle().clone(),
-        })
-    }
-}
-
-impl Drop for StagingBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_buffer(self.buffer, None);
-            self.device.free_memory(self.memory, None);
-        }
-    }
-}
-
-fn find_host_memory_type(
-    properties: &vk::PhysicalDeviceMemoryProperties,
-    type_bits: u32,
-) -> Option<(u32, bool)> {
-    let mut host_visible = None;
-    for index in 0..properties.memory_type_count {
-        if type_bits & (1 << index) == 0 {
-            continue;
-        }
-        let flags = properties.memory_types[index as usize].property_flags;
-        if !flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
-            continue;
-        }
-        let coherent = flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT);
-        if coherent {
-            return Some((index, true));
-        }
-        host_visible = Some((index, false));
-    }
-    host_visible
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vulkan::{Framebuffer, RenderPass, VulkanContext, clear_framebuffer_to_color};
+    use crate::vulkan::{Framebuffer, RenderPass, clear_framebuffer_to_color};
 
     #[test]
     #[ignore = "requires a Vulkan GPU with DMA-BUF export support"]
     fn hardware_uploads_bgra_to_exportable_image() {
-        let vulkan = VulkanContext::new(None).unwrap();
+        let mut vulkan = VulkanContext::new(None).unwrap();
         let image = DmaBufImage::allocate(
             vulkan.device(),
             vulkan.physical_device(),
@@ -384,16 +278,7 @@ mod tests {
         .unwrap();
 
         let pixels = vec![0x7f; 16 * 16 * 4];
-        upload_bgra_to_image(
-            vulkan.device(),
-            vulkan.physical_device(),
-            vulkan.graphics_command_pool(),
-            &image,
-            &pixels,
-            16,
-            16,
-        )
-        .unwrap();
+        upload_bgra_to_image(&mut vulkan, &image, &pixels, 16, 16).unwrap();
         image.export_dma_buf().unwrap();
     }
 }

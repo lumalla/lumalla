@@ -18,6 +18,7 @@ mod pipeline;
 mod render_pass;
 mod sampler;
 pub mod shaders;
+mod staging;
 mod sync;
 mod upload;
 
@@ -44,5 +45,6 @@ pub use physical_device::PhysicalDevice;
 pub use pipeline::{GraphicsPipeline, GraphicsPipelineBuilder, ShaderModule};
 pub use render_pass::RenderPass;
 pub use sampler::Sampler;
+pub use staging::{StagingBuffer, StagingBufferPool};
 pub use sync::{Fence, Semaphore};
 pub use upload::{UploadRegion, upload_bgra_regions_from_backing, upload_bgra_to_image};

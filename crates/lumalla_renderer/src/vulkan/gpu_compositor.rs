@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::ptr;
 
 use anyhow::Context;
 use ash::vk;
@@ -20,8 +19,8 @@ const WL_SHM_FORMAT_ARGB8888: u32 = 0;
 
 use super::{
     CommandBufferRecorder, CommandPool, DescriptorPool, DescriptorSetLayout, Device, DmaBufImage,
-    Fence, Framebuffer, GraphicsPipeline, GraphicsPipelineBuilder, Image, PhysicalDevice,
-    RenderPass, Sampler, ShaderModule, VulkanContext, drm_fourcc_to_vulkan,
+    Fence, Framebuffer, GraphicsPipeline, GraphicsPipelineBuilder, Image, RenderPass, Sampler,
+    ShaderModule, StagingBuffer, VulkanContext, drm_fourcc_to_vulkan,
 };
 
 const MAX_SURFACE_TEXTURES: u32 = 320;
@@ -91,31 +90,29 @@ impl PendingGpuSubmit {
         self.fence.is_some()
     }
 
-    /// Recycle command buffers and drop staging after the fence has signaled.
-    fn recycle(&mut self, device: &Device, command_pool: &CommandPool) {
-        if !self.command_buffers.is_empty() {
-            command_pool.free_command_buffers(device, &self.command_buffers);
-            self.command_buffers.clear();
-        }
-        self.staging.clear();
+    /// Recycle command buffers and return staging to the pool after the fence has signaled.
+    fn recycle(&mut self, vulkan: &mut VulkanContext) {
+        vulkan.free_command_buffers(&self.command_buffers);
+        self.command_buffers.clear();
+        vulkan.release_staging_many(self.staging.drain(..));
         let _ = self.fence.take();
     }
 
-    /// Blocks until GPU work finishes and recycles command buffers.
-    pub fn wait(mut self, device: &Device, command_pool: &CommandPool) -> anyhow::Result<()> {
+    /// Blocks until GPU work finishes and recycles command buffers / staging.
+    pub fn wait(mut self, vulkan: &mut VulkanContext) -> anyhow::Result<()> {
         if let Some(fence) = self.fence.take() {
             if let Err(error) = fence
                 .wait_default()
                 .context("Timed out waiting for GPU frame work")
             {
-                let _ = device.wait_idle();
-                if !self.command_buffers.is_empty() {
-                    command_pool.free_command_buffers(device, &self.command_buffers);
-                }
+                let _ = vulkan.device().wait_idle();
+                vulkan.free_command_buffers(&self.command_buffers);
+                self.command_buffers.clear();
+                vulkan.release_staging_many(self.staging.drain(..));
                 return Err(error);
             }
         }
-        self.recycle(device, command_pool);
+        self.recycle(vulkan);
         Ok(())
     }
 
@@ -125,8 +122,7 @@ impl PendingGpuSubmit {
     /// `Ok(Some(self))` when the fence is still pending.
     pub fn try_complete(
         mut self,
-        device: &Device,
-        command_pool: &CommandPool,
+        vulkan: &mut VulkanContext,
     ) -> anyhow::Result<Option<Self>> {
         if let Some(fence) = &self.fence {
             if !fence
@@ -136,7 +132,7 @@ impl PendingGpuSubmit {
                 return Ok(Some(self));
             }
         }
-        self.recycle(device, command_pool);
+        self.recycle(vulkan);
         Ok(None)
     }
 }
@@ -647,9 +643,7 @@ impl SurfaceTextureCache {
 
         if upload_regions.is_none() {
             upload_bgra_texture(
-                vulkan.device(),
-                vulkan.physical_device(),
-                vulkan.graphics_command_pool(),
+                vulkan,
                 batch,
                 image,
                 &frame.pixels,
@@ -662,9 +656,7 @@ impl SurfaceTextureCache {
         } else {
             for region in upload_regions.unwrap_or_default() {
                 upload_bgra_texture(
-                    vulkan.device(),
-                    vulkan.physical_device(),
-                    vulkan.graphics_command_pool(),
+                    vulkan,
                     batch,
                     image,
                     &frame.pixels,
@@ -868,9 +860,7 @@ impl SurfaceTextureCache {
             TextureBacking::Dmabuf(_) => anyhow::bail!("SHM upload targeted imported DMA-BUF"),
         };
         upload_bgra_texture(
-            vulkan.device(),
-            vulkan.physical_device(),
-            vulkan.graphics_command_pool(),
+            vulkan,
             batch,
             image,
             pixels,
@@ -2024,9 +2014,7 @@ fn transition_scanout_for_render(
 }
 
 fn upload_bgra_texture(
-    device: &Device,
-    physical_device: &PhysicalDevice,
-    command_pool: &CommandPool,
+    vulkan: &mut VulkanContext,
     batch: &mut GpuWorkBatch,
     image: &Image,
     pixels: &[u8],
@@ -2044,13 +2032,20 @@ fn upload_bgra_texture(
 
     let (staging, copy_stride, copy_height, image_offset, image_extent) = match region {
         Some(region) => {
-            let staging = StagingBuffer::from_packed_region(
-                device,
-                physical_device,
-                pixels,
-                stride,
-                region,
-            )?;
+            let region_row_bytes = usize::try_from(region.width)
+                .context("Region width overflows")?
+                .checked_mul(4)
+                .context("Region row bytes overflow")?;
+            let region_size = region_row_bytes
+                .checked_mul(region.height as usize)
+                .context("Region size overflows")?;
+            let staging = vulkan.acquire_staging(region_size as vk::DeviceSize)?;
+            if let Err(error) =
+                staging.write_packed_region(vulkan.device(), pixels, stride, region)
+            {
+                vulkan.release_staging_many([staging]);
+                return Err(error);
+            }
             (
                 staging,
                 region.width,
@@ -2068,8 +2063,11 @@ fn upload_bgra_texture(
             )
         }
         None => {
-            let staging =
-                StagingBuffer::from_slice(device, physical_device, &pixels[..full_size])?;
+            let staging = vulkan.acquire_staging(full_size as vk::DeviceSize)?;
+            if let Err(error) = staging.write_slice(vulkan.device(), &pixels[..full_size]) {
+                vulkan.release_staging_many([staging]);
+                return Err(error);
+            }
             (
                 staging,
                 width,
@@ -2084,87 +2082,116 @@ fn upload_bgra_texture(
         }
     };
 
-    let command_buffer = command_pool.allocate_command_buffer(device)?;
+    let command_buffer = {
+        let device = vulkan.device();
+        vulkan
+            .graphics_command_pool()
+            .allocate_command_buffer(device)?
+    };
 
-    let record_result = (|| -> anyhow::Result<()> {
-        let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
-        let old_layout = if previously_uploaded {
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-        } else {
-            vk::ImageLayout::UNDEFINED
-        };
-        let to_transfer = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_READ)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(old_layout)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                recorder.command_buffer(),
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_transfer],
-            );
-        }
-
-        let region = vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(copy_stride)
-            .buffer_image_height(copy_height)
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_offset(image_offset)
-            .image_extent(image_extent);
-        unsafe {
-            device.handle().cmd_copy_buffer_to_image(
-                recorder.command_buffer(),
-                staging.buffer,
-                image.image(),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
-        }
-
-        let to_sample = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image())
-            .subresource_range(color_subresource_range());
-        unsafe {
-            device.handle().cmd_pipeline_barrier(
-                recorder.command_buffer(),
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_sample],
-            );
-        }
-        recorder.end()?;
-        Ok(())
-    })();
+    let record_result = record_bgra_texture_upload(
+        vulkan,
+        image,
+        &staging,
+        previously_uploaded,
+        copy_stride,
+        copy_height,
+        image_offset,
+        image_extent,
+        command_buffer,
+    );
 
     if let Err(error) = record_result {
-        command_pool.free_command_buffers(device, &[command_buffer]);
+        vulkan.free_command_buffers(&[command_buffer]);
+        vulkan.release_staging_many([staging]);
         return Err(error);
     }
     batch.push(command_buffer, Some(staging));
+    Ok(())
+}
+
+fn record_bgra_texture_upload(
+    vulkan: &VulkanContext,
+    image: &Image,
+    staging: &StagingBuffer,
+    previously_uploaded: bool,
+    copy_stride: u32,
+    copy_height: u32,
+    image_offset: vk::Offset3D,
+    image_extent: vk::Extent3D,
+    command_buffer: vk::CommandBuffer,
+) -> anyhow::Result<()> {
+    let device = vulkan.device();
+    let recorder = CommandBufferRecorder::begin_one_time(device, command_buffer)?;
+    let old_layout = if previously_uploaded {
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+    } else {
+        vk::ImageLayout::UNDEFINED
+    };
+    let to_transfer = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_READ)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(old_layout)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            recorder.command_buffer(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_transfer],
+        );
+    }
+
+    let region = vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(copy_stride)
+        .buffer_image_height(copy_height)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_offset(image_offset)
+        .image_extent(image_extent);
+    unsafe {
+        device.handle().cmd_copy_buffer_to_image(
+            recorder.command_buffer(),
+            staging.buffer(),
+            image.image(),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+    }
+
+    let to_sample = vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image.image())
+        .subresource_range(color_subresource_range());
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            recorder.command_buffer(),
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_sample],
+        );
+    }
+    recorder.end()?;
     Ok(())
 }
 
@@ -2605,189 +2632,6 @@ fn spv_from_bytes(bytes: &[u8]) -> Vec<u32> {
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
-}
-
-struct StagingBuffer {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    device: ash::Device,
-}
-
-impl StagingBuffer {
-    /// Copy `bytes` once into a newly allocated host-visible staging buffer.
-    fn from_slice(
-        device: &Device,
-        physical_device: &PhysicalDevice,
-        bytes: &[u8],
-    ) -> anyhow::Result<Self> {
-        let (staging, mapped, coherent) =
-            Self::allocate_mapped(device, physical_device, bytes.len() as vk::DeviceSize)?;
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast(), bytes.len());
-        }
-        staging.finish_mapped(device, coherent)?;
-        Ok(staging)
-    }
-
-    /// Pack a damage region into tightly packed BGRA rows in staging (one GPU alloc).
-    fn from_packed_region(
-        device: &Device,
-        physical_device: &PhysicalDevice,
-        pixels: &[u8],
-        stride: u32,
-        region: UploadRect,
-    ) -> anyhow::Result<Self> {
-        let row_bytes = usize::try_from(stride).context("Stride overflows")?;
-        let region_row_bytes = usize::try_from(region.width)
-            .context("Region width overflows")?
-            .checked_mul(4)
-            .context("Region row bytes overflow")?;
-        let region_size = region_row_bytes
-            .checked_mul(region.height as usize)
-            .context("Region size overflows")?;
-        let (staging, mapped, coherent) =
-            Self::allocate_mapped(device, physical_device, region_size as vk::DeviceSize)?;
-        unsafe {
-            let dst_base = mapped.cast::<u8>();
-            for row in 0..region.height {
-                let src_row = (region.y + row) as usize;
-                let src_start = src_row
-                    .checked_mul(row_bytes)
-                    .and_then(|offset| offset.checked_add(region.x as usize * 4))
-                    .context("Region source offset overflows")?;
-                anyhow::ensure!(
-                    src_start + region_row_bytes <= pixels.len(),
-                    "Texture pixel data is truncated for damage region"
-                );
-                let dst_start = row as usize * region_row_bytes;
-                ptr::copy_nonoverlapping(
-                    pixels.as_ptr().add(src_start),
-                    dst_base.add(dst_start),
-                    region_row_bytes,
-                );
-            }
-        }
-        staging.finish_mapped(device, coherent)?;
-        Ok(staging)
-    }
-
-    fn allocate_mapped(
-        device: &Device,
-        physical_device: &PhysicalDevice,
-        size: vk::DeviceSize,
-    ) -> anyhow::Result<(Self, *mut std::ffi::c_void, bool)> {
-        anyhow::ensure!(size > 0, "Staging buffer size must be non-zero");
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { device.handle().create_buffer(&buffer_info, None) }
-            .context("Failed to create texture staging buffer")?;
-        let requirements = unsafe { device.handle().get_buffer_memory_requirements(buffer) };
-        let Some((memory_type_index, coherent)) = find_host_memory_type(
-            physical_device.memory_properties(),
-            requirements.memory_type_bits,
-        ) else {
-            unsafe {
-                device.handle().destroy_buffer(buffer, None);
-            }
-            anyhow::bail!("No host-visible Vulkan memory for texture staging");
-        };
-        let allocate_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type_index);
-        let memory = match unsafe { device.handle().allocate_memory(&allocate_info, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                unsafe {
-                    device.handle().destroy_buffer(buffer, None);
-                }
-                return Err(error).context("Failed to allocate texture staging memory");
-            }
-        };
-        if let Err(error) = unsafe { device.handle().bind_buffer_memory(buffer, memory, 0) } {
-            unsafe {
-                device.handle().free_memory(memory, None);
-                device.handle().destroy_buffer(buffer, None);
-            }
-            return Err(error).context("Failed to bind texture staging memory");
-        };
-
-        let mapped = match unsafe {
-            device
-                .handle()
-                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-        } {
-            Ok(mapped) => mapped,
-            Err(error) => {
-                unsafe {
-                    device.handle().free_memory(memory, None);
-                    device.handle().destroy_buffer(buffer, None);
-                }
-                return Err(error).context("Failed to map texture staging memory");
-            }
-        };
-
-        Ok((
-            Self {
-                buffer,
-                memory,
-                device: device.handle().clone(),
-            },
-            mapped,
-            coherent,
-        ))
-    }
-
-    fn finish_mapped(&self, device: &Device, coherent: bool) -> anyhow::Result<()> {
-        if !coherent {
-            let range = vk::MappedMemoryRange::default()
-                .memory(self.memory)
-                .offset(0)
-                .size(vk::WHOLE_SIZE);
-            unsafe {
-                device
-                    .handle()
-                    .flush_mapped_memory_ranges(&[range])
-                    .context("Failed to flush texture staging memory")?;
-            }
-        }
-        unsafe {
-            device.handle().unmap_memory(self.memory);
-        }
-        Ok(())
-    }
-}
-
-impl Drop for StagingBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_buffer(self.buffer, None);
-            self.device.free_memory(self.memory, None);
-        }
-    }
-}
-
-fn find_host_memory_type(
-    properties: &vk::PhysicalDeviceMemoryProperties,
-    type_bits: u32,
-) -> Option<(u32, bool)> {
-    let mut host_visible = None;
-    for index in 0..properties.memory_type_count {
-        if type_bits & (1 << index) == 0 {
-            continue;
-        }
-        let flags = properties.memory_types[index as usize].property_flags;
-        if !flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
-            continue;
-        }
-        let coherent = flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT);
-        if coherent {
-            return Some((index, true));
-        }
-        host_visible = Some((index, false));
-    }
-    host_visible
 }
 
 #[cfg(test)]

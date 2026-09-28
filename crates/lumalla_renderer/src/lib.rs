@@ -1067,7 +1067,7 @@ impl RendererState {
                     .vulkan
                     .as_mut()
                     .context("Vulkan is not initialized for screenshot capture")?;
-                pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
+                pending.wait(vulkan)?;
             }
 
             let vulkan = self
@@ -1314,12 +1314,12 @@ impl RendererState {
                     .vulkan
                     .as_mut()
                     .context("Vulkan missing while waiting for scanout")?;
-                pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
+                pending.wait(vulkan)?;
             }
         }
 
         let mut batch = GpuWorkBatch::new();
-        // Clear so multi-region / partial coverage never leaves UNDEFINED garbage.
+        // Clear so multi-region / partial coverage never leaves framebuffer garbage.
         {
             let dst_ptr = {
                 let slots = self
@@ -1870,7 +1870,7 @@ impl RendererState {
             .vulkan
             .as_mut()
             .context("Vulkan missing while waiting for screencast GPU work")?;
-        pending.wait(vulkan.device(), vulkan.graphics_command_pool())
+        pending.wait(vulkan)
     }
 
     /// Block until all in-flight screencast GPU fills for `stream_id` complete.
@@ -1927,7 +1927,7 @@ impl RendererState {
                 .vulkan
                 .as_mut()
                 .context("Vulkan missing while polling screencast GPU work")?;
-            match pending.try_complete(vulkan.device(), vulkan.graphics_command_pool())? {
+            match pending.try_complete(vulkan)? {
                 None => ready.push((stream_id, index)),
                 Some(still) => {
                     if let Some(slot) = self
@@ -3201,7 +3201,7 @@ impl RendererState {
             .vulkan
             .as_mut()
             .context("VulkanContext missing while waiting for scanout GPU work")?;
-        pending.wait(vulkan.device(), vulkan.graphics_command_pool())
+        pending.wait(vulkan)
     }
 
     fn retire_page_flip(&mut self, crtc_id: u32) -> anyhow::Result<Option<String>> {
@@ -3500,15 +3500,7 @@ impl RendererState {
             format,
             fourcc,
         )?;
-        upload_bgra_to_image(
-            vulkan.device(),
-            vulkan.physical_device(),
-            vulkan.graphics_command_pool(),
-            &buffer.dma_image,
-            pixels,
-            width,
-            height,
-        )?;
+        upload_bgra_to_image(vulkan, &buffer.dma_image, pixels, width, height)?;
         buffer.fresh = false;
 
         let old = {

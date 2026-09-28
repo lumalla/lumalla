@@ -76,7 +76,7 @@ impl ScanoutBufferPool {
         };
         if let Some(mut buffer) = self.free.get_mut(&key).and_then(|free| free.pop()) {
             if let Some(pending) = buffer.gpu_pending.take() {
-                pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
+                pending.wait(vulkan)?;
             }
             return Ok(buffer);
         }
@@ -100,7 +100,7 @@ impl ScanoutBufferPool {
         };
         if let Some(mut buffer) = self.free.get_mut(&key).and_then(|free| free.pop()) {
             if let Some(pending) = buffer.gpu_pending.take() {
-                pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
+                pending.wait(vulkan)?;
             }
             return Ok(buffer);
         }

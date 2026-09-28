@@ -6,7 +6,10 @@ use anyhow::Context;
 use ash::vk;
 use log::{debug, info, warn};
 
-use super::{CommandPool, Device, Image, MemoryAllocator, PhysicalDevice, RenderPass};
+use super::{
+    CommandPool, Device, Image, MemoryAllocator, PhysicalDevice, RenderPass, StagingBuffer,
+    StagingBufferPool,
+};
 
 /// Holds the core Vulkan objects needed for rendering.
 ///
@@ -25,6 +28,8 @@ pub struct VulkanContext {
     graphics_command_pool: Option<CommandPool>,
     /// Memory allocator (must be destroyed before device)
     memory_allocator: Option<MemoryAllocator>,
+    /// Reused host-visible staging buffers for SHM / label uploads (dropped before device).
+    staging_pool: Option<StagingBufferPool>,
     /// Cached render pass for KMS scanout clears (dropped before device).
     scanout_render_pass: Option<RenderPass>,
     /// Cached render pass for incremental scanout compositing (dropped before device).
@@ -182,6 +187,7 @@ impl VulkanContext {
             device: Some(device),
             graphics_command_pool: Some(graphics_command_pool),
             memory_allocator: Some(memory_allocator),
+            staging_pool: Some(StagingBufferPool::new()),
             scanout_render_pass: None,
             scanout_render_pass_load: None,
             #[cfg(debug_assertions)]
@@ -316,6 +322,36 @@ impl VulkanContext {
             .expect("Memory allocator should always be present while VulkanContext is alive")
     }
 
+    /// Acquire a reusable host-visible staging buffer with at least `size` bytes.
+    pub fn acquire_staging(&mut self, size: vk::DeviceSize) -> anyhow::Result<StagingBuffer> {
+        let device = self
+            .device
+            .as_ref()
+            .expect("Device should always be present while VulkanContext is alive");
+        let physical_device = &self.physical_device;
+        self.staging_pool
+            .as_mut()
+            .expect("Staging pool should always be present while VulkanContext is alive")
+            .acquire(device, physical_device, size)
+    }
+
+    /// Return staging buffers to the pool after GPU work that referenced them completed.
+    pub fn release_staging_many(&mut self, buffers: impl IntoIterator<Item = StagingBuffer>) {
+        self.staging_pool
+            .as_mut()
+            .expect("Staging pool should always be present while VulkanContext is alive")
+            .release_many(buffers);
+    }
+
+    /// Free command buffers allocated from the graphics pool.
+    pub fn free_command_buffers(&self, buffers: &[vk::CommandBuffer]) {
+        if buffers.is_empty() {
+            return;
+        }
+        self.graphics_command_pool()
+            .free_command_buffers(self.device(), buffers);
+    }
+
     /// Returns a reference to the Vulkan entry (function loader).
     pub fn entry(&self) -> &ash::Entry {
         &self.entry
@@ -341,6 +377,12 @@ impl Drop for VulkanContext {
             command_pool.destroy(device);
         }
         self.graphics_command_pool = None;
+
+        // Staging buffers own device memory; clear before destroying the device.
+        if let Some(pool) = self.staging_pool.as_mut() {
+            pool.clear();
+        }
+        self.staging_pool = None;
 
         // Memory allocator must be destroyed before device
         // (gpu-allocator handles cleanup internally, but we drop it explicitly)
