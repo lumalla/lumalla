@@ -265,18 +265,20 @@ impl ZwpLinuxBufferParamsV1 for DisplayState {
         object_id: ObjectId,
         params: &ZwpLinuxBufferParamsV1CreateImmed<'_>,
     ) {
+        let buffer_id = *params.buffer_id();
         if !register_object(ctx, params.buffer_id(), InterfaceIndex::WlBuffer, 1) {
             return;
         }
         if let Err(error) = self.dmabuf_manager.create_immed(
             ctx.client_id,
             object_id,
-            *params.buffer_id(),
+            buffer_id,
             params.width(),
             params.height(),
             params.format(),
             params.flags(),
         ) {
+            ctx.registry.free_object(buffer_id, ctx.writer);
             report_params_error(ctx, object_id, &error);
         }
     }

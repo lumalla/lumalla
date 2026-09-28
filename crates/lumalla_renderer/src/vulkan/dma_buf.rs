@@ -334,6 +334,13 @@ impl DmaBufImage {
         let image = unsafe { device.handle().create_image(&image_info, None) }
             .context("Failed to create Vulkan image for DMA-BUF import")?;
 
+        // Destroy image/memory on any failure before the full DmaBufImage is built.
+        let mut cleanup = ImportCleanup {
+            device: device.handle(),
+            image: Some(image),
+            memory: None,
+        };
+
         let mut dedicated_requirements = vk::MemoryDedicatedRequirements::default();
         let mut memory_requirements2 =
             vk::MemoryRequirements2::default().push_next(&mut dedicated_requirements);
@@ -372,6 +379,7 @@ impl DmaBufImage {
             .context("Failed to import DMA-BUF into Vulkan memory")?;
         // Ownership of the FD transferred to Vulkan on success.
         std::mem::forget(fd);
+        cleanup.memory = Some(memory);
 
         unsafe { device.handle().bind_image_memory(image, memory, 0) }
             .context("Failed to bind imported DMA-BUF memory")?;
@@ -390,6 +398,8 @@ impl DmaBufImage {
             });
         let view = unsafe { device.handle().create_image_view(&view_info, None) }
             .context("Failed to create image view for imported DMA-BUF")?;
+
+        cleanup.disarm();
 
         debug!(
             "Imported DMA-BUF as Vulkan image: {}x{} format={:?} modifier={:#x} stride={}",
@@ -458,6 +468,33 @@ impl Drop for DmaBufImage {
             self.device.free_memory(self.memory, None);
         }
         debug!("Destroyed exportable Vulkan DMA-BUF image");
+    }
+}
+
+/// Rolls back a partially constructed DMA-BUF import on error.
+struct ImportCleanup<'a> {
+    device: &'a ash::Device,
+    image: Option<vk::Image>,
+    memory: Option<vk::DeviceMemory>,
+}
+
+impl ImportCleanup<'_> {
+    fn disarm(&mut self) {
+        self.image = None;
+        self.memory = None;
+    }
+}
+
+impl Drop for ImportCleanup<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(memory) = self.memory.take() {
+                self.device.free_memory(memory, None);
+            }
+            if let Some(image) = self.image.take() {
+                self.device.destroy_image(image, None);
+            }
+        }
     }
 }
 

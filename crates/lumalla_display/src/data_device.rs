@@ -1,4 +1,7 @@
-use std::{collections::HashMap, os::unix::io::RawFd};
+use std::{
+    collections::HashMap,
+    os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd},
+};
 
 use lumalla_wayland_protocol::{
     ClientId, ObjectId,
@@ -710,26 +713,19 @@ impl DataDeviceManager {
         fd: RawFd,
         writer: &mut Writer,
     ) -> Result<(), DataDeviceError> {
+        // Own the SCM_RIGHTS fd immediately so every early return closes it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let offer = self
             .offers
             .get(&(client_id, offer_id))
             .ok_or(DataDeviceError::UnknownOffer)?;
         if offer.finished {
-            unsafe {
-                libc::close(fd);
-            }
             return Err(DataDeviceError::InvalidOffer);
         }
         let Some((source_client, source_id)) = offer.source else {
-            unsafe {
-                libc::close(fd);
-            }
             return Ok(());
         };
         if !offer.mime_types.iter().any(|m| m == mime_type) {
-            unsafe {
-                libc::close(fd);
-            }
             return Ok(());
         }
         if source_client != client_id {
@@ -737,14 +733,14 @@ impl DataDeviceManager {
                 client_id: source_client,
                 source_id,
                 mime_type: mime_type.to_owned(),
-                fd,
+                fd: fd.into_raw_fd(),
             });
             return Ok(());
         }
 
         // Forward the destination FD directly to the source — correct Wayland
         // semantics while the FD lives in the compositor process.
-        forward_receive_to_source(writer, source_id, mime_type, fd);
+        forward_receive_to_source(writer, source_id, mime_type, fd.into_raw_fd());
         Ok(())
     }
 
