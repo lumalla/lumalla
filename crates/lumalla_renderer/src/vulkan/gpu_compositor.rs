@@ -304,7 +304,49 @@ impl GpuCompositor {
         clip: Option<&vk::Rect2D>,
     ) {
         recorder.bind_pipeline(&self.pipeline);
-        recorder.bind_descriptor_sets(self.pipeline.layout(), 0, &[texture.descriptor_set], &[]);
+        self.set_layer_viewport(recorder, output_width, output_height, clip);
+        self.draw_layer_prepared(
+            device,
+            recorder,
+            texture.descriptor_set,
+            dest,
+            src_uv,
+            output_width,
+            output_height,
+            force_opaque,
+            buffer_transform,
+        );
+    }
+
+    fn set_layer_viewport(
+        &self,
+        recorder: &mut CommandBufferRecorder,
+        output_width: u32,
+        output_height: u32,
+        clip: Option<&vk::Rect2D>,
+    ) {
+        recorder.set_viewport_fullscreen(output_width, output_height);
+        if let Some(clip) = clip {
+            recorder.set_scissor(clip);
+        } else {
+            recorder.set_scissor_fullscreen(output_width, output_height);
+        }
+    }
+
+    /// Draw a textured quad assuming the layer pipeline and viewport/scissor are already set.
+    fn draw_layer_prepared(
+        &self,
+        device: &Device,
+        recorder: &mut CommandBufferRecorder,
+        descriptor_set: vk::DescriptorSet,
+        dest: [f32; 4],
+        src_uv: [f32; 4],
+        output_width: u32,
+        output_height: u32,
+        force_opaque: bool,
+        buffer_transform: BufferTransform,
+    ) {
+        recorder.bind_descriptor_sets(self.pipeline.layout(), 0, &[descriptor_set], &[]);
         let push = LayerPushConstants {
             dest,
             src_uv,
@@ -320,12 +362,6 @@ impl GpuCompositor {
                 0,
                 bytemuck::bytes_of(&push),
             );
-        }
-        recorder.set_viewport_fullscreen(output_width, output_height);
-        if let Some(clip) = clip {
-            recorder.set_scissor(clip);
-        } else {
-            recorder.set_scissor_fullscreen(output_width, output_height);
         }
         recorder.draw_fullscreen_quad();
     }
@@ -1305,6 +1341,7 @@ pub fn composite_to_scanout(
         scanout_old_layout,
     )?;
     recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
+    let draw_list = build_layer_draw_list(cache, layers);
 
     match composite_mode {
         CompositeMode::Full => {
@@ -1314,7 +1351,7 @@ pub fn composite_to_scanout(
                 &mut recorder,
                 cache,
                 views,
-                layers,
+                &draw_list,
                 guides,
                 cursor,
                 pointer_x,
@@ -1336,7 +1373,7 @@ pub fn composite_to_scanout(
                     &mut recorder,
                     cache,
                     views,
-                    layers,
+                    &draw_list,
                     guides,
                     cursor,
                     pointer_x,
@@ -1391,13 +1428,13 @@ pub fn composite_layers_to_image(
         image_old_layout,
     )?;
     recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
+    let draw_list = build_layer_draw_list(cache, layers);
     draw_scene_layers(
         compositor,
         device,
         &mut recorder,
-        cache,
         view,
-        layers,
+        &draw_list,
         output_width,
         output_height,
         None,
@@ -1510,13 +1547,50 @@ pub fn overlay_cursor_on_image(
     Ok(())
 }
 
+/// Compact per-frame draw record: texture handle + scene geometry without SHM pixels.
+#[derive(Clone, Copy)]
+struct LayerDrawItem {
+    descriptor_set: vk::DescriptorSet,
+    /// Destination rect in scene/compositor space (before view mapping).
+    scene_dest: [f32; 4],
+    src_uv: [f32; 4],
+    force_opaque: bool,
+    buffer_transform: BufferTransform,
+}
+
+fn build_layer_draw_list(
+    cache: &SurfaceTextureCache,
+    layers: &[&SurfaceFrame],
+) -> Vec<LayerDrawItem> {
+    let mut items = Vec::with_capacity(layers.len());
+    for frame in layers {
+        let key = (frame.owner_id, frame.surface_id);
+        let Some(texture) = cache.texture(key) else {
+            continue;
+        };
+        let scene_dest = surface_dest_rect(frame);
+        if scene_dest[2] <= 0.0 || scene_dest[3] <= 0.0 {
+            continue;
+        }
+        items.push(LayerDrawItem {
+            descriptor_set: texture.descriptor_set,
+            scene_dest,
+            src_uv: surface_src_uv(frame),
+            force_opaque: frame.format == WL_SHM_FORMAT_XRGB8888,
+            buffer_transform: BufferTransform::from_raw(frame.buffer_transform)
+                .unwrap_or_default(),
+        });
+    }
+    items
+}
+
 fn draw_views(
     compositor: &GpuCompositor,
     device: &Device,
     recorder: &mut CommandBufferRecorder<'_>,
     cache: &SurfaceTextureCache,
     views: &[View],
-    layers: &[&SurfaceFrame],
+    layers: &[LayerDrawItem],
     guides: &[Guide],
     cursor: CursorDraw<'_>,
     pointer_x: i32,
@@ -1552,7 +1626,6 @@ fn draw_views(
             compositor,
             device,
             recorder,
-            cache,
             view,
             layers,
             output_width,
@@ -1793,19 +1866,19 @@ fn draw_scene_layers(
     compositor: &GpuCompositor,
     device: &Device,
     recorder: &mut CommandBufferRecorder<'_>,
-    cache: &SurfaceTextureCache,
     view: &View,
-    layers: &[&SurfaceFrame],
+    layers: &[LayerDrawItem],
     output_width: u32,
     output_height: u32,
     clip: Option<&vk::Rect2D>,
 ) {
-    for frame in layers {
-        let key = (frame.owner_id, frame.surface_id);
-        let Some(texture) = cache.texture(key) else {
-            continue;
-        };
-        let dest = map_rect_through_view(view, surface_dest_rect(frame));
+    if layers.is_empty() {
+        return;
+    }
+    recorder.bind_pipeline(&compositor.pipeline);
+    compositor.set_layer_viewport(recorder, output_width, output_height, clip);
+    for item in layers {
+        let dest = map_rect_through_view(view, item.scene_dest);
         if dest[2] <= 0.0 || dest[3] <= 0.0 {
             continue;
         }
@@ -1814,17 +1887,16 @@ fn draw_scene_layers(
                 continue;
             }
         }
-        compositor.draw_layer(
+        compositor.draw_layer_prepared(
             device,
             recorder,
-            texture,
+            item.descriptor_set,
             dest,
-            surface_src_uv(frame),
+            item.src_uv,
             output_width,
             output_height,
-            frame.format == WL_SHM_FORMAT_XRGB8888,
-            BufferTransform::from_raw(frame.buffer_transform).unwrap_or_default(),
-            clip,
+            item.force_opaque,
+            item.buffer_transform,
         );
     }
 }
