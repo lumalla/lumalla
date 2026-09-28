@@ -955,6 +955,7 @@ impl AppData {
                                 height: export.height,
                                 stride: export.stride,
                                 offset: export.offset,
+                                size: export.size,
                                 modifier: export.modifier,
                             })
                             .collect();
@@ -1074,6 +1075,7 @@ impl AppData {
                                         height: export.height,
                                         stride: export.stride,
                                         offset: export.offset,
+                                        size: export.size,
                                         modifier: export.modifier,
                                     })
                                     .collect();
@@ -2097,6 +2099,7 @@ impl AppData {
                 height: export.height,
                 stride: export.stride,
                 offset: export.offset,
+                size: export.size,
                 modifier: export.modifier,
             })
             .collect();

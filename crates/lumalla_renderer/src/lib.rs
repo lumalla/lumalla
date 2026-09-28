@@ -390,6 +390,8 @@ pub struct ScreencastDmaExport {
     pub stride: u32,
     /// Byte offset into the DMA-BUF.
     pub offset: u32,
+    /// Plane 0 byte size (may exceed stride×height for tiled modifiers).
+    pub size: u32,
     /// DRM format modifier.
     pub modifier: u64,
 }
@@ -1083,11 +1085,12 @@ impl RendererState {
         })
     }
 
-    /// Allocate LINEAR exportable buffers for a PipeWire DMA-BUF stream.
+    /// Allocate exportable buffers for a PipeWire DMA-BUF stream.
     ///
-    /// Returns one [`ScreencastDmaExport`] per buffer (duplicated fds for the PW thread).
-    /// Images stay owned by [`RendererState`] under `stream_id` until
-    /// [`Self::free_screencast_buffers`].
+    /// Prefers a single-plane tiled DRM modifier when the GPU supports render+blit
+    /// usage; falls back to LINEAR. Returns one [`ScreencastDmaExport`] per buffer
+    /// (duplicated fds for the PW thread). Images stay owned by [`RendererState`]
+    /// under `stream_id` until [`Self::free_screencast_buffers`].
     pub fn alloc_screencast_buffers(
         &mut self,
         stream_id: u32,
@@ -1118,15 +1121,33 @@ impl RendererState {
                 .context("Vulkan is not initialized for screencast buffers")?;
             vulkan.ensure_scanout_render_pass()?;
             let render_pass = vulkan.scanout_render_pass()?;
+
+            // First allocation picks tiled-or-LINEAR; remaining slots match that modifier.
+            let mut chosen_modifier: Option<u64> = None;
             for index in 0..count {
-                let image = DmaBufImage::allocate(
-                    vulkan.device(),
-                    vulkan.physical_device(),
-                    width,
-                    height,
-                    format,
-                )
+                let image = if let Some(modifier) = chosen_modifier {
+                    DmaBufImage::allocate_with_modifiers(
+                        vulkan.device(),
+                        vulkan.physical_device(),
+                        width,
+                        height,
+                        format,
+                        &[modifier],
+                    )
+                } else {
+                    DmaBufImage::allocate_for_screencast(
+                        vulkan.device(),
+                        vulkan.physical_device(),
+                        vulkan.instance(),
+                        width,
+                        height,
+                        format,
+                    )
+                }
                 .with_context(|| format!("allocate screencast buffer {index}"))?;
+                if chosen_modifier.is_none() {
+                    chosen_modifier = Some(image.modifier());
+                }
                 let framebuffer = Framebuffer::from_view(
                     vulkan.device(),
                     render_pass,
@@ -1146,6 +1167,7 @@ impl RendererState {
                     height,
                     stride: image.stride(),
                     offset: image.offset(),
+                    size: image.size(),
                     modifier: image.modifier(),
                 };
                 exports.push(info);
@@ -1158,6 +1180,12 @@ impl RendererState {
                     gpu_pending: None,
                 });
             }
+        }
+        if let Some(first) = exports.first() {
+            info!(
+                "Allocated {count} screencast DMA-BUF(s) {}x{} modifier={:#x} stride={}",
+                width, height, first.modifier, first.stride
+            );
         }
         self.screencast_buffers.insert(stream_id, slots);
         Ok(exports)

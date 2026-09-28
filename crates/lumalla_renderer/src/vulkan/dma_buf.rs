@@ -36,15 +36,14 @@ pub struct DmaBufImage {
     modifier: u64,
     stride: u32,
     offset: u32,
+    /// Byte size of plane 0 (from subresource layout); used for PipeWire maxsize.
+    size: u32,
     device: ash::Device,
     external_memory_fd: ash::khr::external_memory_fd::Device,
 }
 
 impl DmaBufImage {
-    /// Allocates a new exportable image suitable for rendering and DMA-BUF export.
-    ///
-    /// Uses `DRM_FORMAT_MOD_LINEAR` so the buffer can be imported by KMS without
-    /// negotiating a device-specific modifier yet.
+    /// Allocates a LINEAR exportable image suitable for rendering and KMS scanout.
     pub fn allocate(
         device: &Device,
         physical_device: &PhysicalDevice,
@@ -52,15 +51,95 @@ impl DmaBufImage {
         height: u32,
         format: vk::Format,
     ) -> anyhow::Result<Self> {
+        Self::allocate_with_modifiers(
+            device,
+            physical_device,
+            width,
+            height,
+            format,
+            &[DRM_FORMAT_MOD_LINEAR],
+        )
+    }
+
+    /// Allocates an exportable image, preferring a tiled modifier when available.
+    ///
+    /// Tries single-plane non-LINEAR modifiers that support render+blit usage first,
+    /// then falls back to [`DRM_FORMAT_MOD_LINEAR`]. Vulkan may pick any modifier
+    /// from the candidate list, so LINEAR is only included in the fallback attempt.
+    pub fn allocate_for_screencast(
+        device: &Device,
+        physical_device: &PhysicalDevice,
+        instance: &ash::Instance,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> anyhow::Result<Self> {
+        let modifiers = query_exportable_format_modifiers(
+            instance,
+            physical_device.handle(),
+            format,
+        );
+        let tiled: Vec<u64> = modifiers
+            .iter()
+            .copied()
+            .filter(|m| *m != DRM_FORMAT_MOD_LINEAR)
+            .collect();
+        if !tiled.is_empty() {
+            match Self::allocate_with_modifiers(
+                device,
+                physical_device,
+                width,
+                height,
+                format,
+                &tiled,
+            ) {
+                Ok(image) => {
+                    debug!(
+                        "Screencast image using tiled modifier {:#x} ({} candidates)",
+                        image.modifier(),
+                        tiled.len()
+                    );
+                    return Ok(image);
+                }
+                Err(err) => {
+                    debug!(
+                        "Tiled screencast modifiers {:?} failed ({err:#}); falling back to LINEAR",
+                        tiled
+                    );
+                }
+            }
+        }
+        Self::allocate_with_modifiers(
+            device,
+            physical_device,
+            width,
+            height,
+            format,
+            &[DRM_FORMAT_MOD_LINEAR],
+        )
+    }
+
+    /// Allocates an exportable image using one of the given DRM modifiers.
+    ///
+    /// The implementation may select any modifier from `modifiers`. Callers that
+    /// need a specific class (e.g. tiled-only) should pass a filtered list.
+    pub fn allocate_with_modifiers(
+        device: &Device,
+        physical_device: &PhysicalDevice,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        modifiers: &[u64],
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(width > 0 && height > 0, "Image dimensions must be non-zero");
+        anyhow::ensure!(!modifiers.is_empty(), "At least one DRM modifier is required");
 
         let extent = vk::Extent2D { width, height };
-        let modifiers = [DRM_FORMAT_MOD_LINEAR];
 
         let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
         let mut modifier_list_info =
-            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&modifiers);
+            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(modifiers);
 
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -163,9 +242,17 @@ impl DmaBufImage {
         let view = unsafe { device.handle().create_image_view(&view_info, None) }
             .context("Failed to create image view for exportable image")?;
 
+        let stride = layout.row_pitch as u32;
+        let offset = layout.offset as u32;
+        let size = if layout.size > 0 {
+            layout.size as u32
+        } else {
+            stride.saturating_mul(height)
+        };
+
         debug!(
-            "Allocated exportable Vulkan image: {}x{} format={:?} modifier={:#x} stride={}",
-            width, height, format, modifier_props.drm_format_modifier, layout.row_pitch
+            "Allocated exportable Vulkan image: {}x{} format={:?} modifier={:#x} stride={} size={}",
+            width, height, format, modifier_props.drm_format_modifier, stride, size
         );
 
         Ok(Self {
@@ -175,8 +262,9 @@ impl DmaBufImage {
             format,
             extent,
             modifier: modifier_props.drm_format_modifier,
-            stride: layout.row_pitch as u32,
-            offset: layout.offset as u32,
+            stride,
+            offset,
+            size,
             device: device.handle().clone(),
             external_memory_fd: device.external_memory_fd().clone(),
         })
@@ -317,6 +405,7 @@ impl DmaBufImage {
             modifier,
             stride,
             offset: offset as u32,
+            size: stride.saturating_mul(height),
             device: device.handle().clone(),
             external_memory_fd: device.external_memory_fd().clone(),
         })
@@ -348,6 +437,11 @@ impl DmaBufImage {
 
     pub fn offset(&self) -> u32 {
         self.offset
+    }
+
+    /// Byte size of memory plane 0 (for PipeWire / importer maxsize).
+    pub fn size(&self) -> u32 {
+        self.size
     }
 
     /// DRM fourcc matching this Vulkan format, if known.
@@ -401,7 +495,12 @@ pub fn query_samplable_dmabuf_formats(
 
     let mut out = Vec::new();
     for &(fourcc, format) in CANDIDATES {
-        for modifier in query_format_modifiers(instance, physical_device, format) {
+        for modifier in query_format_modifiers(
+            instance,
+            physical_device,
+            format,
+            vk::FormatFeatureFlags::SAMPLED_IMAGE,
+        ) {
             out.push((fourcc, modifier));
         }
     }
@@ -416,10 +515,28 @@ pub fn query_samplable_dmabuf_formats(
     out
 }
 
+/// Single-plane DRM modifiers that can back a screencast render target + blit source.
+pub fn query_exportable_format_modifiers(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    format: vk::Format,
+) -> Vec<u64> {
+    let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+        | vk::FormatFeatureFlags::TRANSFER_SRC
+        | vk::FormatFeatureFlags::TRANSFER_DST
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+    let mut modifiers = query_format_modifiers(instance, physical_device, format, required);
+    if modifiers.is_empty() {
+        modifiers.push(DRM_FORMAT_MOD_LINEAR);
+    }
+    modifiers
+}
+
 fn query_format_modifiers(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     format: vk::Format,
+    required: vk::FormatFeatureFlags,
 ) -> Vec<u64> {
     let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default();
     let mut props = vk::FormatProperties2::default().push_next(&mut modifier_list);
@@ -439,7 +556,6 @@ fn query_format_modifiers(
         instance.get_physical_device_format_properties2(physical_device, format, &mut props);
     }
 
-    let required = vk::FormatFeatureFlags::SAMPLED_IMAGE;
     modifiers
         .into_iter()
         .filter(|props| {

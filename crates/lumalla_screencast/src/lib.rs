@@ -109,6 +109,8 @@ pub struct DmaBufferExport {
     pub stride: u32,
     /// Byte offset.
     pub offset: u32,
+    /// Plane 0 byte size (may exceed stride×height for tiled modifiers).
+    pub size: u32,
     /// DRM modifier.
     pub modifier: u64,
 }
@@ -187,6 +189,7 @@ struct DmaSlot {
     fd: RawFd,
     stride: u32,
     offset: u32,
+    size: u32,
     width: u32,
     height: u32,
     modifier: u64,
@@ -885,6 +888,7 @@ fn create_stream(
             fd: export.fd.as_raw_fd(),
             stride: export.stride,
             offset: export.offset,
+            size: export.size,
             width: export.width,
             height: export.height,
             modifier: export.modifier,
@@ -893,6 +897,17 @@ fn create_stream(
             state: DmaSlotState::WithPw,
         })
         .collect();
+
+    let dma_modifier = dma_slots
+        .first()
+        .map(|slot| slot.modifier)
+        .unwrap_or(0);
+    if let Some(slot) = dma_slots.first() {
+        info!(
+            "PipeWire stream {stream_id} DMA-BUF pool {}x{} modifier={:#x} stride={} size={}",
+            slot.width, slot.height, slot.modifier, slot.stride, slot.size
+        );
+    }
 
     let inner = Rc::new(RefCell::new(StreamInner {
         latest_memfd: None,
@@ -986,7 +1001,15 @@ fn create_stream(
                 } else {
                     width.saturating_mul(4)
                 };
-                let size = stride.saturating_mul(height);
+                let size = if use_dmabuf {
+                    inner
+                        .dma_slots
+                        .first()
+                        .map(|s| s.size.max(s.stride.saturating_mul(height)))
+                        .unwrap_or_else(|| stride.saturating_mul(height))
+                } else {
+                    stride.saturating_mul(height)
+                };
 
                 let buffers = pod::object!(
                     SpaTypes::ObjectParamBuffers,
@@ -1068,7 +1091,7 @@ fn create_stream(
                     (*spa_data).flags = SPA_DATA_FLAG_READWRITE;
                     (*spa_data).fd = slot.fd as i64;
                     (*spa_data).mapoffset = slot.offset;
-                    (*spa_data).maxsize = slot.stride.saturating_mul(slot.height);
+                    (*spa_data).maxsize = slot.size.max(slot.stride.saturating_mul(slot.height));
                     (*spa_data).data = std::ptr::null_mut();
                     let chunk = (*spa_data).chunk;
                     (*chunk).offset = slot.offset;
@@ -1164,7 +1187,8 @@ fn create_stream(
         .context("failed to register PipeWire stream listener")?;
 
     // Prefer MemFd RGBA at a downscaled size so browsers stay cheap; offer
-    // LINEAR BGRx DMA-BUF at the full export size for OBS / DMA consumers.
+    // BGRx DMA-BUF at the full export size with the allocated DRM modifier
+    // (tiled when the GPU supports it, otherwise LINEAR) for OBS-class consumers.
     let (memfd_w, memfd_h) = fit_memfd_output_size(width, height);
     let mut params_bytes: Vec<Vec<u8>> = Vec::new();
     params_bytes.push(serialize_enum_format(
@@ -1177,7 +1201,7 @@ fn create_stream(
         width,
         height,
         VideoFormat::BGRx,
-        Some(0), // DRM_FORMAT_MOD_LINEAR
+        Some(dma_modifier),
     )?);
 
     let mut params: Vec<&Pod> = params_bytes

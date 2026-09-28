@@ -46,6 +46,7 @@ fn dummy_dma_exports(count: usize, width: u32, height: u32) -> Vec<DmaBufferExpo
                 height,
                 stride,
                 offset: 0,
+                size,
                 modifier: 0,
             }
         })
