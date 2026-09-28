@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::mpsc::Receiver,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use allocator_api2::vec::Vec as ArenaVec;
@@ -35,7 +35,7 @@ use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
     Mods, MutterScreenCastTarget, OpKind, encode_user_data, message_loop_with_channel,
-    ring::MESSAGE_CHANNEL_TOKEN,
+    monotonic_deadline_after, ring::MESSAGE_CHANNEL_TOKEN,
 };
 
 use crate::args::Args;
@@ -47,6 +47,10 @@ pub const UDEV_DRM_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 3;
 pub const WAYLAND_ACCEPT_ID: u64 = MESSAGE_CHANNEL_TOKEN + 4;
 pub const DBUS_THREAD_FINISHED_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 5;
 pub const SHUTDOWN_TIMEOUT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 6;
+/// Short wake to poll in-flight screencast GPU fills without blocking the main loop.
+pub const SCREENCAST_GPU_WAKE_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 7;
+/// How soon to re-check screencast fence completion after submit.
+const SCREENCAST_GPU_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// DRM primary-node fds use this high token range to avoid Wayland client tokens.
 pub const DRM_DEVICE_TOKEN_BASE: u64 = 1 << 16;
 
@@ -85,6 +89,9 @@ struct AppData {
     mutter_cast_streams: HashMap<u64, Vec<u32>>,
     /// Prevents `push_screencast_frames` → `arm_presents` re-entrancy.
     screencast_push_active: bool,
+    /// Absolute timeout armed while screencast DMA fills are in flight.
+    screencast_gpu_wake_armed: bool,
+    screencast_gpu_wake_ts: Box<Timespec>,
     frame_clock: Instant,
     drm_device_poll: HashMap<PathBuf, DrmDeviceRegistration>,
     next_drm_device_token: usize,
@@ -149,6 +156,8 @@ impl AppData {
             pending_screencast_replies: HashMap::new(),
             mutter_cast_streams: HashMap::new(),
             screencast_push_active: false,
+            screencast_gpu_wake_armed: false,
+            screencast_gpu_wake_ts: Box::new(Timespec::new()),
             frame_clock: Instant::now(),
             drm_device_poll: HashMap::new(),
             next_drm_device_token: 0,
@@ -1905,6 +1914,11 @@ impl AppData {
                     Err(err) => warn!("Unable to handle present wake timeout: {err}"),
                 }
             }
+            SCREENCAST_GPU_WAKE_TOKEN => {
+                self.screencast_gpu_wake_armed = false;
+                self.finish_ready_screencast_dma();
+                self.arm_screencast_gpu_wake(event_loop);
+            }
             other => {
                 warn!("Ignoring unexpected timeout completion id={other}");
             }
@@ -2027,6 +2041,10 @@ impl AppData {
         if let Err(err) = self.renderer_state.clear_all_present_wakes(event_loop) {
             warn!("Unable to clear present wakes before shutdown timeout: {err}");
         }
+        if self.screencast_gpu_wake_armed {
+            let _ = event_loop.cancel_timeout(SCREENCAST_GPU_WAKE_TOKEN);
+            self.screencast_gpu_wake_armed = false;
+        }
         if let Err(err) =
             event_loop.submit_timeout(Pin::new(&SHUTDOWN_TIMEOUT_TIMESPEC), SHUTDOWN_TIMEOUT_TOKEN)
         {
@@ -2106,9 +2124,66 @@ impl AppData {
         self.renderer_state.free_screencast_buffers(stream_id);
     }
 
+    /// Queue DMA-BUF slots whose GPU fills have finished (non-blocking fence poll).
+    fn finish_ready_screencast_dma(&mut self) {
+        let ready = match self.renderer_state.poll_screencast_gpu() {
+            Ok(ready) => ready,
+            Err(err) => {
+                warn!("Unable to poll screencast GPU fences: {err:#}");
+                return;
+            }
+        };
+        for (stream_id, index) in ready {
+            if let Err(err) = self.screencast.queue_dma_buffer(stream_id, index) {
+                warn!("Unable to queue DMA-BUF for stream {stream_id}: {err:#}");
+                self.renderer_state
+                    .release_screencast_buffer(stream_id, index);
+            }
+        }
+    }
+
+    /// Arm a short absolute timeout while screencast GPU fills are in flight.
+    fn arm_screencast_gpu_wake(&mut self, event_loop: &mut EventLoop) {
+        if !self.renderer_state.has_pending_screencast_gpu() {
+            if self.screencast_gpu_wake_armed {
+                let _ = event_loop.cancel_timeout(SCREENCAST_GPU_WAKE_TOKEN);
+                self.screencast_gpu_wake_armed = false;
+            }
+            return;
+        }
+        let (sec, nsec) = match monotonic_deadline_after(SCREENCAST_GPU_POLL_INTERVAL) {
+            Ok(deadline) => deadline,
+            Err(err) => {
+                warn!("Unable to compute screencast GPU wake deadline: {err}");
+                return;
+            }
+        };
+        if self.screencast_gpu_wake_armed {
+            let _ = event_loop.cancel_timeout(SCREENCAST_GPU_WAKE_TOKEN);
+            self.screencast_gpu_wake_armed = false;
+        }
+        *self.screencast_gpu_wake_ts = Timespec::new().sec(sec).nsec(nsec);
+        if let Err(err) = event_loop
+            .submit_timeout_absolute(Pin::new(self.screencast_gpu_wake_ts.as_ref()), SCREENCAST_GPU_WAKE_TOKEN)
+        {
+            warn!("Unable to arm screencast GPU wake: {err}");
+            return;
+        }
+        self.screencast_gpu_wake_armed = true;
+    }
+
     fn push_screencast_frames(&mut self, event_loop: &mut EventLoop, arena: &Arena) {
-        let _ = event_loop;
+        if !self.screencast.has_streams()
+            && !self.renderer_state.has_pending_screencast_gpu()
+        {
+            return;
+        }
+
+        // Complete any fills that finished since the last wake before submitting more.
+        self.finish_ready_screencast_dma();
+
         if !self.screencast.has_streams() {
+            self.arm_screencast_gpu_wake(event_loop);
             return;
         }
 
@@ -2151,7 +2226,7 @@ impl AppData {
             self.stop_screencast_stream(stream_id);
         }
 
-        // DMA-BUF path: fill buffers that PipeWire has returned for a blit.
+        // DMA-BUF path: submit GPU fills without waiting; queue when fences signal.
         let pending_blits = self.screencast.take_pending_blits();
         let mut deferred = Vec::new();
         for (stream_id, index) in pending_blits {
@@ -2194,13 +2269,9 @@ impl AppData {
 
             match blit_result {
                 Ok(()) => {
-                    if let Err(err) = self.screencast.queue_dma_buffer(stream_id, index) {
-                        warn!("Unable to queue DMA-BUF for stream {stream_id}: {err:#}");
-                        self.renderer_state
-                            .release_screencast_buffer(stream_id, index);
-                    } else if let Some(stream) =
-                        self.screencast.streams_mut().get_mut(&stream_id)
-                    {
+                    // Frame is queued to PipeWire once `finish_ready_screencast_dma` sees
+                    // the fence; pace from submit so we do not over-submit while waiting.
+                    if let Some(stream) = self.screencast.streams_mut().get_mut(&stream_id) {
                         stream.last_capture = Some(now);
                     }
                 }
@@ -2220,7 +2291,11 @@ impl AppData {
             self.screencast.requeue_pending_blits_silent(deferred);
         }
 
+        // Opportunistically queue any fills that completed during this submit batch.
+        self.finish_ready_screencast_dma();
+
         // MemFd path: GPU-scale into the small screencast buffer, then read that back.
+        // Readback still waits on the GPU (capped to ≤5 fps / ≤1280).
         let due: Vec<(u32, ScreencastSource, i32, i32, i32, i32)> = self
             .screencast
             .streams()
@@ -2280,6 +2355,8 @@ impl AppData {
                 }
             }
         }
+
+        self.arm_screencast_gpu_wake(event_loop);
     }
 }
 

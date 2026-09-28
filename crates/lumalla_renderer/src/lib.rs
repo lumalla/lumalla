@@ -402,6 +402,8 @@ struct ScreencastDmaSlot {
     in_use: bool,
     /// True until the first GPU fill (layout still UNDEFINED).
     fresh: bool,
+    /// In-flight GPU fill; must complete before PipeWire queues the buffer.
+    gpu_pending: Option<crate::vulkan::PendingGpuSubmit>,
 }
 
 fn dup_owned_fd(fd: RawFd) -> anyhow::Result<OwnedFd> {
@@ -1153,6 +1155,7 @@ impl RendererState {
                     _export_fd: export_fd,
                     in_use: false,
                     fresh: true,
+                    gpu_pending: None,
                 });
             }
         }
@@ -1160,12 +1163,18 @@ impl RendererState {
         Ok(exports)
     }
 
-    /// Drop capture buffers for `stream_id`.
+    /// Drop capture buffers for `stream_id`, waiting for any in-flight GPU fills.
     pub fn free_screencast_buffers(&mut self, stream_id: u32) {
+        if let Err(err) = self.wait_screencast_stream_gpu(stream_id) {
+            warn!("Error waiting for screencast GPU work before free: {err:#}");
+        }
         self.screencast_buffers.remove(&stream_id);
     }
 
-    /// GPU-blit the compositor region into screencast buffer `index`, waiting for completion.
+    /// GPU-blit the compositor region into screencast buffer `index` (does not wait).
+    ///
+    /// Completion is tracked on the slot; call [`Self::poll_screencast_gpu`] or
+    /// [`Self::wait_screencast_buffer_gpu`] before exporting/reading the buffer.
     ///
     /// `width`/`height` are the capture rectangle in compositor space.
     /// `dest_width`/`dest_height` are the blit destination size (must fit in the buffer).
@@ -1203,6 +1212,10 @@ impl RendererState {
             let slot = slots
                 .get(index)
                 .context("screencast buffer index out of range")?;
+            anyhow::ensure!(
+                slot.gpu_pending.is_none(),
+                "screencast buffer {index} still has pending GPU work"
+            );
             let extent = slot.image.extent();
             (extent.width, extent.height)
         };
@@ -1296,20 +1309,23 @@ impl RendererState {
             .as_ref()
             .context("Vulkan missing for screencast submit")?;
         let pending = batch.submit(vulkan.device())?;
-        pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
 
         if let Some(slot) = self
             .screencast_buffers
             .get_mut(&stream_id)
             .and_then(|slots| slots.get_mut(index))
         {
+            slot.gpu_pending = Some(pending);
             slot.in_use = true;
             slot.fresh = false;
         }
         Ok(())
     }
 
-    /// Composite only the given surface layers into screencast buffer `index`.
+    /// Composite only the given surface layers into screencast buffer `index` (does not wait).
+    ///
+    /// Completion is tracked on the slot; call [`Self::poll_screencast_gpu`] or
+    /// [`Self::wait_screencast_buffer_gpu`] before exporting/reading the buffer.
     ///
     /// `origin`/`width`/`height` are the window AABB in compositor space. Layers are
     /// drawn with a view that maps that AABB onto `dest_width`×`dest_height`.
@@ -1343,6 +1359,10 @@ impl RendererState {
             let slot = slots
                 .get(index)
                 .context("screencast buffer index out of range")?;
+            anyhow::ensure!(
+                slot.gpu_pending.is_none(),
+                "screencast buffer {index} still has pending GPU work"
+            );
             let extent = slot.image.extent();
             (extent.width, extent.height, slot.fresh)
         };
@@ -1440,13 +1460,13 @@ impl RendererState {
             .as_ref()
             .context("Vulkan missing for window screencast submit")?;
         let pending = batch.submit(vulkan.device())?;
-        pending.wait(vulkan.device(), vulkan.graphics_command_pool())?;
 
         if let Some(slot) = self
             .screencast_buffers
             .get_mut(&stream_id)
             .and_then(|slots| slots.get_mut(index))
         {
+            slot.gpu_pending = Some(pending);
             slot.in_use = true;
             slot.fresh = false;
         }
@@ -1479,6 +1499,7 @@ impl RendererState {
             dest_width,
             dest_height,
         )?;
+        self.wait_screencast_buffer_gpu(stream_id, index)?;
 
         let format = {
             let slots = self
@@ -1560,6 +1581,7 @@ impl RendererState {
             dest_height,
             outputs,
         )?;
+        self.wait_screencast_buffer_gpu(stream_id, index)?;
 
         let format = {
             let slots = self
@@ -1625,12 +1647,103 @@ impl RendererState {
         }
     }
 
+    /// Block until GPU fill for one screencast slot completes (MemFd readback path).
+    pub fn wait_screencast_buffer_gpu(
+        &mut self,
+        stream_id: u32,
+        index: usize,
+    ) -> anyhow::Result<()> {
+        let pending = self
+            .screencast_buffers
+            .get_mut(&stream_id)
+            .and_then(|slots| slots.get_mut(index))
+            .and_then(|slot| slot.gpu_pending.take());
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let vulkan = self
+            .vulkan
+            .as_mut()
+            .context("Vulkan missing while waiting for screencast GPU work")?;
+        pending.wait(vulkan.device(), vulkan.graphics_command_pool())
+    }
+
+    /// Block until all in-flight screencast GPU fills for `stream_id` complete.
+    pub fn wait_screencast_stream_gpu(&mut self, stream_id: u32) -> anyhow::Result<()> {
+        let indices: Vec<usize> = self
+            .screencast_buffers
+            .get(&stream_id)
+            .map(|slots| {
+                slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, slot)| slot.gpu_pending.is_some().then_some(i))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for index in indices {
+            self.wait_screencast_buffer_gpu(stream_id, index)?;
+        }
+        Ok(())
+    }
+
+    /// Whether any screencast slot still has in-flight GPU work.
+    pub fn has_pending_screencast_gpu(&self) -> bool {
+        self.screencast_buffers
+            .values()
+            .any(|slots| slots.iter().any(|slot| slot.gpu_pending.is_some()))
+    }
+
+    /// Non-blocking: recycle finished screencast GPU fills.
+    ///
+    /// Returns `(stream_id, buffer_index)` pairs that just became ready to queue
+    /// to PipeWire (or read back).
+    pub fn poll_screencast_gpu(&mut self) -> anyhow::Result<Vec<(u32, usize)>> {
+        let mut pending_keys: Vec<(u32, usize)> = Vec::new();
+        for (stream_id, slots) in &self.screencast_buffers {
+            for (index, slot) in slots.iter().enumerate() {
+                if slot.gpu_pending.is_some() {
+                    pending_keys.push((*stream_id, index));
+                }
+            }
+        }
+
+        let mut ready = Vec::new();
+        for (stream_id, index) in pending_keys {
+            let pending = self
+                .screencast_buffers
+                .get_mut(&stream_id)
+                .and_then(|slots| slots.get_mut(index))
+                .and_then(|slot| slot.gpu_pending.take());
+            let Some(pending) = pending else {
+                continue;
+            };
+            let vulkan = self
+                .vulkan
+                .as_mut()
+                .context("Vulkan missing while polling screencast GPU work")?;
+            match pending.try_complete(vulkan.device(), vulkan.graphics_command_pool())? {
+                None => ready.push((stream_id, index)),
+                Some(still) => {
+                    if let Some(slot) = self
+                        .screencast_buffers
+                        .get_mut(&stream_id)
+                        .and_then(|slots| slots.get_mut(index))
+                    {
+                        slot.gpu_pending = Some(still);
+                    }
+                }
+            }
+        }
+        Ok(ready)
+    }
+
     /// Next free screencast buffer index, if any.
     pub fn next_free_screencast_buffer(&self, stream_id: u32) -> Option<usize> {
         self.screencast_buffers
             .get(&stream_id)?
             .iter()
-            .position(|slot| !slot.in_use)
+            .position(|slot| !slot.in_use && slot.gpu_pending.is_none())
     }
 
     /// DRM format/modifier pairs clients may use with linux-dmabuf.

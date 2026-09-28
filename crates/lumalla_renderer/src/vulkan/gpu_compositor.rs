@@ -91,6 +91,16 @@ impl PendingGpuSubmit {
         self.fence.is_some()
     }
 
+    /// Recycle command buffers and drop staging after the fence has signaled.
+    fn recycle(&mut self, device: &Device, command_pool: &CommandPool) {
+        if !self.command_buffers.is_empty() {
+            command_pool.free_command_buffers(device, &self.command_buffers);
+            self.command_buffers.clear();
+        }
+        self.staging.clear();
+        let _ = self.fence.take();
+    }
+
     /// Blocks until GPU work finishes and recycles command buffers.
     pub fn wait(mut self, device: &Device, command_pool: &CommandPool) -> anyhow::Result<()> {
         if let Some(fence) = self.fence.take() {
@@ -105,12 +115,29 @@ impl PendingGpuSubmit {
                 return Err(error);
             }
         }
-        if !self.command_buffers.is_empty() {
-            command_pool.free_command_buffers(device, &self.command_buffers);
-            self.command_buffers.clear();
-        }
-        self.staging.clear();
+        self.recycle(device, command_pool);
         Ok(())
+    }
+
+    /// Non-blocking completion check.
+    ///
+    /// Returns `Ok(None)` when work is finished (resources recycled), or
+    /// `Ok(Some(self))` when the fence is still pending.
+    pub fn try_complete(
+        mut self,
+        device: &Device,
+        command_pool: &CommandPool,
+    ) -> anyhow::Result<Option<Self>> {
+        if let Some(fence) = &self.fence {
+            if !fence
+                .is_signaled()
+                .context("Failed to poll GPU frame fence")?
+            {
+                return Ok(Some(self));
+            }
+        }
+        self.recycle(device, command_pool);
+        Ok(None)
     }
 }
 

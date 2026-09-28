@@ -59,6 +59,16 @@ impl Fence {
         self.wait(1_000_000_000) // 1 second in nanoseconds
     }
 
+    /// Non-blocking check: `true` if the fence is signaled.
+    pub fn is_signaled(&self) -> anyhow::Result<bool> {
+        match unsafe { self.device.get_fence_status(self.handle) } {
+            Ok(true) => Ok(true),
+            Ok(false) => Ok(false),
+            // ash maps SUCCESS→true / NOT_READY→false; treat other codes as errors.
+            Err(err) => Err(anyhow::Error::new(err).context("Failed to query fence status")),
+        }
+    }
+
     /// Resets the fence to the unsignaled state.
     pub fn reset(&self) -> anyhow::Result<()> {
         unsafe { self.device.reset_fences(&[self.handle]) }.context("Failed to reset fence")?;
