@@ -416,8 +416,10 @@ pub fn atomic_set_plane_fb(
 /// Pass `crtc_id == 0` and `fb_id == 0` to detach the plane. When `test_only` is
 /// set, the commit is validated without applying.
 ///
-/// Real (non-test) commits are blocking so callers can release the previous cursor
-/// FB as soon as this returns — the plane has finished switching.
+/// Use `blocking` only when the FB id changes and the caller will release the
+/// previous FB immediately after success. Position-only updates must stay
+/// non-blocking — a blocking commit on every pointer move stalls the compositor
+/// event loop (noticeable as soon as the user starts dragging).
 pub fn atomic_set_cursor_plane(
     drm_fd: BorrowedFd<'_>,
     plane_id: u32,
@@ -429,6 +431,7 @@ pub fn atomic_set_cursor_plane(
     width: u32,
     height: u32,
     test_only: bool,
+    blocking: bool,
 ) -> anyhow::Result<()> {
     let fd = drm_fd.as_raw_fd();
     let req = AtomicRequest::new()?;
@@ -454,12 +457,13 @@ pub fn atomic_set_cursor_plane(
         req.add(plane_id, props.crtc_h, u64::from(height))?;
     }
 
-    // Blocking apply (except TEST_ONLY) so the previous cursor FB can be released
-    // safely — NONBLOCK would still be scanning the old FB when we RmFB it.
     let flags = if test_only {
         sys::DRM_MODE_ATOMIC_TEST_ONLY | sys::DRM_MODE_ATOMIC_NONBLOCK
-    } else {
+    } else if blocking {
+        // Wait until the plane has switched FB so RmFB of the previous buffer is safe.
         0
+    } else {
+        sys::DRM_MODE_ATOMIC_NONBLOCK
     };
     req.commit(fd, flags, ptr::null_mut())?;
 

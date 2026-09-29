@@ -1122,6 +1122,17 @@ impl WlDataDevice for DisplayState {
             }
         }
 
+        // Protocol: start_drag requires a matching implicit grab serial. Ignore
+        // otherwise so clients are not left in a compositor-side drag with no events.
+        if !self.seat_manager.is_valid_grab_serial(params.serial()) {
+            if let Some(icon) = params.icon() {
+                let _ = self
+                    .surface_manager
+                    .clear_dnd_icon_role(ctx.client_id, icon);
+            }
+            return;
+        }
+
         let (px, py) = self.seat_manager.pointer_position();
         let views = self.pointer_views();
         let (scene_x, scene_y) = lumalla_shared::map_dest_to_source(&views, px, py);
@@ -1159,7 +1170,12 @@ impl WlDataDevice for DisplayState {
                     .clear_dnd_icon_role(ctx.client_id, icon);
             }
             report_data_device_error(ctx, object_id, error);
+            return;
         }
+
+        // DnD grab takes the seat: clients must not keep receiving pointer events.
+        self.seat_manager
+            .begin_dnd_pointer_grab(ctx.client_id, ctx.writer);
     }
 
     fn set_selection(

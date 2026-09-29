@@ -123,6 +123,17 @@ fn is_drm_permission_denied(err: &anyhow::Error) -> bool {
     })
 }
 
+fn is_drm_busy(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::WouldBlock)
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.raw_os_error() == Some(libc::EBUSY))
+    })
+}
+
 /// Outcome of a present or page-flip dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentStatus {
@@ -2151,6 +2162,7 @@ impl RendererState {
             0,
             0,
             false,
+            true,
         ) {
             warn!(
                 "Failed to disable cursor plane {} on {}: {err:#}",
@@ -2765,6 +2777,7 @@ impl RendererState {
                         0,
                         0,
                         false,
+                        true,
                     ) {
                         warn!("Failed to disable cursor plane {plane_id} on {name}: {err:#}");
                     }
@@ -3367,6 +3380,10 @@ impl RendererState {
             let show_here = active_name.as_ref() == Some(&name) && !hidden;
             if let Err(err) = self.commit_hw_cursor_on_output(&name, show_here, pointer_x, pointer_y)
             {
+                if is_drm_busy(&err) {
+                    // Pending primary flip / prior cursor update — retry next motion/present.
+                    continue;
+                }
                 warn!("HW cursor update failed on {name}: {err:#}; falling back to software");
                 if let Some(output) = self.outputs.get(&name) {
                     self.disable_hw_cursor_plane(output);
@@ -3463,6 +3480,7 @@ impl RendererState {
                 .opened()
                 .get(&drm_path)
                 .with_context(|| format!("DRM device {} is not open", drm_path.display()))?;
+            // Blocking: caller may release the current cursor FB after detach.
             atomic_set_cursor_plane(
                 device.fd(),
                 plane_id,
@@ -3474,6 +3492,7 @@ impl RendererState {
                 0,
                 0,
                 false,
+                true,
             )?;
             if let Some(cursor) = self.outputs.get_mut(name).and_then(|o| o.cursor_mut()) {
                 cursor.geometry = PlaneGeometry::cursor(0, 0, 0, 0);
@@ -3527,10 +3546,14 @@ impl RendererState {
                 width,
                 height,
                 true,
+                false,
             )
             .context("cursor plane TEST_ONLY rejected")?;
         }
 
+        // Block only when replacing the FB so RmFB is safe. Position-only moves stay
+        // NONBLOCK so drag/motion does not freeze the compositor on every vblank.
+        let block_for_fb_release = new_image.is_some();
         let device = self
             .drm_devices
             .opened()
@@ -3547,6 +3570,7 @@ impl RendererState {
             width,
             height,
             false,
+            block_for_fb_release,
         )?;
 
         if let Some(new_image) = new_image {

@@ -1294,6 +1294,16 @@ impl DataDeviceManager {
         self.drag.as_ref().and_then(|d| d.icon)
     }
 
+    /// True while a DnD pointer grab is active (after `start_drag`, before drop/cancel).
+    pub fn has_active_drag_grab(&self) -> bool {
+        self.drag.as_ref().is_some_and(|d| !d.drop_performed)
+    }
+
+    /// Icon surface to unmap when the drag grab ends (drop or cancel).
+    pub fn take_drag_icon(&mut self) -> Option<(ClientId, ObjectId)> {
+        self.drag.as_mut().and_then(|d| d.icon.take())
+    }
+
     fn device_for_client(&self, client_id: ClientId) -> Option<ObjectId> {
         self.devices
             .iter()

@@ -533,6 +533,40 @@ impl SeatManager {
         }
     }
 
+    /// Drop all pointer focus for a DnD grab. Leaves are sent for `client_id`;
+    /// other clients' focus is cleared in state (their leave is delivered on next
+    /// enter after the grab ends).
+    pub fn begin_dnd_pointer_grab(&mut self, client_id: ClientId, writer: &mut Writer) {
+        let focused: Vec<(ClientId, ObjectId, ObjectId, u32)> = self
+            .pointers
+            .iter()
+            .filter_map(|p| {
+                p.focus
+                    .map(|surface| (p.client_id, p.id, surface, p.version))
+            })
+            .collect();
+        for (owner, pointer_id, surface, version) in focused {
+            if owner == client_id {
+                let serial = self.serial.next_serial();
+                writer
+                    .wl_pointer_leave(pointer_id)
+                    .serial(serial)
+                    .surface(surface);
+                if version >= 5 {
+                    writer.wl_pointer_frame(pointer_id);
+                }
+            }
+            if let Some(pointer) = self
+                .pointers
+                .iter_mut()
+                .find(|p| p.client_id == owner && p.id == pointer_id)
+            {
+                pointer.focus = None;
+                pointer.enter_serial = None;
+            }
+        }
+    }
+
     /// Focus keyboard input on `surface` for `client_id`.
     ///
     /// Clears keyboard focus on every other surface/client first so there is at

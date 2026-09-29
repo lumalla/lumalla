@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::Context;
-use lumalla_shared::{View, WindowGeometryUpdate, WindowRule, WindowState, map_source_to_dest};
+use lumalla_shared::{View, WindowGeometryUpdate, WindowRule, WindowState, map_dest_to_source, map_source_to_dest};
 use lumalla_wayland_protocol::protocols::presentation_time::{
     WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK, WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION,
     WP_PRESENTATION_FEEDBACK_KIND_VSYNC,
@@ -241,58 +241,14 @@ impl DisplayState {
         self.seat_manager.handle_modifiers(clients, modifiers);
     }
 
-    pub fn handle_pointer_motion(
-        &mut self,
-        clients: &mut ConnectedClients,
-        time_msec: u32,
-        dx: f64,
-        dy: f64,
-        dx_unaccel: f64,
-        dy_unaccel: f64,
-        arena: &Arena,
-    ) {
-        let views = self.pointer_views();
-        self.seat_manager.handle_pointer_motion(
-            clients,
-            &self.surface_manager,
-            &mut self.pointer_constraints_manager,
-            &self.relative_pointer_manager,
-            &views,
-            time_msec,
-            dx,
-            dy,
-            dx_unaccel,
-            dy_unaccel,
-            arena,
-        );
-    }
-
-    pub fn handle_pointer_absolute(
-        &mut self,
-        clients: &mut ConnectedClients,
-        time_msec: u32,
-        x: f64,
-        y: f64,
-        arena: &Arena,
-    ) {
-        let views = self.pointer_views();
-        self.seat_manager.handle_pointer_absolute(
-            clients,
-            &self.surface_manager,
-            &mut self.pointer_constraints_manager,
-            &self.relative_pointer_manager,
-            &views,
-            time_msec,
-            x,
-            y,
-            arena,
-        );
-    }
-
     /// Recompute pointer enter/leave from current coordinates and stacking.
     ///
     /// Call after client dispatch or when mapping changes under a stationary cursor.
+    /// Skipped while a DnD grab owns the pointer — re-entering would steal the grab.
     pub fn refresh_pointer_focus(&mut self, clients: &mut ConnectedClients, arena: &Arena) {
+        if self.data_device_manager.has_active_drag_grab() {
+            return;
+        }
         let views = self.pointer_views();
         self.seat_manager.update_pointer_focus_and_motion(
             clients,
@@ -352,6 +308,82 @@ impl DisplayState {
         self.seat_manager.active_cursor()
     }
 
+    pub fn handle_pointer_motion(
+        &mut self,
+        clients: &mut ConnectedClients,
+        time_msec: u32,
+        dx: f64,
+        dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
+        arena: &Arena,
+    ) {
+        if self.data_device_manager.has_active_drag_grab() {
+            self.seat_manager.nudge_pointer(dx, dy);
+            self.drive_active_drag_motion(clients, time_msec);
+            return;
+        }
+        let views = self.pointer_views();
+        self.seat_manager.handle_pointer_motion(
+            clients,
+            &self.surface_manager,
+            &mut self.pointer_constraints_manager,
+            &self.relative_pointer_manager,
+            &views,
+            time_msec,
+            dx,
+            dy,
+            dx_unaccel,
+            dy_unaccel,
+            arena,
+        );
+    }
+
+    pub fn handle_pointer_absolute(
+        &mut self,
+        clients: &mut ConnectedClients,
+        time_msec: u32,
+        x: f64,
+        y: f64,
+        arena: &Arena,
+    ) {
+        if self.data_device_manager.has_active_drag_grab() {
+            self.seat_manager.set_pointer_position(x, y);
+            self.drive_active_drag_motion(clients, time_msec);
+            return;
+        }
+        let views = self.pointer_views();
+        self.seat_manager.handle_pointer_absolute(
+            clients,
+            &self.surface_manager,
+            &mut self.pointer_constraints_manager,
+            &self.relative_pointer_manager,
+            &views,
+            time_msec,
+            x,
+            y,
+            arena,
+        );
+    }
+
+    fn drive_active_drag_motion(&mut self, clients: &mut ConnectedClients, time_msec: u32) {
+        let views = self.pointer_views();
+        let (px, py) = self.seat_manager.pointer_position();
+        let (scene_x, scene_y) = map_dest_to_source(&views, px, py);
+        let target = self
+            .surface_manager
+            .global_pointer_target(None, scene_x, scene_y);
+        let (x, y) = match target {
+            Some((tid, surface)) => self
+                .surface_manager
+                .surface_local_coords(tid, surface, scene_x, scene_y)
+                .unwrap_or((scene_x as f32, scene_y as f32)),
+            None => (scene_x as f32, scene_y as f32),
+        };
+        self.data_device_manager
+            .drag_motion(time_msec, x, y, target, clients);
+    }
+
     pub fn handle_pointer_button(
         &mut self,
         clients: &mut ConnectedClients,
@@ -360,6 +392,18 @@ impl DisplayState {
         pressed: bool,
         arena: &Arena,
     ) {
+        if self.data_device_manager.has_active_drag_grab() {
+            if !pressed {
+                let icon = self.data_device_manager.take_drag_icon();
+                self.data_device_manager.drag_drop(clients);
+                if let Some((client_id, icon)) = icon {
+                    let _ = self.surface_manager.clear_dnd_icon_role(client_id, icon);
+                }
+                // Grab ends on drop even if the offer lives until finish().
+                self.refresh_pointer_focus(clients, arena);
+            }
+            return;
+        }
         if pressed {
             // Resolve the top-most surface under the cursor before focusing; do not
             // trust sticky pointer focus from a covered window.
