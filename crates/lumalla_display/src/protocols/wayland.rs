@@ -1151,6 +1151,10 @@ impl WlDataDevice for DisplayState {
             None => (scene_x as f32, scene_y as f32),
         };
 
+        // DnD grab takes the seat before enter so clients see pointer.leave first.
+        self.seat_manager
+            .begin_dnd_pointer_grab(ctx.client_id, ctx.writer);
+
         if let Err(error) = self.data_device_manager.start_drag(
             ctx.client_id,
             object_id,
@@ -1172,10 +1176,6 @@ impl WlDataDevice for DisplayState {
             report_data_device_error(ctx, object_id, error);
             return;
         }
-
-        // DnD grab takes the seat: clients must not keep receiving pointer events.
-        self.seat_manager
-            .begin_dnd_pointer_grab(ctx.client_id, ctx.writer);
     }
 
     fn set_selection(

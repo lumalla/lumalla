@@ -106,6 +106,8 @@ struct DataOffer {
     selected_action: u32,
     source_actions: u32,
     finished: bool,
+    /// Cleared from the drag on leave/cancel; client must still destroy the object.
+    inert: bool,
     version: u32,
 }
 
@@ -409,6 +411,12 @@ impl DataDeviceManager {
                     return Err(DataDeviceError::UsedSource);
                 }
                 source_state.used = true;
+                // Protocol: if the source never called set_actions, the compositor
+                // chooses. Default to COPY — advertising NONE makes destinations'
+                // set_actions(COPY) fail with invalid_action and disconnect the client.
+                if !source_state.actions_set {
+                    source_state.dnd_actions = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+                }
                 (
                     Some((client_id, source_id)),
                     source_state.dnd_actions,
@@ -550,7 +558,9 @@ impl DataDeviceManager {
                 clients.mark_send_needed(tc);
             }
             if let Some(offer_id) = old_offer {
-                self.offers.remove(&(tc, offer_id));
+                if let Some(offer) = self.offers.get_mut(&(tc, offer_id)) {
+                    offer.inert = true;
+                }
             }
             if let Some(drag) = self.drag.as_mut() {
                 drag.target_client = None;
@@ -685,6 +695,9 @@ impl DataDeviceManager {
             .offers
             .get_mut(&(client_id, offer_id))
             .ok_or(DataDeviceError::UnknownOffer)?;
+        if offer.inert {
+            return Ok(());
+        }
         if offer.finished {
             return Err(DataDeviceError::InvalidOffer);
         }
@@ -719,8 +732,8 @@ impl DataDeviceManager {
             .offers
             .get(&(client_id, offer_id))
             .ok_or(DataDeviceError::UnknownOffer)?;
-        if offer.finished {
-            return Err(DataDeviceError::InvalidOffer);
+        if offer.inert || offer.finished {
+            return Ok(());
         }
         let Some((source_client, source_id)) = offer.source else {
             return Ok(());
@@ -749,10 +762,11 @@ impl DataDeviceManager {
         client_id: ClientId,
         offer_id: ObjectId,
     ) -> Result<(), DataDeviceError> {
-        let offer = self
-            .offers
-            .remove(&(client_id, offer_id))
-            .ok_or(DataDeviceError::UnknownOffer)?;
+        // Offers may already have been dropped server-side on data_device.leave /
+        // cancel. The client is still required to call destroy; treat that as success.
+        let Some(offer) = self.offers.remove(&(client_id, offer_id)) else {
+            return Ok(());
+        };
         if let Some(device) = self.devices.get_mut(&(client_id, offer.device))
             && device.selection_offer == Some(offer_id)
         {
@@ -780,7 +794,7 @@ impl DataDeviceManager {
         if offer.kind != OfferKind::Drag {
             return Err(DataDeviceError::InvalidFinish);
         }
-        if offer.finished {
+        if offer.inert || offer.finished {
             return Err(DataDeviceError::InvalidOffer);
         }
         if matches!(offer.accepted_mime, Some(None)) || offer.selected_action == 0 {
@@ -831,8 +845,8 @@ impl DataDeviceManager {
         if offer.kind != OfferKind::Drag {
             return Err(DataDeviceError::InvalidOffer);
         }
-        if offer.finished {
-            return Err(DataDeviceError::InvalidOffer);
+        if offer.inert || offer.finished {
+            return Ok(());
         }
         if preferred_action != WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE
             && (offer.source_actions & preferred_action) == 0
@@ -940,7 +954,9 @@ impl DataDeviceManager {
             }
         } else if let Some((_tdevice, toffer)) = drag_target {
             if let Some(offer_id) = toffer {
-                self.offers.remove(&(client_id, offer_id));
+                if let Some(offer) = self.offers.get_mut(&(client_id, offer_id)) {
+                    offer.inert = true;
+                }
             }
             if let Some(drag) = self.drag.as_mut() {
                 drag.target_client = None;
@@ -1461,6 +1477,7 @@ impl DataDeviceManager {
                 selected_action: selected,
                 source_actions,
                 finished: false,
+                inert: false,
                 version,
             },
         );
@@ -1492,7 +1509,9 @@ impl DataDeviceManager {
                 });
             }
             if let Some(offer_id) = drag.target_offer {
-                self.offers.remove(&(tc, offer_id));
+                if let Some(offer) = self.offers.get_mut(&(tc, offer_id)) {
+                    offer.inert = true;
+                }
             }
         }
         if let Some((source_client, source_id)) = drag.source {
@@ -1946,5 +1965,170 @@ mod tests {
         assert_eq!(manager.pending_drag_enters.len(), 1);
         manager.flush_pending_for_client(client_b, &mut registry_b, &mut writer_b);
         assert!(manager.drag.as_ref().is_some_and(|d| d.target_offer.is_some()));
+    }
+
+    #[test]
+    fn start_drag_without_source_actions_defaults_to_copy() {
+        let (_receiver, mut writer) = writer_pair();
+        let mut registry = Registry::new();
+        let mut manager = DataDeviceManager::default();
+        let client_id = client(1);
+        let source = object(10);
+        let device = object(11);
+        let target = object(21);
+
+        manager.create_data_source(client_id, source, 3);
+        manager.offer(client_id, source, "text/plain").unwrap();
+        // Deliberately skip set_source_actions — Qt destinations still call set_actions(COPY).
+        manager.create_data_device(client_id, device, object(12), 3, &mut registry, &mut writer);
+        manager
+            .start_drag(
+                client_id,
+                device,
+                Some(source),
+                object(20),
+                None,
+                7,
+                Some((client_id, target)),
+                1.0,
+                2.0,
+                &mut registry,
+                &mut writer,
+            )
+            .unwrap();
+
+        let offer = manager
+            .drag
+            .as_ref()
+            .and_then(|d| d.target_offer)
+            .expect("drag offer");
+        manager
+            .set_offer_actions(
+                client_id,
+                offer,
+                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
+                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
+                &mut writer,
+            )
+            .expect("destination set_actions(COPY) must succeed with defaulted source actions");
+    }
+
+    #[test]
+    fn leave_then_destroy_offer_does_not_error() {
+        let (_receiver, mut writer) = writer_pair();
+        let mut registry = Registry::new();
+        let mut manager = DataDeviceManager::default();
+        let client_id = client(1);
+        let source = object(10);
+        let device = object(11);
+        let target_a = object(21);
+        let target_b = object(22);
+
+        manager.create_data_source(client_id, source, 3);
+        manager.offer(client_id, source, "text/plain").unwrap();
+        manager
+            .set_source_actions(client_id, source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)
+            .unwrap();
+        manager.create_data_device(client_id, device, object(12), 3, &mut registry, &mut writer);
+        manager
+            .start_drag(
+                client_id,
+                device,
+                Some(source),
+                object(20),
+                None,
+                7,
+                Some((client_id, target_a)),
+                1.0,
+                2.0,
+                &mut registry,
+                &mut writer,
+            )
+            .unwrap();
+        let old_offer = manager.drag.as_ref().unwrap().target_offer.unwrap();
+
+        let mut clients = ConnectedClients::new();
+        // Motion onto another surface leaves the first offer (client must destroy it).
+        manager.drag_motion(10, 3.0, 4.0, Some((client_id, target_b)), &mut clients);
+        assert!(manager.offers.get(&(client_id, old_offer)).unwrap().inert);
+
+        manager
+            .destroy_offer(client_id, old_offer)
+            .expect("destroy after leave must be idempotent");
+        manager
+            .destroy_offer(client_id, old_offer)
+            .expect("second destroy is also fine");
+    }
+
+    #[test]
+    fn same_client_dnd_accept_drop_receive_finish() {
+        let (_receiver, mut writer) = writer_pair();
+        let mut registry = Registry::new();
+        let mut manager = DataDeviceManager::default();
+        let client_id = client(1);
+        let source = object(10);
+        let device = object(11);
+        let target = object(21);
+
+        manager.create_data_source(client_id, source, 3);
+        manager.offer(client_id, source, "text/plain").unwrap();
+        manager
+            .set_source_actions(client_id, source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)
+            .unwrap();
+        manager.create_data_device(client_id, device, object(12), 3, &mut registry, &mut writer);
+        manager
+            .start_drag(
+                client_id,
+                device,
+                Some(source),
+                object(20),
+                None,
+                7,
+                Some((client_id, target)),
+                1.0,
+                2.0,
+                &mut registry,
+                &mut writer,
+            )
+            .unwrap();
+        let offer = manager.drag.as_ref().unwrap().target_offer.unwrap();
+
+        manager
+            .set_offer_actions(
+                client_id,
+                offer,
+                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY | WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE,
+                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
+                &mut writer,
+            )
+            .unwrap();
+        manager
+            .accept(client_id, offer, 8, Some("text/plain"), &mut writer)
+            .unwrap();
+
+        let mut clients = ConnectedClients::new();
+        manager.drag_motion(5, 1.5, 2.5, Some((client_id, target)), &mut clients);
+        manager.drag_drop(&mut clients);
+        assert!(manager.drag.as_ref().unwrap().drop_performed);
+
+        let (read_fd, write_fd) = pipe_pair();
+        manager
+            .receive(client_id, offer, "text/plain", write_fd, &mut writer)
+            .unwrap();
+        let _ = writer.flush();
+
+        manager.finish(client_id, offer, &mut writer).unwrap();
+        assert!(manager.drag.is_none());
+        manager.destroy_offer(client_id, offer).unwrap();
+
+        unsafe {
+            libc::close(read_fd);
+        }
+    }
+
+    fn pipe_pair() -> (RawFd, RawFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
     }
 }
