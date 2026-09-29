@@ -493,13 +493,21 @@ impl LibInput {
                     }
                 }
                 bindings::LIBINPUT_EVENT_POINTER_SCROLL_WHEEL
-                | bindings::LIBINPUT_EVENT_POINTER_SCROLL_FINGER
                 | bindings::LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS => {
                     let pointer = unsafe { bindings::libinput_event_get_pointer_event(event) };
                     if pointer.is_null() {
                         None
                     } else {
-                        parse_scroll_axes(pointer)
+                        parse_scroll_axes(pointer, false)
+                    }
+                }
+                bindings::LIBINPUT_EVENT_POINTER_SCROLL_FINGER => {
+                    let pointer = unsafe { bindings::libinput_event_get_pointer_event(event) };
+                    if pointer.is_null() {
+                        None
+                    } else {
+                        // Invert touchpad two-finger scroll (natural scrolling).
+                        parse_scroll_axes(pointer, true)
                     }
                 }
                 bindings::LIBINPUT_EVENT_POINTER_AXIS => None,
@@ -569,7 +577,10 @@ impl LibInput {
     }
 }
 
-fn parse_scroll_axes(pointer: *mut bindings::libinput_event_pointer) -> Option<InputEvent> {
+fn parse_scroll_axes(
+    pointer: *mut bindings::libinput_event_pointer,
+    invert: bool,
+) -> Option<InputEvent> {
     // Prefer vertical, then horizontal; emit one axis event per libinput event.
     for axis in [
         bindings::LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL,
@@ -577,7 +588,11 @@ fn parse_scroll_axes(pointer: *mut bindings::libinput_event_pointer) -> Option<I
     ] {
         let has = unsafe { bindings::libinput_event_pointer_has_axis(pointer, axis) };
         if has != 0 {
-            let value = unsafe { bindings::libinput_event_pointer_get_scroll_value(pointer, axis) };
+            let mut value =
+                unsafe { bindings::libinput_event_pointer_get_scroll_value(pointer, axis) };
+            if invert {
+                value = -value;
+            }
             return Some(InputEvent::PointerAxis { axis, value });
         }
     }
