@@ -475,7 +475,7 @@ impl RendererState {
     fn note_pointer_damage(&mut self, new_x: i32, new_y: i32) {
         if self.any_hw_cursor_capable() {
             for output in self.outputs.values_mut() {
-                if output.cursor().is_some_and(|c| c.plane_id != 0) {
+                if output.cursor().is_some_and(|c| c.is_hw_cursor()) {
                     output.dirty.cursor_pos = true;
                 }
             }
@@ -494,18 +494,7 @@ impl RendererState {
     fn note_cursor_redraw(&mut self) {
         if self.any_hw_cursor_capable() {
             for output in self.outputs.values_mut() {
-                let mark = if let Some(cursor) = output.cursor_mut() {
-                    if cursor.plane_id != 0 {
-                        // Retry HW after image change.
-                        cursor.software = false;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if mark {
+                if output.cursor().is_some_and(|c| c.is_hw_cursor()) {
                     output.dirty.cursor_image = true;
                     output.dirty.cursor_pos = true;
                 }
@@ -526,7 +515,7 @@ impl RendererState {
     fn any_hw_cursor_capable(&self) -> bool {
         self.outputs
             .values()
-            .any(|o| o.cursor().is_some_and(|c| c.plane_id != 0))
+            .any(|o| o.cursor().is_some_and(|c| c.is_hw_cursor()))
     }
 
     pub fn scene_dirty(&self) -> bool {
@@ -1009,7 +998,7 @@ impl RendererState {
         }
         if hw {
             for output in self.outputs.values_mut() {
-                if output.cursor().is_some_and(|c| c.plane_id != 0) {
+                if output.cursor().is_some_and(|c| c.is_hw_cursor()) {
                     output.dirty.cursor_pos = true;
                 }
             }
@@ -3341,7 +3330,7 @@ impl RendererState {
 
         for name in names {
             let needs = self.outputs.get(&name).is_some_and(|o| {
-                o.cursor().is_some_and(|c| c.plane_id != 0)
+                o.cursor().is_some_and(|c| c.is_hw_cursor())
                     && (o.dirty.cursor_pos || o.dirty.cursor_image || hidden)
             });
             if !needs {
@@ -3352,12 +3341,15 @@ impl RendererState {
             if let Err(err) = self.commit_hw_cursor_on_output(&name, show_here, pointer_x, pointer_y)
             {
                 warn!("HW cursor update failed on {name}: {err:#}; falling back to software");
-                if let Some(cursor) = self
-                    .outputs
-                    .get_mut(&name)
-                    .and_then(|o| o.cursor_mut())
-                {
-                    cursor.software = true;
+                if let Some(output) = self.outputs.get(&name) {
+                    self.disable_hw_cursor_plane(output);
+                }
+                if let Some(output) = self.outputs.get_mut(&name) {
+                    if let Some(cursor) = output.cursor_mut() {
+                        cursor.software = true;
+                    }
+                    output.dirty.cursor_pos = false;
+                    output.dirty.cursor_image = false;
                 }
                 self.pending_pointer_damage = true;
                 self.cursor_buffer_dirty = true;
