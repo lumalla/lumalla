@@ -2986,13 +2986,18 @@ impl RendererState {
             .map(|o| o.present_serial.wrapping_add(1))
             .unwrap_or(1);
         let mut skip_scanout_copy = false;
-        if let CompositeMode::Partial(regions) = &composite_mode {
+        // History must record this frame's damage only (not the age-expanded rect).
+        let frame_damage = match &composite_mode {
+            CompositeMode::Partial(regions) => regions.first().copied(),
+            CompositeMode::Full => None,
+        };
+        if let (Some(current), CompositeMode::Partial(_)) = (frame_damage, &composite_mode) {
             let age = if buffer.fresh || buffer.content_serial == 0 {
                 None
             } else {
                 Some(next_serial.wrapping_sub(buffer.content_serial))
             };
-            if let (Some(age), Some(current)) = (age, regions.first().copied()) {
+            if let Some(age) = age {
                 let history = self
                     .outputs
                     .get(&target.name)
@@ -3006,6 +3011,23 @@ impl RendererState {
         }
 
         if matches!(composite_mode, CompositeMode::Partial(_)) && !skip_scanout_copy {
+            // newest_buffer may be a still-rendering queued frame — finish GPU first.
+            let src_gpu = self.outputs.get_mut(&target.name).and_then(|output| {
+                let primary = output.primary_mut()?;
+                let buf = primary
+                    .queued
+                    .as_mut()
+                    .or(primary.pending.as_mut())
+                    .or(primary.current.as_mut())?;
+                buf.gpu_pending.take()
+            });
+            if let Some(pending) = src_gpu {
+                let vulkan = self
+                    .vulkan
+                    .as_mut()
+                    .context("VulkanContext missing while waiting for scanout copy source")?;
+                pending.wait(vulkan)?;
+            }
             let src_ptr = self.outputs.get(&target.name).and_then(|output| {
                 let image = output.primary()?.newest_buffer()?;
                 Some(&image.dma_image as *const DmaBufImage)
@@ -3033,7 +3055,7 @@ impl RendererState {
 
         let history_damage = match &composite_mode {
             CompositeMode::Full => None,
-            CompositeMode::Partial(regions) => regions.first().copied(),
+            CompositeMode::Partial(_) => frame_damage,
         };
 
         {
@@ -3189,6 +3211,8 @@ impl RendererState {
         };
 
         if flip_busy {
+            // Keep GPU work in flight while the previous flip waits for vblank —
+            // only the eventual KMS submit (below / on retire) needs the fence.
             let primary = self
                 .outputs
                 .get_mut(connector_name)
@@ -3200,7 +3224,7 @@ impl RendererState {
             return Ok(());
         }
 
-        // Overlap CPU flip prep with GPU: wait only when the buffer must be scanout-ready.
+        // Buffer is about to become the scanout FB — rendering must be finished.
         self.wait_scanout_gpu(&mut buffer)?;
 
         let fb_id = buffer
@@ -3246,18 +3270,21 @@ impl RendererState {
                             .context("Failed blocking plane FB update after page-flip error");
                     }
                 }
-                let old = {
+                let (old, dropped_pending, dropped_queued) = {
                     let primary = self
                         .outputs
                         .get_mut(connector_name)
                         .and_then(|o| o.primary_mut())
                         .context("Missing primary plane after blocking flip fallback")?;
                     let old = primary.current.replace(buffer);
-                    primary.pending = None;
-                    primary.queued = None;
-                    old
+                    let dropped_pending = primary.pending.take();
+                    let dropped_queued = primary.queued.take();
+                    (old, dropped_pending, dropped_queued)
                 };
-                if let Some(old) = old {
+                for old in [old, dropped_pending, dropped_queued]
+                    .into_iter()
+                    .flatten()
+                {
                     self.release_scanout_buffer(old);
                 }
                 Ok(())
@@ -3462,16 +3489,24 @@ impl RendererState {
         let crtc_x = local_x - hotspot_x;
         let crtc_y = local_y - hotspot_y;
 
-        if need_image {
-            self.upload_hw_cursor_fb(name, &drm_path, &pixels, width, height)?;
-        }
+        // Upload into a side buffer first — do not install/release until KMS has
+        // switched the plane to the new FB (RmFB of the live cursor FB glitches).
+        let new_image = if need_image {
+            Some(self.create_hw_cursor_fb(&drm_path, &pixels, width, height)?)
+        } else {
+            None
+        };
 
-        let fb_id = self
-            .outputs
-            .get(name)
-            .and_then(|o| o.cursor())
-            .and_then(|c| c.current.as_ref())
+        let fb_id = new_image
+            .as_ref()
             .and_then(|b| b.drm_fb_id())
+            .or_else(|| {
+                self.outputs
+                    .get(name)
+                    .and_then(|o| o.cursor())
+                    .and_then(|c| c.current.as_ref())
+                    .and_then(|b| b.drm_fb_id())
+            })
             .context("cursor plane has no FB")?;
 
         // Probe once when uploading a new image.
@@ -3514,6 +3549,20 @@ impl RendererState {
             false,
         )?;
 
+        if let Some(new_image) = new_image {
+            let old = {
+                let cursor = self
+                    .outputs
+                    .get_mut(name)
+                    .and_then(|o| o.cursor_mut())
+                    .context("missing cursor pipeline after commit")?;
+                cursor.current.replace(new_image)
+            };
+            if let Some(old) = old {
+                self.release_scanout_buffer(old);
+            }
+        }
+
         if let Some(cursor) = self.outputs.get_mut(name).and_then(|o| o.cursor_mut()) {
             cursor.geometry = PlaneGeometry::cursor(crtc_x, crtc_y, width, height);
         }
@@ -3550,14 +3599,13 @@ impl RendererState {
         Some((frame.hotspot_x, frame.hotspot_y, pixels, width, height))
     }
 
-    fn upload_hw_cursor_fb(
+    fn create_hw_cursor_fb(
         &mut self,
-        output_name: &str,
         drm_path: &Path,
         pixels: &[u8],
         width: u32,
         height: u32,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ScanoutBuffer> {
         let fourcc = DRM_FORMAT_ARGB8888;
         let format = vk::Format::B8G8R8A8_UNORM;
         let drm_device = self
@@ -3581,19 +3629,7 @@ impl RendererState {
         )?;
         upload_bgra_to_image(vulkan, &buffer.dma_image, pixels, width, height)?;
         buffer.fresh = false;
-
-        let old = {
-            let cursor = self
-                .outputs
-                .get_mut(output_name)
-                .and_then(|o| o.cursor_mut())
-                .context("missing cursor pipeline for upload")?;
-            cursor.current.replace(buffer)
-        };
-        if let Some(old) = old {
-            self.release_scanout_buffer(old);
-        }
-        Ok(())
+        Ok(buffer)
     }
 
     fn wait_for_connector_flip(&mut self, connector_name: &str) -> anyhow::Result<()> {

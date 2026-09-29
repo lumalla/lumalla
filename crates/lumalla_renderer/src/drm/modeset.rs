@@ -415,6 +415,9 @@ pub fn atomic_set_plane_fb(
 ///
 /// Pass `crtc_id == 0` and `fb_id == 0` to detach the plane. When `test_only` is
 /// set, the commit is validated without applying.
+///
+/// Real (non-test) commits are blocking so callers can release the previous cursor
+/// FB as soon as this returns — the plane has finished switching.
 pub fn atomic_set_cursor_plane(
     drm_fd: BorrowedFd<'_>,
     plane_id: u32,
@@ -451,10 +454,13 @@ pub fn atomic_set_cursor_plane(
         req.add(plane_id, props.crtc_h, u64::from(height))?;
     }
 
-    let mut flags = sys::DRM_MODE_ATOMIC_NONBLOCK;
-    if test_only {
-        flags |= sys::DRM_MODE_ATOMIC_TEST_ONLY;
-    }
+    // Blocking apply (except TEST_ONLY) so the previous cursor FB can be released
+    // safely — NONBLOCK would still be scanning the old FB when we RmFB it.
+    let flags = if test_only {
+        sys::DRM_MODE_ATOMIC_TEST_ONLY | sys::DRM_MODE_ATOMIC_NONBLOCK
+    } else {
+        0
+    };
     req.commit(fd, flags, ptr::null_mut())?;
 
     if !test_only {
