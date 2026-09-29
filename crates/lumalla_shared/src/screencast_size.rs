@@ -8,7 +8,7 @@
 pub const SCREENCAST_DMA_MAX_EDGE: u32 = 7680;
 
 /// Longest edge for MemFd frames — full-res CPU readback freezes the session.
-pub const SCREENCAST_MEMFD_MAX_EDGE: u32 = 1280;
+pub const SCREENCAST_MEMFD_MAX_EDGE: u32 = 1920;
 
 fn fit_edge(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
     let width = width.max(1);
