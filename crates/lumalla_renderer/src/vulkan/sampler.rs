@@ -14,9 +14,18 @@ pub struct Sampler {
 impl Sampler {
     /// Nearest-neighbor sampler matching CPU nearest scaling for buffer_scale > 1.
     pub fn new_nearest(device: &Device) -> anyhow::Result<Self> {
+        Self::new(device, vk::Filter::NEAREST, "nearest-neighbor")
+    }
+
+    /// Bilinear sampler for downscaled screencast / preview paths.
+    pub fn new_linear(device: &Device) -> anyhow::Result<Self> {
+        Self::new(device, vk::Filter::LINEAR, "linear")
+    }
+
+    fn new(device: &Device, filter: vk::Filter, label: &str) -> anyhow::Result<Self> {
         let create_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::NEAREST)
-            .min_filter(vk::Filter::NEAREST)
+            .mag_filter(filter)
+            .min_filter(filter)
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
@@ -24,7 +33,7 @@ impl Sampler {
         let handle = unsafe { device.handle().create_sampler(&create_info, None) }
             .context("Failed to create texture sampler")?;
 
-        debug!("Created nearest-neighbor sampler");
+        debug!("Created {label} sampler");
 
         Ok(Self {
             handle,

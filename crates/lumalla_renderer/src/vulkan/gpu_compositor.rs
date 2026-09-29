@@ -224,6 +224,23 @@ pub struct GpuCompositor {
     descriptor_layout: DescriptorSetLayout,
     pub(crate) descriptor_pool: DescriptorPool,
     sampler: Sampler,
+    /// Used when compositing a downscaled screencast so text stays readable.
+    sampler_linear: Sampler,
+}
+
+/// Restores nearest-neighbor sampling when dropped after a linear screencast composite.
+pub struct LinearSampleGuard<'a> {
+    device: &'a Device,
+    nearest: vk::Sampler,
+    rebound: Vec<(vk::DescriptorSet, vk::ImageView)>,
+}
+
+impl Drop for LinearSampleGuard<'_> {
+    fn drop(&mut self) {
+        for &(descriptor_set, view) in &self.rebound {
+            write_texture_descriptor(self.device, descriptor_set, view, self.nearest);
+        }
+    }
 }
 
 impl GpuCompositor {
@@ -253,6 +270,7 @@ impl GpuCompositor {
         let descriptor_pool =
             DescriptorPool::new_combined_image_sampler(device, MAX_SURFACE_TEXTURES)?;
         let sampler = Sampler::new_nearest(device)?;
+        let sampler_linear = Sampler::new_linear(device)?;
 
         let push_constants = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
@@ -288,7 +306,45 @@ impl GpuCompositor {
             descriptor_layout,
             descriptor_pool,
             sampler,
+            sampler_linear,
         })
+    }
+
+    /// Rebind layer textures to bilinear sampling for a downscaled composite.
+    /// Drop the returned guard to restore nearest sampling for scanout.
+    pub fn bind_linear_sampling<'a>(
+        &'a self,
+        device: &'a Device,
+        cache: &SurfaceTextureCache,
+        layers: &[&SurfaceFrame],
+        cursor: CursorDraw<'_>,
+    ) -> LinearSampleGuard<'a> {
+        let mut rebound: Vec<(vk::DescriptorSet, vk::ImageView)> = Vec::new();
+        let mut rebind = |key: (u32, u32)| {
+            if let Some(texture) = cache.texture(key) {
+                let view = texture.backing.view();
+                write_texture_descriptor(
+                    device,
+                    texture.descriptor_set,
+                    view,
+                    self.sampler_linear.handle(),
+                );
+                rebound.push((texture.descriptor_set, view));
+            }
+        };
+        for frame in layers {
+            rebind((frame.owner_id, frame.surface_id));
+        }
+        match cursor {
+            CursorDraw::Client(frame) => rebind((frame.owner_id, frame.surface_id)),
+            CursorDraw::Default => rebind(CURSOR_TEXTURE_KEY),
+            CursorDraw::Hidden => {}
+        }
+        LinearSampleGuard {
+            device,
+            nearest: self.sampler.handle(),
+            rebound,
+        }
     }
 
     fn draw_layer(
@@ -1395,6 +1451,9 @@ pub fn composite_to_scanout(
 ///
 /// `cursor` / `pointer_*` are in destination (buffer) pixel space. Leaves the
 /// image in `GENERAL`.
+///
+/// When `linear_filter` is true, textures are temporarily rebound to bilinear
+/// sampling (for downscaled MemFd captures) and restored afterward.
 pub fn composite_layers_to_image(
     vulkan: &VulkanContext,
     batch: &mut GpuWorkBatch,
@@ -1412,7 +1471,15 @@ pub fn composite_layers_to_image(
     cursor: CursorDraw<'_>,
     pointer_x: i32,
     pointer_y: i32,
+    linear_filter: bool,
 ) -> anyhow::Result<()> {
+    let device = vulkan.device();
+    let linear_guard = if linear_filter {
+        Some(compositor.bind_linear_sampling(device, cache, layers, cursor))
+    } else {
+        None
+    };
+
     let clear_value = vk::ClearValue {
         color: vk::ClearColorValue {
             float32: clear_color,
@@ -1420,7 +1487,6 @@ pub fn composite_layers_to_image(
     };
 
     let command_buffer = batch.recording_buffer()?;
-    let device = vulkan.device();
     let mut recorder = CommandBufferRecorder::continue_recording(device, command_buffer);
     transition_scanout_for_render(
         device,
@@ -1475,6 +1541,7 @@ pub fn composite_layers_to_image(
             &[barrier],
         );
     }
+    drop(linear_guard);
     Ok(())
 }
 
@@ -2319,6 +2386,9 @@ fn write_texture_descriptor(
 }
 
 /// Copies (with optional scale) a rectangular region from `src` into `dst`.
+///
+/// Downscales with linear filtering so MemFd screencast previews stay readable;
+/// 1:1 and upscales keep nearest to avoid softening crisp content.
 pub fn blit_image_region(
     vulkan: &mut VulkanContext,
     batch: &mut GpuWorkBatch,
@@ -2428,6 +2498,12 @@ pub fn blit_image_region(
                 z: 1,
             },
         ])];
+    // Nearest on downscale picks single source pixels and makes text unreadable.
+    let filter = if dst_w < src_w || dst_h < src_h {
+        vk::Filter::LINEAR
+    } else {
+        vk::Filter::NEAREST
+    };
     unsafe {
         device.handle().cmd_blit_image(
             command_buffer,
@@ -2436,7 +2512,7 @@ pub fn blit_image_region(
             dst.image(),
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             &regions,
-            vk::Filter::NEAREST,
+            filter,
         );
     }
 

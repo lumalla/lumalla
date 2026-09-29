@@ -1643,6 +1643,7 @@ impl RendererState {
                 };
                 // Safety: both are owned by self for this call.
                 unsafe {
+                    let linear_filter = dest_width < width as u32 || dest_height < height as u32;
                     composite_layers_to_image(
                         vulkan,
                         &mut batch,
@@ -1660,6 +1661,7 @@ impl RendererState {
                         cursor,
                         dest_px,
                         dest_py,
+                        linear_filter,
                     )?;
                 }
                 Ok(())
