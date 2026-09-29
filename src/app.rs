@@ -2342,7 +2342,7 @@ impl AppData {
         self.finish_ready_screencast_dma();
 
         // MemFd path: GPU-scale into the small screencast buffer, then read that back.
-        // Readback still waits on the GPU (capped to ≤5 fps / ≤1920).
+        // Readback still waits on the GPU (capped to ≤30 fps / ≤2880).
         let due: Vec<(u32, ScreencastSource, i32, i32, i32, i32, bool)> = self
             .screencast
             .streams()

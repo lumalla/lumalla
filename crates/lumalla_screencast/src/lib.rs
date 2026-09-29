@@ -56,7 +56,7 @@ const DMA_BUFFER_COUNT: usize = 4;
 const SCREENCAST_DMA_MAX_FPS: u32 = 30;
 
 /// Hard cap for MemFd capture rate (GPU blit + CPU readback).
-const SCREENCAST_MEMFD_MAX_FPS: u32 = 5;
+const SCREENCAST_MEMFD_MAX_FPS: u32 = 30;
 
 /// Shrink for DMA-BUF / portal size (high cap — typically native).
 pub fn fit_output_size(width: u32, height: u32) -> (u32, u32) {
