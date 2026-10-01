@@ -132,14 +132,22 @@ impl RenderPass {
             layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         };
 
-        // External dependency after the pass so KMS can sample the stored image.
+        // LOAD must be able to read existing attachment contents; CLEAR only writes.
+        let (src_access, dst_access) = if load_op == vk::AttachmentLoadOp::LOAD {
+            (
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            )
+        } else {
+            (vk::AccessFlags::empty(), vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        };
         let dependency_begin = vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
             .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags::empty())
+            .src_access_mask(src_access)
             .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+            .dst_access_mask(dst_access);
 
         let dependency_end = vk::SubpassDependency::default()
             .src_subpass(0)

@@ -2156,9 +2156,16 @@ fn transition_scanout_for_render(
         ),
     };
 
+    // LOAD_OP_LOAD (partial damage) reads undamaged tiles; CLEAR only needs write.
+    let dst_access = if old_layout == vk::ImageLayout::UNDEFINED {
+        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+    } else {
+        vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+    };
+
     let barrier = vk::ImageMemoryBarrier::default()
         .src_access_mask(src_access)
-        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .dst_access_mask(dst_access)
         .old_layout(old_layout)
         .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
