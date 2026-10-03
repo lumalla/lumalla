@@ -784,6 +784,7 @@ fn init_dbus_window(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
                 composition: zone.composition,
                 default_width: zone.default_width,
                 default_height: zone.default_height,
+                ignore_window_rules: zone.ignore_window_rules,
             }))?;
             Ok(())
         })?,
@@ -1630,6 +1631,7 @@ struct ConfigZone {
     composition: String,
     default_width: i32,
     default_height: i32,
+    ignore_window_rules: bool,
 }
 
 impl FromLua for ConfigZone {
@@ -1651,6 +1653,7 @@ impl FromLua for ConfigZone {
                 .unwrap_or_else(|_| String::from("free")),
             default_width: table.get("default_width").unwrap_or(800),
             default_height: table.get("default_height").unwrap_or(600),
+            ignore_window_rules: table.get("ignore_window_rules").unwrap_or(false),
         })
     }
 }

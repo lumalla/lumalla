@@ -140,7 +140,7 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 | `focus_window({id?, raise?})` | Focus a window (`raise` defaults to `false`). |
 | `raise_window({id?})` | Raise without changing focus. |
 | `close_window({id?})` | Ask the client to close via `xdg_toplevel.close` (client may ignore / prompt). Omit `id` for the focused window. |
-| `add_zone({name, x?, y?, default?, composition?, default_width?, default_height?})` | Add or replace a zone. `composition` defaults to `"free"`; size defaults to 800×600. |
+| `add_zone({name, x?, y?, default?, composition?, default_width?, default_height?, ignore_window_rules?})` | Add or replace a zone. `composition` defaults to `"free"`; size defaults to 800×600. When `ignore_window_rules` is true, matching window rules do nothing for windows already in this zone. |
 | `remove_zone(name)` | Remove a zone. |
 | `add_guide({name, kind?, layer?, ...})` | Add or replace a guide (helper line/box). See below. |
 | `remove_guide(name)` | Remove a guide. |

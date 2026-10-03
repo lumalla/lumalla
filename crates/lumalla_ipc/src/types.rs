@@ -310,6 +310,8 @@ pub struct ZoneInfo {
     pub default_width: i32,
     /// Default window height for the `free` strategy.
     pub default_height: i32,
+    /// When true, matching window rules do nothing for windows already in this zone.
+    pub ignore_window_rules: bool,
 }
 
 impl From<Zone> for ZoneInfo {
@@ -328,6 +330,7 @@ impl From<Zone> for ZoneInfo {
             composition,
             default_width,
             default_height,
+            ignore_window_rules: zone.ignore_window_rules,
         }
     }
 }
@@ -344,7 +347,14 @@ impl From<ZoneInfo> for Zone {
                 default_height: zone.default_height,
             },
         };
-        Zone::new(zone.name, zone.x, zone.y, zone.default, composition)
+        Zone::new(
+            zone.name,
+            zone.x,
+            zone.y,
+            zone.default,
+            composition,
+            zone.ignore_window_rules,
+        )
     }
 }
 

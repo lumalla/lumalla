@@ -24,6 +24,8 @@ pub struct Zone {
     pub default: bool,
     /// How windows are placed when they join this zone.
     pub composition: CompositionStrategy,
+    /// When true, matching window rules do nothing for windows already in this zone.
+    pub ignore_window_rules: bool,
 }
 
 impl Zone {
@@ -34,12 +36,14 @@ impl Zone {
         y: i32,
         default: bool,
         composition: CompositionStrategy,
+        ignore_window_rules: bool,
     ) -> Self {
         Self {
             name,
             anchor: (x, y),
             default,
             composition,
+            ignore_window_rules,
         }
     }
 

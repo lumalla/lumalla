@@ -235,6 +235,10 @@ impl WindowManager {
             return Vec::new();
         };
 
+        if self.window_zone_ignores_rules(id) {
+            return Vec::new();
+        }
+
         let mut changes = Vec::new();
         if let Some(zone_name) = rule.zone.as_deref()
             && let Ok(zone_changes) =
@@ -248,6 +252,16 @@ impl WindowManager {
             changes.extend(self.apply_update(id, geometry, false, surface_manager, xdg_manager));
         }
         changes
+    }
+
+    fn window_zone_ignores_rules(&self, id: u32) -> bool {
+        let Some(zone_name) = self.window_zone(id) else {
+            return false;
+        };
+        self.zones
+            .iter()
+            .find(|zone| zone.name == zone_name)
+            .is_some_and(|zone| zone.ignore_window_rules)
     }
 
     pub fn set_focus_from_surface(&mut self, client_id: ClientId, wl_surface: ObjectId) {
@@ -593,6 +607,7 @@ mod tests {
                 default_width: w,
                 default_height: h,
             },
+            false,
         )
     }
 
@@ -856,5 +871,75 @@ mod tests {
             Some(2)
         );
         assert!(wm.matching_rule("any", "nope").is_none());
+    }
+
+    #[test]
+    fn zone_ignore_window_rules_skips_matching_rule() {
+        let mut wm = WindowManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let mut xdg = XdgManager::default();
+        let mut zone = free_zone("main", 10, 20, true, 400, 300);
+        zone.ignore_window_rules = true;
+        wm.add_zone(zone);
+        wm.add_zone(free_zone("side", 500, 0, false, 200, 200));
+        wm.add_rule(WindowRule {
+            app_id: Some(String::from("app")),
+            title: None,
+            zone: Some(String::from("side")),
+            x: Some(99),
+            y: Some(99),
+            width: Some(640),
+            height: Some(480),
+        });
+
+        let _ = register_with_surface(&mut wm, &mut surfaces, &mut xdg);
+        assert_eq!(wm.window_zone(1), Some("main"));
+        assert_eq!(
+            surfaces.surface_layout(client(1), object(12)),
+            Some((10, 20))
+        );
+
+        let changes = wm.on_app_id_set(
+            client(1),
+            object(10),
+            String::from("app"),
+            &surfaces,
+            &mut xdg,
+        );
+        assert!(changes.is_empty());
+        assert_eq!(wm.window_zone(1), Some("main"));
+        assert_eq!(
+            surfaces.surface_layout(client(1), object(12)),
+            Some((10, 20))
+        );
+    }
+
+    #[test]
+    fn zone_without_ignore_window_rules_still_applies_rule() {
+        let mut wm = WindowManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let mut xdg = XdgManager::default();
+        wm.add_zone(free_zone("main", 10, 20, true, 400, 300));
+        wm.add_zone(free_zone("side", 500, 0, false, 200, 200));
+        wm.add_rule(WindowRule {
+            app_id: Some(String::from("app")),
+            title: None,
+            zone: Some(String::from("side")),
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+        });
+
+        let _ = register_with_surface(&mut wm, &mut surfaces, &mut xdg);
+        let changes = wm.on_app_id_set(
+            client(1),
+            object(10),
+            String::from("app"),
+            &surfaces,
+            &mut xdg,
+        );
+        assert_eq!(wm.window_zone(1), Some("side"));
+        assert!(changes.iter().any(|c| c.position == Some((500, 0))));
     }
 }
