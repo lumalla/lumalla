@@ -319,6 +319,8 @@ pub(crate) fn init_dbus_module(
         })?,
     )?;
 
+    install_exports_api(lua, &module)?;
+
     init_dbus_keymap(lua, &module, client.clone(), callback_state.clone())?;
     init_dbus_output(lua, &module, client.clone())?;
     init_dbus_drm(lua, &module, client.clone())?;
@@ -328,6 +330,43 @@ pub(crate) fn init_dbus_module(
     crate::ui::register_ui(lua, &module, callback_state, ui_host)?;
 
     Ok(module)
+}
+
+/// Attach `exports` / `export(name, value)` so config can expose helpers to the REPL.
+fn install_exports_api(lua: &Lua, module: &LuaTable) -> LuaResult<()> {
+    let exports = lua.create_table()?;
+    module.set("exports", exports.clone())?;
+    module.set(
+        "export",
+        lua.create_function(move |_, (name, value): (String, LuaValue)| {
+            exports.set(name, value)?;
+            Ok(())
+        })?,
+    )?;
+    Ok(())
+}
+
+/// Remove all keys from `require("lumalla").exports` in place (keeps REPL `cfg` alias valid).
+pub(crate) fn clear_config_exports(lua: &Lua) -> anyhow::Result<()> {
+    let exports: LuaTable = lua
+        .load("return require('lumalla').exports")
+        .eval()
+        .map_err(|err| anyhow::anyhow!("Unable to load lumalla.exports: {err}"))?;
+    clear_lua_table(&exports)
+        .map_err(|err| anyhow::anyhow!("Unable to clear lumalla.exports: {err}"))?;
+    Ok(())
+}
+
+fn clear_lua_table(table: &LuaTable) -> LuaResult<()> {
+    let keys: Vec<LuaValue> = table
+        .clone()
+        .pairs::<LuaValue, LuaValue>()
+        .map(|pair| pair.map(|(key, _)| key))
+        .collect::<LuaResult<_>>()?;
+    for key in keys {
+        table.set(key, LuaValue::Nil)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn register_dbus_module(
@@ -1998,6 +2037,7 @@ pub(crate) fn reload_config_file(
         .context("Failed to clear keymaps before config reload")?;
     callback_state.forget_keymap_callbacks();
     set_default_keymaps(lua, client, callback_state)?;
+    clear_config_exports(lua)?;
     exec_config_file(lua, path)
 }
 
@@ -2009,15 +2049,25 @@ fn exec_config_file(lua: &Lua, path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Expose `require("lumalla")` as a global for REPL convenience.
+/// Expose `require("lumalla")` (and aliases) as globals for REPL convenience.
 pub(crate) fn prepare_repl_env(lua: &Lua) -> anyhow::Result<()> {
     let lumalla: LuaTable = lua
         .load("return require('lumalla')")
         .eval()
         .map_err(|err| anyhow::anyhow!("Unable to preload lumalla for REPL: {err}"))?;
-    lua.globals()
-        .set("lumalla", lumalla)
+    let exports: LuaTable = lumalla
+        .get("exports")
+        .map_err(|err| anyhow::anyhow!("Unable to read lumalla.exports: {err}"))?;
+    let globals = lua.globals();
+    globals
+        .set("lumalla", lumalla.clone())
         .map_err(|err| anyhow::anyhow!("Unable to set lumalla global: {err}"))?;
+    globals
+        .set("lum", lumalla)
+        .map_err(|err| anyhow::anyhow!("Unable to set lum global: {err}"))?;
+    globals
+        .set("cfg", exports)
+        .map_err(|err| anyhow::anyhow!("Unable to set cfg global: {err}"))?;
     Ok(())
 }
 
@@ -2195,8 +2245,20 @@ fn is_lua_identifier(text: &str) -> bool {
 
 #[cfg(test)]
 mod repl_eval_tests {
-    use super::{eval_repl_chunk, format_lua_value};
+    use super::{
+        clear_config_exports, eval_repl_chunk, format_lua_value, install_exports_api,
+        prepare_repl_env, LUA_MODULE_NAME,
+    };
     use mlua::{Lua, Value as LuaValue};
+
+    fn lua_with_exports_module() -> Lua {
+        let lua = Lua::new();
+        let module = lua.create_table().unwrap();
+        install_exports_api(&lua, &module).unwrap();
+        lua.register_module(LUA_MODULE_NAME, module).unwrap();
+        prepare_repl_env(&lua).unwrap();
+        lua
+    }
 
     #[test]
     fn evaluates_expressions() {
@@ -2252,6 +2314,48 @@ mod repl_eval_tests {
     fn pretty_prints_cycles_without_looping() {
         let lua = Lua::new();
         assert_eq!(eval_repl_chunk(&lua, "t = {}; t.self = t; return t").unwrap().contains("{...}"), true);
+    }
+
+    #[test]
+    fn prepare_repl_env_exposes_lum_and_cfg() {
+        let lua = lua_with_exports_module();
+        assert_eq!(
+            eval_repl_chunk(&lua, "lumalla == lum and lumalla.exports == cfg").unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn export_registers_helpers_callable_from_repl() {
+        let lua = lua_with_exports_module();
+        assert_eq!(
+            eval_repl_chunk(
+                &lua,
+                "lumalla.export(\"add\", function(a, b) return a + b end)"
+            )
+            .unwrap(),
+            ""
+        );
+        assert_eq!(eval_repl_chunk(&lua, "cfg.add(2, 3)").unwrap(), "5");
+        assert_eq!(
+            eval_repl_chunk(&lua, "lumalla.exports.greet = function() return \"hi\" end").unwrap(),
+            ""
+        );
+        assert_eq!(eval_repl_chunk(&lua, "cfg.greet()").unwrap(), "\"hi\"");
+    }
+
+    #[test]
+    fn clear_config_exports_removes_helpers_in_place() {
+        let lua = lua_with_exports_module();
+        eval_repl_chunk(&lua, "cfg.answer = 42").unwrap();
+        assert_eq!(eval_repl_chunk(&lua, "cfg.answer").unwrap(), "42");
+        clear_config_exports(&lua).unwrap();
+        assert_eq!(eval_repl_chunk(&lua, "cfg.answer").unwrap(), "nil");
+        // Same table identity so the REPL `cfg` alias stays valid after reload.
+        assert_eq!(
+            eval_repl_chunk(&lua, "cfg == lumalla.exports").unwrap(),
+            "true"
+        );
     }
 }
 

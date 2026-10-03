@@ -94,7 +94,7 @@ fn handle_client(stream: UnixStream, request_tx: mpsc::Sender<ReplRequest>) {
 
     let _ = writeln!(
         writer,
-        "lumalla config REPL — `lumalla` is preloaded; empty line ignored; Ctrl-D to exit"
+        "lumalla config REPL — `lumalla`/`lum` and `cfg` (exports) are preloaded; empty line ignored; Ctrl-D to exit"
     );
     let _ = write!(writer, "> ");
     let _ = writer.flush();

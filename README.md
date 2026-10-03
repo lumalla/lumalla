@@ -66,7 +66,16 @@ Configuration runs in a separate `lumalla_config` process. Scripts load the modu
 
 Config files are passed with `--config <path>`, or loaded from `~/.config/lumalla/*.lua` when no path is given. See `init.lua` for a full example.
 
+With `--repl`, a Unix-socket Lua REPL shares the same VM. Locals from the config file are **not** visible there; expose helpers via `export` / `exports` (see below). The REPL preloads globals `lumalla`, `lum` (same module), and `cfg` (`lumalla.exports`).
+
 Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 switch VTs.
+
+### Exports (REPL)
+
+| Function / field | Description |
+| --- | --- |
+| `exports` | Table of values the config opts into exposing. Cleared on config reload, then rebuilt when the file re-runs. |
+| `export(name, value)` | Set `exports[name] = value`. Prefer this (or assigning into `exports`) for helpers the REPL should call, e.g. `cfg.apply_view_preset("pip")`. |
 
 ### Lifecycle
 

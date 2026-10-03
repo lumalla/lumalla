@@ -441,6 +441,15 @@ local function add_view_helper(name, source)
 	})
 end
 
+--- Expose helpers to the config REPL (`cfg.apply_view_preset("pip")`, etc.).
+lum.export("primary_output", primary_output)
+lum.export("enable_outputs", enable_outputs)
+lum.export("apply_view_preset", apply_view_preset)
+lum.export("pan_main_view", pan_main_view)
+lum.export("zoom_main_view", zoom_main_view)
+lum.export("apply_demo_guides", apply_demo_guides)
+lum.export("add_view_helper", add_view_helper)
+
 -- Call set_xkb before map_key so binding key names resolve against the active layout.
 lum.set_xkb({
 	layout = "de",
