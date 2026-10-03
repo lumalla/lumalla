@@ -38,7 +38,7 @@ fn register_object(
     true
 }
 
-fn report_xdg_error(ctx: &mut Ctx, object_id: ObjectId, error: XdgError) {
+pub(crate) fn report_xdg_error(ctx: &mut Ctx, object_id: ObjectId, error: XdgError) {
     let (code, message) = match error {
         XdgError::RoleConflict => (XDG_WM_BASE_ERROR_ROLE, "Surface already has a role"),
         XdgError::AlreadyConstructed => (
@@ -177,9 +177,8 @@ fn popup_constraint_bounds(
         .surface_manager
         .surface_window_origin(client_id, parent_wl)
         .unwrap_or((0, 0));
-    let (work_x, work_y, work_width, work_height) = state
-        .output_manager
-        .work_area_for_point(parent_x, parent_y)?;
+    let (work_x, work_y, work_width, work_height) =
+        state.exclusive_work_area_for_point(parent_x, parent_y)?;
     Some((
         work_x - parent_x,
         work_y - parent_y,
@@ -480,16 +479,13 @@ impl XdgSurface for DisplayState {
             Some(parent)
                 if ctx.registry.interface_index(parent) == Some(InterfaceIndex::XdgSurface) =>
             {
-                parent
+                Some(parent)
             }
             Some(parent) => {
                 report_xdg_error(ctx, parent, XdgError::UnknownXdgSurface);
                 return;
             }
-            None => {
-                report_xdg_error(ctx, object_id, XdgError::UnknownXdgSurface);
-                return;
-            }
+            None => None,
         };
         let version = ctx
             .registry
@@ -498,7 +494,8 @@ impl XdgSurface for DisplayState {
         if !register_object(ctx, params.id(), InterfaceIndex::XdgPopup, version) {
             return;
         }
-        let constraint_bounds = popup_constraint_bounds(self, ctx.client_id, parent);
+        let constraint_bounds =
+            parent.and_then(|parent| popup_constraint_bounds(self, ctx.client_id, parent));
         match self.xdg_manager.create_popup_with_bounds(
             ctx.client_id,
             *params.id(),
@@ -664,9 +661,7 @@ impl XdgToplevel for DisplayState {
         object_id: ObjectId,
         _params: &XdgToplevelSetMaximized<'_>,
     ) {
-        let size = self
-            .output_manager
-            .logical_size_for_client_output(ctx.client_id, None);
+        let size = self.exclusive_logical_size_for_client_output(ctx.client_id, None);
         match self
             .xdg_manager
             .set_toplevel_maximized_size(ctx.client_id, object_id, true, size)
@@ -871,10 +866,9 @@ pub(crate) fn apply_xdg_surface_commit_with_buffer(
         let _ = state
             .surface_manager
             .set_surface_layout(client_id, surface_id, geometry.x, geometry.y);
-        if let Some(parent_xdg) = state
+        if let Some(parent_wl) = state
             .xdg_manager
-            .popup_parent_xdg(client_id, snapshot.role_id)
-            && let Some(parent_wl) = state.xdg_manager.xdg_surface_wl(client_id, parent_xdg)
+            .popup_parent_wl(client_id, snapshot.role_id)
         {
             let _ = state
                 .surface_manager

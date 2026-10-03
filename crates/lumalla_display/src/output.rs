@@ -280,6 +280,32 @@ impl OutputManager {
         self.outputs.keys().copied().min()
     }
 
+    pub fn get(&self, global_id: GlobalId) -> Option<&OutputInfo> {
+        self.outputs.get(&global_id)
+    }
+
+    pub fn global_by_name(&self, name: &str) -> Option<GlobalId> {
+        self.by_name.get(name).copied()
+    }
+
+    pub fn global_for_binding(
+        &self,
+        client_id: ClientId,
+        output: ObjectId,
+    ) -> Option<GlobalId> {
+        self.bindings.get(&(client_id, output)).copied()
+    }
+
+    pub fn binding_for_global(
+        &self,
+        client_id: ClientId,
+        global_id: GlobalId,
+    ) -> Option<ObjectId> {
+        self.bindings.iter().find_map(|(&(cid, object_id), gid)| {
+            (cid == client_id && *gid == global_id).then_some(object_id)
+        })
+    }
+
     pub fn update_output(
         &mut self,
         global_id: GlobalId,

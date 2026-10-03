@@ -736,6 +736,37 @@ impl SeatManager {
         dy_unaccel: f64,
         arena: &Arena,
     ) {
+        self.handle_pointer_motion_with_target(
+            clients,
+            surface_manager,
+            constraints,
+            relative_pointers,
+            views,
+            time_msec,
+            dx,
+            dy,
+            dx_unaccel,
+            dy_unaccel,
+            None,
+            arena,
+        );
+    }
+
+    pub fn handle_pointer_motion_with_target(
+        &mut self,
+        clients: &mut ConnectedClients,
+        surface_manager: &SurfaceManager,
+        constraints: &mut PointerConstraintsManager,
+        relative_pointers: &RelativePointerManager,
+        views: &[View],
+        time_msec: u32,
+        dx: f64,
+        dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
+        override_target: Option<(ClientId, ObjectId)>,
+        arena: &Arena,
+    ) {
         self.apply_pointer_motion(
             clients,
             surface_manager,
@@ -748,6 +779,7 @@ impl SeatManager {
                 seat.pointer_x += dx;
                 seat.pointer_y += dy;
             },
+            override_target,
             arena,
         );
     }
@@ -762,6 +794,33 @@ impl SeatManager {
         time_msec: u32,
         x: f64,
         y: f64,
+        arena: &Arena,
+    ) {
+        self.handle_pointer_absolute_with_target(
+            clients,
+            surface_manager,
+            constraints,
+            relative_pointers,
+            views,
+            time_msec,
+            x,
+            y,
+            None,
+            arena,
+        );
+    }
+
+    pub fn handle_pointer_absolute_with_target(
+        &mut self,
+        clients: &mut ConnectedClients,
+        surface_manager: &SurfaceManager,
+        constraints: &mut PointerConstraintsManager,
+        relative_pointers: &RelativePointerManager,
+        views: &[View],
+        time_msec: u32,
+        x: f64,
+        y: f64,
+        override_target: Option<(ClientId, ObjectId)>,
         arena: &Arena,
     ) {
         let old_x = self.pointer_x;
@@ -779,6 +838,7 @@ impl SeatManager {
                 seat.pointer_x = x;
                 seat.pointer_y = y;
             },
+            override_target,
             arena,
         );
     }
@@ -793,6 +853,7 @@ impl SeatManager {
         time_msec: u32,
         relative: Option<(f64, f64, f64, f64)>,
         update: impl FnOnce(&mut Self),
+        override_target: Option<(ClientId, ObjectId)>,
         arena: &Arena,
     ) {
         let active = constraints.active_for_seat();
@@ -818,13 +879,14 @@ impl SeatManager {
         }
 
         let send_motion = !locked;
-        self.update_pointer_focus_and_motion(
+        self.update_pointer_focus_and_motion_with_target(
             clients,
             surface_manager,
             constraints,
             views,
             time_msec,
             send_motion,
+            override_target,
             arena,
         );
 
@@ -1087,13 +1149,37 @@ impl SeatManager {
         send_motion: bool,
         arena: &Arena,
     ) {
+        self.update_pointer_focus_and_motion_with_target(
+            clients,
+            surface_manager,
+            constraints,
+            views,
+            time_msec,
+            send_motion,
+            None,
+            arena,
+        );
+    }
+
+    pub fn update_pointer_focus_and_motion_with_target(
+        &mut self,
+        clients: &mut ConnectedClients,
+        surface_manager: &SurfaceManager,
+        constraints: &mut PointerConstraintsManager,
+        views: &[View],
+        time_msec: u32,
+        send_motion: bool,
+        override_target: Option<(ClientId, ObjectId)>,
+        arena: &Arena,
+    ) {
         let (scene_x, scene_y) = map_dest_to_source(views, self.pointer_x, self.pointer_y);
         let sticky = constraints
             .active_for_seat()
             .map(|c| (c.client_id, c.surface));
         let target = match sticky {
             Some((client_id, surface)) => Some((client_id, surface)),
-            None => surface_manager.global_pointer_target(None, scene_x, scene_y),
+            None => override_target
+                .or_else(|| surface_manager.global_pointer_target(None, scene_x, scene_y)),
         };
 
         // Leave pointers whose focus no longer matches the target.
@@ -1134,9 +1220,16 @@ impl SeatManager {
             return;
         };
 
+        let (hit_x, hit_y) = if surface_manager
+            .surface_in_layer_tree(target_client, target_surface)
+        {
+            (self.pointer_x, self.pointer_y)
+        } else {
+            (scene_x, scene_y)
+        };
         let (sx, sy) = surface_manager
-            .surface_local_coords(target_client, target_surface, scene_x, scene_y)
-            .unwrap_or((scene_x as f32, scene_y as f32));
+            .surface_local_coords(target_client, target_surface, hit_x, hit_y)
+            .unwrap_or((hit_x as f32, hit_y as f32));
 
         let mut enter_list = ArenaVec::new_in(arena);
         enter_list.extend(

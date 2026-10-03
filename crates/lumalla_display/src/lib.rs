@@ -15,6 +15,7 @@ use stumpalo::Arena;
 use crate::{
     data_device::DataDeviceManager,
     dmabuf::DmabufManager,
+    layer_shell::LayerShellManager,
     output::OutputManager,
     pointer_constraints::PointerConstraintsManager,
     relative_pointer::RelativePointerManager,
@@ -28,6 +29,7 @@ use crate::{
 mod clients;
 mod data_device;
 mod dmabuf;
+mod layer_shell;
 mod output;
 mod pointer_constraints;
 mod protocols;
@@ -137,6 +139,7 @@ pub struct DisplayState {
     output_manager: OutputManager,
     data_device_manager: DataDeviceManager,
     xdg_manager: XdgManager,
+    layer_shell_manager: LayerShellManager,
     window_manager: WindowManager,
     surface_updates: VecDeque<SurfaceUpdate>,
     pending_geometry_changes: Vec<WindowGeometryChange>,
@@ -159,6 +162,7 @@ impl Default for DisplayState {
             output_manager: OutputManager::default(),
             data_device_manager: DataDeviceManager::default(),
             xdg_manager: XdgManager::default(),
+            layer_shell_manager: LayerShellManager::default(),
             window_manager: WindowManager::default(),
             surface_updates: VecDeque::new(),
             pending_geometry_changes: Vec::new(),
@@ -287,17 +291,53 @@ impl DisplayState {
 
     /// Views used for pointer dest↔source mapping (primary/first output with views).
     pub fn pointer_views(&self) -> Vec<View> {
+        self.pointer_output()
+            .map(|output| output.views.clone())
+            .unwrap_or_default()
+    }
+
+    fn pointer_output(&self) -> Option<&crate::output::OutputInfo> {
         self.output_manager
             .outputs()
             .find(|output| !output.views.is_empty())
-            .map(|output| output.views.clone())
-            .or_else(|| {
-                self.output_manager
-                    .outputs()
-                    .next()
-                    .map(|output| output.views.clone())
-            })
-            .unwrap_or_default()
+            .or_else(|| self.output_manager.outputs().next())
+    }
+
+    /// Resolve pointer target in output-local coordinates: overlay/top layers,
+    /// then desktop via views, then bottom/background layers.
+    pub fn pointer_target_at_output_local(
+        &self,
+        px: f64,
+        py: f64,
+    ) -> Option<(ClientId, ObjectId)> {
+        let output = self.pointer_output()?;
+        let global = self.output_manager.global_by_name(&output.name)?;
+        let roots = self.layer_shell_manager.mapped_roots_for_output(global);
+
+        let mut above = Vec::new();
+        let mut below = Vec::new();
+        for (client_id, root, band) in &roots {
+            let mut tree = allocator_api2::vec::Vec::new();
+            self.surface_manager
+                .collect_mapped_tree(*client_id, *root, &mut tree);
+            use crate::layer_shell::LayerBand;
+            match band {
+                LayerBand::Overlay | LayerBand::Top => above.extend(tree),
+                LayerBand::Bottom | LayerBand::Background => below.extend(tree),
+            }
+        }
+        if let Some(target) = self.surface_manager.hit_test_scene(&above, px, py) {
+            return Some(target);
+        }
+        let views = self.pointer_views();
+        let (scene_x, scene_y) = map_dest_to_source(&views, px, py);
+        if let Some(target) = self
+            .surface_manager
+            .global_pointer_target(None, scene_x, scene_y)
+        {
+            return Some(target);
+        }
+        self.surface_manager.hit_test_scene(&below, px, py)
     }
 
     pub fn pointer_cursor(&self) -> PointerCursor {
@@ -324,7 +364,10 @@ impl DisplayState {
             return;
         }
         let views = self.pointer_views();
-        self.seat_manager.handle_pointer_motion(
+        let (px, py) = self.seat_manager.pointer_position();
+        let predicted = (px + dx, py + dy);
+        let target = self.pointer_target_at_output_local(predicted.0, predicted.1);
+        self.seat_manager.handle_pointer_motion_with_target(
             clients,
             &self.surface_manager,
             &mut self.pointer_constraints_manager,
@@ -335,6 +378,7 @@ impl DisplayState {
             dy,
             dx_unaccel,
             dy_unaccel,
+            target,
             arena,
         );
     }
@@ -353,7 +397,8 @@ impl DisplayState {
             return;
         }
         let views = self.pointer_views();
-        self.seat_manager.handle_pointer_absolute(
+        let target = self.pointer_target_at_output_local(x, y);
+        self.seat_manager.handle_pointer_absolute_with_target(
             clients,
             &self.surface_manager,
             &mut self.pointer_constraints_manager,
@@ -362,6 +407,7 @@ impl DisplayState {
             time_msec,
             x,
             y,
+            target,
             arena,
         );
     }
@@ -408,13 +454,16 @@ impl DisplayState {
             // Resolve the top-most surface under the cursor before focusing; do not
             // trust sticky pointer focus from a covered window.
             let views = self.pointer_views();
-            self.seat_manager.update_pointer_focus_and_motion(
+            let (px, py) = self.seat_manager.pointer_position();
+            let target = self.pointer_target_at_output_local(px, py);
+            self.seat_manager.update_pointer_focus_and_motion_with_target(
                 clients,
                 &self.surface_manager,
                 &mut self.pointer_constraints_manager,
                 &views,
                 time_msec,
                 false,
+                target,
                 arena,
             );
             let click_target = self.seat_manager.focused_pointer_surface();
@@ -424,25 +473,38 @@ impl DisplayState {
             // Apply popup-aware keyboard focus once before the button event so
             // clients never see a leave/enter churn on non-grabbed popups.
             if let Some((client_id, surface)) = click_target {
-                let focus_surface = self.keyboard_focus_for_pointer_target(client_id, surface);
-                if let Some(client) = clients.get_mut(&client_id) {
-                    self.seat_manager.focus_keyboards_on_surface(
-                        client_id,
-                        focus_surface,
-                        client.writer_mut(),
-                    );
+                let is_layer = self
+                    .surface_manager
+                    .surface_in_layer_tree(client_id, surface);
+                let allow_keyboard = self
+                    .layer_shell_manager
+                    .can_take_keyboard_focus(client_id, surface)
+                    .unwrap_or(true);
+                if allow_keyboard {
+                    let focus_surface = self.keyboard_focus_for_pointer_target(client_id, surface);
+                    if let Some(client) = clients.get_mut(&client_id) {
+                        self.seat_manager.focus_keyboards_on_surface(
+                            client_id,
+                            focus_surface,
+                            client.writer_mut(),
+                        );
+                    }
+                    self.seat_manager.flush_pending_keyboard_leaves(clients);
+                    self.data_device_manager.flush_pending(clients);
+                    if !is_layer {
+                        self.on_surface_focused(client_id, focus_surface);
+                        if let Some(client) = clients.get_mut(&client_id) {
+                            self.apply_activation(client_id, focus_surface, client.writer_mut());
+                        }
+                        self.flush_pending_activation_configures(clients);
+                    }
                 }
-                self.seat_manager.flush_pending_keyboard_leaves(clients);
-                self.data_device_manager.flush_pending(clients);
-                self.on_surface_focused(client_id, focus_surface);
-                if let Some(client) = clients.get_mut(&client_id) {
-                    self.apply_activation(client_id, focus_surface, client.writer_mut());
+                if !is_layer {
+                    // Click-to-raise: move the window's paint-order root to the top.
+                    let raise_surface = self.stack_root_for_pointer_target(client_id, surface);
+                    self.surface_manager
+                        .record_painted_surface(client_id, raise_surface);
                 }
-                self.flush_pending_activation_configures(clients);
-                // Click-to-raise: move the window's paint-order root to the top.
-                let raise_surface = self.stack_root_for_pointer_target(client_id, surface);
-                self.surface_manager
-                    .record_painted_surface(client_id, raise_surface);
             }
         }
         self.seat_manager.handle_pointer_button(
@@ -606,6 +668,7 @@ impl DisplayState {
         self.data_device_manager.remove_client(client_id);
         self.data_device_manager.flush_pending(clients);
         self.xdg_manager.delete_client(client_id);
+        self.layer_shell_manager.delete_client(client_id);
         self.window_manager.delete_client(client_id);
         self.pending_frame_callbacks
             .retain(|pending| pending.client_id != client_id);
@@ -639,6 +702,69 @@ impl DisplayState {
         scene: &mut allocator_api2::vec::Vec<SceneSurface, A>,
     ) {
         self.surface_manager.collect_scene_surfaces(scene);
+    }
+
+    /// Per-output layer-shell scenes in paint order (background → overlay).
+    ///
+    /// Each entry is `(output_name, [(owner, surface, x, y, band), ...])` with
+    /// coordinates in output-local space and band `0..=3`.
+    pub fn collect_output_layer_scenes(&self) -> Vec<(String, Vec<(u32, u32, i32, i32, u8)>)> {
+        let mut scenes = Vec::new();
+        for info in self.output_manager.outputs() {
+            let Some(global) = self.output_manager.global_by_name(&info.name) else {
+                continue;
+            };
+            let roots = self.layer_shell_manager.mapped_roots_for_output(global);
+            if roots.is_empty() {
+                scenes.push((info.name.clone(), Vec::new()));
+                continue;
+            }
+            let mut entries = Vec::new();
+            for (client_id, root, band) in roots {
+                let mut tree = allocator_api2::vec::Vec::new();
+                self.surface_manager
+                    .collect_mapped_tree(client_id, root, &mut tree);
+                for surface in tree {
+                    entries.push((
+                        surface.client_id.get(),
+                        surface.surface_id.get(),
+                        surface.x,
+                        surface.y,
+                        band.as_u8(),
+                    ));
+                }
+            }
+            scenes.push((info.name.clone(), entries));
+        }
+        scenes
+    }
+
+    /// Work area in global compositor space, inset by layer-shell exclusive zones.
+    pub fn exclusive_work_area_for_point(&self, x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
+        let output = self.output_manager.outputs().find(|output| {
+            x >= output.x
+                && y >= output.y
+                && x < output.x.saturating_add(output.width)
+                && y < output.y.saturating_add(output.height)
+        })
+        .or_else(|| self.output_manager.outputs().next())?;
+        let global = self.output_manager.global_by_name(&output.name)?;
+        let insets = self.layer_shell_manager.exclusive_insets_for_output(global);
+        Some(insets.inset_rect(output.x, output.y, output.width, output.height))
+    }
+
+    /// Maximized size for an output, inset by exclusive zones.
+    pub fn exclusive_logical_size_for_client_output(
+        &self,
+        client_id: ClientId,
+        output_id: Option<ObjectId>,
+    ) -> Option<(i32, i32)> {
+        let global = output_id
+            .and_then(|id| self.output_manager.global_for_binding(client_id, id))
+            .or_else(|| self.output_manager.primary_global_id())?;
+        let info = self.output_manager.get(global)?;
+        let insets = self.layer_shell_manager.exclusive_insets_for_output(global);
+        Some(insets.inset_size(info.width, info.height))
     }
 
     /// Capture layers for a managed window: content AABB and surface tree.
@@ -845,6 +971,24 @@ impl DisplayState {
         name: &str,
         clients: &mut ConnectedClients,
     ) -> anyhow::Result<()> {
+        if let Some(global) = self.output_manager.global_by_name(name) {
+            let closed = self.layer_shell_manager.close_output(global);
+            for (client_id, layer_id, wl_surface) in closed {
+                let _ = self
+                    .surface_manager
+                    .set_xdg_map_ready(client_id, wl_surface, false);
+                self.surface_updates
+                    .push_back(SurfaceUpdate::Unmapped {
+                        client_id,
+                        surface_id: wl_surface,
+                    });
+                if let Some(client) = clients.get_mut(&client_id) {
+                    client
+                        .writer_mut()
+                        .zwlr_layer_surface_v1_closed(layer_id);
+                }
+            }
+        }
         self.output_manager
             .remove_output(name, &mut self.globals, clients.values_mut())
     }
@@ -1101,6 +1245,24 @@ impl DisplayState {
             return;
         }
 
+        if let Some(info) = self.layer_shell_manager.info_for_wl(client_id, surface_id) {
+            use crate::layer_shell::KeyboardInteractivity;
+            match info.keyboard_interactivity {
+                // none / on_demand: no automatic keyboard focus on map.
+                KeyboardInteractivity::None | KeyboardInteractivity::OnDemand => return,
+                KeyboardInteractivity::Exclusive => {
+                    if matches!(
+                        info.band,
+                        crate::layer_shell::LayerBand::Top | crate::layer_shell::LayerBand::Overlay
+                    ) {
+                        self.seat_manager
+                            .focus_keyboards_on_surface(client_id, surface_id, writer);
+                    }
+                    return;
+                }
+            }
+        }
+
         if let Some(popup) = self.xdg_manager.popup_info_for_wl(client_id, surface_id) {
             if !popup.grabbed {
                 return;
@@ -1329,7 +1491,7 @@ pub fn create_wayland_display(socket_path: Option<PathBuf>) -> anyhow::Result<Wa
     }
 }
 
-type GlobalId = u32;
+pub(crate) type GlobalId = u32;
 
 #[derive(Debug)]
 struct Globals {
@@ -1371,6 +1533,7 @@ impl Default for Globals {
             1,
             [].into_iter(),
         );
+        globals.register_version(InterfaceIndex::ZwlrLayerShellV1, 5, [].into_iter());
         globals
     }
 }

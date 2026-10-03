@@ -568,10 +568,24 @@ fn process_surface_commit_body(
                         }
                     }
                     state.focus_newly_mapped_surface(ctx.client_id, commit.surface_id, ctx.writer);
-                    for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
-                        ctx.writer
-                            .wl_surface_enter(commit.surface_id)
-                            .output(output);
+                    if let Some(info) = state
+                        .layer_shell_manager
+                        .info_for_wl(ctx.client_id, commit.surface_id)
+                    {
+                        if let Some(output) = state
+                            .output_manager
+                            .binding_for_global(ctx.client_id, info.output)
+                        {
+                            ctx.writer
+                                .wl_surface_enter(commit.surface_id)
+                                .output(output);
+                        }
+                    } else {
+                        for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
+                            ctx.writer
+                                .wl_surface_enter(commit.surface_id)
+                                .output(output);
+                        }
                     }
                 }
             }
@@ -845,6 +859,10 @@ impl WlRegistry for DisplayState {
             }
             _ if interface_name == InterfaceIndex::XdgWmBase.interface_name() => {
                 self.xdg_manager.create_wm_base(ctx.client_id, *id);
+            }
+            _ if interface_name == InterfaceIndex::ZwlrLayerShellV1.interface_name() => {
+                self.layer_shell_manager
+                    .create_shell(ctx.client_id, *id);
             }
             _ if interface_name == InterfaceIndex::ZwpLinuxDmabufV1.interface_name() => {
                 super::linux_dmabuf::send_dmabuf_formats(
@@ -1658,16 +1676,39 @@ impl WlSurface for DisplayState {
             crate::protocols::xdg_shell::report_commit_error(ctx, object_id, error);
             return;
         }
+        if attaching_buffer
+            && let Err(error) = self.layer_shell_manager.check_buffer_commit(
+                ctx.client_id,
+                object_id,
+                true,
+            )
+        {
+            crate::protocols::layer_shell::report_layer_commit_error(ctx, object_id, error);
+            return;
+        }
 
+        let buffer_flag = pending_attachment.map(|buffer| buffer.is_some());
         let xdg_outcome = match crate::protocols::xdg_shell::apply_xdg_surface_commit_with_buffer(
             self,
             ctx.client_id,
             object_id,
-            pending_attachment.map(|buffer| buffer.is_some()),
+            buffer_flag,
         ) {
             Ok(outcome) => outcome,
             Err((error_object, error)) => {
                 crate::protocols::xdg_shell::report_commit_error(ctx, error_object, error);
+                return;
+            }
+        };
+        let layer_outcome = match crate::protocols::layer_shell::apply_layer_surface_commit(
+            self,
+            ctx.client_id,
+            object_id,
+            buffer_flag,
+        ) {
+            Ok(outcome) => outcome,
+            Err((error_object, error)) => {
+                crate::protocols::layer_shell::report_layer_commit_error(ctx, error_object, error);
                 return;
             }
         };
@@ -1680,6 +1721,12 @@ impl WlSurface for DisplayState {
         };
 
         crate::protocols::xdg_shell::emit_xdg_commit_events(self, ctx, object_id, xdg_outcome);
+        if let Some(layer_id) = self
+            .layer_shell_manager
+            .layer_surface_for_wl(ctx.client_id, object_id)
+        {
+            crate::protocols::layer_shell::emit_layer_commit_events(ctx, layer_id, layer_outcome);
+        }
         process_surface_commit(self, ctx, result.primary);
         for child in result.synchronized_children {
             process_surface_commit(self, ctx, child);
@@ -2259,6 +2306,10 @@ mod tests {
         assert!(globals.contains(&(
             lumalla_wayland_protocol::protocols::relative_pointer::ZWP_RELATIVE_POINTER_MANAGER_V1_NAME,
             1
+        )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::wlr_layer_shell::ZWLR_LAYER_SHELL_V1_NAME,
+            5
         )));
     }
 

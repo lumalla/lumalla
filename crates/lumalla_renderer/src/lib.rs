@@ -375,6 +375,11 @@ pub struct RendererState {
     /// Mapped surfaces in paint order (back to front).
     surface_frames: HashMap<(u32, u32), SurfaceFrame>,
     surface_order: Vec<(u32, u32)>,
+    /// Per-output layer-shell scene: `(owner, surface, x, y, band)` in output-local space.
+    /// Band: 0=background, 1=bottom, 2=top, 3=overlay.
+    output_layer_scenes: HashMap<String, Vec<(u32, u32, i32, i32, u8)>>,
+    /// Keys that belong to layer-shell scenes (excluded from desktop `surface_order` draws).
+    layer_surface_keys: HashSet<(u32, u32)>,
     cursor_state: CursorState,
     pointer_x: i32,
     pointer_y: i32,
@@ -458,6 +463,8 @@ impl RendererState {
             flip_events: Box::new(FlipEventQueue::new()),
             surface_frames: HashMap::new(),
             surface_order: Vec::new(),
+            output_layer_scenes: HashMap::new(),
+            layer_surface_keys: HashSet::new(),
             cursor_state: CursorState::Default,
             pointer_x: 0,
             pointer_y: 0,
@@ -875,7 +882,7 @@ impl RendererState {
     pub fn set_surface_frame(&mut self, frame: SurfaceFrame) -> anyhow::Result<()> {
         frame.validate()?;
         let key = (frame.owner_id, frame.surface_id);
-        if !self.surface_frames.contains_key(&key) {
+        if !self.surface_frames.contains_key(&key) && !self.layer_surface_keys.contains(&key) {
             self.surface_order.push(key);
         }
         if frame.full_surface {
@@ -928,15 +935,20 @@ impl RendererState {
     }
 
     /// Replace cached placement and z-order from the display's authoritative
-    /// back-to-front scene.
+    /// back-to-front desktop scene (excludes layer-shell surfaces).
     pub fn sync_surface_scene(&mut self, scene: &[(u32, u32, i32, i32)], arena: &Arena) {
         let new_order: Vec<(u32, u32)> = scene
             .iter()
             .map(|(owner, surface, _, _)| (*owner, *surface))
-            .filter(|key| self.surface_frames.contains_key(key))
+            .filter(|key| {
+                self.surface_frames.contains_key(key) && !self.layer_surface_keys.contains(key)
+            })
             .collect();
         let mut changed = new_order != self.surface_order;
         for &(owner, surface, x, y) in scene {
+            if self.layer_surface_keys.contains(&(owner, surface)) {
+                continue;
+            }
             if let Some(frame) = self.surface_frames.get_mut(&(owner, surface))
                 && (frame.x != x || frame.y != y)
             {
@@ -947,6 +959,7 @@ impl RendererState {
         }
         let mut visible = allocator_api2::vec::Vec::new_in(arena);
         visible.extend(new_order.iter().copied());
+        visible.extend(self.layer_surface_keys.iter().copied());
         let mut removed = allocator_api2::vec::Vec::new_in(arena);
         for key in self.surface_frames.keys().copied() {
             if !visible.contains(&key) {
@@ -961,6 +974,71 @@ impl RendererState {
             changed = true;
         }
         self.surface_order = new_order;
+        if changed {
+            let _ = self.flush_retired_textures();
+            self.pending_full_redraw = true;
+            self.pending_damage.clear();
+            self.mark_dirty_if_active();
+        }
+    }
+
+    /// Replace per-output layer-shell scenes (output-local coordinates).
+    ///
+    /// Each entry is `(owner, surface, x, y, band)` with band
+    /// `0=background, 1=bottom, 2=top, 3=overlay`.
+    pub fn sync_output_layer_scenes(
+        &mut self,
+        scenes: &[(String, Vec<(u32, u32, i32, i32, u8)>)],
+    ) {
+        let mut new_keys = HashSet::new();
+        let mut changed = false;
+        let mut new_map = HashMap::new();
+        for (output, entries) in scenes {
+            let filtered: Vec<_> = entries
+                .iter()
+                .copied()
+                .filter(|(owner, surface, _, _, _)| {
+                    self.surface_frames.contains_key(&(*owner, *surface))
+                })
+                .collect();
+            for &(owner, surface, x, y, _) in &filtered {
+                new_keys.insert((owner, surface));
+                if let Some(frame) = self.surface_frames.get_mut(&(owner, surface))
+                    && (frame.x != x || frame.y != y)
+                {
+                    frame.x = x;
+                    frame.y = y;
+                    changed = true;
+                }
+            }
+            if self.output_layer_scenes.get(output) != Some(&filtered) {
+                changed = true;
+            }
+            new_map.insert(output.clone(), filtered);
+        }
+        if self.output_layer_scenes != new_map || self.layer_surface_keys != new_keys {
+            changed = true;
+        }
+        // Drop layer keys that vanished from every output scene.
+        for key in self.layer_surface_keys.difference(&new_keys).copied() {
+            if !self.surface_order.contains(&key) {
+                self.surface_frames.remove(&key);
+                self.gpu.surface_textures.remove(key);
+                self.dirty_surface_keys.remove(&key);
+                self.pending_surface_buffer_damage.remove(&key);
+            }
+            self.surface_order.retain(|k| *k != key);
+            changed = true;
+        }
+        self.layer_surface_keys = new_keys;
+        self.output_layer_scenes = new_map;
+        // Keep layer keys out of the desktop order.
+        let before = self.surface_order.len();
+        self.surface_order
+            .retain(|key| !self.layer_surface_keys.contains(key));
+        if self.surface_order.len() != before {
+            changed = true;
+        }
         if changed {
             let _ = self.flush_retired_textures();
             self.pending_full_redraw = true;
@@ -3170,8 +3248,27 @@ impl RendererState {
         let layers: Vec<&SurfaceFrame> = self
             .surface_order
             .iter()
+            .filter(|key| !self.layer_surface_keys.contains(*key))
             .filter_map(|key| self.surface_frames.get(key))
             .collect();
+        let empty_layer_scene = Vec::new();
+        let layer_scene = self
+            .output_layer_scenes
+            .get(&target.name)
+            .unwrap_or(&empty_layer_scene);
+        let below_layers: Vec<&SurfaceFrame> = layer_scene
+            .iter()
+            .filter(|(_, _, _, _, band)| *band <= 1)
+            .filter_map(|(owner, surface, _, _, _)| self.surface_frames.get(&(*owner, *surface)))
+            .collect();
+        let above_layers: Vec<&SurfaceFrame> = layer_scene
+            .iter()
+            .filter(|(_, _, _, _, band)| *band >= 2)
+            .filter_map(|(owner, surface, _, _, _)| self.surface_frames.get(&(*owner, *surface)))
+            .collect();
+        let mut sync_layers = layers.clone();
+        sync_layers.extend(below_layers.iter().copied());
+        sync_layers.extend(above_layers.iter().copied());
         let cursor = if hw_cursor {
             CursorDraw::Hidden
         } else {
@@ -3212,7 +3309,7 @@ impl RendererState {
                     vulkan,
                     &compositor,
                     &mut batch,
-                    &layers,
+                    &sync_layers,
                     cursor,
                     &composite_mode,
                     &dirty_surfaces,
@@ -3283,6 +3380,8 @@ impl RendererState {
                     composite_mode,
                     &views,
                     &layers,
+                    &below_layers,
+                    &above_layers,
                     &self.guides,
                     cursor,
                     pointer_x,
@@ -4226,6 +4325,29 @@ mod tests {
         state.sync_surface_scene(&[], &arena);
         assert!(state.surface_frames.is_empty());
         assert!(state.surface_order.is_empty());
+    }
+
+    #[test]
+    fn layer_scene_sync_keeps_frames_out_of_desktop_order() {
+        let mut state = RendererState::new().unwrap();
+        let mut layer = frame();
+        layer.surface_id = 9;
+        layer.buffer_id = 9;
+        state.set_surface_frame(layer).unwrap();
+        state.set_surface_frame(frame()).unwrap();
+
+        state.sync_output_layer_scenes(&[("HDMI-A-1".into(), vec![(1, 9, 0, 0, 2)])]);
+        let arena = Arena::new();
+        state.sync_surface_scene(&[(1, 2, 10, 20)], &arena);
+
+        assert!(state.layer_surface_keys.contains(&(1, 9)));
+        assert!(state.surface_frames.contains_key(&(1, 9)));
+        assert!(!state.surface_order.contains(&(1, 9)));
+        assert_eq!(state.surface_order, vec![(1, 2)]);
+        assert_eq!(
+            state.output_layer_scenes["HDMI-A-1"],
+            vec![(1, 9, 0, 0, 2)]
+        );
     }
 
     #[test]

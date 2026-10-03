@@ -49,7 +49,7 @@ pub struct XdgManager {
 pub struct PopupSurfaceInfo {
     pub popup_id: ObjectId,
     pub xdg_surface: ObjectId,
-    pub parent_xdg: ObjectId,
+    pub parent_xdg: Option<ObjectId>,
     pub grabbed: bool,
 }
 
@@ -154,7 +154,10 @@ fn toplevel_size_pair_invalid(min: (i32, i32), max: (i32, i32)) -> bool {
 #[derive(Debug)]
 struct PopupState {
     xdg_surface: ObjectId,
-    parent: ObjectId,
+    /// Parent xdg_surface, if any. `None` until assigned (layer-shell parent path).
+    parent: Option<ObjectId>,
+    /// Layer-shell parent `wl_surface` when parented via `zwlr_layer_surface_v1.get_popup`.
+    layer_parent_wl: Option<ObjectId>,
     positioner: PositionerState,
     current_geometry: Option<PopupGeometry>,
     pending_reposition: Option<(u32, PopupGeometry)>,
@@ -900,7 +903,7 @@ impl XdgManager {
             client_id,
             popup_id,
             xdg_surface_id,
-            parent,
+            Some(parent),
             positioner,
             None,
         )
@@ -911,7 +914,7 @@ impl XdgManager {
         client_id: ClientId,
         popup_id: ObjectId,
         xdg_surface_id: ObjectId,
-        parent: ObjectId,
+        parent: Option<ObjectId>,
         positioner: ObjectId,
         constraint_bounds: Option<(i32, i32, i32, i32)>,
     ) -> Result<PopupGeometry, XdgError> {
@@ -922,43 +925,45 @@ impl XdgManager {
             .clone();
         positioner_state.validate_complete()?;
         positioner_state.validate_anchor_bounds()?;
-        let parent_surface = self
-            .xdg_surfaces
-            .get(&(client_id, parent))
-            .ok_or(XdgError::InvalidPopupParent)?;
-        if !parent_surface.role_alive || !parent_surface.mapped {
-            return Err(XdgError::InvalidPopupParent);
-        }
-        let parent_size = parent_surface.current_window_geometry.map_or_else(
-            || match parent_surface
-                .current_configure
-                .map(|snapshot| snapshot.payload)
-            {
-                Some(ConfigurePayload::Toplevel { width, height, .. })
-                    if width > 0 && height > 0 =>
+        if let Some(parent) = parent {
+            let parent_surface = self
+                .xdg_surfaces
+                .get(&(client_id, parent))
+                .ok_or(XdgError::InvalidPopupParent)?;
+            if !parent_surface.role_alive || !parent_surface.mapped {
+                return Err(XdgError::InvalidPopupParent);
+            }
+            let parent_size = parent_surface.current_window_geometry.map_or_else(
+                || match parent_surface
+                    .current_configure
+                    .map(|snapshot| snapshot.payload)
                 {
-                    Some((width, height))
+                    Some(ConfigurePayload::Toplevel { width, height, .. })
+                        if width > 0 && height > 0 =>
+                    {
+                        Some((width, height))
+                    }
+                    Some(ConfigurePayload::Popup { geometry, .. }) => {
+                        Some((geometry.width, geometry.height))
+                    }
+                    _ => None,
+                },
+                |geometry| Some((geometry.width, geometry.height)),
+            );
+            if let Some((width, height)) = parent_size {
+                positioner_state.validate_anchor_with_size(width, height)?;
+            }
+            if let Some(serial) = positioner_state.parent_configure {
+                let valid = parent_surface
+                    .current_configure
+                    .is_some_and(|snapshot| snapshot.serial == serial)
+                    || parent_surface
+                        .pending_configures
+                        .iter()
+                        .any(|snapshot| snapshot.serial == serial);
+                if !valid {
+                    return Err(XdgError::InvalidPositioner);
                 }
-                Some(ConfigurePayload::Popup { geometry, .. }) => {
-                    Some((geometry.width, geometry.height))
-                }
-                _ => None,
-            },
-            |geometry| Some((geometry.width, geometry.height)),
-        );
-        if let Some((width, height)) = parent_size {
-            positioner_state.validate_anchor_with_size(width, height)?;
-        }
-        if let Some(serial) = positioner_state.parent_configure {
-            let valid = parent_surface
-                .current_configure
-                .is_some_and(|snapshot| snapshot.serial == serial)
-                || parent_surface
-                    .pending_configures
-                    .iter()
-                    .any(|snapshot| snapshot.serial == serial);
-            if !valid {
-                return Err(XdgError::InvalidPositioner);
             }
         }
         let geometry = positioner_state.compute_geometry_with_bounds(constraint_bounds);
@@ -976,6 +981,7 @@ impl XdgManager {
             PopupState {
                 xdg_surface: xdg_surface_id,
                 parent,
+                layer_parent_wl: None,
                 positioner: positioner_state,
                 current_geometry: None,
                 pending_reposition: None,
@@ -983,6 +989,24 @@ impl XdgManager {
             },
         );
         Ok(geometry)
+    }
+
+    /// Assign a layer-shell `wl_surface` as the parent of an unparented popup.
+    pub fn assign_popup_layer_parent(
+        &mut self,
+        client_id: ClientId,
+        popup_id: ObjectId,
+        layer_wl: ObjectId,
+    ) -> Result<(), XdgError> {
+        let popup = self
+            .popups
+            .get_mut(&(client_id, popup_id))
+            .ok_or(XdgError::UnknownPopup)?;
+        if popup.parent.is_some() || popup.layer_parent_wl.is_some() {
+            return Err(XdgError::InvalidPopupParent);
+        }
+        popup.layer_parent_wl = Some(layer_wl);
+        Ok(())
     }
 
     /// wl_surface backing an xdg_surface, if known.
@@ -1023,7 +1047,8 @@ impl XdgManager {
             .get(&(client_id, popup_id))
             .ok_or(XdgError::UnknownPopup)?
             .parent;
-        if let Some(parent_surface) = self.xdg_surfaces.get(&(client_id, parent))
+        if let Some(parent) = parent
+            && let Some(parent_surface) = self.xdg_surfaces.get(&(client_id, parent))
             && let Some(geometry) = parent_surface.current_window_geometry
         {
             positioner_state.validate_anchor_with_size(geometry.width, geometry.height)?;
@@ -1042,7 +1067,9 @@ impl XdgManager {
 
     /// Parent xdg_surface for a popup, if known.
     pub fn popup_parent_xdg(&self, client_id: ClientId, popup_id: ObjectId) -> Option<ObjectId> {
-        self.popups.get(&(client_id, popup_id)).map(|p| p.parent)
+        self.popups
+            .get(&(client_id, popup_id))
+            .and_then(|p| p.parent)
     }
 
     pub fn grab_popup(&mut self, client_id: ClientId, popup_id: ObjectId) -> Result<(), XdgError> {
@@ -1057,10 +1084,11 @@ impl XdgManager {
         if surface.mapped {
             return Err(XdgError::InvalidGrab);
         }
-        if let Some(parent_popup) = self
-            .popups
-            .values()
-            .find(|candidate| candidate.xdg_surface == popup.parent)
+        if let Some(parent_xdg) = popup.parent
+            && let Some(parent_popup) = self
+                .popups
+                .values()
+                .find(|candidate| candidate.xdg_surface == parent_xdg)
             && !parent_popup.grabbed
         {
             return Err(XdgError::InvalidGrab);
@@ -1111,7 +1139,11 @@ impl XdgManager {
 
     /// Parent wl_surface of a popup, if known.
     pub fn popup_parent_wl(&self, client_id: ClientId, popup_id: ObjectId) -> Option<ObjectId> {
-        let parent_xdg = self.popup_parent_xdg(client_id, popup_id)?;
+        let popup = self.popups.get(&(client_id, popup_id))?;
+        if let Some(layer_wl) = popup.layer_parent_wl {
+            return Some(layer_wl);
+        }
+        let parent_xdg = popup.parent?;
         self.xdg_surface_wl(client_id, parent_xdg)
     }
 
@@ -1258,7 +1290,9 @@ impl XdgManager {
         if self
             .popups
             .iter()
-            .any(|((owner, _), child)| *owner == client_id && child.parent == popup.xdg_surface)
+            .any(|((owner, _), child)| {
+                *owner == client_id && child.parent == Some(popup.xdg_surface)
+            })
         {
             return Err(XdgError::NotTopmostPopup);
         }

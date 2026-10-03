@@ -1681,6 +1681,13 @@ impl AppData {
     }
 
     fn sync_renderer_scene(&mut self, arena: &Arena) {
+        // Layer scenes must be synced before the desktop scene so
+        // `sync_surface_scene` preserves layer-shell frames (it drops any
+        // surface_frames key not listed in the desktop scene or layer keys).
+        let layer_scenes = self.display_state.collect_output_layer_scenes();
+        self.renderer_state
+            .sync_output_layer_scenes(&layer_scenes);
+
         let mut surfaces = ArenaVec::new_in(arena);
         self.display_state.collect_scene_surfaces(&mut surfaces);
         let mut scene = ArenaVec::with_capacity_in(surfaces.len(), arena);

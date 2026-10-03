@@ -148,7 +148,10 @@ impl SurfaceManager {
                 .surfaces
                 .get(&(client_id, id))
                 .ok_or(SurfaceError::UnknownSurface)?;
-            if matches!(surface.role, Some(Role::Subsurface(_)) | Some(Role::Xdg(_))) {
+            if matches!(
+                surface.role,
+                Some(Role::Subsurface(_)) | Some(Role::Xdg(_)) | Some(Role::Layer(_))
+            ) {
                 return Err(SurfaceError::DefunctRoleObject);
             }
         }
@@ -193,6 +196,7 @@ impl SurfaceManager {
             // Xdg role should already be cleared via xdg_surface.destroy;
             // Subsurface is rejected above. Leave a no-op arm for safety.
             Some(Role::Xdg(_))
+            | Some(Role::Layer(_))
             | Some(Role::Subsurface(_))
             | Some(Role::Cursor)
             | Some(Role::DndIcon)
@@ -264,13 +268,27 @@ impl SurfaceManager {
             let Some(surface) = self.surfaces.get(&(client_id, surface_id)) else {
                 continue;
             };
-            if matches!(surface.role, Some(Role::Subsurface(_)))
-                || surface.role_parent.is_some()
+            if matches!(
+                surface.role,
+                Some(Role::Subsurface(_)) | Some(Role::Layer(_))
+            ) || surface.role_parent.is_some()
                 || !self.is_mapped(client_id, surface_id).unwrap_or(false)
             {
                 continue;
             }
             self.flatten_surface_tree(client_id, surface_id, scene);
+        }
+    }
+
+    /// Flatten a mapped surface tree (used for output-local layer roots).
+    pub fn collect_mapped_tree<A: allocator_api2::alloc::Allocator>(
+        &self,
+        client_id: ClientId,
+        root: ObjectId,
+        scene: &mut allocator_api2::vec::Vec<SceneSurface, A>,
+    ) {
+        if self.is_mapped(client_id, root).unwrap_or(false) {
+            self.flatten_surface_tree(client_id, root, scene);
         }
     }
 
@@ -418,6 +436,57 @@ impl SurfaceManager {
         self.hit_test(preferred_client, x, y)
     }
 
+    /// Hit-test a pre-built scene list (back-to-front), returning the top-most hit.
+    pub fn hit_test_scene(
+        &self,
+        scene: &[SceneSurface],
+        x: f64,
+        y: f64,
+    ) -> Option<(ClientId, ObjectId)> {
+        for entry in scene.iter().rev() {
+            let client_id = entry.client_id;
+            let surface_id = entry.surface_id;
+            if !self.is_mapped(client_id, surface_id).unwrap_or(false) {
+                continue;
+            }
+            let Some(surface) = self.surfaces.get(&(client_id, surface_id)) else {
+                continue;
+            };
+            let Some((bw, bh)) = surface.buffer_size else {
+                continue;
+            };
+            let scale = surface.current.buffer_scale.max(1);
+            let Some((width, height)) = effective_surface_size(
+                Some((bw, bh)),
+                scale,
+                surface.current.buffer_transform,
+                &surface.current.viewport,
+            ) else {
+                continue;
+            };
+            let Some((content_x, content_y)) = self.content_origin(client_id, surface_id) else {
+                continue;
+            };
+            if x < content_x as f64
+                || y < content_y as f64
+                || x >= (content_x + width) as f64
+                || y >= (content_y + height) as f64
+            {
+                continue;
+            }
+            let Some((surface_x, surface_y)) = self.surface_origin(client_id, surface_id) else {
+                continue;
+            };
+            let local_x = (x - surface_x as f64) as i32;
+            let local_y = (y - surface_y as f64) as i32;
+            if !self.surface_accepts_input_at(surface, local_x, local_y) {
+                continue;
+            }
+            return Some((client_id, surface_id));
+        }
+        None
+    }
+
     fn hit_test(
         &self,
         preferred_client: Option<ClientId>,
@@ -441,7 +510,10 @@ impl SurfaceManager {
             // Include shell/xdg tops and their subsurfaces; skip cursor/dnd icons.
             if !matches!(
                 surface.role,
-                Some(Role::Shell(_)) | Some(Role::Xdg(_)) | Some(Role::Subsurface(_))
+                Some(Role::Shell(_))
+                    | Some(Role::Xdg(_))
+                    | Some(Role::Layer(_))
+                    | Some(Role::Subsurface(_))
             ) {
                 continue;
             }
@@ -562,6 +634,61 @@ impl SurfaceManager {
         surface.role = Some(Role::Xdg(xdg_surface_id));
         surface.xdg_map_ready = false;
         Ok(())
+    }
+
+    pub fn assign_layer_role(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        layer_surface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        if surface.role.is_some() {
+            return Err(SurfaceError::RoleAlreadyAssigned);
+        }
+        surface.role = Some(Role::Layer(layer_surface_id));
+        surface.xdg_map_ready = false;
+        Ok(())
+    }
+
+    pub fn clear_layer_role(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Result<(), SurfaceError> {
+        let surface = self
+            .surfaces
+            .get_mut(&(client_id, surface_id))
+            .ok_or(SurfaceError::UnknownSurface)?;
+        if matches!(surface.role, Some(Role::Layer(_))) {
+            surface.role = None;
+            surface.xdg_map_ready = false;
+        }
+        Ok(())
+    }
+
+    pub fn surface_role_is_layer(&self, client_id: ClientId, surface_id: ObjectId) -> bool {
+        self.surfaces
+            .get(&(client_id, surface_id))
+            .is_some_and(|surface| matches!(surface.role, Some(Role::Layer(_))))
+    }
+
+    /// True when the surface (or an ancestor via role_parent) is a layer-shell root.
+    pub fn surface_in_layer_tree(&self, client_id: ClientId, surface_id: ObjectId) -> bool {
+        let mut current = Some(surface_id);
+        while let Some(id) = current {
+            let Some(surface) = self.surfaces.get(&(client_id, id)) else {
+                return false;
+            };
+            if matches!(surface.role, Some(Role::Layer(_))) {
+                return true;
+            }
+            current = surface.role_parent;
+        }
+        false
     }
 
     pub fn clear_xdg_role(
@@ -1688,7 +1815,11 @@ impl SurfaceManager {
         let layout = self.surface_origin(client_id, id).unwrap_or((0, 0));
         // Only restack on map/unmap. Re-raising on every commit desyncs hit-testing
         // from draw order (renderer keeps insertion order) and steals pointer focus.
-        if newly_mapped {
+        let is_layer = self
+            .surfaces
+            .get(&(client_id, id))
+            .is_some_and(|surface| matches!(surface.role, Some(Role::Layer(_))));
+        if newly_mapped && !is_layer {
             self.record_painted_surface(client_id, id);
         } else if was_mapped && !mapped {
             self.remove_painted_surface(client_id, id);
@@ -1808,6 +1939,7 @@ impl SurfaceManager {
                 }
                 Ok(true)
             }
+            Some(Role::Layer(_)) => Ok(surface.xdg_map_ready),
             Some(Role::Subsurface(sub_id)) => {
                 let parent = self
                     .subsurfaces
@@ -2166,6 +2298,7 @@ fn is_whole_number(value: f32) -> bool {
 enum Role {
     Shell(ObjectId),
     Xdg(ObjectId),
+    Layer(ObjectId),
     Subsurface(ObjectId),
     Cursor,
     DndIcon,

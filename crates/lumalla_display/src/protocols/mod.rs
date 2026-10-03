@@ -1,3 +1,4 @@
+pub(crate) mod layer_shell;
 mod linux_dmabuf;
 mod pointer_constraints;
 mod presentation_time;

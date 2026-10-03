@@ -11,8 +11,9 @@ use crate::{
     protocols::{
         LinuxDmabufV1Protocol, PointerConstraintsUnstableV1Protocol, PresentationTimeProtocol,
         RelativePointerUnstableV1Protocol, ViewporterProtocol, WaylandProtocol, WlDisplay,
-        XdgShellProtocol, linux_dmabuf::*, pointer_constraints::*, presentation_time::*,
-        relative_pointer::*, viewporter::*, wayland::*, xdg_shell::*,
+        WlrLayerShellUnstableV1Protocol, XdgShellProtocol, linux_dmabuf::*,
+        pointer_constraints::*, presentation_time::*, relative_pointer::*, viewporter::*,
+        wayland::*, wlr_layer_shell::*, xdg_shell::*,
     },
 };
 
@@ -58,6 +59,8 @@ pub enum InterfaceIndex {
     ZwpConfinedPointerV1,
     ZwpRelativePointerManagerV1,
     ZwpRelativePointerV1,
+    ZwlrLayerShellV1,
+    ZwlrLayerSurfaceV1,
 }
 
 impl InterfaceIndex {
@@ -103,6 +106,8 @@ impl InterfaceIndex {
             InterfaceIndex::ZwpConfinedPointerV1 => ZWP_CONFINED_POINTER_V1_NAME,
             InterfaceIndex::ZwpRelativePointerManagerV1 => ZWP_RELATIVE_POINTER_MANAGER_V1_NAME,
             InterfaceIndex::ZwpRelativePointerV1 => ZWP_RELATIVE_POINTER_V1_NAME,
+            InterfaceIndex::ZwlrLayerShellV1 => ZWLR_LAYER_SHELL_V1_NAME,
+            InterfaceIndex::ZwlrLayerSurfaceV1 => ZWLR_LAYER_SURFACE_V1_NAME,
         }
     }
 
@@ -148,6 +153,8 @@ impl InterfaceIndex {
             InterfaceIndex::ZwpConfinedPointerV1 => ZWP_CONFINED_POINTER_V1_VERSION,
             InterfaceIndex::ZwpRelativePointerManagerV1 => ZWP_RELATIVE_POINTER_MANAGER_V1_VERSION,
             InterfaceIndex::ZwpRelativePointerV1 => ZWP_RELATIVE_POINTER_V1_VERSION,
+            InterfaceIndex::ZwlrLayerShellV1 => ZWLR_LAYER_SHELL_V1_VERSION,
+            InterfaceIndex::ZwlrLayerSurfaceV1 => ZWLR_LAYER_SURFACE_V1_VERSION,
         }
     }
 }
@@ -318,7 +325,8 @@ where
         + PresentationTimeProtocol
         + ViewporterProtocol
         + PointerConstraintsUnstableV1Protocol
-        + RelativePointerUnstableV1Protocol,
+        + RelativePointerUnstableV1Protocol
+        + WlrLayerShellUnstableV1Protocol,
 {
     fn handle_request(
         &mut self,
@@ -469,6 +477,12 @@ where
             }
             InterfaceIndex::ZwpRelativePointerV1 => {
                 ZwpRelativePointerV1::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ZwlrLayerShellV1 => {
+                ZwlrLayerShellV1::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ZwlrLayerSurfaceV1 => {
+                ZwlrLayerSurfaceV1::handle_request(self, ctx, header, data, fds, object.version)
             }
         }
     }

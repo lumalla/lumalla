@@ -1538,6 +1538,8 @@ pub fn composite_to_scanout(
     composite_mode: CompositeMode,
     views: &[View],
     layers: &[&SurfaceFrame],
+    below_layers: &[&SurfaceFrame],
+    above_layers: &[&SurfaceFrame],
     guides: &[Guide],
     cursor: CursorDraw<'_>,
     pointer_x: i32,
@@ -1560,6 +1562,8 @@ pub fn composite_to_scanout(
     )?;
     recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
     let draw_list = build_layer_draw_list(cache, layers);
+    let below_list = build_layer_draw_list(cache, below_layers);
+    let above_list = build_layer_draw_list(cache, above_layers);
 
     match composite_mode {
         CompositeMode::Full => {
@@ -1570,6 +1574,8 @@ pub fn composite_to_scanout(
                 cache,
                 views,
                 &draw_list,
+                &below_list,
+                &above_list,
                 guides,
                 cursor,
                 pointer_x,
@@ -1592,6 +1598,8 @@ pub fn composite_to_scanout(
                     cache,
                     views,
                     &draw_list,
+                    &below_list,
+                    &above_list,
                     guides,
                     cursor,
                     pointer_x,
@@ -1820,6 +1828,8 @@ fn draw_views(
     cache: &SurfaceTextureCache,
     views: &[View],
     layers: &[LayerDrawItem],
+    below_layers: &[LayerDrawItem],
+    above_layers: &[LayerDrawItem],
     guides: &[Guide],
     cursor: CursorDraw<'_>,
     pointer_x: i32,
@@ -1828,6 +1838,16 @@ fn draw_views(
     output_height: u32,
     outer_clip: Option<&vk::Rect2D>,
 ) {
+    // Output-local shell chrome below the desktop views (background + bottom).
+    draw_output_local_layers(
+        compositor,
+        device,
+        recorder,
+        below_layers,
+        output_width,
+        output_height,
+        outer_clip,
+    );
     for view in views {
         let Some(view_clip) = view_dest_clip(view, output_width, output_height) else {
             continue;
@@ -1874,6 +1894,16 @@ fn draw_views(
             Some(&clip),
         );
     }
+    // Output-local shell chrome above the desktop views (top + overlay).
+    draw_output_local_layers(
+        compositor,
+        device,
+        recorder,
+        above_layers,
+        output_width,
+        output_height,
+        outer_clip,
+    );
     // Cursor is monitor/dest-native: draw once in output pixels, never through a view.
     draw_cursor_layer(
         compositor,
@@ -1887,6 +1917,44 @@ fn draw_views(
         output_height,
         outer_clip,
     );
+}
+
+fn draw_output_local_layers(
+    compositor: &GpuCompositor,
+    device: &Device,
+    recorder: &mut CommandBufferRecorder<'_>,
+    layers: &[LayerDrawItem],
+    output_width: u32,
+    output_height: u32,
+    clip: Option<&vk::Rect2D>,
+) {
+    if layers.is_empty() {
+        return;
+    }
+    recorder.bind_pipeline(&compositor.pipeline);
+    compositor.set_layer_viewport(recorder, output_width, output_height, clip);
+    for item in layers {
+        let dest = item.scene_dest;
+        if dest[2] <= 0.0 || dest[3] <= 0.0 {
+            continue;
+        }
+        if let Some(clip) = clip
+            && !dest_intersects_clip(dest, clip)
+        {
+            continue;
+        }
+        compositor.draw_layer_prepared(
+            device,
+            recorder,
+            item.descriptor_set,
+            dest,
+            item.src_uv,
+            output_width,
+            output_height,
+            item.force_opaque,
+            item.buffer_transform,
+        );
+    }
 }
 
 fn draw_guides(
