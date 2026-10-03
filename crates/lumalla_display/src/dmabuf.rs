@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fmt,
     io::Write,
+    mem::ManuallyDrop,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     path::Path,
 };
@@ -120,10 +121,18 @@ pub struct ExportedDmabuf {
 
 #[derive(Debug)]
 struct Plane {
-    fd: OwnedFd,
+    /// Wrapped so [`Drop`] can close without `OwnedFd`'s debug abort on EBADF.
+    fd: ManuallyDrop<OwnedFd>,
     offset: u32,
     stride: u32,
     modifier: u64,
+}
+
+impl Drop for Plane {
+    fn drop(&mut self) {
+        // Prefer quiet close(2): a double-closed fd must not abort the compositor.
+        close_owned_fd(unsafe { ManuallyDrop::take(&mut self.fd) });
+    }
 }
 
 #[derive(Debug)]
@@ -392,7 +401,7 @@ impl DmabufManager {
         }
         let modifier = ((modifier_hi as u64) << 32) | (modifier_lo as u64);
         params.planes[plane_idx as usize] = Some(Plane {
-            fd,
+            fd: ManuallyDrop::new(fd),
             offset,
             stride,
             modifier,
@@ -475,12 +484,19 @@ impl DmabufManager {
         if plane.modifier == DRM_FORMAT_MOD_LINEAR {
             let needed = (plane.offset as u64)
                 .saturating_add((plane.stride as u64).saturating_mul(height as u64));
-            let size = fd_size(plane.fd.as_raw_fd())?;
-            if needed > size {
-                return Err(DmabufError::new(
-                    DmabufErrorKind::OutOfBounds,
-                    "dmabuf plane is out of bounds",
-                ));
+            match fd_size(plane.fd.as_raw_fd()) {
+                Ok(size) if needed > size => {
+                    params.planes[0] = Some(plane);
+                    return Err(DmabufError::new(
+                        DmabufErrorKind::OutOfBounds,
+                        "dmabuf plane is out of bounds",
+                    ));
+                }
+                Err(error) => {
+                    params.planes[0] = Some(plane);
+                    return Err(error);
+                }
+                Ok(_) => {}
             }
         }
         params.used = true;

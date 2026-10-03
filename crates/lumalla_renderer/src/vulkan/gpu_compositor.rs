@@ -123,6 +123,7 @@ impl GpuWorkBatch {
             fence: Some(fence),
             command_buffers: vec![command_buffer],
             staging: std::mem::take(&mut self.staging),
+            texture_epoch: None,
         })
     }
 }
@@ -132,6 +133,8 @@ pub struct PendingGpuSubmit {
     fence: Option<Fence>,
     command_buffers: Vec<vk::CommandBuffer>,
     staging: Vec<StagingBuffer>,
+    /// Texture-cache epoch from [`SurfaceTextureCache::begin_submit`], if tracked.
+    texture_epoch: Option<u64>,
 }
 
 impl PendingGpuSubmit {
@@ -140,11 +143,23 @@ impl PendingGpuSubmit {
             fence: None,
             command_buffers: Vec::new(),
             staging: Vec::new(),
+            texture_epoch: None,
         }
     }
 
     pub fn is_pending(&self) -> bool {
         self.fence.is_some()
+    }
+
+    /// Bind this submit to a [`SurfaceTextureCache::begin_submit`] epoch.
+    pub fn with_texture_epoch(mut self, epoch: u64) -> Self {
+        self.texture_epoch = Some(epoch);
+        self
+    }
+
+    /// Epoch used for deferred texture retirement, if any.
+    pub fn texture_epoch(&self) -> Option<u64> {
+        self.texture_epoch
     }
 
     /// Recycle command buffers and return staging to the pool after the fence has signaled.
@@ -189,6 +204,25 @@ impl PendingGpuSubmit {
         }
         self.recycle(vulkan);
         Ok(None)
+    }
+}
+
+impl Drop for PendingGpuSubmit {
+    fn drop(&mut self) {
+        // Staging buffers and the fence must outlive GPU use. Callers should
+        // recycle via wait()/try_complete(); this is a safety net against UAF
+        // when a ScanoutBuffer/slot is dropped with work still in flight.
+        if let Some(fence) = self.fence.take() {
+            if fence.wait_default().is_err() {
+                let _ = unsafe { fence.device_handle().device_wait_idle() };
+            }
+        }
+        self.staging.clear();
+        // Command buffers cannot be returned without VulkanContext; leak rather
+        // than free into a live pool from the wrong thread/context.
+        if !self.command_buffers.is_empty() {
+            std::mem::forget(std::mem::take(&mut self.command_buffers));
+        }
     }
 }
 
@@ -500,6 +534,14 @@ impl TextureBacking {
     }
 }
 
+/// Texture kept alive until the GPU submits that may still sample it complete.
+struct RetiredTexture {
+    texture: SurfaceTexture,
+    /// Submit epochs that were in flight when this texture was retired. Safe to
+    /// free once none of these epochs remain in flight.
+    blocked_by: HashSet<u64>,
+}
+
 pub struct SurfaceTextureCache {
     /// Current texture bound for compositing, keyed by `(owner_id, surface_id)`.
     textures: HashMap<(u32, u32), SurfaceTexture>,
@@ -507,6 +549,12 @@ pub struct SurfaceTextureCache {
     dmabuf_by_buffer: HashMap<(u32, u32), SurfaceTexture>,
     /// Content last uploaded for each guide-label texture index.
     guide_label_uploaded: HashMap<u32, GuideLabelKey>,
+    /// Textures no longer referenced by the cache, kept alive until in-flight GPU
+    /// submits that may still sample them have finished.
+    retired: Vec<RetiredTexture>,
+    /// Epochs of GPU submits that have been installed but not yet finished.
+    in_flight_epochs: HashSet<u64>,
+    next_submit_epoch: u64,
 }
 
 /// Soft cap on parked DMA-BUF imports per client (beyond the currently bound ones).
@@ -518,41 +566,141 @@ impl SurfaceTextureCache {
             textures: HashMap::new(),
             dmabuf_by_buffer: HashMap::new(),
             guide_label_uploaded: HashMap::new(),
+            retired: Vec::new(),
+            in_flight_epochs: HashSet::new(),
+            next_submit_epoch: 1,
         }
     }
 
     pub fn clear(&mut self) {
-        self.textures.clear();
-        self.dmabuf_by_buffer.clear();
+        let blocking = self.in_flight_epochs.clone();
+        for (_, tex) in self.textures.drain() {
+            self.retired.push(RetiredTexture {
+                texture: tex,
+                blocked_by: blocking.clone(),
+            });
+        }
+        for (_, tex) in self.dmabuf_by_buffer.drain() {
+            self.retired.push(RetiredTexture {
+                texture: tex,
+                blocked_by: blocking.clone(),
+            });
+        }
         self.guide_label_uploaded.clear();
+        self.in_flight_epochs.clear();
+    }
+
+    fn retire(&mut self, tex: SurfaceTexture) {
+        self.retired.push(RetiredTexture {
+            texture: tex,
+            blocked_by: self.in_flight_epochs.clone(),
+        });
+    }
+
+    /// Allocate a submit epoch and mark it in flight. Pair with [`Self::complete_submit`].
+    pub fn begin_submit(&mut self) -> u64 {
+        let epoch = self.next_submit_epoch;
+        self.next_submit_epoch = self.next_submit_epoch.wrapping_add(1).max(1);
+        self.in_flight_epochs.insert(epoch);
+        epoch
+    }
+
+    /// Mark a submit finished so retired textures blocked only on it can flush.
+    pub fn complete_submit(&mut self, epoch: u64) {
+        self.in_flight_epochs.remove(&epoch);
+    }
+
+    /// Drop tracking for epochs that are no longer referenced by any live pending submit.
+    ///
+    /// Handles the rare case where a [`PendingGpuSubmit`] is dropped without
+    /// [`Self::complete_submit`] (epoch would otherwise pin retired textures forever).
+    pub fn retain_in_flight(&mut self, live_epochs: &HashSet<u64>) {
+        self.in_flight_epochs
+            .retain(|epoch| live_epochs.contains(epoch));
+    }
+
+    /// Whether any textures are waiting to be freed after GPU work completes.
+    pub fn has_retired(&self) -> bool {
+        !self.retired.is_empty()
+    }
+
+    /// Free descriptor sets and drop retired textures whose blocking submits finished.
+    pub fn flush_retired(
+        &mut self,
+        device: &Device,
+        pool: &DescriptorPool,
+    ) -> anyhow::Result<()> {
+        let mut i = 0;
+        while i < self.retired.len() {
+            let unblocked = self.retired[i]
+                .blocked_by
+                .iter()
+                .all(|epoch| !self.in_flight_epochs.contains(epoch));
+            if unblocked {
+                let retired = self.retired.swap_remove(i);
+                pool.free_set(device, retired.texture.descriptor_set)?;
+            } else {
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop retired textures without touching the descriptor pool (device gone).
+    pub fn forget_retired(&mut self) {
+        self.retired.clear();
+        self.in_flight_epochs.clear();
     }
 
     pub fn remove(&mut self, key: (u32, u32)) {
-        if let Some(tex) = self.textures.remove(&key)
-            && matches!(tex.backing, TextureBacking::Dmabuf(_))
-        {
+        let Some(tex) = self.textures.remove(&key) else {
+            return;
+        };
+        if matches!(tex.backing, TextureBacking::Dmabuf(_)) {
             let buf_key = (key.0, tex.buffer_id);
             self.dmabuf_by_buffer.insert(buf_key, tex);
+        } else {
+            // SHM images may still be sampled by an in-flight submit.
+            self.retire(tex);
         }
     }
 
     pub fn remove_client(&mut self, owner_id: u32) {
-        self.textures.retain(|(owner, _), _| *owner != owner_id);
-        self.dmabuf_by_buffer
-            .retain(|(owner, _), _| *owner != owner_id);
+        let texture_keys: Vec<(u32, u32)> = self
+            .textures
+            .keys()
+            .copied()
+            .filter(|(owner, _)| *owner == owner_id)
+            .collect();
+        for key in texture_keys {
+            if let Some(tex) = self.textures.remove(&key) {
+                self.retire(tex);
+            }
+        }
+        let buffer_keys: Vec<(u32, u32)> = self
+            .dmabuf_by_buffer
+            .keys()
+            .copied()
+            .filter(|(owner, _)| *owner == owner_id)
+            .collect();
+        for key in buffer_keys {
+            if let Some(tex) = self.dmabuf_by_buffer.remove(&key) {
+                self.retire(tex);
+            }
+        }
     }
 
     /// Drop a parked or currently-bound DMA-BUF import when the `wl_buffer` is destroyed.
     pub fn remove_dmabuf_buffer(
         &mut self,
-        device: &Device,
-        pool: &DescriptorPool,
+        _device: &Device,
+        _pool: &DescriptorPool,
         owner_id: u32,
         buffer_id: u32,
     ) -> anyhow::Result<()> {
         let buf_key = (owner_id, buffer_id);
         if let Some(tex) = self.dmabuf_by_buffer.remove(&buf_key) {
-            pool.free_set(device, tex.descriptor_set)?;
+            self.retire(tex);
         }
         let doomed: Vec<(u32, u32)> = self
             .textures
@@ -570,7 +718,7 @@ impl SurfaceTextureCache {
             .collect();
         for key in doomed {
             if let Some(tex) = self.textures.remove(&key) {
-                pool.free_set(device, tex.descriptor_set)?;
+                self.retire(tex);
             }
         }
         Ok(())
@@ -578,12 +726,28 @@ impl SurfaceTextureCache {
 
     /// Drop cached DMA-BUF entries without freeing descriptor sets (Vulkan already gone).
     pub fn forget_dmabuf_buffer(&mut self, owner_id: u32, buffer_id: u32) {
-        self.dmabuf_by_buffer.remove(&(owner_id, buffer_id));
-        self.textures.retain(|key, tex| {
-            !(key.0 == owner_id
-                && tex.buffer_id == buffer_id
-                && matches!(tex.backing, TextureBacking::Dmabuf(_)))
-        });
+        if let Some(tex) = self.dmabuf_by_buffer.remove(&(owner_id, buffer_id)) {
+            self.retire(tex);
+        }
+        let doomed: Vec<(u32, u32)> = self
+            .textures
+            .iter()
+            .filter_map(|(&key, tex)| {
+                if key.0 == owner_id
+                    && tex.buffer_id == buffer_id
+                    && matches!(tex.backing, TextureBacking::Dmabuf(_))
+                {
+                    Some(key)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for key in doomed {
+            if let Some(tex) = self.textures.remove(&key) {
+                self.retire(tex);
+            }
+        }
     }
 
     fn texture(&self, key: (u32, u32)) -> Option<&SurfaceTexture> {
@@ -592,8 +756,8 @@ impl SurfaceTextureCache {
 
     fn replace_texture(
         &mut self,
-        device: &Device,
-        pool: &DescriptorPool,
+        _device: &Device,
+        _pool: &DescriptorPool,
         key: (u32, u32),
         texture: SurfaceTexture,
     ) -> anyhow::Result<()> {
@@ -602,12 +766,12 @@ impl SurfaceTextureCache {
                 TextureBacking::Dmabuf(_) => {
                     let buf_key = (key.0, old.buffer_id);
                     if let Some(dup) = self.dmabuf_by_buffer.insert(buf_key, old) {
-                        pool.free_set(device, dup.descriptor_set)?;
+                        self.retire(dup);
                     }
-                    self.trim_parked_dmabufs(device, pool, key.0)?;
+                    self.trim_parked_dmabufs(key.0);
                 }
                 TextureBacking::Shm(_) => {
-                    pool.free_set(device, old.descriptor_set)?;
+                    self.retire(old);
                 }
             }
         }
@@ -615,12 +779,7 @@ impl SurfaceTextureCache {
         Ok(())
     }
 
-    fn trim_parked_dmabufs(
-        &mut self,
-        device: &Device,
-        pool: &DescriptorPool,
-        owner_id: u32,
-    ) -> anyhow::Result<()> {
+    fn trim_parked_dmabufs(&mut self, owner_id: u32) {
         let parked: Vec<(u32, u32)> = self
             .dmabuf_by_buffer
             .keys()
@@ -630,10 +789,9 @@ impl SurfaceTextureCache {
         let excess = parked.len().saturating_sub(MAX_PARKED_DMABUFS_PER_CLIENT);
         for buf_key in parked.into_iter().take(excess) {
             if let Some(tex) = self.dmabuf_by_buffer.remove(&buf_key) {
-                pool.free_set(device, tex.descriptor_set)?;
+                self.retire(tex);
             }
         }
-        Ok(())
     }
 
     fn dmabuf_params_match(tex: &SurfaceTexture, frame: &SurfaceFrame, dmabuf: &DmabufAttachment) -> bool {
@@ -886,9 +1044,7 @@ impl SurfaceTextureCache {
                 acquire_dmabuf_for_sample(vulkan, batch, image, false)?;
                 return Ok(());
             }
-            compositor
-                .descriptor_pool
-                .free_set(vulkan.device(), cached.descriptor_set)?;
+            self.retire(cached);
         }
 
         let format = drm_fourcc_to_vulkan(dmabuf.drm_fourcc)
@@ -1071,8 +1227,8 @@ impl SurfaceTextureCache {
     /// Drop guide-label textures (and upload tracking) for indices ≥ `live_count`.
     pub fn prune_guide_labels(
         &mut self,
-        device: &Device,
-        pool: &DescriptorPool,
+        _device: &Device,
+        _pool: &DescriptorPool,
         live_count: u32,
     ) -> anyhow::Result<()> {
         let doomed: Vec<(u32, u32)> = self
@@ -1083,7 +1239,7 @@ impl SurfaceTextureCache {
             .collect();
         for key in doomed {
             if let Some(tex) = self.textures.remove(&key) {
-                pool.free_set(device, tex.descriptor_set)?;
+                self.retire(tex);
             }
             self.guide_label_uploaded.remove(&key.1);
         }

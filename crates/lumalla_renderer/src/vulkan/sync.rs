@@ -79,6 +79,11 @@ impl Fence {
     pub fn handle(&self) -> vk::Fence {
         self.handle
     }
+
+    /// Underlying ash device (for emergency `device_wait_idle` from Drop paths).
+    pub(crate) fn device_handle(&self) -> &ash::Device {
+        &self.device
+    }
 }
 
 impl Drop for Fence {

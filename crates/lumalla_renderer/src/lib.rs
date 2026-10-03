@@ -72,6 +72,7 @@ impl GpuRenderResources {
     fn clear(&mut self) {
         self.compositor = None;
         self.surface_textures.clear();
+        self.surface_textures.forget_retired();
         self.guide_labels.clear();
     }
 
@@ -474,6 +475,9 @@ impl RendererState {
     }
 
     fn invalidate_surface_textures(&mut self) {
+        if let Err(err) = self.wait_all_pending_gpu() {
+            warn!("Failed waiting for GPU work before invalidating textures: {err:#}");
+        }
         self.gpu.clear();
         self.pending_damage.clear();
         self.pending_surface_buffer_damage.clear();
@@ -481,6 +485,126 @@ impl RendererState {
         self.pending_pointer_damage = false;
         self.dirty_surface_keys.clear();
         self.cursor_buffer_dirty = false;
+    }
+
+    fn live_texture_epochs(&self) -> HashSet<u64> {
+        let mut live = HashSet::new();
+        for output in self.outputs.values() {
+            let Some(planes) = output.planes.as_ref() else {
+                continue;
+            };
+            for pipe in std::iter::once(&planes.primary)
+                .chain(planes.cursor.iter())
+                .chain(planes.overlays.iter())
+            {
+                for buffer in [&pipe.current, &pipe.pending, &pipe.queued]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(epoch) = buffer
+                        .gpu_pending
+                        .as_ref()
+                        .and_then(|p| p.texture_epoch())
+                    {
+                        live.insert(epoch);
+                    }
+                }
+            }
+        }
+        for slots in self.screencast_buffers.values() {
+            for slot in slots {
+                if let Some(epoch) = slot.gpu_pending.as_ref().and_then(|p| p.texture_epoch())
+                {
+                    live.insert(epoch);
+                }
+            }
+        }
+        live
+    }
+
+    /// Wait for every in-flight scanout/screencast GPU submit, then free retired textures.
+    fn wait_all_pending_gpu(&mut self) -> anyhow::Result<()> {
+        let mut pending = Vec::new();
+        for output in self.outputs.values_mut() {
+            if let Some(planes) = output.planes.as_mut() {
+                for pipe in std::iter::once(&mut planes.primary)
+                    .chain(planes.cursor.iter_mut())
+                    .chain(planes.overlays.iter_mut())
+                {
+                    for slot in [
+                        &mut pipe.current,
+                        &mut pipe.pending,
+                        &mut pipe.queued,
+                    ] {
+                        if let Some(buffer) = slot.as_mut()
+                            && let Some(submit) = buffer.gpu_pending.take()
+                        {
+                            pending.push(submit);
+                        }
+                    }
+                }
+            }
+        }
+        for slots in self.screencast_buffers.values_mut() {
+            for slot in slots.iter_mut() {
+                if let Some(submit) = slot.gpu_pending.take() {
+                    pending.push(submit);
+                }
+            }
+        }
+        if pending.is_empty() {
+            return self.flush_retired_textures();
+        }
+        for submit in pending {
+            self.finish_gpu_pending(submit)?;
+        }
+        self.flush_retired_textures()
+    }
+
+    fn flush_retired_textures(&mut self) -> anyhow::Result<()> {
+        if !self.gpu.surface_textures.has_retired() {
+            return Ok(());
+        }
+        let live = self.live_texture_epochs();
+        self.gpu.surface_textures.retain_in_flight(&live);
+        let (Some(vulkan), Some(compositor)) =
+            (self.vulkan.as_ref(), self.gpu.compositor.as_ref())
+        else {
+            self.gpu.surface_textures.forget_retired();
+            return Ok(());
+        };
+        self.gpu
+            .surface_textures
+            .flush_retired(vulkan.device(), &compositor.descriptor_pool)
+    }
+
+    fn install_scanout_gpu_pending(
+        &mut self,
+        buffer: &mut ScanoutBuffer,
+        pending: crate::vulkan::PendingGpuSubmit,
+    ) -> anyhow::Result<()> {
+        if let Some(previous) = buffer.gpu_pending.take() {
+            self.finish_gpu_pending(previous)?;
+        }
+        let epoch = self.gpu.surface_textures.begin_submit();
+        buffer.gpu_pending = Some(pending.with_texture_epoch(epoch));
+        Ok(())
+    }
+
+    fn finish_gpu_pending(
+        &mut self,
+        pending: crate::vulkan::PendingGpuSubmit,
+    ) -> anyhow::Result<()> {
+        let epoch = pending.texture_epoch();
+        let vulkan = self
+            .vulkan
+            .as_mut()
+            .context("VulkanContext missing while finishing GPU work")?;
+        pending.wait(vulkan)?;
+        if let Some(epoch) = epoch {
+            self.gpu.surface_textures.complete_submit(epoch);
+        }
+        self.flush_retired_textures()
     }
 
     fn note_pointer_damage(&mut self, new_x: i32, new_y: i32) {
@@ -837,6 +961,7 @@ impl RendererState {
         }
         self.surface_order = new_order;
         if changed {
+            let _ = self.flush_retired_textures();
             self.pending_full_redraw = true;
             self.pending_damage.clear();
             self.mark_dirty_if_active();
@@ -850,6 +975,7 @@ impl RendererState {
             self.gpu.surface_textures.remove(key);
             self.dirty_surface_keys.remove(&key);
             self.pending_surface_buffer_damage.remove(&key);
+            self.flush_retired_textures()?;
             self.pending_full_redraw = true;
             self.pending_damage.clear();
             self.mark_dirty_if_active();
@@ -864,6 +990,7 @@ impl RendererState {
             self.gpu
                 .surface_textures
                 .forget_dmabuf_buffer(owner_id, buffer_id);
+            self.gpu.surface_textures.forget_retired();
             return Ok(());
         };
         self.gpu.surface_textures.remove_dmabuf_buffer(
@@ -871,7 +998,8 @@ impl RendererState {
             &compositor.descriptor_pool,
             owner_id,
             buffer_id,
-        )
+        )?;
+        self.flush_retired_textures()
     }
 
     pub fn remove_client_frames(&mut self, owner_id: u32) -> anyhow::Result<()> {
@@ -880,6 +1008,7 @@ impl RendererState {
             .retain(|(owner, _), _| *owner != owner_id);
         self.surface_order.retain(|(owner, _)| *owner != owner_id);
         self.gpu.surface_textures.remove_client(owner_id);
+        let _ = self.flush_retired_textures();
         self.pending_surface_buffer_damage
             .retain(|(owner, _), _| *owner != owner_id);
         let cursor_removed = self
@@ -1070,11 +1199,7 @@ impl RendererState {
                 .and_then(|p| p.current.as_mut())
                 .and_then(|b| b.gpu_pending.take())
             {
-                let vulkan = self
-                    .vulkan
-                    .as_mut()
-                    .context("Vulkan is not initialized for screenshot capture")?;
-                pending.wait(vulkan)?;
+                self.finish_gpu_pending(pending)?;
             }
 
             let vulkan = self
@@ -1317,11 +1442,7 @@ impl RendererState {
                 .and_then(|p| p.current.as_mut())
                 .and_then(|b| b.gpu_pending.take())
             {
-                let vulkan = self
-                    .vulkan
-                    .as_mut()
-                    .context("Vulkan missing while waiting for scanout")?;
-                pending.wait(vulkan)?;
+                self.finish_gpu_pending(pending)?;
             }
         }
 
@@ -1493,17 +1614,7 @@ impl RendererState {
             .context("Vulkan missing for screencast submit")?;
         let pending = batch.submit(vulkan)?;
         let serial = self.screencast_content_serial;
-
-        if let Some(slot) = self
-            .screencast_buffers
-            .get_mut(&stream_id)
-            .and_then(|slots| slots.get_mut(index))
-        {
-            slot.gpu_pending = Some(pending);
-            slot.in_use = true;
-            slot.fresh = false;
-            slot.content_serial = Some(serial);
-        }
+        self.install_screencast_gpu_pending(stream_id, index, pending, serial)?;
         Ok(())
     }
 
@@ -1681,16 +1792,38 @@ impl RendererState {
             .context("Vulkan missing for window screencast submit")?;
         let pending = batch.submit(vulkan)?;
         let serial = self.screencast_content_serial;
+        self.install_screencast_gpu_pending(stream_id, index, pending, serial)?;
+        Ok(())
+    }
 
+    fn install_screencast_gpu_pending(
+        &mut self,
+        stream_id: u32,
+        index: usize,
+        pending: crate::vulkan::PendingGpuSubmit,
+        serial: u64,
+    ) -> anyhow::Result<()> {
+        let previous = self
+            .screencast_buffers
+            .get_mut(&stream_id)
+            .and_then(|slots| slots.get_mut(index))
+            .and_then(|slot| slot.gpu_pending.take());
+        if let Some(previous) = previous {
+            self.finish_gpu_pending(previous)?;
+        }
+        let epoch = self.gpu.surface_textures.begin_submit();
         if let Some(slot) = self
             .screencast_buffers
             .get_mut(&stream_id)
             .and_then(|slots| slots.get_mut(index))
         {
-            slot.gpu_pending = Some(pending);
+            slot.gpu_pending = Some(pending.with_texture_epoch(epoch));
             slot.in_use = true;
             slot.fresh = false;
             slot.content_serial = Some(serial);
+        } else {
+            // Slot vanished; finish immediately so the epoch does not leak.
+            self.finish_gpu_pending(pending.with_texture_epoch(epoch))?;
         }
         Ok(())
     }
@@ -1887,11 +2020,7 @@ impl RendererState {
         let Some(pending) = pending else {
             return Ok(());
         };
-        let vulkan = self
-            .vulkan
-            .as_mut()
-            .context("Vulkan missing while waiting for screencast GPU work")?;
-        pending.wait(vulkan)
+        self.finish_gpu_pending(pending)
     }
 
     /// Block until all in-flight screencast GPU fills for `stream_id` complete.
@@ -1944,12 +2073,19 @@ impl RendererState {
             let Some(pending) = pending else {
                 continue;
             };
+            let epoch = pending.texture_epoch();
             let vulkan = self
                 .vulkan
                 .as_mut()
                 .context("Vulkan missing while polling screencast GPU work")?;
             match pending.try_complete(vulkan)? {
-                None => ready.push((stream_id, index)),
+                None => {
+                    if let Some(epoch) = epoch {
+                        self.gpu.surface_textures.complete_submit(epoch);
+                    }
+                    let _ = self.flush_retired_textures();
+                    ready.push((stream_id, index));
+                }
                 Some(still) => {
                     if let Some(slot) = self
                         .screencast_buffers
@@ -1957,6 +2093,9 @@ impl RendererState {
                         .and_then(|slots| slots.get_mut(index))
                     {
                         slot.gpu_pending = Some(still);
+                    } else {
+                        // Slot gone while still pending — finish so textures can retire.
+                        self.finish_gpu_pending(still)?;
                     }
                 }
             }
@@ -2924,6 +3063,7 @@ impl RendererState {
                     .acquire_virtual(vulkan, width, height, format, fourcc)?
             }
         };
+        self.wait_scanout_gpu(&mut buffer)?;
 
         let _pending_damage = std::mem::take(&mut self.pending_damage);
         let pending_surface_buffer_damage = std::mem::take(&mut self.pending_surface_buffer_damage);
@@ -2976,19 +3116,6 @@ impl RendererState {
             buffer.fresh,
         );
 
-        let layers: Vec<&SurfaceFrame> = self
-            .surface_order
-            .iter()
-            .filter_map(|key| self.surface_frames.get(key))
-            .collect();
-        let cursor = if hw_cursor {
-            CursorDraw::Hidden
-        } else {
-            self.cursor_state.draw_ref()
-        };
-        let pointer_x = self.pointer_x;
-        let pointer_y = self.pointer_y;
-
         let mut batch = GpuWorkBatch::new();
 
         // Buffer-age path: when the back buffer still holds a recent frame, expand
@@ -3035,11 +3162,7 @@ impl RendererState {
                 buf.gpu_pending.take()
             });
             if let Some(pending) = src_gpu {
-                let vulkan = self
-                    .vulkan
-                    .as_mut()
-                    .context("VulkanContext missing while waiting for scanout copy source")?;
-                pending.wait(vulkan)?;
+                self.finish_gpu_pending(pending)?;
             }
             let src_ptr = self.outputs.get(&target.name).and_then(|output| {
                 let image = output.primary()?.newest_buffer()?;
@@ -3070,6 +3193,19 @@ impl RendererState {
             CompositeMode::Full => None,
             CompositeMode::Partial(_) => frame_damage,
         };
+
+        let layers: Vec<&SurfaceFrame> = self
+            .surface_order
+            .iter()
+            .filter_map(|key| self.surface_frames.get(key))
+            .collect();
+        let cursor = if hw_cursor {
+            CursorDraw::Hidden
+        } else {
+            self.cursor_state.draw_ref()
+        };
+        let pointer_x = self.pointer_x;
+        let pointer_y = self.pointer_y;
 
         {
             let vulkan = self
@@ -3186,11 +3322,16 @@ impl RendererState {
                 batch.abandon(vulkan);
                 self.gpu.surface_textures.clear();
                 self.gpu.compositor = Some(compositor);
+                // Finish other outputs' in-flight work so retired textures can free.
+                let _ = self.wait_all_pending_gpu();
                 return Err(error);
             }
             self.gpu.compositor = Some(compositor);
 
-            buffer.gpu_pending = Some(batch.submit(vulkan)?);
+            let pending = batch.submit(vulkan)?;
+            self.install_scanout_gpu_pending(&mut buffer, pending)?;
+            // sync_scene may have retired replaced textures; free any unblocked ones.
+            let _ = self.flush_retired_textures();
             buffer.fresh = false;
             buffer.content_serial = next_serial;
         }
@@ -3309,11 +3450,7 @@ impl RendererState {
         let Some(pending) = buffer.gpu_pending.take() else {
             return Ok(());
         };
-        let vulkan = self
-            .vulkan
-            .as_mut()
-            .context("VulkanContext missing while waiting for scanout GPU work")?;
-        pending.wait(vulkan)
+        self.finish_gpu_pending(pending)
     }
 
     fn retire_page_flip(&mut self, crtc_id: u32) -> anyhow::Result<Option<String>> {
@@ -3651,6 +3788,12 @@ impl RendererState {
             format,
             fourcc,
         )?;
+        drop(vulkan);
+        self.wait_scanout_gpu(&mut buffer)?;
+        let vulkan = self
+            .vulkan
+            .as_mut()
+            .context("Vulkan missing for cursor FB upload")?;
         upload_bgra_to_image(vulkan, &buffer.dma_image, pixels, width, height)?;
         buffer.fresh = false;
         Ok(buffer)

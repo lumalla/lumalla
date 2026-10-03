@@ -76,10 +76,10 @@ impl ScanoutBufferPool {
             height,
             fourcc,
         };
-        if let Some(mut buffer) = self.free.get_mut(&key).and_then(|free| free.pop()) {
-            if let Some(pending) = buffer.gpu_pending.take() {
-                pending.wait(vulkan)?;
-            }
+        if let Some(buffer) = self.free.get_mut(&key).and_then(|free| free.pop()) {
+            // Caller must finish any leftover `gpu_pending` before reuse so texture
+            // retirement tracking stays accurate on RendererState.
+            let _ = vulkan;
             return Ok(buffer);
         }
         create_kms_scanout_buffer(vulkan, drm_path, drm_fd, width, height, format, fourcc)
@@ -100,10 +100,8 @@ impl ScanoutBufferPool {
             height,
             fourcc,
         };
-        if let Some(mut buffer) = self.free.get_mut(&key).and_then(|free| free.pop()) {
-            if let Some(pending) = buffer.gpu_pending.take() {
-                pending.wait(vulkan)?;
-            }
+        if let Some(buffer) = self.free.get_mut(&key).and_then(|free| free.pop()) {
+            let _ = vulkan;
             return Ok(buffer);
         }
         create_virtual_scanout_buffer(vulkan, width, height, format, fourcc)
