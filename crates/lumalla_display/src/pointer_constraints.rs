@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use lumalla_wayland_protocol::{
     ClientId, ObjectId,
+    buffer::Writer,
     protocols::pointer_constraints::{
         ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT,
     },
@@ -295,13 +296,13 @@ impl PointerConstraintsManager {
     }
 
     /// Deactivate an active constraint (compositor-initiated unlock/unconfine).
-    #[allow(dead_code)]
+    ///
+    /// Returns the committed cursor position hint for an active lock, if any.
     pub fn deactivate(
         &mut self,
-        clients: &mut ConnectedClients,
+        writer: &mut Writer,
         client_id: ClientId,
         object_id: ObjectId,
-        send_event: bool,
     ) -> Option<(f64, f64)> {
         let constraint = self.constraints.get_mut(&(client_id, object_id))?;
         if constraint.phase != ConstraintPhase::Active {
@@ -314,18 +315,12 @@ impl PointerConstraintsManager {
         } else {
             None
         };
-        if send_event {
-            if let Some(client) = clients.get_mut(&client_id) {
-                match kind {
-                    ConstraintKind::Locked => {
-                        client.writer_mut().zwp_locked_pointer_v1_unlocked(object_id);
-                    }
-                    ConstraintKind::Confined => {
-                        client
-                            .writer_mut()
-                            .zwp_confined_pointer_v1_unconfined(object_id);
-                    }
-                }
+        match kind {
+            ConstraintKind::Locked => {
+                writer.zwp_locked_pointer_v1_unlocked(object_id);
+            }
+            ConstraintKind::Confined => {
+                writer.zwp_confined_pointer_v1_unconfined(object_id);
             }
         }
         let constraint = self.constraints.get_mut(&(client_id, object_id))?;
@@ -338,6 +333,21 @@ impl PointerConstraintsManager {
             }
         }
         hint
+    }
+
+    /// Deactivate an active constraint on `surface`, if any.
+    ///
+    /// Used when the surface unmaps or otherwise loses the conditions for a
+    /// capture; the constraint object remains so a persistent lifetime may
+    /// reactivate later.
+    pub fn deactivate_for_surface(
+        &mut self,
+        writer: &mut Writer,
+        client_id: ClientId,
+        surface: ObjectId,
+    ) -> Option<(f64, f64)> {
+        let object_id = self.by_surface.get(&(client_id, surface)).copied()?;
+        self.deactivate(writer, client_id, object_id)
     }
 
     /// Destroy constraint object (client destroy request or teardown).
@@ -414,13 +424,36 @@ impl PointerConstraintsManager {
             constraint.phase = ConstraintPhase::Active;
         }
     }
+
+    #[cfg(test)]
+    fn phase_for_test(&self, client_id: ClientId, object_id: ObjectId) -> Option<ConstraintPhase> {
+        self.constraints
+            .get(&(client_id, object_id))
+            .map(|c| c.phase)
+    }
+
+    #[cfg(test)]
+    fn set_cursor_hint_for_test(
+        &mut self,
+        client_id: ClientId,
+        object_id: ObjectId,
+        hint: (f64, f64),
+    ) {
+        if let Some(constraint) = self.constraints.get_mut(&(client_id, object_id)) {
+            constraint.cursor_hint = Some(hint);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{
+        num::NonZeroU32,
+        os::fd::AsRawFd,
+        os::unix::net::UnixStream,
+    };
 
-    use lumalla_wayland_protocol::{ClientId, ObjectId};
+    use lumalla_wayland_protocol::{ClientId, ObjectId, buffer::Writer};
 
     use super::*;
 
@@ -430,6 +463,12 @@ mod tests {
 
     fn object(id: u32) -> ObjectId {
         ObjectId::new(NonZeroU32::new(id).unwrap())
+    }
+
+    fn writer() -> (UnixStream, Writer) {
+        let (receiver, sender) = UnixStream::pair().unwrap();
+        let writer = Writer::new(sender.as_raw_fd());
+        (receiver, writer)
     }
 
     #[test]
@@ -538,5 +577,58 @@ mod tests {
             .unwrap();
         // Destroy still works.
         assert!(manager.destroy(client(1), object(10)).is_some());
+    }
+
+    #[test]
+    fn deactivate_oneshot_becomes_defunct_and_returns_hint() {
+        let mut manager = PointerConstraintsManager::default();
+        manager
+            .create_constraint(
+                client(1),
+                object(10),
+                ConstraintKind::Locked,
+                object(2),
+                object(3),
+                None,
+                ConstraintLifetime::Oneshot,
+            )
+            .unwrap();
+        manager.force_active_for_test(client(1), object(10));
+        manager.set_cursor_hint_for_test(client(1), object(10), (12.0, 34.0));
+
+        let (_keep, mut writer) = writer();
+        let hint = manager.deactivate_for_surface(&mut writer, client(1), object(2));
+        assert_eq!(hint, Some((12.0, 34.0)));
+        assert_eq!(
+            manager.phase_for_test(client(1), object(10)),
+            Some(ConstraintPhase::Defunct)
+        );
+        assert!(manager.active_for_seat().is_none());
+    }
+
+    #[test]
+    fn deactivate_persistent_returns_to_pending() {
+        let mut manager = PointerConstraintsManager::default();
+        manager
+            .create_constraint(
+                client(1),
+                object(10),
+                ConstraintKind::Confined,
+                object(2),
+                object(3),
+                None,
+                ConstraintLifetime::Persistent,
+            )
+            .unwrap();
+        manager.force_active_for_test(client(1), object(10));
+
+        let (_keep, mut writer) = writer();
+        let hint = manager.deactivate_for_surface(&mut writer, client(1), object(2));
+        assert_eq!(hint, None);
+        assert_eq!(
+            manager.phase_for_test(client(1), object(10)),
+            Some(ConstraintPhase::Pending)
+        );
+        assert!(manager.active_for_seat().is_none());
     }
 }

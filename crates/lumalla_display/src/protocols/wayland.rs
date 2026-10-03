@@ -361,6 +361,31 @@ fn activate_pending_constraints_for_writer(state: &mut DisplayState, ctx: &mut C
     );
 }
 
+/// Compositor-initiated unlock/unconfine when a surface can no longer hold a capture
+/// (unmap, subsurface teardown, etc.). Applies any committed lock cursor hint.
+fn release_pointer_constraint_for_surface(
+    state: &mut DisplayState,
+    ctx: &mut Ctx,
+    surface: ObjectId,
+) {
+    let Some((sx, sy)) = state.pointer_constraints_manager.deactivate_for_surface(
+        ctx.writer,
+        ctx.client_id,
+        surface,
+    ) else {
+        return;
+    };
+    if let Some((gx, gy)) =
+        state
+            .surface_manager
+            .global_from_surface_local(ctx.client_id, surface, sx, sy)
+    {
+        let views = state.pointer_views();
+        let (dx, dy) = lumalla_shared::map_source_to_dest(&views, gx, gy);
+        state.seat_manager.set_pointer_position(dx, dy);
+    }
+}
+
 fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, mut commit: SurfaceCommit) {
     let frame_callbacks = std::mem::take(&mut commit.frame_callbacks);
     let presentation_feedbacks = std::mem::take(&mut commit.presentation_feedbacks);
@@ -565,6 +590,8 @@ fn process_surface_commit_body(
             let _ = state
                 .surface_manager
                 .clear_committed_buffer_size(ctx.client_id, commit.surface_id);
+            // Unlock before leave so sticky constraint focus cannot re-enter.
+            release_pointer_constraint_for_surface(state, ctx, commit.surface_id);
             state.release_keyboard_focus_from_surface(
                 ctx.client_id,
                 commit.surface_id,
@@ -1658,14 +1685,9 @@ impl WlSurface for DisplayState {
             process_surface_commit(self, ctx, child);
         }
         apply_pointer_constraint_commit(self, ctx, object_id);
-        for child in &result.unmapped_descendants {
-            self.pointer_constraints_manager.mark_surface_destroyed(
-                ctx.writer,
-                ctx.client_id,
-                *child,
-            );
-        }
         for child in result.unmapped_descendants {
+            // Surface still exists; deactivate so persistent constraints can reactivate.
+            release_pointer_constraint_for_surface(self, ctx, child);
             self.release_keyboard_focus_from_surface(ctx.client_id, child, ctx.writer);
             self.seat_manager
                 .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
@@ -1952,6 +1974,7 @@ impl WlSubsurface for DisplayState {
         {
             Ok((surface_id, was_mapped)) => {
                 if was_mapped {
+                    release_pointer_constraint_for_surface(self, ctx, surface_id);
                     self.seat_manager.leave_pointers_on_surface(
                         ctx.client_id,
                         surface_id,
