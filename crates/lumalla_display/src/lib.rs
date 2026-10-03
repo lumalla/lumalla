@@ -439,6 +439,10 @@ impl DisplayState {
                     self.apply_activation(client_id, focus_surface, client.writer_mut());
                 }
                 self.flush_pending_activation_configures(clients);
+                // Click-to-raise: move the window's paint-order root to the top.
+                let raise_surface = self.stack_root_for_pointer_target(client_id, surface);
+                self.surface_manager
+                    .record_painted_surface(client_id, raise_surface);
             }
         }
         self.seat_manager.handle_pointer_button(
@@ -477,6 +481,24 @@ impl DisplayState {
             }
         }
         current
+    }
+
+    /// Paint-order root for a pointer hit (subsurface / popup → toplevel).
+    fn stack_root_for_pointer_target(
+        &self,
+        client_id: ClientId,
+        surface: ObjectId,
+    ) -> ObjectId {
+        let mut current = surface;
+        for _ in 0..32 {
+            match self.surface_manager.parent_surface(client_id, current) {
+                Some(parent) if parent != current => current = parent,
+                _ => break,
+            }
+        }
+        self.xdg_manager
+            .activation_root_wl(client_id, current)
+            .unwrap_or(current)
     }
 
     pub fn handle_pointer_axis(
