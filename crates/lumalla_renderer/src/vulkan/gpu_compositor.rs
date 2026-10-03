@@ -1404,7 +1404,11 @@ fn acquire_dmabuf_for_sample(
     Ok(())
 }
 
-/// Copies the displayed scanout image into a back buffer before incremental compositing.
+/// Copies a scanout image into a back buffer before incremental compositing.
+///
+/// Both images stay in `GENERAL`. The source is often the live KMS front buffer;
+/// transitioning it to `TRANSFER_SRC_OPTIMAL` glitches undamaged tiles for a frame
+/// on some laptop GPUs. Vulkan 1.2 allows `vkCmdCopyImage` with `GENERAL`.
 pub fn copy_scanout_frame(
     vulkan: &mut VulkanContext,
     batch: &mut GpuWorkBatch,
@@ -1422,11 +1426,12 @@ pub fn copy_scanout_frame(
         vk::ImageLayout::GENERAL
     };
 
+    // Memory barriers only — keep src in GENERAL so a displayed FB is not retiled.
     let src_barrier = vk::ImageMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
         .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
         .old_layout(vk::ImageLayout::GENERAL)
-        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(src.image())
@@ -1440,7 +1445,7 @@ pub fn copy_scanout_frame(
         .src_access_mask(dst_src_access)
         .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .old_layout(dst_old_layout)
-        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(dst.image())
@@ -1479,9 +1484,9 @@ pub fn copy_scanout_frame(
         device.handle().cmd_copy_image(
             command_buffer,
             src.image(),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::GENERAL,
             dst.image(),
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::GENERAL,
             &[copy_region],
         );
     }
@@ -1489,7 +1494,7 @@ pub fn copy_scanout_frame(
     let src_back = vk::ImageMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::TRANSFER_READ)
         .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .old_layout(vk::ImageLayout::GENERAL)
         .new_layout(vk::ImageLayout::GENERAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -1498,7 +1503,7 @@ pub fn copy_scanout_frame(
     let dst_back = vk::ImageMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .old_layout(vk::ImageLayout::GENERAL)
         .new_layout(vk::ImageLayout::GENERAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)

@@ -211,10 +211,8 @@ pub fn prepare_gpu_composite(
         return CompositeMode::Full;
     }
 
-    // Partial+seed-copy is pointless when damage already covers most of the FB.
-    let damage_pixels = u64::from(upload.width).saturating_mul(u64::from(upload.height));
-    let output_pixels = u64::from(output_width).saturating_mul(u64::from(output_height));
-    if damage_pixels.saturating_mul(2) > output_pixels {
+    // Partial repair is pointless when damage already covers most of the FB.
+    if upload_rect_covers_most(upload, output_width, output_height) {
         return CompositeMode::Full;
     }
 
@@ -222,14 +220,25 @@ pub fn prepare_gpu_composite(
 }
 
 /// Maximum scanout buffer age (in presents) that can be repaired from damage history
-/// without seeding from the front buffer. Matches the scanout pool depth.
+/// without a full redraw. Matches the scanout pool depth.
 pub const MAX_SCANOUT_BUFFER_AGE: u64 = 3;
+
+/// True when `upload` covers more than half of the output (Partial is not worth it).
+pub fn upload_rect_covers_most(
+    upload: UploadRect,
+    output_width: u32,
+    output_height: u32,
+) -> bool {
+    let damage_pixels = u64::from(upload.width).saturating_mul(u64::from(upload.height));
+    let output_pixels = u64::from(output_width).saturating_mul(u64::from(output_height));
+    damage_pixels.saturating_mul(2) > output_pixels
+}
 
 /// Expand `current` damage by the `age - 1` most recent history entries.
 ///
 /// `history` is newest-last; each `None` means that present was a full redraw.
 /// Returns `None` when age is out of range, history is too short, or a prior
-/// present was full (caller should seed-copy or fully redraw).
+/// present was full (caller should fully redraw).
 pub fn expand_damage_for_buffer_age(
     current: UploadRect,
     history: &[Option<UploadRect>],
@@ -1011,6 +1020,24 @@ mod tests {
             false,
         );
         assert!(matches!(mode, CompositeMode::Full));
+    }
+
+    #[test]
+    fn upload_rect_covers_most_matches_half_threshold() {
+        let small = UploadRect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        };
+        let large = UploadRect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 80,
+        };
+        assert!(!upload_rect_covers_most(small, 100, 100));
+        assert!(upload_rect_covers_most(large, 100, 100));
     }
 
     #[test]

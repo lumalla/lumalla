@@ -45,13 +45,14 @@ pub use crate::scene_backing::{
     CompositeMode, DamageRect as OutputDamageRect, UploadRect, buffer_damage_to_upload_rect,
     clip_buffer_damage_list, clip_damage_list, cursor_damage_rects, cursor_damage_rects_default,
     expand_damage_for_buffer_age, prepare_gpu_composite, rect_union, union_damage_rects,
+    upload_rect_covers_most,
 };
 pub use crate::scheduler::{FrameTimings, RenderScheduler};
 use crate::vulkan::{
     DRM_FORMAT_ARGB8888, DmaBufImage, Framebuffer, GpuCompositor, GpuWorkBatch,
     SurfaceTextureCache, VulkanContext, blit_image_region, clear_dma_image_color,
-    composite_layers_to_image, composite_to_scanout, copy_scanout_frame, download_bgra_region,
-    map_rect_through_view, overlay_cursor_on_image, upload_bgra_to_image, vulkan_to_drm_fourcc,
+    composite_layers_to_image, composite_to_scanout, download_bgra_region, map_rect_through_view,
+    overlay_cursor_on_image, upload_bgra_to_image, vulkan_to_drm_fourcc,
 };
 
 struct GpuRenderResources {
@@ -3118,14 +3119,16 @@ impl RendererState {
 
         let mut batch = GpuWorkBatch::new();
 
-        // Buffer-age path: when the back buffer still holds a recent frame, expand
-        // damage across the missed presents and skip the full FB seed copy.
+        // Buffer-age path: when the recycled back buffer still holds a recent frame,
+        // expand damage across missed presents and LOAD those pixels in place.
+        // Never seed-copy from the live front buffer — layout changes / reads of the
+        // KMS FB cause one-frame flicker on some laptop panels (esp. while scrolling).
         let next_serial = self
             .outputs
             .get(&target.name)
             .map(|o| o.present_serial.wrapping_add(1))
             .unwrap_or(1);
-        let mut skip_scanout_copy = false;
+        let mut age_repaired = false;
         // History must record this frame's damage only (not the age-expanded rect).
         let frame_damage = match &composite_mode {
             CompositeMode::Partial(regions) => regions.first().copied(),
@@ -3144,49 +3147,19 @@ impl RendererState {
                     .map(|o| o.damage_history.entries())
                     .unwrap_or_default();
                 if let Some(expanded) = expand_damage_for_buffer_age(current, &history, age) {
-                    composite_mode = CompositeMode::Partial(vec![expanded]);
-                    skip_scanout_copy = true;
+                    if upload_rect_covers_most(expanded, width, height) {
+                        composite_mode = CompositeMode::Full;
+                    } else {
+                        composite_mode = CompositeMode::Partial(vec![expanded]);
+                        age_repaired = true;
+                    }
                 }
             }
         }
 
-        if matches!(composite_mode, CompositeMode::Partial(_)) && !skip_scanout_copy {
-            // newest_buffer may be a still-rendering queued frame — finish GPU first.
-            let src_gpu = self.outputs.get_mut(&target.name).and_then(|output| {
-                let primary = output.primary_mut()?;
-                let buf = primary
-                    .queued
-                    .as_mut()
-                    .or(primary.pending.as_mut())
-                    .or(primary.current.as_mut())?;
-                buf.gpu_pending.take()
-            });
-            if let Some(pending) = src_gpu {
-                self.finish_gpu_pending(pending)?;
-            }
-            let src_ptr = self.outputs.get(&target.name).and_then(|output| {
-                let image = output.primary()?.newest_buffer()?;
-                Some(&image.dma_image as *const DmaBufImage)
-            });
-            let dst_ptr = &buffer.dma_image as *const DmaBufImage;
-            let dst_fresh = buffer.fresh;
-            if let Some(src_ptr) = src_ptr {
-                let vulkan = self
-                    .vulkan
-                    .as_mut()
-                    .context("VulkanContext missing during scanout copy")?;
-                copy_scanout_frame(
-                    vulkan,
-                    &mut batch,
-                    unsafe { &*src_ptr },
-                    unsafe { &*dst_ptr },
-                    dst_fresh,
-                )
-                .context("Failed to seed back buffer from current scanout")?;
-                buffer.fresh = false;
-            } else {
-                composite_mode = CompositeMode::Full;
-            }
+        if matches!(composite_mode, CompositeMode::Partial(_)) && !age_repaired {
+            // Age history cannot repair this back buffer safely — full redraw.
+            composite_mode = CompositeMode::Full;
         }
 
         let history_damage = match &composite_mode {
