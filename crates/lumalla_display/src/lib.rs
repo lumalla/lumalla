@@ -6,8 +6,9 @@ use std::rc::Rc;
 
 use anyhow::Context;
 use lumalla_shared::{
-    DisplayHost, PresentationNotify, RenderSink, SurfaceDmabuf, SurfaceSubmit, SurfaceSubmitRole,
-    View, WindowGeometryUpdate, WindowRule, WindowState, map_dest_to_source, map_source_to_dest,
+    DisplayHost, PresentationNotify, PrimaryModeApply, PrimaryOutputMode, RenderSink,
+    SurfaceDmabuf, SurfaceSubmit, SurfaceSubmitRole, View, WindowGeometryUpdate, WindowRule,
+    WindowState, map_dest_to_source, map_source_to_dest,
 };
 use lumalla_wayland_protocol::buffer::MessageHeader;
 use lumalla_wayland_protocol::protocols::presentation_time::{
@@ -132,6 +133,59 @@ impl DisplayHost for DisplayConfigHost<'_> {
     ) {
         self.state
             .set_dmabuf_formats(formats, device_path, self.clients);
+    }
+
+    fn apply_primary_output_mode(&mut self, mode: PrimaryOutputMode) -> PrimaryModeApply {
+        let width_u = mode.width.max(1) as u32;
+        let height_u = mode.height.max(1) as u32;
+        self.state.set_output_geometry(width_u, height_u);
+        let (px, py) = self.state.pointer_position();
+        let pointer_x = px.round() as i32;
+        let pointer_y = py.round() as i32;
+
+        // Only rewrite the primary Wayland output when it already exists and is physical
+        // (DRM hotplug sync). Virtual outputs are owned entirely by config `add_output`.
+        let existing = self.state.outputs().find(|o| o.name == mode.name);
+        let is_virtual_primary = existing.map(|o| o.is_virtual).unwrap_or(true);
+        if is_virtual_primary {
+            return PrimaryModeApply {
+                pointer_x,
+                pointer_y,
+                updated_views: None,
+            };
+        }
+
+        let old_size = existing
+            .map(|o| (o.width, o.height))
+            .unwrap_or((mode.width, mode.height));
+        let mut views = existing.map(|o| o.views.clone()).unwrap_or_default();
+        for view in &mut views {
+            view.resize_for_output_mode(old_size, (mode.width, mode.height));
+        }
+        let (x, y) = views
+            .first()
+            .map(|view| (view.source.0, view.source.1))
+            .unwrap_or((0, 0));
+        let info = OutputInfo {
+            name: mode.name.clone(),
+            description: format!("Lumalla output {}", mode.name),
+            x,
+            y,
+            physical_width_mm: 300,
+            physical_height_mm: 200,
+            width: mode.width,
+            height: mode.height,
+            refresh_mhz: mode.refresh_mhz,
+            scale: 1,
+            is_virtual: false,
+            views: views.clone(),
+        };
+        self.state.update_primary_output(info, self.clients);
+        PrimaryModeApply {
+            pointer_x,
+            pointer_y,
+            updated_views: Some((mode.name, views)),
+        }
     }
 }
 

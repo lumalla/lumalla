@@ -10,7 +10,8 @@ use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     BufferTransform, CapturedImage, DisplayHost, DrmDeviceState, Guide, Output, OutputConfig,
-    RenderSink, SurfaceSubmit, SurfaceSubmitRole, View, view_at_source,
+    PrimaryGeometryEffect, PrimaryOutputMode, RenderSink, SurfaceSubmit, SurfaceSubmitRole, View,
+    view_at_source,
 };
 use stumpalo::Arena;
 
@@ -1340,6 +1341,38 @@ impl RendererState {
             target.height as i32,
             target.refresh_mhz.max(60_000),
         ))
+    }
+
+    /// Push primary present-target geometry through [`DisplayHost`], then sync pointer/views.
+    pub fn sync_primary_output_geometry(
+        &mut self,
+        host: &mut dyn DisplayHost,
+    ) -> Option<PrimaryGeometryEffect> {
+        let (name, width, height, refresh_mhz) = self.primary_output_geometry()?;
+        let width_u = width.max(1) as u32;
+        let height_u = height.max(1) as u32;
+        let apply = host.apply_primary_output_mode(PrimaryOutputMode {
+            name,
+            width,
+            height,
+            refresh_mhz,
+        });
+        if let Err(err) =
+            RenderSink::update_pointer_position(self, apply.pointer_x, apply.pointer_y)
+        {
+            error!("Unable to sync pointer after output geometry change: {err:#}");
+        }
+        let outputs_changed = if let Some((name, views)) = apply.updated_views {
+            self.set_output_views(&name, views);
+            true
+        } else {
+            false
+        };
+        Some(PrimaryGeometryEffect {
+            width: width_u,
+            height: height_u,
+            outputs_changed,
+        })
     }
 
     /// Capture a rectangular region of the displayed scanouts as RGBA8 pixels.

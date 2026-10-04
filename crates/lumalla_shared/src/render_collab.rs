@@ -2,13 +2,15 @@
 //!
 //! Display calls [`RenderSink`] while handling client requests / layout changes.
 //! Renderer calls [`PresentationNotify`] after present / page-flip, and
-//! [`DisplayHost`] when pushing config (e.g. linux-dmabuf formats).
+//! [`DisplayHost`] when pushing config (dmabuf formats, primary output mode).
 
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::rc::Rc;
 
 use anyhow::Result;
+
+use crate::View;
 
 /// Axis-aligned damage / clip rectangle in integer coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,8 +117,38 @@ pub trait PresentationNotify {
     }
 }
 
-/// Renderer → display config updates (capabilities advertised to Wayland clients).
+/// Present-target mode for the primary output (physical or virtual).
+#[derive(Debug, Clone)]
+pub struct PrimaryOutputMode {
+    pub name: String,
+    pub width: i32,
+    pub height: i32,
+    pub refresh_mhz: i32,
+}
+
+/// Display-side result of applying a primary mode (seat clamp + optional wl_output rewrite).
+#[derive(Debug, Clone)]
+pub struct PrimaryModeApply {
+    /// Rounded pointer after seat geometry clamp.
+    pub pointer_x: i32,
+    pub pointer_y: i32,
+    /// When physical primary `wl_output` was rewritten: name + resized views for the renderer.
+    pub updated_views: Option<(String, Vec<View>)>,
+}
+
+/// App-facing side effects after renderer↔display primary geometry sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimaryGeometryEffect {
+    pub width: u32,
+    pub height: u32,
+    pub outputs_changed: bool,
+}
+
+/// Renderer → display config updates (capabilities / mode advertised to Wayland clients).
 pub trait DisplayHost {
     /// Configure linux-dmabuf format/modifier pairs and feedback `main_device` path.
     fn set_dmabuf_formats(&mut self, formats: Vec<(u32, u64)>, device_path: Option<&Path>);
+
+    /// Apply primary present-target mode: seat clamp, and rewrite physical primary if present.
+    fn apply_primary_output_mode(&mut self, mode: PrimaryOutputMode) -> PrimaryModeApply;
 }

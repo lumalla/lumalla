@@ -18,7 +18,7 @@ use stumpalo::Arena;
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::{
     ClientId, ConnectedClients, DisplayConfigHost, DisplayHandler, DisplayPresentationNotify,
-    DisplayState, OutputInfo, ReadResult, SeatInputHandler, Wayland, create_wayland_display,
+    DisplayState, ReadResult, SeatInputHandler, Wayland, create_wayland_display,
 };
 use lumalla_input::{BTN_LEFT, InputState, SeatEvent};
 use lumalla_renderer::{RendererState, is_present_wake_token};
@@ -94,9 +94,9 @@ struct DrmDeviceRegistration {
 ///
 /// Display ↔ renderer collaboration is phase-local (`DisplayHandler` on client
 /// dispatch, `DisplayPresentationNotify` on present/flip, `DisplayConfigHost`
-/// for dmabuf advertising). Seat input is phase-local via `SeatInputHandler`.
-/// Residual mediation that still lives here: DRM↔Wayland output geometry,
-/// screencast, and seat enable/disable wiring.
+/// for dmabuf / primary geometry). Seat input is phase-local via
+/// `SeatInputHandler`. Residual mediation that still lives here: screencast
+/// and seat enable/disable wiring.
 struct AppData {
     comms: Comms,
     _dbus_thread_completion_fd: OwnedFd,
@@ -1395,64 +1395,18 @@ impl AppData {
 
     /// Apply primary present-target geometry to input transform and display layout.
     fn sync_primary_output_geometry(&mut self) {
-        let Some((name, width, height, refresh_mhz)) =
-            self.renderer_state.primary_output_geometry()
-        else {
+        let mut host = DisplayConfigHost {
+            state: &mut self.display_state,
+            clients: &mut self.clients,
+        };
+        let Some(effect) = self.renderer_state.sync_primary_output_geometry(&mut host) else {
             return;
         };
-        let width_u = width.max(1) as u32;
-        let height_u = height.max(1) as u32;
-        self.input_state.set_output_geometry(width_u, height_u);
-        self.display_state.set_output_geometry(width_u, height_u);
-        // Geometry clamp may move the display pointer; keep the renderer in sync.
-        let (px, py) = self.display_state.pointer_position();
-        if let Err(err) = lumalla_shared::RenderSink::update_pointer_position(
-            &mut self.renderer_state,
-            px.round() as i32,
-            py.round() as i32,
-        ) {
-            error!("Unable to sync pointer after output geometry change: {err:#}");
+        self.input_state
+            .set_output_geometry(effect.width, effect.height);
+        if effect.outputs_changed {
+            self.emit_outputs_changed();
         }
-
-        // Only rewrite the primary Wayland output when it already exists and is physical
-        // (DRM hotplug sync). Virtual outputs are owned entirely by config `add_output`.
-        let existing = self.display_state.outputs().find(|o| o.name == name);
-        let is_virtual_primary = existing.map(|o| o.is_virtual).unwrap_or(true);
-        if is_virtual_primary {
-            return;
-        }
-
-        let old_size = existing
-            .map(|o| (o.width, o.height))
-            .unwrap_or((width, height));
-        let mut views = existing
-            .map(|o| o.views.clone())
-            .unwrap_or_default();
-        for view in &mut views {
-            view.resize_for_output_mode(old_size, (width, height));
-        }
-        let (x, y) = views
-            .first()
-            .map(|view| (view.source.0, view.source.1))
-            .unwrap_or((0, 0));
-        let info = OutputInfo {
-            name: name.clone(),
-            description: format!("Lumalla output {name}"),
-            x,
-            y,
-            physical_width_mm: 300,
-            physical_height_mm: 200,
-            width,
-            height,
-            refresh_mhz,
-            scale: 1,
-            is_virtual: false,
-            views: views.clone(),
-        };
-        self.display_state
-            .update_primary_output(info, &mut self.clients);
-        self.renderer_state.set_output_views(&name, views);
-        self.emit_outputs_changed();
     }
 
     fn sync_pointer_cursor(&mut self, event_loop: &mut EventLoop, arena: &Arena) {

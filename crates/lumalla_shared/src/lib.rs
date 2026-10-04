@@ -38,8 +38,9 @@ pub use output::{
     Output, View, map_dest_to_source, map_source_to_dest, view_at_dest, view_at_source,
 };
 pub use render_collab::{
-    DamageRect, DisplayHost, PresentationFlipInfo, PresentationNotify, RenderSink, SurfaceDmabuf,
-    SurfaceSubmit, SurfaceSubmitRole,
+    DamageRect, DisplayHost, PresentationFlipInfo, PresentationNotify, PrimaryGeometryEffect,
+    PrimaryModeApply, PrimaryOutputMode, RenderSink, SurfaceDmabuf, SurfaceSubmit,
+    SurfaceSubmitRole,
 };
 pub use ring::{
     Completion, EventLoop, Interest, OpKind, SharedWaker, Waker, decode_user_data,
