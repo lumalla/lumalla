@@ -6,8 +6,8 @@ use std::rc::Rc;
 
 use anyhow::Context;
 use lumalla_shared::{
-    PresentationNotify, RenderSink, SurfaceDmabuf, SurfaceSubmit, SurfaceSubmitRole, View,
-    WindowGeometryUpdate, WindowRule, WindowState, map_dest_to_source, map_source_to_dest,
+    DisplayHost, PresentationNotify, RenderSink, SurfaceDmabuf, SurfaceSubmit, SurfaceSubmitRole,
+    View, WindowGeometryUpdate, WindowRule, WindowState, map_dest_to_source, map_source_to_dest,
 };
 use lumalla_wayland_protocol::buffer::MessageHeader;
 use lumalla_wayland_protocol::protocols::presentation_time::{
@@ -115,6 +115,23 @@ impl PresentationNotify for DisplayPresentationNotify<'_> {
 
     fn pending_frame_callbacks(&self) -> bool {
         self.state.pending_frame_callback_count() > 0
+    }
+}
+
+/// Adapter for renderer → display config updates (e.g. linux-dmabuf formats).
+pub struct DisplayConfigHost<'a> {
+    pub state: &'a mut DisplayState,
+    pub clients: &'a mut ConnectedClients,
+}
+
+impl DisplayHost for DisplayConfigHost<'_> {
+    fn set_dmabuf_formats(
+        &mut self,
+        formats: Vec<(u32, u64)>,
+        device_path: Option<&std::path::Path>,
+    ) {
+        self.state
+            .set_dmabuf_formats(formats, device_path, self.clients);
     }
 }
 

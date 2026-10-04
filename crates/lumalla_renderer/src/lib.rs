@@ -9,8 +9,8 @@ use ash::vk;
 use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
-    BufferTransform, CapturedImage, DrmDeviceState, Guide, Output, OutputConfig, RenderSink,
-    SurfaceSubmit, SurfaceSubmitRole, View, view_at_source,
+    BufferTransform, CapturedImage, DisplayHost, DrmDeviceState, Guide, Output, OutputConfig,
+    RenderSink, SurfaceSubmit, SurfaceSubmitRole, View, view_at_source,
 };
 use stumpalo::Arena;
 
@@ -2326,6 +2326,22 @@ impl RendererState {
         self.vulkan
             .as_ref()
             .and_then(|v| v.drm_device_path().cloned())
+    }
+
+    /// Query GPU dmabuf capabilities and push them to the display host for Wayland advertising.
+    pub fn advertise_dmabuf_formats(&mut self, host: &mut dyn DisplayHost) -> anyhow::Result<()> {
+        let formats = self.supported_dmabuf_formats()?;
+        let device_path = self.dmabuf_feedback_device_path();
+        info!(
+            "Advertising {} linux-dmabuf format/modifier pairs (main_device={})",
+            formats.len(),
+            device_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none>".into())
+        );
+        host.set_dmabuf_formats(formats, device_path.as_deref());
+        Ok(())
     }
 
     /// Whether `name` is a virtual (non-KMS) present target.

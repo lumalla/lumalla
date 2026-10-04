@@ -1,9 +1,11 @@
 //! Phase-local collaboration between display (Wayland) and renderer (GPU/KMS).
 //!
 //! Display calls [`RenderSink`] while handling client requests / layout changes.
-//! Renderer calls [`PresentationNotify`] after present / page-flip.
+//! Renderer calls [`PresentationNotify`] after present / page-flip, and
+//! [`DisplayHost`] when pushing config (e.g. linux-dmabuf formats).
 
 use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -111,4 +113,10 @@ pub trait PresentationNotify {
     fn pending_present_work(&self) -> bool {
         self.pending_presentation_feedback() || self.pending_frame_callbacks()
     }
+}
+
+/// Renderer → display config updates (capabilities advertised to Wayland clients).
+pub trait DisplayHost {
+    /// Configure linux-dmabuf format/modifier pairs and feedback `main_device` path.
+    fn set_dmabuf_formats(&mut self, formats: Vec<(u32, u64)>, device_path: Option<&Path>);
 }

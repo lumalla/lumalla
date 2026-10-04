@@ -38,7 +38,7 @@ pub use output::{
     Output, View, map_dest_to_source, map_source_to_dest, view_at_dest, view_at_source,
 };
 pub use render_collab::{
-    DamageRect, PresentationFlipInfo, PresentationNotify, RenderSink, SurfaceDmabuf,
+    DamageRect, DisplayHost, PresentationFlipInfo, PresentationNotify, RenderSink, SurfaceDmabuf,
     SurfaceSubmit, SurfaceSubmitRole,
 };
 pub use ring::{

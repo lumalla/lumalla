@@ -17,8 +17,8 @@ use log::{debug, error, info, warn};
 use stumpalo::Arena;
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::{
-    ClientId, ConnectedClients, DisplayHandler, DisplayPresentationNotify, DisplayState,
-    OutputInfo, ReadResult, SeatInputHandler, Wayland, create_wayland_display,
+    ClientId, ConnectedClients, DisplayConfigHost, DisplayHandler, DisplayPresentationNotify,
+    DisplayState, OutputInfo, ReadResult, SeatInputHandler, Wayland, create_wayland_display,
 };
 use lumalla_input::{BTN_LEFT, InputState, SeatEvent};
 use lumalla_renderer::{RendererState, is_present_wake_token};
@@ -93,10 +93,10 @@ struct DrmDeviceRegistration {
 /// Main event-loop owner.
 ///
 /// Display ↔ renderer collaboration is phase-local (`DisplayHandler` on client
-/// dispatch, `DisplayPresentationNotify` on present/flip). Seat input is
-/// phase-local via `SeatInputHandler`. Residual mediation that still lives
-/// here: DRM↔Wayland output geometry, dmabuf format advertising, screencast,
-/// and seat enable/disable wiring.
+/// dispatch, `DisplayPresentationNotify` on present/flip, `DisplayConfigHost`
+/// for dmabuf advertising). Seat input is phase-local via `SeatInputHandler`.
+/// Residual mediation that still lives here: DRM↔Wayland output geometry,
+/// screencast, and seat enable/disable wiring.
 struct AppData {
     comms: Comms,
     _dbus_thread_completion_fd: OwnedFd,
@@ -303,14 +303,18 @@ impl AppData {
                             if let Err(err) = self.sync_drm_device_poll(event_loop, arena) {
                                 error!("Unable to refresh DRM device poll fds: {err}");
                             }
-                            if let Err(err) = configure_dmabuf_formats(
-                                &mut self.display_state,
-                                &mut self.renderer_state,
-                                &mut self.clients,
-                            ) {
-                                warn!(
-                                    "Unable to refresh GPU dmabuf formats after DRM reconcile: {err:#}"
-                                );
+                            {
+                                let mut host = DisplayConfigHost {
+                                    state: &mut self.display_state,
+                                    clients: &mut self.clients,
+                                };
+                                if let Err(err) =
+                                    self.renderer_state.advertise_dmabuf_formats(&mut host)
+                                {
+                                    warn!(
+                                        "Unable to refresh GPU dmabuf formats after DRM reconcile: {err:#}"
+                                    );
+                                }
                             }
                         }
                         self.sync_wayland_output_from_drm();
@@ -643,14 +647,18 @@ impl AppData {
                         if let Err(err) = self.sync_drm_device_poll(event_loop, arena) {
                             error!("Unable to register DRM device poll fds: {err}");
                         }
-                        if let Err(err) = configure_dmabuf_formats(
-                            &mut self.display_state,
-                            &mut self.renderer_state,
-                            &mut self.clients,
-                        ) {
-                            warn!(
-                                "Unable to refresh GPU dmabuf formats after DRM activate: {err:#}"
-                            );
+                        {
+                            let mut host = DisplayConfigHost {
+                                state: &mut self.display_state,
+                                clients: &mut self.clients,
+                            };
+                            if let Err(err) =
+                                self.renderer_state.advertise_dmabuf_formats(&mut host)
+                            {
+                                warn!(
+                                    "Unable to refresh GPU dmabuf formats after DRM activate: {err:#}"
+                                );
+                            }
                         }
                         self.sync_wayland_output_from_drm();
                         self.comms.dbus(DbusMessage::SetDrmDevices(
@@ -2030,25 +2038,6 @@ fn init_and_register_renderer_state(
     Ok(renderer_state)
 }
 
-fn configure_dmabuf_formats(
-    display_state: &mut DisplayState,
-    renderer_state: &mut RendererState,
-    clients: &mut ConnectedClients,
-) -> anyhow::Result<()> {
-    let formats = renderer_state.supported_dmabuf_formats()?;
-    let device_path = renderer_state.dmabuf_feedback_device_path();
-    info!(
-        "Advertising {} linux-dmabuf format/modifier pairs (main_device={})",
-        formats.len(),
-        device_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<none>".into())
-    );
-    display_state.set_dmabuf_formats(formats, device_path.as_deref(), clients);
-    Ok(())
-}
-
 fn init_and_register_wayland_display(
     socket_path: Option<PathBuf>,
     main_event_loop: &mut EventLoop,
@@ -2086,9 +2075,14 @@ fn init_display_state(
         Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
     }
     let mut no_clients = ConnectedClients::new();
-    if let Err(err) = configure_dmabuf_formats(&mut display_state, renderer_state, &mut no_clients)
     {
-        warn!("Unable to query GPU dmabuf formats; using linear defaults: {err:#}");
+        let mut host = DisplayConfigHost {
+            state: &mut display_state,
+            clients: &mut no_clients,
+        };
+        if let Err(err) = renderer_state.advertise_dmabuf_formats(&mut host) {
+            warn!("Unable to query GPU dmabuf formats; using linear defaults: {err:#}");
+        }
     }
     display_state
 }
