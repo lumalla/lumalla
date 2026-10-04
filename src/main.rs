@@ -15,6 +15,8 @@ use crate::{app::run_app, args::Args, os_signal::handle_signals};
 mod app;
 mod args;
 mod os_signal;
+mod screencast_capture;
+mod screencast_lifecycle;
 mod seat_lifecycle;
 
 fn main() -> anyhow::Result<()> {

@@ -22,16 +22,12 @@ use lumalla_display::{
 };
 use lumalla_input::{BTN_LEFT, InputState, SeatEvent};
 use lumalla_renderer::{RendererState, is_present_wake_token};
-use lumalla_screencast::{
-    DmaBufferExport, FormatOffer, ScreencastManager, ScreencastSource, ScreencastWake, VideoFrame,
-    fit_memfd_output_size, fit_output_size,
-};
+use lumalla_screencast::{ScreencastManager, ScreencastWake};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
     Comms, Completion, CursorListenPolicy, CursorListenSink, DbusMessage, EventLoop, InjectedInput,
-    Interest, MainMessage, MessageSender, MutterScreenCastTarget, OpKind, ScreencastCursorMode,
-    encode_user_data, message_loop_with_channel, monotonic_deadline_after,
-    ring::MESSAGE_CHANNEL_TOKEN,
+    Interest, MainMessage, MessageSender, OpKind, encode_user_data, message_loop_with_channel,
+    monotonic_deadline_after, ring::MESSAGE_CHANNEL_TOKEN,
 };
 
 /// Cursor-listen side effects over dbus/config.
@@ -61,6 +57,10 @@ impl CursorListenSink for CommsCursorListen<'_> {
 }
 
 use crate::args::Args;
+use crate::screencast_capture::ScreencastCapturePhase;
+use crate::screencast_lifecycle::{
+    ScreencastLifecycleEffects, ScreencastSessionPeers, ScreencastSessionState,
+};
 use crate::seat_lifecycle::{SeatDisableOutcome, SeatEnableOutcome, SeatSessionPeers};
 
 pub static SHUTDOWN_TIMEOUT_TIMESPEC: Timespec = Timespec::new().sec(1);
@@ -77,15 +77,6 @@ const SCREENCAST_GPU_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// DRM primary-node fds use this high token range to avoid Wayland client tokens.
 pub const DRM_DEVICE_TOKEN_BASE: u64 = 1 << 16;
 
-/// D-Bus / portal reply waiting on an in-flight PipeWire stream start.
-enum PendingScreencastReply {
-    Pipewire { request_id: usize },
-    Mutter {
-        mutter_stream_id: u64,
-        session_id: u64,
-    },
-}
-
 struct DrmDeviceRegistration {
     fd: RawFd,
     token: u64,
@@ -97,8 +88,11 @@ struct DrmDeviceRegistration {
 /// dispatch, `DisplayPresentationNotify` on present/flip, `DisplayConfigHost`
 /// for dmabuf / primary geometry). Seat input is phase-local via
 /// `SeatInputHandler`. Session enable/disable is sequenced by
-/// [`SeatSessionPeers`](crate::seat_lifecycle::SeatSessionPeers) (poll/dbus
-/// effects stay here). Residual mediation that still lives here: screencast.
+/// [`SeatSessionPeers`](crate::seat_lifecycle::SeatSessionPeers). Screencast
+/// lifecycle/capture is sequenced by
+/// [`ScreencastSessionPeers`](crate::screencast_lifecycle::ScreencastSessionPeers)
+/// and [`ScreencastCapturePhase`](crate::screencast_capture::ScreencastCapturePhase)
+/// (poll/dbus/present effects stay here).
 struct AppData {
     comms: Comms,
     _dbus_thread_completion_fd: OwnedFd,
@@ -113,12 +107,7 @@ struct AppData {
     display_state: DisplayState,
     renderer_state: RendererState,
     screencast: ScreencastManager,
-    /// Local PipeWire stream id → D-Bus reply still waiting for node id.
-    pending_screencast_replies: HashMap<u32, PendingScreencastReply>,
-    /// Mutter ScreenCast session id → PipeWire stream ids started for that session.
-    mutter_cast_streams: HashMap<u64, Vec<u32>>,
-    /// Prevents `push_screencast_frames` → `arm_presents` re-entrancy.
-    screencast_push_active: bool,
+    screencast_session: ScreencastSessionState,
     /// Absolute timeout armed while screencast DMA fills are in flight.
     screencast_gpu_wake_armed: bool,
     screencast_gpu_wake_ts: Box<Timespec>,
@@ -163,9 +152,7 @@ impl AppData {
             display_state,
             renderer_state,
             screencast,
-            pending_screencast_replies: HashMap::new(),
-            mutter_cast_streams: HashMap::new(),
-            screencast_push_active: false,
+            screencast_session: ScreencastSessionState::default(),
             screencast_gpu_wake_armed: false,
             screencast_gpu_wake_ts: Box::new(Timespec::new()),
             frame_clock: Instant::now(),
@@ -859,34 +846,8 @@ impl AppData {
                 }
                 MainMessage::Shutdown => {
                     if !self.shutting_down {
-                        let mut ids: Vec<u32> =
-                            self.screencast.streams().keys().copied().collect();
-                        ids.extend(self.pending_screencast_replies.keys().copied());
-                        ids.sort_unstable();
-                        ids.dedup();
-                        for (_stream_id, reply) in self.pending_screencast_replies.drain() {
-                            match reply {
-                                PendingScreencastReply::Pipewire { request_id } => {
-                                    self.comms.dbus(DbusMessage::PipewireStreamStarted {
-                                        request_id,
-                                        result: Err(String::from("compositor shutting down")),
-                                    });
-                                }
-                                PendingScreencastReply::Mutter {
-                                    mutter_stream_id, ..
-                                } => {
-                                    self.comms.dbus(DbusMessage::MutterScreenCastStarted {
-                                        mutter_stream_id,
-                                        result: Err(String::from("compositor shutting down")),
-                                    });
-                                }
-                            }
-                        }
-                        self.mutter_cast_streams.clear();
-                        self.screencast.shutdown();
-                        for id in ids {
-                            self.renderer_state.free_screencast_buffers(id);
-                        }
+                        let effects = self.screencast_peers().shutdown();
+                        self.apply_screencast_lifecycle(effects, event_loop, arena);
                         self.init_shutdown(event_loop);
                     }
                 }
@@ -924,69 +885,10 @@ impl AppData {
                     name,
                     max_fps,
                 } => {
-                    let stream_id = self.screencast.peek_next_stream_id();
-                    let start_result = (|| -> Result<u32, String> {
-                        let (out_w, out_h) = fit_output_size(width as u32, height as u32);
-                        let exports = self
-                            .renderer_state
-                            .alloc_screencast_buffers(
-                                stream_id,
-                                out_w,
-                                out_h,
-                                ScreencastManager::dma_buffer_count(),
-                            )
-                            .map_err(|err| format!("{err:#}"))?;
-                        let dma_exports = exports
-                            .into_iter()
-                            .map(|export| DmaBufferExport {
-                                index: export.index,
-                                fd: export.fd,
-                                width: export.width,
-                                height: export.height,
-                                stride: export.stride,
-                                offset: export.offset,
-                                size: export.size,
-                                modifier: export.modifier,
-                            })
-                            .collect();
-                        self.screencast
-                            .start_stream(
-                                ScreencastSource::Region {
-                                    x,
-                                    y,
-                                    width,
-                                    height,
-                                },
-                                x,
-                                y,
-                                width,
-                                height,
-                                name,
-                                max_fps,
-                                dma_exports,
-                                FormatOffer::PreferMemFd,
-                                ScreencastCursorMode::Embedded,
-                            )
-                            .map_err(|err| {
-                                self.renderer_state.free_screencast_buffers(stream_id);
-                                format!("{err:#}")
-                            })
-                    })();
-                    match start_result {
-                        Ok(stream_id) => {
-                            self.pending_screencast_replies.insert(
-                                stream_id,
-                                PendingScreencastReply::Pipewire { request_id },
-                            );
-                            self.mark_present_dirty(event_loop, arena);
-                        }
-                        Err(err) => {
-                            self.comms.dbus(DbusMessage::PipewireStreamStarted {
-                                request_id,
-                                result: Err(err),
-                            });
-                        }
-                    }
+                    let effects = self.screencast_peers().start_pipewire_region(
+                        request_id, x, y, width, height, name, max_fps,
+                    );
+                    self.apply_screencast_lifecycle(effects, event_loop, arena);
                 }
                 MainMessage::StartPipewireWindowStream {
                     request_id,
@@ -994,40 +896,14 @@ impl AppData {
                     name,
                     max_fps,
                 } => {
-                    let start_result = self.start_window_screencast(
-                        window_id,
-                        name,
-                        max_fps,
-                        FormatOffer::PreferMemFd,
-                        ScreencastCursorMode::Embedded,
+                    let effects = self.screencast_peers().start_pipewire_window(
+                        request_id, window_id, name, max_fps,
                     );
-                    match start_result {
-                        Ok(stream_id) => {
-                            self.pending_screencast_replies.insert(
-                                stream_id,
-                                PendingScreencastReply::Pipewire { request_id },
-                            );
-                            self.mark_present_dirty(event_loop, arena);
-                        }
-                        Err(err) => {
-                            self.comms.dbus(DbusMessage::PipewireStreamStarted {
-                                request_id,
-                                result: Err(err),
-                            });
-                        }
-                    }
+                    self.apply_screencast_lifecycle(effects, event_loop, arena);
                 }
                 MainMessage::StopPipewireStream { stream_id } => {
-                    if let Some(PendingScreencastReply::Pipewire { request_id }) =
-                        self.pending_screencast_replies.remove(&stream_id)
-                    {
-                        self.comms.dbus(DbusMessage::PipewireStreamStarted {
-                            request_id,
-                            result: Err(String::from("stream start was cancelled")),
-                        });
-                    }
-                    self.screencast.stop_stream(stream_id);
-                    self.renderer_state.free_screencast_buffers(stream_id);
+                    let effects = self.screencast_peers().stop_pipewire(stream_id);
+                    self.apply_screencast_lifecycle(effects, event_loop, arena);
                 }
                 MainMessage::StartMutterScreenCast {
                     mutter_stream_id,
@@ -1035,123 +911,17 @@ impl AppData {
                     target,
                     cursor_mode,
                 } => {
-                    let start_result = (|| -> Result<u32, String> {
-                        match target {
-                            MutterScreenCastTarget::Monitor { connector } => {
-                                let output = self
-                                    .display_state
-                                    .outputs()
-                                    .find(|o| o.name == connector)
-                                    .ok_or_else(|| format!("no such monitor: {connector}"))?;
-                                let (x, y) = (output.x, output.y);
-                                let (width, height) = (output.width, output.height);
-                                if width <= 0 || height <= 0 {
-                                    return Err(format!("monitor '{connector}' has invalid size"));
-                                }
-                                let max_fps = if output.refresh_mhz > 0 {
-                                    ((output.refresh_mhz + 999) / 1000).max(1) as u32
-                                } else {
-                                    60
-                                };
-                                let name = format!("Lumalla ScreenCast ({connector})");
-                                let stream_id = self.screencast.peek_next_stream_id();
-                                let (out_w, out_h) = fit_output_size(width as u32, height as u32);
-                                let exports = self
-                                    .renderer_state
-                                    .alloc_screencast_buffers(
-                                        stream_id,
-                                        out_w,
-                                        out_h,
-                                        ScreencastManager::dma_buffer_count(),
-                                    )
-                                    .map_err(|err| format!("{err:#}"))?;
-                                let dma_exports = exports
-                                    .into_iter()
-                                    .map(|export| DmaBufferExport {
-                                        index: export.index,
-                                        fd: export.fd,
-                                        width: export.width,
-                                        height: export.height,
-                                        stride: export.stride,
-                                        offset: export.offset,
-                                        size: export.size,
-                                        modifier: export.modifier,
-                                    })
-                                    .collect();
-                                self.screencast
-                                    .start_stream(
-                                        ScreencastSource::Region {
-                                            x,
-                                            y,
-                                            width,
-                                            height,
-                                        },
-                                        x,
-                                        y,
-                                        width,
-                                        height,
-                                        name,
-                                        max_fps,
-                                        dma_exports,
-                                        FormatOffer::DmaOnly,
-                                        cursor_mode,
-                                    )
-                                    .map_err(|err| {
-                                        self.renderer_state.free_screencast_buffers(stream_id);
-                                        format!("{err:#}")
-                                    })
-                            }
-                            MutterScreenCastTarget::Window { window_id } => {
-                                let name = format!("Lumalla ScreenCast (window {window_id})");
-                                self.start_window_screencast(
-                                    window_id,
-                                    name,
-                                    30,
-                                    FormatOffer::DmaOnly,
-                                    cursor_mode,
-                                )
-                            }
-                        }
-                    })();
-                    match start_result {
-                        Ok(stream_id) => {
-                            self.pending_screencast_replies.insert(
-                                stream_id,
-                                PendingScreencastReply::Mutter {
-                                    mutter_stream_id,
-                                    session_id,
-                                },
-                            );
-                            self.mutter_cast_streams
-                                .entry(session_id)
-                                .or_default()
-                                .push(stream_id);
-                            self.mark_present_dirty(event_loop, arena);
-                        }
-                        Err(err) => {
-                            self.comms.dbus(DbusMessage::MutterScreenCastStarted {
-                                mutter_stream_id,
-                                result: Err(err),
-                            });
-                        }
-                    }
+                    let effects = self.screencast_peers().start_mutter(
+                        mutter_stream_id,
+                        session_id,
+                        target,
+                        cursor_mode,
+                    );
+                    self.apply_screencast_lifecycle(effects, event_loop, arena);
                 }
                 MainMessage::StopMutterScreenCast { session_id } => {
-                    if let Some(stream_ids) = self.mutter_cast_streams.remove(&session_id) {
-                        for stream_id in stream_ids {
-                            if let Some(PendingScreencastReply::Mutter {
-                                mutter_stream_id, ..
-                            }) = self.pending_screencast_replies.remove(&stream_id)
-                            {
-                                self.comms.dbus(DbusMessage::MutterScreenCastStarted {
-                                    mutter_stream_id,
-                                    result: Err(String::from("stream start was cancelled")),
-                                });
-                            }
-                            self.screencast.stop_stream(stream_id);
-                            self.renderer_state.free_screencast_buffers(stream_id);
-                        }
-                    }
+                    let effects = self.screencast_peers().stop_mutter(session_id);
+                    self.apply_screencast_lifecycle(effects, event_loop, arena);
                 }
                 MainMessage::InjectWaylandClient { fd } => {
                     let raw = fd.into_raw_fd();
@@ -1163,45 +933,8 @@ impl AppData {
                     }
                 }
                 MainMessage::PipewireStreamReady { stream_id, result } => {
-                    let reply = self.pending_screencast_replies.remove(&stream_id);
-                    let completed = self.screencast.complete_start(stream_id, result);
-                    if completed.is_err() {
-                        self.renderer_state.free_screencast_buffers(stream_id);
-                        if let Some(PendingScreencastReply::Mutter { session_id, .. }) = &reply {
-                            if let Some(ids) = self.mutter_cast_streams.get_mut(session_id) {
-                                ids.retain(|id| *id != stream_id);
-                                if ids.is_empty() {
-                                    self.mutter_cast_streams.remove(session_id);
-                                }
-                            }
-                        }
-                    } else {
-                        self.mark_present_dirty(event_loop, arena);
-                        // Blits may have been queued while the stream was still starting.
-                        self.push_screencast_frames(event_loop, arena);
-                    }
-                    match reply {
-                        Some(PendingScreencastReply::Pipewire { request_id }) => {
-                            let result = completed.map(|node_id| (stream_id, node_id));
-                            self.comms
-                                .dbus(DbusMessage::PipewireStreamStarted { request_id, result });
-                        }
-                        Some(PendingScreencastReply::Mutter {
-                            mutter_stream_id, ..
-                        }) => {
-                            self.comms.dbus(DbusMessage::MutterScreenCastStarted {
-                                mutter_stream_id,
-                                result: completed,
-                            });
-                        }
-                        None => {
-                            if let Ok(_node_id) = completed {
-                                // Orphan success (reply already cancelled): drop the stream.
-                                self.screencast.stop_stream(stream_id);
-                                self.renderer_state.free_screencast_buffers(stream_id);
-                            }
-                        }
-                    }
+                    let effects = self.screencast_peers().on_stream_ready(stream_id, result);
+                    self.apply_screencast_lifecycle(effects, event_loop, arena);
                 }
                 MainMessage::ScreencastBlitNeeded => {
                     self.push_screencast_frames(event_loop, arena);
@@ -1447,7 +1180,7 @@ impl AppData {
         ) {
             Ok(result) => {
                 self.flush_client_sends(event_loop, arena);
-                if !result.presented_outputs.is_empty() && !self.screencast_push_active {
+                if !result.presented_outputs.is_empty() {
                     self.push_screencast_frames(event_loop, arena);
                 }
             }
@@ -1508,7 +1241,7 @@ impl AppData {
                 ) {
                     Ok(result) => {
                         self.flush_client_sends(event_loop, arena);
-                        if !result.presented_outputs.is_empty() && !self.screencast_push_active {
+                        if !result.presented_outputs.is_empty() {
                             self.push_screencast_frames(event_loop, arena);
                         }
                     }
@@ -1517,7 +1250,7 @@ impl AppData {
             }
             SCREENCAST_GPU_WAKE_TOKEN => {
                 self.screencast_gpu_wake_armed = false;
-                self.finish_ready_screencast_dma();
+                self.screencast_capture().finish_ready_dma();
                 self.arm_screencast_gpu_wake(event_loop);
             }
             other => {
@@ -1592,90 +1325,38 @@ impl AppData {
         }
     }
 
-    fn start_window_screencast(
+    fn screencast_peers(&mut self) -> ScreencastSessionPeers<'_> {
+        ScreencastSessionPeers {
+            state: &mut self.screencast_session,
+            screencast: &mut self.screencast,
+            render: &mut self.renderer_state,
+            display: &self.display_state,
+        }
+    }
+
+    fn screencast_capture(&mut self) -> ScreencastCapturePhase<'_> {
+        ScreencastCapturePhase {
+            session: &mut self.screencast_session,
+            screencast: &mut self.screencast,
+            render: &mut self.renderer_state,
+            display: &self.display_state,
+        }
+    }
+
+    fn apply_screencast_lifecycle(
         &mut self,
-        window_id: u32,
-        name: String,
-        max_fps: u32,
-        format_offer: FormatOffer,
-        cursor_mode: ScreencastCursorMode,
-    ) -> Result<u32, String> {
-        let id = if window_id == 0 { None } else { Some(window_id) };
-        let (resolved_id, x, y, width, height, _layers) = self
-            .display_state
-            .window_capture_layers(id)
-            .ok_or_else(|| {
-                if window_id == 0 {
-                    String::from("no focused window to capture")
-                } else {
-                    format!("no such window: {window_id}")
-                }
-            })?;
-        let stream_id = self.screencast.peek_next_stream_id();
-        let (out_w, out_h) = fit_output_size(width as u32, height as u32);
-        let exports = self
-            .renderer_state
-            .alloc_screencast_buffers(
-                stream_id,
-                out_w,
-                out_h,
-                ScreencastManager::dma_buffer_count(),
-            )
-            .map_err(|err| format!("{err:#}"))?;
-        let dma_exports = exports
-            .into_iter()
-            .map(|export| DmaBufferExport {
-                index: export.index,
-                fd: export.fd,
-                width: export.width,
-                height: export.height,
-                stride: export.stride,
-                offset: export.offset,
-                size: export.size,
-                modifier: export.modifier,
-            })
-            .collect();
-        self.screencast
-            .start_stream(
-                ScreencastSource::Window {
-                    window_id: resolved_id,
-                },
-                x,
-                y,
-                width,
-                height,
-                name,
-                max_fps,
-                dma_exports,
-                format_offer,
-                cursor_mode,
-            )
-            .map_err(|err| {
-                self.renderer_state.free_screencast_buffers(stream_id);
-                format!("{err:#}")
-            })
-    }
-
-    fn stop_screencast_stream(&mut self, stream_id: u32) {
-        self.screencast.stop_stream(stream_id);
-        self.renderer_state.free_screencast_buffers(stream_id);
-    }
-
-    /// Queue DMA-BUF slots whose GPU fills have finished (non-blocking fence poll).
-    fn finish_ready_screencast_dma(&mut self) {
-        let ready = match self.renderer_state.poll_screencast_gpu() {
-            Ok(ready) => ready,
-            Err(err) => {
-                warn!("Unable to poll screencast GPU fences: {err:#}");
-                return;
-            }
-        };
-        for (stream_id, index) in ready {
-            if let Err(err) = self.screencast.queue_dma_buffer(stream_id, index) {
-                warn!("Unable to queue DMA-BUF for stream {stream_id}: {err:#}");
-                self.renderer_state
-                    .release_screencast_buffer(stream_id, index);
-            }
+        effects: ScreencastLifecycleEffects,
+        event_loop: &mut EventLoop,
+        arena: &Arena,
+    ) {
+        for msg in effects.dbus {
+            self.comms.dbus(msg);
+        }
+        if effects.mark_present_dirty {
+            self.mark_present_dirty(event_loop, arena);
+        }
+        if effects.push_frames_now {
+            self.push_screencast_frames(event_loop, arena);
         }
     }
 
@@ -1700,9 +1381,10 @@ impl AppData {
             self.screencast_gpu_wake_armed = false;
         }
         *self.screencast_gpu_wake_ts = Timespec::new().sec(sec).nsec(nsec);
-        if let Err(err) = event_loop
-            .submit_timeout_absolute(Pin::new(self.screencast_gpu_wake_ts.as_ref()), SCREENCAST_GPU_WAKE_TOKEN)
-        {
+        if let Err(err) = event_loop.submit_timeout_absolute(
+            Pin::new(self.screencast_gpu_wake_ts.as_ref()),
+            SCREENCAST_GPU_WAKE_TOKEN,
+        ) {
             warn!("Unable to arm screencast GPU wake: {err}");
             return;
         }
@@ -1710,222 +1392,13 @@ impl AppData {
     }
 
     fn push_screencast_frames(&mut self, event_loop: &mut EventLoop, arena: &Arena) {
-        if !self.screencast.has_streams()
-            && !self.renderer_state.has_pending_screencast_gpu()
-        {
-            return;
+        let effects = self.screencast_capture().push_frames(arena);
+        for msg in effects.dbus {
+            self.comms.dbus(msg);
         }
-
-        // Complete any fills that finished since the last wake before submitting more.
-        self.finish_ready_screencast_dma();
-
-        if !self.screencast.has_streams() {
+        if effects.arm_gpu_wake {
             self.arm_screencast_gpu_wake(event_loop);
-            return;
         }
-
-        let now = Instant::now();
-        let mut outputs = ArenaVec::new_in(arena);
-        outputs.extend(
-            self.display_state
-                .outputs()
-                .map(lumalla_shared::Output::from),
-        );
-
-        // Refresh window geometry / tear down destroyed window streams.
-        let mut stop_ids = Vec::new();
-        let all_ids: Vec<u32> = self.screencast.streams().keys().copied().collect();
-        for stream_id in all_ids {
-            let Some(source) = self.screencast.stream_source(stream_id) else {
-                continue;
-            };
-            let ScreencastSource::Window { window_id } = source else {
-                continue;
-            };
-            match self.display_state.window_capture_layers(Some(window_id)) {
-                Some((_, x, y, width, height, _)) => {
-                    if self
-                        .screencast
-                        .update_capture_geometry(stream_id, x, y, width, height)
-                    {
-                        self.renderer_state
-                            .invalidate_screencast_content(stream_id);
-                    }
-                }
-                None => stop_ids.push(stream_id),
-            }
-        }
-        for stream_id in stop_ids {
-            warn!("Stopping PipeWire window stream {stream_id}: window gone");
-            if let Some(PendingScreencastReply::Pipewire { request_id }) =
-                self.pending_screencast_replies.remove(&stream_id)
-            {
-                self.comms.dbus(DbusMessage::PipewireStreamStarted {
-                    request_id,
-                    result: Err(String::from("window was destroyed")),
-                });
-            }
-            self.stop_screencast_stream(stream_id);
-        }
-
-        // DMA-BUF path: submit GPU fills without waiting; queue when fences signal.
-        let pending_blits = self.screencast.take_pending_blits();
-        let mut deferred = Vec::new();
-        for (stream_id, index) in pending_blits {
-            let Some((x, y, width, height, out_w, out_h, uses_dmabuf)) =
-                self.screencast.stream_capture_region(stream_id)
-            else {
-                let _ = self.screencast.queue_dma_buffer(stream_id, index);
-                continue;
-            };
-            if !uses_dmabuf {
-                deferred.push((stream_id, index));
-                continue;
-            }
-            if let Some(stream) = self.screencast.streams().get(&stream_id)
-                && !stream.due_at(now)
-            {
-                deferred.push((stream_id, index));
-                continue;
-            }
-
-            let embed_cursor = self
-                .screencast
-                .streams()
-                .get(&stream_id)
-                .is_some_and(|s| s.embed_cursor());
-
-            // Re-queue without GPU when this slot already holds current content.
-            let content_serial = self.renderer_state.screencast_content_serial();
-            if self
-                .renderer_state
-                .screencast_slot_content_serial(stream_id, index)
-                == Some(content_serial)
-            {
-                if let Err(err) = self.screencast.queue_dma_buffer(stream_id, index) {
-                    warn!(
-                        "Unable to re-queue unchanged DMA-BUF for stream {stream_id}: {err:#}"
-                    );
-                    self.renderer_state
-                        .release_screencast_buffer(stream_id, index);
-                } else if let Some(stream) = self.screencast.streams_mut().get_mut(&stream_id)
-                {
-                    stream.last_capture = Some(now);
-                }
-                continue;
-            }
-
-            let blit_result = match self.screencast.stream_source(stream_id) {
-                Some(ScreencastSource::Window { window_id }) => {
-                    match self.display_state.window_capture_layers(Some(window_id)) {
-                        Some((_, ox, oy, w, h, layers)) => {
-                            let keys: Vec<(u32, u32)> = layers
-                                .iter()
-                                .map(|s| (s.client_id.get(), s.surface_id.get()))
-                                .collect();
-                            self.renderer_state.composite_window_to_screencast_buffer(
-                                stream_id, index, &keys, ox, oy, w, h, out_w, out_h, embed_cursor,
-                            )
-                        }
-                        None => Err(anyhow::anyhow!("window {window_id} gone")),
-                    }
-                }
-                _ => self.renderer_state.blit_region_to_screencast_buffer(
-                    stream_id, index, x, y, width, height, out_w, out_h, &outputs, embed_cursor,
-                ),
-            };
-
-            match blit_result {
-                Ok(()) => {
-                    // Frame is queued to PipeWire once `finish_ready_screencast_dma` sees
-                    // the fence; pace from submit so we do not over-submit while waiting.
-                    if let Some(stream) = self.screencast.streams_mut().get_mut(&stream_id) {
-                        stream.last_capture = Some(now);
-                    }
-                }
-                Err(err) => {
-                    warn!("Unable to fill PipeWire DMA buffer for stream {stream_id}: {err:#}");
-                    if let Err(queue_err) = self.screencast.queue_dma_buffer(stream_id, index) {
-                        warn!(
-                            "Unable to recycle DMA-BUF after blit failure for stream {stream_id}: {queue_err:#}"
-                        );
-                        self.renderer_state
-                            .release_screencast_buffer(stream_id, index);
-                    }
-                }
-            }
-        }
-        if !deferred.is_empty() {
-            self.screencast.requeue_pending_blits_silent(deferred);
-        }
-
-        // Opportunistically queue any fills that completed during this submit batch.
-        self.finish_ready_screencast_dma();
-
-        // MemFd path: GPU-scale into the small screencast buffer, then read that back.
-        // Readback still waits on the GPU (capped to ≤30 fps / ≤2880).
-        let due: Vec<(u32, ScreencastSource, i32, i32, i32, i32, bool)> = self
-            .screencast
-            .streams()
-            .values()
-            .filter(|stream| !stream.uses_dmabuf() && stream.due_at(now))
-            .map(|stream| {
-                (
-                    stream.id,
-                    stream.source,
-                    stream.x,
-                    stream.y,
-                    stream.width,
-                    stream.height,
-                    stream.embed_cursor(),
-                )
-            })
-            .collect();
-
-        for (stream_id, source, x, y, width, height, embed_cursor) in due {
-            let (memfd_w, memfd_h) = fit_memfd_output_size(width as u32, height as u32);
-            let capture_result = match source {
-                ScreencastSource::Window { window_id } => {
-                    match self.display_state.window_capture_layers(Some(window_id)) {
-                        Some((_, ox, oy, w, h, layers)) => {
-                            let keys: Vec<(u32, u32)> = layers
-                                .iter()
-                                .map(|s| (s.client_id.get(), s.surface_id.get()))
-                                .collect();
-                            let (mw, mh) = fit_memfd_output_size(w as u32, h as u32);
-                            self.renderer_state.capture_window_for_screencast(
-                                stream_id, &keys, ox, oy, w, h, mw, mh, embed_cursor,
-                            )
-                        }
-                        None => Err(anyhow::anyhow!("window {window_id} gone")),
-                    }
-                }
-                ScreencastSource::Region { .. } => self.renderer_state.capture_region_for_screencast(
-                    stream_id, x, y, width, height, memfd_w, memfd_h, &outputs, embed_cursor,
-                ),
-            };
-            match capture_result {
-                Ok(image) => {
-                    let frame = VideoFrame {
-                        width: image.width,
-                        height: image.height,
-                        rgba: image.rgba,
-                    };
-                    if let Err(err) = self.screencast.push_memfd_frame(stream_id, frame) {
-                        warn!("Unable to push PipeWire frame for stream {stream_id}: {err:#}");
-                    } else if let Some(stream) =
-                        self.screencast.streams_mut().get_mut(&stream_id)
-                    {
-                        stream.last_capture = Some(now);
-                    }
-                }
-                Err(err) => {
-                    warn!("Unable to capture PipeWire frame for stream {stream_id}: {err:#}");
-                }
-            }
-        }
-
-        self.arm_screencast_gpu_wake(event_loop);
     }
 }
 
