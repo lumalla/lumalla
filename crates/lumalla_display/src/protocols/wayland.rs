@@ -561,7 +561,12 @@ fn process_surface_commit_body(
                             ctx.writer.wl_shell_surface_ping(shell_id).serial(serial);
                         }
                     }
-                    state.focus_newly_mapped_surface(ctx.client_id, commit.surface_id, ctx.writer);
+                    state.focus_newly_mapped_surface(
+                        ctx.client_id,
+                        commit.surface_id,
+                        ctx.registry,
+                        ctx.writer,
+                    );
                     if let Some(info) = state
                         .layer_shell_manager
                         .info_for_wl(ctx.client_id, commit.surface_id)
@@ -603,6 +608,7 @@ fn process_surface_commit_body(
             state.release_keyboard_focus_from_surface(
                 ctx.client_id,
                 commit.surface_id,
+                ctx.registry,
                 ctx.writer,
             );
             state.seat_manager.leave_pointers_on_surface(
@@ -1072,9 +1078,11 @@ impl WlDataSource for DisplayState {
     }
 
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlDataSourceDestroy<'_>) {
+        let focused = self.seat_manager.focused_keyboard_surface().map(|(c, _)| c);
         if let Err(error) = self.data_device_manager.destroy_source(
             ctx.client_id,
             object_id,
+            focused,
             ctx.registry,
             ctx.writer,
         ) {
@@ -1220,11 +1228,13 @@ impl WlDataDevice for DisplayState {
         if !self.seat_manager.is_valid_grab_serial(params.serial()) {
             return;
         }
+        let focused = self.seat_manager.focused_keyboard_surface().map(|(c, _)| c);
         if let Err(error) = self.data_device_manager.set_selection(
             ctx.client_id,
             object_id,
             params.source(),
             params.serial(),
+            focused,
             ctx.registry,
             ctx.writer,
         ) {
@@ -1289,8 +1299,6 @@ impl WlDataDeviceManager for DisplayState {
             *params.id(),
             params.seat(),
             version,
-            ctx.registry,
-            ctx.writer,
         );
     }
 }
@@ -1389,8 +1397,12 @@ impl WlShellSurface for DisplayState {
             .surface_manager
             .surface_for_shell(ctx.client_id, object_id)
         {
-            self.seat_manager
-                .focus_keyboards_on_surface(ctx.client_id, surface_id, ctx.writer);
+            self.focus_keyboards_on_surface(
+                ctx.client_id,
+                surface_id,
+                ctx.registry,
+                ctx.writer,
+            );
         }
     }
 
@@ -1493,7 +1505,12 @@ impl WlSurface for DisplayState {
                     ctx.client_id,
                     object_id,
                 );
-                self.release_keyboard_focus_from_surface(ctx.client_id, object_id, ctx.writer);
+                self.release_keyboard_focus_from_surface(
+                    ctx.client_id,
+                    object_id,
+                    ctx.registry,
+                    ctx.writer,
+                );
                 self.seat_manager
                     .leave_pointers_on_surface(ctx.client_id, object_id, ctx.writer);
                 self.discard_frame_callbacks_for_surface(
@@ -1527,7 +1544,12 @@ impl WlSurface for DisplayState {
                         ctx.client_id,
                         child,
                     );
-                    self.release_keyboard_focus_from_surface(ctx.client_id, child, ctx.writer);
+                    self.release_keyboard_focus_from_surface(
+                        ctx.client_id,
+                        child,
+                        ctx.registry,
+                        ctx.writer,
+                    );
                     self.seat_manager
                         .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
                     self.shm_manager
@@ -1710,7 +1732,12 @@ impl WlSurface for DisplayState {
         for child in result.unmapped_descendants {
             // Surface still exists; deactivate so persistent constraints can reactivate.
             release_pointer_constraint_for_surface(self, ctx, child);
-            self.release_keyboard_focus_from_surface(ctx.client_id, child, ctx.writer);
+            self.release_keyboard_focus_from_surface(
+                        ctx.client_id,
+                        child,
+                        ctx.registry,
+                        ctx.writer,
+                    );
             self.seat_manager
                 .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
             self.shm_manager
@@ -1985,7 +2012,12 @@ impl WlSubsurface for DisplayState {
             .surface_manager
             .subsurface_surface_and_parent(ctx.client_id, object_id)
         {
-            self.release_keyboard_focus_from_surface(ctx.client_id, surface_id, ctx.writer);
+            self.release_keyboard_focus_from_surface(
+                ctx.client_id,
+                surface_id,
+                ctx.registry,
+                ctx.writer,
+            );
         }
         match self
             .surface_manager

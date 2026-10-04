@@ -760,7 +760,12 @@ impl XdgPopup for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &XdgPopupDestroy<'_>) {
         // Restore parent keyboard focus before role-parent links are cleared.
         if let Some(wl_surface) = self.xdg_manager.popup_wl(ctx.client_id, object_id) {
-            self.release_keyboard_focus_from_surface(ctx.client_id, wl_surface, ctx.writer);
+            self.release_keyboard_focus_from_surface(
+                ctx.client_id,
+                wl_surface,
+                ctx.registry,
+                ctx.writer,
+            );
         }
         match self.xdg_manager.destroy_popup(ctx.client_id, object_id) {
             Ok(xdg_surface) => {

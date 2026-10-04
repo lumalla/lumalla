@@ -245,8 +245,6 @@ impl DataDeviceManager {
         id: ObjectId,
         seat: ObjectId,
         version: u32,
-        registry: &mut Registry,
-        writer: &mut Writer,
     ) {
         self.devices.insert(
             (client_id, id),
@@ -256,15 +254,10 @@ impl DataDeviceManager {
                 selection_offer: None,
             },
         );
-        if let Some(selection) = self.selection.clone() {
-            let _ = self.send_selection_to_device(
-                client_id,
-                id,
-                Some((selection.source_client, selection.source)),
-                registry,
-                writer,
-            );
-        }
+        // Do not advertise selection here. Protocol requires selection events
+        // immediately before keyboard focus (and on selection changes while
+        // focused). Sending on get_data_device races Qt's platform init and
+        // null-derefs QGuiApplicationPrivate::platform_integration.
     }
 
     pub fn offer(
@@ -308,6 +301,7 @@ impl DataDeviceManager {
         &mut self,
         client_id: ClientId,
         source_id: ObjectId,
+        focused_client: Option<ClientId>,
         registry: &mut Registry,
         writer: &mut Writer,
     ) -> Result<(), DataDeviceError> {
@@ -320,7 +314,13 @@ impl DataDeviceManager {
             .is_some_and(|s| s.source_client == client_id && s.source == source_id)
         {
             self.selection = None;
-            self.advertise_selection(None, Some(client_id), registry, writer)?;
+            self.advertise_selection_to_focused(
+                None,
+                focused_client,
+                Some(client_id),
+                registry,
+                writer,
+            )?;
         }
         if let Some(drag) = self.drag.as_ref()
             && drag.source == Some((client_id, source_id))
@@ -336,6 +336,7 @@ impl DataDeviceManager {
         device_id: ObjectId,
         source: Option<ObjectId>,
         serial: u32,
+        focused_client: Option<ClientId>,
         registry: &mut Registry,
         writer: &mut Writer,
     ) -> Result<(), DataDeviceError> {
@@ -379,7 +380,48 @@ impl DataDeviceManager {
             serial,
         });
 
-        self.advertise_selection(new_source, Some(client_id), registry, writer)?;
+        // Only the keyboard-focused client receives selection events.
+        self.advertise_selection_to_focused(
+            new_source,
+            focused_client,
+            Some(client_id),
+            registry,
+            writer,
+        )?;
+        Ok(())
+    }
+
+    /// Advertise the current selection after a client gains keyboard focus.
+    pub fn on_keyboard_enter(
+        &mut self,
+        client_id: ClientId,
+        registry: &mut Registry,
+        writer: &mut Writer,
+    ) -> Result<(), DataDeviceError> {
+        let source = self
+            .selection
+            .as_ref()
+            .map(|s| (s.source_client, s.source));
+        self.advertise_selection_to_client(client_id, source, registry, writer)
+    }
+
+    /// Clear the selection offer when a client loses keyboard focus.
+    pub fn on_keyboard_leave(
+        &mut self,
+        client_id: ClientId,
+        writer: &mut Writer,
+    ) -> Result<(), DataDeviceError> {
+        let devices: Vec<ObjectId> = self
+            .devices
+            .iter()
+            .filter_map(|((owner, id), _)| (*owner == client_id).then_some(*id))
+            .collect();
+        for device_id in devices {
+            if let Some(device) = self.devices.get_mut(&(client_id, device_id)) {
+                device.selection_offer = None;
+            }
+            writer.wl_data_device_selection(device_id).id(None);
+        }
         Ok(())
     }
 
@@ -1343,31 +1385,61 @@ impl DataDeviceManager {
         }
     }
 
-    fn advertise_selection(
+    fn advertise_selection_to_focused(
         &mut self,
         source: Option<(ClientId, ObjectId)>,
+        focused_client: Option<ClientId>,
         immediate_client: Option<ClientId>,
         registry: &mut Registry,
         writer: &mut Writer,
     ) -> Result<(), DataDeviceError> {
-        let devices: Vec<(ClientId, ObjectId)> = self
+        let Some(focused) = focused_client else {
+            return Ok(());
+        };
+        if Some(focused) == immediate_client {
+            self.advertise_selection_to_client(focused, source, registry, writer)
+        } else {
+            self.queue_selection_notifies_for_client(focused, source);
+            Ok(())
+        }
+    }
+
+    fn advertise_selection_to_client(
+        &mut self,
+        client_id: ClientId,
+        source: Option<(ClientId, ObjectId)>,
+        registry: &mut Registry,
+        writer: &mut Writer,
+    ) -> Result<(), DataDeviceError> {
+        let devices: Vec<ObjectId> = self
             .devices
-            .keys()
-            .map(|(owner, id)| (*owner, *id))
+            .iter()
+            .filter_map(|((owner, id), _)| (*owner == client_id).then_some(*id))
             .collect();
-        for (owner, id) in devices {
-            if Some(owner) == immediate_client {
-                self.send_selection_to_device(owner, id, source, registry, writer)?;
-            } else {
-                self.pending_selection_notifies
-                    .push(PendingSelectionNotify {
-                        client_id: owner,
-                        device_id: id,
-                        source,
-                    });
-            }
+        for device_id in devices {
+            self.send_selection_to_device(client_id, device_id, source, registry, writer)?;
         }
         Ok(())
+    }
+
+    fn queue_selection_notifies_for_client(
+        &mut self,
+        client_id: ClientId,
+        source: Option<(ClientId, ObjectId)>,
+    ) {
+        let devices: Vec<ObjectId> = self
+            .devices
+            .iter()
+            .filter_map(|((owner, id), _)| (*owner == client_id).then_some(*id))
+            .collect();
+        for device_id in devices {
+            self.pending_selection_notifies
+                .push(PendingSelectionNotify {
+                    client_id,
+                    device_id,
+                    source,
+                });
+        }
     }
 
     fn queue_selection_notifies(&mut self, source: Option<(ClientId, ObjectId)>) {
@@ -1640,13 +1712,14 @@ mod tests {
 
         manager.create_data_source(client_id, source, 3);
         manager.offer(client_id, source, "text/plain").unwrap();
-        manager.create_data_device(client_id, device, seat, 3, &mut registry, &mut writer);
+        manager.create_data_device(client_id, device, seat, 3);
         manager
             .set_selection(
                 client_id,
                 device,
                 Some(source),
                 1,
+                Some(client_id),
                 &mut registry,
                 &mut writer,
             )
@@ -1679,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_client_set_selection_fans_out_on_flush() {
+    fn set_selection_only_notifies_focused_client() {
         let (_recv_a, mut writer_a) = writer_pair();
         let (_recv_b, mut writer_b) = writer_pair();
         let mut registry_a = Registry::new();
@@ -1695,15 +1768,17 @@ mod tests {
 
         manager.create_data_source(client_a, source, 3);
         manager.offer(client_a, source, "text/plain").unwrap();
-        manager.create_data_device(client_a, device_a, seat_a, 3, &mut registry_a, &mut writer_a);
-        manager.create_data_device(client_b, device_b, seat_b, 3, &mut registry_b, &mut writer_b);
+        manager.create_data_device(client_a, device_a, seat_a, 3);
+        manager.create_data_device(client_b, device_b, seat_b, 3);
 
+        // A sets selection while A has keyboard focus — only A is notified.
         manager
             .set_selection(
                 client_a,
                 device_a,
                 Some(source),
                 1,
+                Some(client_a),
                 &mut registry_a,
                 &mut writer_a,
             )
@@ -1712,13 +1787,88 @@ mod tests {
         assert_eq!(manager.selection_source(), Some((client_a, source)));
         assert!(manager.selection_offer(client_a, device_a).is_some());
         assert!(manager.selection_offer(client_b, device_b).is_none());
-        assert_eq!(manager.pending_selection_notify_count(), 1);
+        assert_eq!(manager.pending_selection_notify_count(), 0);
 
-        manager.flush_pending_for_client(client_b, &mut registry_b, &mut writer_b);
+        // B learns about the selection when it gains keyboard focus.
+        manager
+            .on_keyboard_enter(client_b, &mut registry_b, &mut writer_b)
+            .unwrap();
         let offer_b = manager
             .selection_offer(client_b, device_b)
-            .expect("B should receive selection offer after flush");
+            .expect("B should receive selection offer on keyboard enter");
         assert!(manager.has_offer(client_b, offer_b));
+    }
+
+    #[test]
+    fn create_data_device_does_not_advertise_selection() {
+        let (_recv_a, mut writer_a) = writer_pair();
+        let (_recv_b, mut writer_b) = writer_pair();
+        let mut registry_a = Registry::new();
+        let mut registry_b = Registry::new();
+        let mut manager = DataDeviceManager::default();
+        let client_a = client(1);
+        let client_b = client(2);
+        let source = object(10);
+        let device_a = object(11);
+        let device_b = object(21);
+
+        manager.create_data_source(client_a, source, 3);
+        manager.offer(client_a, source, "text/plain").unwrap();
+        manager.create_data_device(client_a, device_a, object(12), 3);
+        manager
+            .set_selection(
+                client_a,
+                device_a,
+                Some(source),
+                1,
+                Some(client_a),
+                &mut registry_a,
+                &mut writer_a,
+            )
+            .unwrap();
+
+        manager.create_data_device(client_b, device_b, object(22), 3);
+        assert!(
+            manager.selection_offer(client_b, device_b).is_none(),
+            "get_data_device must not send selection (Qt init crash)"
+        );
+        assert_eq!(manager.pending_selection_notify_count(), 0);
+
+        manager
+            .on_keyboard_enter(client_b, &mut registry_b, &mut writer_b)
+            .unwrap();
+        assert!(manager.selection_offer(client_b, device_b).is_some());
+    }
+
+    #[test]
+    fn keyboard_leave_clears_selection_offer() {
+        let (_recv, mut writer) = writer_pair();
+        let mut registry = Registry::new();
+        let mut manager = DataDeviceManager::default();
+        let client_id = client(1);
+        let source = object(10);
+        let device = object(11);
+
+        manager.create_data_source(client_id, source, 3);
+        manager.offer(client_id, source, "text/plain").unwrap();
+        manager.create_data_device(client_id, device, object(12), 3);
+        manager
+            .set_selection(
+                client_id,
+                device,
+                Some(source),
+                1,
+                Some(client_id),
+                &mut registry,
+                &mut writer,
+            )
+            .unwrap();
+        assert!(manager.selection_offer(client_id, device).is_some());
+
+        manager.on_keyboard_leave(client_id, &mut writer).unwrap();
+        assert!(manager.selection_offer(client_id, device).is_none());
+        // Selection ownership is unchanged — only the offer to this client is cleared.
+        assert_eq!(manager.selection_source(), Some((client_id, source)));
     }
 
     #[test]
@@ -1738,20 +1888,23 @@ mod tests {
 
         manager.create_data_source(client_a, source, 3);
         manager.offer(client_a, source, "text/plain").unwrap();
-        manager.create_data_device(client_a, device_a, seat_a, 3, &mut registry_a, &mut writer_a);
-        manager.create_data_device(client_b, device_b, seat_b, 3, &mut registry_b, &mut writer_b);
+        manager.create_data_device(client_a, device_a, seat_a, 3);
+        manager.create_data_device(client_b, device_b, seat_b, 3);
         manager
             .set_selection(
                 client_a,
                 device_a,
                 Some(source),
                 1,
+                Some(client_a),
                 &mut registry_a,
                 &mut writer_a,
             )
             .unwrap();
         writer_a.flush().unwrap();
-        manager.flush_pending_for_client(client_b, &mut registry_b, &mut writer_b);
+        manager
+            .on_keyboard_enter(client_b, &mut registry_b, &mut writer_b)
+            .unwrap();
         let offer_b = manager.selection_offer(client_b, device_b).unwrap();
 
         drain_socket(&mut recv_a);
@@ -1794,8 +1947,8 @@ mod tests {
         manager.offer(client_a, source_a, "text/plain").unwrap();
         manager.create_data_source(client_b, source_b, 3);
         manager.offer(client_b, source_b, "text/plain").unwrap();
-        manager.create_data_device(client_a, device_a, object(12), 3, &mut registry_a, &mut writer_a);
-        manager.create_data_device(client_b, device_b, object(22), 3, &mut registry_b, &mut writer_b);
+        manager.create_data_device(client_a, device_a, object(12), 3);
+        manager.create_data_device(client_b, device_b, object(22), 3);
 
         manager
             .set_selection(
@@ -1803,21 +1956,30 @@ mod tests {
                 device_a,
                 Some(source_a),
                 1,
+                Some(client_a),
                 &mut registry_a,
                 &mut writer_a,
             )
             .unwrap();
         writer_a.flush().unwrap();
-        manager.flush_pending_for_client(client_b, &mut registry_b, &mut writer_b);
+
+        // Focus moves A → B (leave clears A's offer, enter advertises to B).
+        manager.on_keyboard_leave(client_a, &mut writer_a).unwrap();
+        manager
+            .on_keyboard_enter(client_b, &mut registry_b, &mut writer_b)
+            .unwrap();
+        assert!(manager.selection_offer(client_a, device_a).is_none());
 
         drain_socket(&mut recv_a);
 
+        // B takes the selection while B has focus — A's source is cancelled.
         manager
             .set_selection(
                 client_b,
                 device_b,
                 Some(source_b),
                 2,
+                Some(client_b),
                 &mut registry_b,
                 &mut writer_b,
             )
@@ -1827,7 +1989,7 @@ mod tests {
 
         manager.flush_pending_for_client(client_a, &mut registry_a, &mut writer_a);
 
-        // Flush may emit selection(new offer) then cancelled; find cancelled on source_a.
+        // Flush delivers cancelled to A's source.
         let mut found_cancel = false;
         for _ in 0..8 {
             let (object_id, opcode, size) = read_event_header(&mut recv_a);
@@ -1838,10 +2000,14 @@ mod tests {
             }
         }
         assert!(found_cancel, "expected wl_data_source.cancelled for previous owner");
-        // Previous owner still learns about the new clipboard contents.
+
+        // A receives B's selection offer when A regains keyboard focus.
+        manager
+            .on_keyboard_enter(client_a, &mut registry_a, &mut writer_a)
+            .unwrap();
         let offer_a = manager
             .selection_offer(client_a, device_a)
-            .expect("A should receive B's selection offer");
+            .expect("A should receive B's selection offer on keyboard enter");
         assert!(manager.has_offer(client_a, offer_a));
     }
 
@@ -1860,19 +2026,22 @@ mod tests {
 
         manager.create_data_source(client_a, source, 3);
         manager.offer(client_a, source, "text/plain").unwrap();
-        manager.create_data_device(client_a, device_a, object(12), 3, &mut registry_a, &mut writer_a);
-        manager.create_data_device(client_b, device_b, object(22), 3, &mut registry_b, &mut writer_b);
+        manager.create_data_device(client_a, device_a, object(12), 3);
+        manager.create_data_device(client_b, device_b, object(22), 3);
         manager
             .set_selection(
                 client_a,
                 device_a,
                 Some(source),
                 1,
+                Some(client_a),
                 &mut registry_a,
                 &mut writer_a,
             )
             .unwrap();
-        manager.flush_pending_for_client(client_b, &mut registry_b, &mut writer_b);
+        manager
+            .on_keyboard_enter(client_b, &mut registry_b, &mut writer_b)
+            .unwrap();
         assert!(manager.selection_offer(client_b, device_b).is_some());
 
         manager.remove_client(client_a);
@@ -1900,7 +2069,7 @@ mod tests {
         manager
             .set_source_actions(client_id, source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)
             .unwrap();
-        manager.create_data_device(client_id, device, seat, 3, &mut registry, &mut writer);
+        manager.create_data_device(client_id, device, seat, 3);
         manager
             .start_drag(
                 client_id,
@@ -1943,8 +2112,8 @@ mod tests {
         manager
             .set_source_actions(client_a, source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)
             .unwrap();
-        manager.create_data_device(client_a, device_a, object(12), 3, &mut registry_a, &mut writer_a);
-        manager.create_data_device(client_b, device_b, object(22), 3, &mut registry_b, &mut writer_b);
+        manager.create_data_device(client_a, device_a, object(12), 3);
+        manager.create_data_device(client_b, device_b, object(22), 3);
 
         manager
             .start_drag(
@@ -1980,7 +2149,7 @@ mod tests {
         manager.create_data_source(client_id, source, 3);
         manager.offer(client_id, source, "text/plain").unwrap();
         // Deliberately skip set_source_actions — Qt destinations still call set_actions(COPY).
-        manager.create_data_device(client_id, device, object(12), 3, &mut registry, &mut writer);
+        manager.create_data_device(client_id, device, object(12), 3);
         manager
             .start_drag(
                 client_id,
@@ -2029,7 +2198,7 @@ mod tests {
         manager
             .set_source_actions(client_id, source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)
             .unwrap();
-        manager.create_data_device(client_id, device, object(12), 3, &mut registry, &mut writer);
+        manager.create_data_device(client_id, device, object(12), 3);
         manager
             .start_drag(
                 client_id,
@@ -2075,7 +2244,7 @@ mod tests {
         manager
             .set_source_actions(client_id, source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)
             .unwrap();
-        manager.create_data_device(client_id, device, object(12), 3, &mut registry, &mut writer);
+        manager.create_data_device(client_id, device, object(12), 3);
         manager
             .start_drag(
                 client_id,

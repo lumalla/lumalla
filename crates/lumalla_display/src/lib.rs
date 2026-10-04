@@ -500,7 +500,55 @@ impl DisplayState {
     }
 
     pub fn flush_pending_keyboard_leaves(&mut self, clients: &mut ConnectedClients) {
-        self.seat_manager.flush_pending_keyboard_leaves(clients);
+        let left = self.seat_manager.flush_pending_keyboard_leaves(clients);
+        for client_id in left {
+            let Some(client) = clients.get_mut(&client_id) else {
+                continue;
+            };
+            let _ = self
+                .data_device_manager
+                .on_keyboard_leave(client_id, client.writer_mut());
+            clients.mark_send_needed(client_id);
+        }
+    }
+
+    /// Focus keyboards on `surface`, advertising clipboard selection when the
+    /// client newly gains keyboard focus (not on same-client surface switches).
+    pub(crate) fn focus_keyboards_on_surface(
+        &mut self,
+        client_id: ClientId,
+        surface: ObjectId,
+        registry: &mut Registry,
+        writer: &mut Writer,
+    ) {
+        let previous_client = self.seat_manager.focused_keyboard_surface().map(|(c, _)| c);
+        let newly_focused = previous_client != Some(client_id);
+        self.seat_manager
+            .focus_keyboards_on_surface(client_id, surface, writer);
+        if newly_focused {
+            let _ = self
+                .data_device_manager
+                .on_keyboard_enter(client_id, registry, writer);
+        }
+    }
+
+    /// Leave keyboards on `surface`, clearing the selection offer if the client
+    /// no longer has any keyboard focus.
+    pub(crate) fn leave_keyboards_on_surface(
+        &mut self,
+        client_id: ClientId,
+        surface: ObjectId,
+        writer: &mut Writer,
+    ) {
+        self.seat_manager
+            .leave_keyboards_on_surface(client_id, surface, writer);
+        let still_focused = self
+            .seat_manager
+            .focused_keyboard_surface()
+            .is_some_and(|(c, _)| c == client_id);
+        if !still_focused {
+            let _ = self.data_device_manager.on_keyboard_leave(client_id, writer);
+        }
     }
 
     pub fn flush_pending_data_device(&mut self, clients: &mut ConnectedClients) {
@@ -779,13 +827,15 @@ impl DisplayState {
                 if allow_keyboard {
                     let focus_surface = self.keyboard_focus_for_pointer_target(client_id, surface);
                     if let Some(client) = clients.get_mut(&client_id) {
-                        self.seat_manager.focus_keyboards_on_surface(
+                        let (registry, writer) = client.registry_and_writer_mut();
+                        self.focus_keyboards_on_surface(
                             client_id,
                             focus_surface,
-                            client.writer_mut(),
+                            registry,
+                            writer,
                         );
                     }
-                    self.seat_manager.flush_pending_keyboard_leaves(clients);
+                    self.flush_pending_keyboard_leaves(clients);
                     self.data_device_manager.flush_pending(clients);
                     if !is_layer {
                         self.on_surface_focused(client_id, focus_surface);
@@ -1344,13 +1394,10 @@ impl DisplayState {
     ) -> Result<bool, WindowError> {
         let (client_id, wl_surface) = self.window_manager.resolve_surface(id)?;
         if let Some(client) = clients.get_mut(&client_id) {
-            self.seat_manager.focus_keyboards_on_surface(
-                client_id,
-                wl_surface,
-                client.writer_mut(),
-            );
+            let (registry, writer) = client.registry_and_writer_mut();
+            self.focus_keyboards_on_surface(client_id, wl_surface, registry, writer);
         }
-        self.seat_manager.flush_pending_keyboard_leaves(clients);
+        self.flush_pending_keyboard_leaves(clients);
         self.data_device_manager.flush_pending(clients);
         self.on_surface_focused(client_id, wl_surface);
         if let Some(client) = clients.get_mut(&client_id) {
@@ -1519,6 +1566,7 @@ impl DisplayState {
         &mut self,
         client_id: ClientId,
         surface_id: ObjectId,
+        registry: &mut Registry,
         writer: &mut Writer,
     ) {
         if self
@@ -1543,8 +1591,7 @@ impl DisplayState {
                         info.band,
                         crate::layer_shell::LayerBand::Top | crate::layer_shell::LayerBand::Overlay
                     ) {
-                        self.seat_manager
-                            .focus_keyboards_on_surface(client_id, surface_id, writer);
+                        self.focus_keyboards_on_surface(client_id, surface_id, registry, writer);
                     }
                     return;
                 }
@@ -1555,8 +1602,7 @@ impl DisplayState {
             if !popup.grabbed {
                 return;
             }
-            self.seat_manager
-                .focus_keyboards_on_surface(client_id, surface_id, writer);
+            self.focus_keyboards_on_surface(client_id, surface_id, registry, writer);
             if let Some(parent_wl) = self.xdg_manager.popup_parent_wl(client_id, popup.popup_id) {
                 self.on_surface_focused(client_id, parent_wl);
                 self.apply_activation(client_id, parent_wl, writer);
@@ -1564,8 +1610,7 @@ impl DisplayState {
             return;
         }
 
-        self.seat_manager
-            .focus_keyboards_on_surface(client_id, surface_id, writer);
+        self.focus_keyboards_on_surface(client_id, surface_id, registry, writer);
         self.on_surface_focused(client_id, surface_id);
         self.apply_activation(client_id, surface_id, writer);
     }
@@ -1579,6 +1624,7 @@ impl DisplayState {
         &mut self,
         client_id: ClientId,
         surface_id: ObjectId,
+        registry: &mut Registry,
         writer: &mut Writer,
     ) {
         let had_focus = self.seat_manager.focused_keyboard_surface().is_some_and(
@@ -1589,13 +1635,11 @@ impl DisplayState {
         let restore = had_focus
             .then(|| self.keyboard_focus_restore_target(client_id, surface_id))
             .flatten();
-        self.seat_manager
-            .leave_keyboards_on_surface(client_id, surface_id, writer);
+        self.leave_keyboards_on_surface(client_id, surface_id, writer);
         let Some(restore) = restore else {
             return;
         };
-        self.seat_manager
-            .focus_keyboards_on_surface(client_id, restore, writer);
+        self.focus_keyboards_on_surface(client_id, restore, registry, writer);
         self.on_surface_focused(client_id, restore);
         self.apply_activation(client_id, restore, writer);
     }
@@ -1687,10 +1731,12 @@ impl DisplayState {
         if let Some((client_id, parent_wl)) = parent_focus
             && let Some(client) = clients.get_mut(&client_id)
         {
-            self.seat_manager
-                .focus_keyboards_on_surface(client_id, parent_wl, client.writer_mut());
+            let (registry, writer) = client.registry_and_writer_mut();
+            self.focus_keyboards_on_surface(client_id, parent_wl, registry, writer);
             self.on_surface_focused(client_id, parent_wl);
-            self.apply_activation(client_id, parent_wl, client.writer_mut());
+            if let Some(client) = clients.get_mut(&client_id) {
+                self.apply_activation(client_id, parent_wl, client.writer_mut());
+            }
         }
         self.flush_pending_keyboard_leaves(clients);
         self.flush_pending_data_device(clients);

@@ -641,8 +641,14 @@ impl SeatManager {
     }
 
     /// Deliver queued `wl_keyboard.leave` events to other clients.
-    pub fn flush_pending_keyboard_leaves(&mut self, clients: &mut ConnectedClients) {
+    ///
+    /// Returns the distinct client IDs that received a leave (for selection cleanup).
+    pub fn flush_pending_keyboard_leaves(
+        &mut self,
+        clients: &mut ConnectedClients,
+    ) -> Vec<ClientId> {
         let pending = std::mem::take(&mut self.pending_keyboard_leaves);
+        let mut left_clients = Vec::new();
         for (client_id, keyboard_id, surface) in pending {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
@@ -653,7 +659,11 @@ impl SeatManager {
                 .wl_keyboard_leave(keyboard_id)
                 .serial(serial)
                 .surface(surface);
+            if !left_clients.contains(&client_id) {
+                left_clients.push(client_id);
+            }
         }
+        left_clients
     }
 
     pub fn handle_key(
