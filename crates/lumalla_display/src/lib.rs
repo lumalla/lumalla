@@ -339,13 +339,15 @@ impl DisplayState {
     }
 
     pub(crate) fn submit_committed_frame(&mut self, frame: CommittedFrame, is_cursor: bool) {
+        // Only the focused client's active cursor surface may drive the rendered
+        // pointer image; unfocused cursor-role commits must not hijack it.
         let hotspot = if is_cursor {
-            self.active_cursor()
-                .filter(|cursor| {
-                    cursor.client_id == frame.client_id && cursor.surface_id == frame.surface_id
-                })
-                .map(|cursor| (cursor.hotspot_x, cursor.hotspot_y))
-                .unwrap_or((0, 0))
+            let Some(active) = self.active_cursor().filter(|cursor| {
+                cursor.client_id == frame.client_id && cursor.surface_id == frame.surface_id
+            }) else {
+                return;
+            };
+            (active.hotspot_x, active.hotspot_y)
         } else {
             (0, 0)
         };
@@ -512,6 +514,13 @@ impl DisplayState {
         }
     }
 
+    /// Deliver queued `wl_pointer.leave` events (e.g. after a DnD grab starts).
+    pub fn flush_pending_pointer_leaves(&mut self, clients: &mut ConnectedClients) {
+        for client_id in self.seat_manager.flush_pending_pointer_leaves(clients) {
+            clients.mark_send_needed(client_id);
+        }
+    }
+
     /// Focus keyboards on `surface`, advertising clipboard selection when the
     /// client newly gains keyboard focus (not on same-client surface switches).
     pub(crate) fn focus_keyboards_on_surface(
@@ -593,18 +602,24 @@ impl DisplayState {
     ///
     /// Call after client dispatch or when mapping changes under a stationary cursor.
     /// Skipped while a DnD grab owns the pointer — re-entering would steal the grab.
+    ///
+    /// Uses the same layer-aware hit-test as motion/button so a stationary cursor
+    /// over a layer surface is not rewritten onto the desktop window underneath.
     pub fn refresh_pointer_focus(&mut self, clients: &mut ConnectedClients, arena: &Arena) {
         if self.data_device_manager.has_active_drag_grab() {
             return;
         }
         let views = self.pointer_views();
-        self.seat_manager.update_pointer_focus_and_motion(
+        let (px, py) = self.seat_manager.pointer_position();
+        let target = self.pointer_target_at_output_local(px, py);
+        self.seat_manager.update_pointer_focus_and_motion_with_target(
             clients,
             &self.surface_manager,
             &mut self.pointer_constraints_manager,
             &views,
             0,
             false,
+            target,
             arena,
         );
     }

@@ -90,6 +90,10 @@ pub struct SeatManager {
     /// `wl_keyboard.leave` events for clients other than the one currently being
     /// dispatched (protocol handlers only have that client's writer).
     pending_keyboard_leaves: Vec<(ClientId, ObjectId, ObjectId)>,
+    /// `wl_pointer.leave` events for clients other than the one currently being
+    /// dispatched (e.g. when a DnD grab clears another client's pointer focus).
+    /// Entries are `(client, pointer, surface, version)`.
+    pending_pointer_leaves: Vec<(ClientId, ObjectId, ObjectId, u32)>,
     serial: Serial,
 }
 
@@ -135,6 +139,7 @@ impl Default for SeatManager {
             output_height: 0,
             active_touches: HashMap::new(),
             pending_keyboard_leaves: Vec::new(),
+            pending_pointer_leaves: Vec::new(),
             serial: Serial::new(),
         }
     }
@@ -309,6 +314,10 @@ impl SeatManager {
         self.touches.retain(|t| t.client_id != client_id);
         self.active_touches
             .retain(|_, (owner, _)| *owner != client_id);
+        self.pending_keyboard_leaves
+            .retain(|(owner, ..)| *owner != client_id);
+        self.pending_pointer_leaves
+            .retain(|(owner, ..)| *owner != client_id);
     }
 
     pub fn next_serial(&mut self) -> u32 {
@@ -527,9 +536,13 @@ impl SeatManager {
         }
     }
 
-    /// Drop all pointer focus for a DnD grab. Leaves are sent for `client_id`;
-    /// other clients' focus is cleared in state (their leave is delivered on next
-    /// enter after the grab ends).
+    /// Drop all pointer focus for a DnD grab.
+    ///
+    /// Leaves are sent immediately for `client_id`. Other clients' leaves are
+    /// queued in [`Self::pending_pointer_leaves`] (only this client's writer is
+    /// available here); call [`Self::flush_pending_pointer_leaves`] once those
+    /// writers are reachable. Focus is cleared immediately so pointer events are
+    /// not dual-delivered before flush.
     pub fn begin_dnd_pointer_grab(&mut self, client_id: ClientId, writer: &mut Writer) {
         let focused: Vec<(ClientId, ObjectId, ObjectId, u32)> = self
             .pointers
@@ -549,6 +562,9 @@ impl SeatManager {
                 if version >= 5 {
                     writer.wl_pointer_frame(pointer_id);
                 }
+            } else {
+                self.pending_pointer_leaves
+                    .push((owner, pointer_id, surface, version));
             }
             if let Some(pointer) = self
                 .pointers
@@ -659,6 +675,35 @@ impl SeatManager {
                 .wl_keyboard_leave(keyboard_id)
                 .serial(serial)
                 .surface(surface);
+            if !left_clients.contains(&client_id) {
+                left_clients.push(client_id);
+            }
+        }
+        left_clients
+    }
+
+    /// Deliver queued `wl_pointer.leave` events to other clients.
+    ///
+    /// Returns the distinct client IDs that received a leave.
+    pub fn flush_pending_pointer_leaves(
+        &mut self,
+        clients: &mut ConnectedClients,
+    ) -> Vec<ClientId> {
+        let pending = std::mem::take(&mut self.pending_pointer_leaves);
+        let mut left_clients = Vec::new();
+        for (client_id, pointer_id, surface, version) in pending {
+            let Some(client) = clients.get_mut(&client_id) else {
+                continue;
+            };
+            let serial = self.serial.next_serial();
+            client
+                .writer_mut()
+                .wl_pointer_leave(pointer_id)
+                .serial(serial)
+                .surface(surface);
+            if version >= 5 {
+                client.writer_mut().wl_pointer_frame(pointer_id);
+            }
             if !left_clients.contains(&client_id) {
                 left_clients.push(client_id);
             }
@@ -1777,6 +1822,126 @@ mod tests {
         seat.leave_pointers_on_surface(client_id, surface, &mut writer);
         assert!(seat.pointers[0].focus.is_none());
         assert!(seat.pointers[0].enter_serial.is_none());
+    }
+
+    #[test]
+    fn begin_dnd_pointer_grab_queues_other_client_leave() {
+        let mut seat = SeatManager::default();
+        let (_keep_a, mut writer_a) = writer();
+        let (_keep_b, mut writer_b) = writer();
+        let client_a = client(1);
+        let client_b = client(2);
+        let pointer_a = object(10);
+        let pointer_b = object(11);
+        let surface_a = object(20);
+
+        seat.create_pointer(
+            client_a,
+            pointer_a,
+            5,
+            &mut writer_a,
+            Some(surface_a),
+            &SurfaceManager::default(),
+            &[],
+        );
+        seat.create_pointer(
+            client_b,
+            pointer_b,
+            5,
+            &mut writer_b,
+            None,
+            &SurfaceManager::default(),
+            &[],
+        );
+        assert_eq!(seat.pointers[0].focus, Some(surface_a));
+
+        // Client B starts a drag; client A's leave must be queued (B's writer only).
+        seat.begin_dnd_pointer_grab(client_b, &mut writer_b);
+        assert!(seat.pointers[0].focus.is_none());
+        assert!(seat.pointers[1].focus.is_none());
+        assert_eq!(seat.pending_pointer_leaves.len(), 1);
+        assert_eq!(
+            seat.pending_pointer_leaves[0],
+            (client_a, pointer_a, surface_a, 5)
+        );
+    }
+
+    #[test]
+    fn update_pointer_focus_override_target_keeps_focus_off_desktop_top() {
+        use crate::pointer_constraints::PointerConstraintsManager;
+
+        let mut seat = SeatManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let mut clients = ConnectedClients::new();
+        let (_keep, mut writer) = writer();
+        let client_a = client(1);
+        let client_b = client(2);
+        let pointer_a = object(10);
+        let pointer_b = object(11);
+        let surface_a = object(20);
+        let surface_b = object(21);
+
+        for (cid, sid, buf) in [
+            (client_a, surface_a, object(40)),
+            (client_b, surface_b, object(41)),
+        ] {
+            surfaces.create_surface(cid, sid);
+            surfaces.create_shell_surface(cid, object(30), sid).unwrap();
+            surfaces
+                .set_shell_mode(cid, object(30), ShellMode::Toplevel)
+                .unwrap();
+            surfaces.attach(cid, sid, Some(buf), 0, 0, 1).unwrap();
+            let _ = surfaces.commit(cid, sid).unwrap();
+            surfaces
+                .set_committed_buffer_size(cid, sid, 100, 100)
+                .unwrap();
+            surfaces.set_surface_layout(cid, sid, 0, 0).unwrap();
+        }
+        // B painted later → top-most for global_pointer_target at (50,50).
+        surfaces.record_painted_surface(client_a, surface_a);
+        surfaces.record_painted_surface(client_b, surface_b);
+
+        // Pretend both somehow have focus (the pre-fix thrash shape).
+        seat.create_pointer(
+            client_a,
+            pointer_a,
+            5,
+            &mut writer,
+            Some(surface_a),
+            &surfaces,
+            &[],
+        );
+        seat.create_pointer(
+            client_b,
+            pointer_b,
+            5,
+            &mut writer,
+            Some(surface_b),
+            &surfaces,
+            &[],
+        );
+        seat.set_pointer_position(50.0, 50.0);
+        assert_eq!(
+            surfaces.global_pointer_target(None, 50.0, 50.0),
+            Some((client_b, surface_b))
+        );
+
+        let arena = Arena::new();
+        let mut constraints = PointerConstraintsManager::default();
+        // Layer-aware refresh passes A as override; B must leave even though it
+        // wins the desktop-only hit-test.
+        seat.update_pointer_focus_and_motion_with_target(
+            &mut clients,
+            &surfaces,
+            &mut constraints,
+            &[],
+            0,
+            false,
+            Some((client_a, surface_a)),
+            &arena,
+        );
+        assert_eq!(seat.pointers[0].focus, Some(surface_a));
+        assert!(seat.pointers[1].focus.is_none());
     }
 
     #[test]

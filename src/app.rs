@@ -438,6 +438,10 @@ impl AppData {
                 } else {
                     self.display_state
                         .flush_pending_keyboard_leaves(&mut self.clients);
+                    // Pointer leaves before data-device drag enter so clients never
+                    // see enter while still believing they own pointer focus.
+                    self.display_state
+                        .flush_pending_pointer_leaves(&mut self.clients);
                     self.display_state
                         .flush_pending_data_device(&mut self.clients);
                     self.display_state
