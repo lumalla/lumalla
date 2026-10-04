@@ -1,15 +1,24 @@
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 use anyhow::Context;
-use lumalla_shared::{View, WindowGeometryUpdate, WindowRule, WindowState, map_dest_to_source, map_source_to_dest};
+use lumalla_shared::{
+    PresentationNotify, RenderSink, SurfaceDmabuf, SurfaceSubmit, SurfaceSubmitRole, View,
+    WindowGeometryUpdate, WindowRule, WindowState, map_dest_to_source, map_source_to_dest,
+};
+use lumalla_wayland_protocol::buffer::MessageHeader;
 use lumalla_wayland_protocol::protocols::presentation_time::{
     WP_PRESENTATION_FEEDBACK_KIND_HW_CLOCK, WP_PRESENTATION_FEEDBACK_KIND_HW_COMPLETION,
     WP_PRESENTATION_FEEDBACK_KIND_VSYNC,
 };
 use lumalla_wayland_protocol::registry::InterfaceIndex;
-use lumalla_wayland_protocol::{ObjectId, buffer::Writer, registry::Registry};
+use lumalla_wayland_protocol::{
+    Ctx, ObjectId, buffer::Writer, registry::ObjectMetadata, registry::Registry,
+    registry::RequestHandler,
+};
 use stumpalo::Arena;
 
 use crate::{
@@ -33,6 +42,7 @@ mod layer_shell;
 mod output;
 mod pointer_constraints;
 mod protocols;
+mod recording_sink;
 mod relative_pointer;
 mod seat;
 mod shm;
@@ -42,19 +52,68 @@ mod xdg;
 
 pub use clients::ConnectedClients;
 pub use dmabuf::ExportedDmabuf;
+pub use lumalla_shared::PresentationFlipInfo;
 pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland, buffer::ReadResult};
 pub use output::OutputInfo;
+pub use recording_sink::RecordingRenderSink;
 pub use seat::{ActiveCursor, KeyboardModifiers, PointerCursor};
 pub use surface::{Rectangle, SceneSurface};
 pub use window_manager::{WindowError, WindowGeometryChange};
 
-/// Presentation timing for a completed DRM page-flip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PresentationFlipInfo {
-    pub tv_sec: u32,
-    pub tv_usec: u32,
-    pub sequence: u32,
-    pub refresh_ns: u32,
+/// Short-lived protocol handler that gives display a [`RenderSink`] for the dispatch phase.
+///
+/// Protocol impls stay on [`DisplayState`]; this wrapper installs `render` for the duration of
+/// each request so commit/layout paths can call the sink in-place.
+pub struct DisplayHandler<'a> {
+    pub state: &'a mut DisplayState,
+    pub render: &'a mut dyn RenderSink,
+}
+
+impl RequestHandler for DisplayHandler<'_> {
+    fn handle_request(
+        &mut self,
+        object: ObjectMetadata,
+        ctx: &mut Ctx,
+        header: &MessageHeader,
+        data: &[u8],
+        fds: &mut VecDeque<OwnedFd>,
+    ) -> anyhow::Result<()> {
+        let DisplayHandler { state, render } = self;
+        // SAFETY: `render` is exclusively borrowed for this call; the pointer is cleared before
+        // returning and never escapes DisplayState.
+        unsafe {
+            state.enter_render(&mut **render);
+        }
+        let result = state.handle_request(object, ctx, header, data, fds);
+        state.exit_render();
+        result
+    }
+}
+
+/// Adapter that completes Wayland frame/presentation objects after renderer present/flip.
+pub struct DisplayPresentationNotify<'a> {
+    pub state: &'a mut DisplayState,
+    pub clients: &'a mut ConnectedClients,
+}
+
+impl PresentationNotify for DisplayPresentationNotify<'_> {
+    fn presentation_completed(&mut self, info: PresentationFlipInfo) {
+        self.state
+            .complete_presentation_feedbacks(self.clients, info);
+    }
+
+    fn frames_completed(&mut self, time_msec: u32) {
+        self.state
+            .complete_frame_callbacks(self.clients, time_msec);
+    }
+
+    fn pending_presentation_feedback(&self) -> bool {
+        self.state.pending_presentation_feedback_count() > 0
+    }
+
+    fn pending_frame_callbacks(&self) -> bool {
+        self.state.pending_frame_callback_count() > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,8 +132,9 @@ pub(crate) struct PendingFrameCallback {
 
 pub struct DisplayMessage;
 
+/// Built during a surface commit before submitting to [`RenderSink`].
 #[derive(Debug)]
-pub struct CommittedFrame {
+pub(crate) struct CommittedFrame {
     pub client_id: ClientId,
     pub surface_id: lumalla_wayland_protocol::ObjectId,
     pub buffer_id: lumalla_wayland_protocol::ObjectId,
@@ -89,43 +149,13 @@ pub struct CommittedFrame {
     pub offset_y: i32,
     pub x: i32,
     pub y: i32,
-    /// Surface-local size after viewport destination / crop (or buffer/scale).
     pub surface_width: i32,
     pub surface_height: i32,
-    /// Viewport source rectangle in post-scale coords, if set.
     pub viewport_src: Option<(f32, f32, f32, f32)>,
-    /// Populated for linux-dmabuf commits; renderer imports this FD on the GPU.
     pub dmabuf: Option<ExportedDmabuf>,
-    /// Output-space region that changed this commit.
     pub damage: Option<Rectangle>,
-    /// Buffer-space region that changed this commit (for GPU texture uploads).
     pub buffer_damage: Option<Rectangle>,
-    /// When true, the entire surface area must be recomposited.
     pub full_surface: bool,
-}
-
-#[derive(Debug)]
-pub enum SurfaceUpdate {
-    Frame(CommittedFrame),
-    Cursor(CommittedFrame),
-    Unmapped {
-        client_id: ClientId,
-        surface_id: lumalla_wayland_protocol::ObjectId,
-    },
-    /// A `wl_buffer` was destroyed; drop any cached GPU imports for it.
-    BufferDestroyed {
-        client_id: ClientId,
-        buffer_id: lumalla_wayland_protocol::ObjectId,
-    },
-}
-
-/// Renderer position update after a window move.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RendererLayoutSync {
-    pub owner_id: u32,
-    pub surface_id: u32,
-    pub x: i32,
-    pub y: i32,
 }
 
 pub struct DisplayState {
@@ -141,12 +171,19 @@ pub struct DisplayState {
     xdg_manager: XdgManager,
     layer_shell_manager: LayerShellManager,
     window_manager: WindowManager,
-    surface_updates: VecDeque<SurfaceUpdate>,
     pending_geometry_changes: Vec<WindowGeometryChange>,
     pub(crate) pending_frame_callbacks: VecDeque<PendingFrameCallback>,
     pending_presentation_feedbacks: VecDeque<PendingPresentationFeedback>,
     /// Activation configures for clients other than the one currently writing.
     pending_activation_configures: Vec<ActivationConfigure>,
+    /// Installed only while a [`DisplayHandler`] is dispatching a request.
+    ///
+    /// Stored as `'static` via transmute for the duration of `enter_render`…`exit_render` only.
+    active_render: Option<NonNull<dyn RenderSink + 'static>>,
+    /// Used when no live renderer is installed (unit tests / early init).
+    fallback_sink: RecordingRenderSink,
+    /// True when a commit/unmap/buffer change was pushed to the render sink this cycle.
+    render_content_changed: bool,
 }
 
 impl Default for DisplayState {
@@ -164,16 +201,202 @@ impl Default for DisplayState {
             xdg_manager: XdgManager::default(),
             layer_shell_manager: LayerShellManager::default(),
             window_manager: WindowManager::default(),
-            surface_updates: VecDeque::new(),
             pending_geometry_changes: Vec::new(),
             pending_frame_callbacks: VecDeque::new(),
             pending_presentation_feedbacks: VecDeque::new(),
             pending_activation_configures: Vec::new(),
+            active_render: None,
+            fallback_sink: RecordingRenderSink::default(),
+            render_content_changed: false,
         }
     }
 }
 
 impl DisplayState {
+    /// # Safety
+    /// `render` must remain exclusively borrowed and valid until [`Self::exit_render`].
+    pub(crate) unsafe fn enter_render(&mut self, render: &mut dyn RenderSink) {
+        let ptr: *mut dyn RenderSink = render;
+        // SAFETY: pointer is only used until `exit_render`, while `render` is borrowed.
+        let ptr: *mut (dyn RenderSink + 'static) = unsafe { std::mem::transmute(ptr) };
+        self.active_render = Some(unsafe { NonNull::new_unchecked(ptr) });
+    }
+
+    pub(crate) fn exit_render(&mut self) {
+        self.active_render = None;
+    }
+
+    /// Active [`RenderSink`]: live renderer when installed, else the recording fallback.
+    pub(crate) fn render_mut(&mut self) -> &mut dyn RenderSink {
+        if let Some(mut ptr) = self.active_render {
+            // SAFETY: pointer is valid between enter_render/exit_render.
+            return unsafe { ptr.as_mut() as &mut dyn RenderSink };
+        }
+        &mut self.fallback_sink
+    }
+
+    /// Run `f` with a render sink installed (for layout/config paths outside protocol dispatch).
+    pub fn with_render<R: RenderSink, T>(
+        &mut self,
+        render: &mut R,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        // SAFETY: `render` is borrowed for the duration of `f`.
+        unsafe {
+            self.enter_render(render);
+        }
+        let result = f(self);
+        self.exit_render();
+        result
+    }
+
+    /// Test/helper: drain submits recorded on the fallback sink.
+    pub fn take_recorded_submits(&mut self) -> Vec<SurfaceSubmit> {
+        self.fallback_sink.take_submits()
+    }
+
+    /// Test/helper: drain surface removals recorded on the fallback sink.
+    pub fn take_recorded_removals(&mut self) -> Vec<(u32, u32)> {
+        self.fallback_sink.take_removed_surfaces()
+    }
+
+    /// Whether protocol handling pushed content to the render sink since the last clear.
+    pub fn take_render_content_changed(&mut self) -> bool {
+        std::mem::take(&mut self.render_content_changed)
+    }
+
+    pub(crate) fn submit_committed_frame(&mut self, frame: CommittedFrame, is_cursor: bool) {
+        let hotspot = if is_cursor {
+            self.active_cursor()
+                .filter(|cursor| {
+                    cursor.client_id == frame.client_id && cursor.surface_id == frame.surface_id
+                })
+                .map(|cursor| (cursor.hotspot_x, cursor.hotspot_y))
+                .unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+        let buffer_id = frame.buffer_id.get();
+        let submit = SurfaceSubmit {
+            owner_id: frame.client_id.get(),
+            surface_id: frame.surface_id.get(),
+            buffer_id,
+            pixels: frame.pixels,
+            width: frame.width,
+            height: frame.height,
+            stride: frame.stride,
+            format: frame.format,
+            x: frame.x,
+            y: frame.y,
+            buffer_scale: frame.buffer_scale,
+            buffer_transform: frame.buffer_transform,
+            surface_width: frame.surface_width,
+            surface_height: frame.surface_height,
+            viewport_src: frame.viewport_src,
+            dmabuf: frame.dmabuf.map(|exported| SurfaceDmabuf {
+                buffer_id,
+                fd: exported.fd,
+                drm_fourcc: exported.drm_fourcc,
+                offset: exported.offset,
+                modifier: exported.modifier,
+            }),
+            damage: frame.damage.map(|rect| lumalla_shared::DamageRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            }),
+            buffer_damage: frame.buffer_damage.map(|rect| lumalla_shared::DamageRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            }),
+            full_surface: frame.full_surface,
+            role: if is_cursor {
+                SurfaceSubmitRole::Cursor {
+                    hotspot_x: hotspot.0,
+                    hotspot_y: hotspot.1,
+                }
+            } else {
+                SurfaceSubmitRole::Content
+            },
+        };
+        if let Err(err) = self.render_mut().submit_surface(submit) {
+            log::error!("Unable to submit surface to renderer: {err:#}");
+        }
+        self.render_mut().request_present();
+        self.render_content_changed = true;
+    }
+
+    pub(crate) fn emit_surface_unmapped(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) {
+        if let Err(err) = self
+            .render_mut()
+            .remove_surface(client_id.get(), surface_id.get())
+        {
+            log::error!("Unable to remove surface from renderer: {err:#}");
+        }
+        self.render_mut().request_present();
+        self.render_content_changed = true;
+    }
+
+    pub(crate) fn emit_buffer_destroyed(&mut self, client_id: ClientId, buffer_id: ObjectId) {
+        if let Err(err) = self
+            .render_mut()
+            .remove_buffer(client_id.get(), buffer_id.get())
+        {
+            log::error!("Unable to drop destroyed buffer in renderer: {err:#}");
+        }
+    }
+
+    /// Push pointer cursor policy (hotspot / hide / default) into the active render sink.
+    pub fn sync_pointer_cursor_to_render(&mut self) {
+        match self.pointer_cursor() {
+            PointerCursor::Surface(active) => {
+                if let Err(err) = self
+                    .render_mut()
+                    .update_cursor_hotspot(active.hotspot_x, active.hotspot_y)
+                {
+                    log::error!("Unable to update cursor hotspot: {err:#}");
+                }
+            }
+            PointerCursor::Hidden => {
+                if let Err(err) = self.render_mut().hide_cursor() {
+                    log::error!("Unable to hide pointer cursor: {err:#}");
+                }
+            }
+            PointerCursor::Default => {
+                if let Err(err) = self.render_mut().clear_cursor() {
+                    log::error!("Unable to restore default cursor: {err:#}");
+                }
+            }
+        }
+    }
+
+    /// Push the authoritative desktop + layer scenes into the active render sink.
+    pub fn push_renderer_scenes(&mut self) {
+        let layer_scenes = self.collect_output_layer_scenes();
+        self.render_mut().set_output_layer_scenes(&layer_scenes);
+
+        let surfaces = self.scene_surfaces();
+        let scene: Vec<(u32, u32, i32, i32)> = surfaces
+            .iter()
+            .map(|surface| {
+                (
+                    surface.client_id.get(),
+                    surface.surface_id.get(),
+                    surface.x,
+                    surface.y,
+                )
+            })
+            .collect();
+        self.render_mut().set_desktop_scene(&scene);
+    }
+
     pub fn set_keyboard_keymap(&mut self, keymap: lumalla_shared::KeymapMemfd) {
         self.seat_manager.set_keymap(keymap);
     }
@@ -674,21 +897,18 @@ impl DisplayState {
             .retain(|pending| pending.client_id != client_id);
         self.pending_presentation_feedbacks
             .retain(|pending| pending.client_id != client_id);
-        self.surface_updates.retain(|update| match update {
-            SurfaceUpdate::Frame(frame) | SurfaceUpdate::Cursor(frame) => {
-                frame.client_id != client_id
-            }
-            SurfaceUpdate::Unmapped {
-                client_id: owner, ..
-            }
-            | SurfaceUpdate::BufferDestroyed {
-                client_id: owner, ..
-            } => *owner != client_id,
-        });
-    }
-
-    pub fn take_surface_updates(&mut self) -> impl Iterator<Item = SurfaceUpdate> + '_ {
-        self.surface_updates.drain(..)
+        self.fallback_sink
+            .submits
+            .retain(|submit| submit.owner_id != client_id.get());
+        self.fallback_sink
+            .removed_surfaces
+            .retain(|(owner, _)| *owner != client_id.get());
+        if let Err(err) = self.render_mut().remove_client(client_id.get()) {
+            log::error!("Unable to remove client frames from renderer: {err:#}");
+        } else {
+            self.render_mut().request_present();
+            self.render_content_changed = true;
+        }
     }
 
     /// Current mapped scene in authoritative back-to-front order.
@@ -977,11 +1197,7 @@ impl DisplayState {
                 let _ = self
                     .surface_manager
                     .set_xdg_map_ready(client_id, wl_surface, false);
-                self.surface_updates
-                    .push_back(SurfaceUpdate::Unmapped {
-                        client_id,
-                        surface_id: wl_surface,
-                    });
+                self.emit_surface_unmapped(client_id, wl_surface);
                 if let Some(client) = clients.get_mut(&client_id) {
                     client
                         .writer_mut()
@@ -1026,14 +1242,13 @@ impl DisplayState {
         Ok(())
     }
 
-    pub fn set_window<'a>(
+    pub fn set_window(
         &mut self,
         id: Option<u32>,
         geometry: WindowGeometryUpdate,
         user_initiated: bool,
         clients: &mut ConnectedClients,
-        arena: &'a Arena,
-    ) -> Result<allocator_api2::vec::Vec<RendererLayoutSync, &'a Arena>, WindowError> {
+    ) -> Result<bool, WindowError> {
         let changes = self.window_manager.set_window(
             id,
             geometry,
@@ -1041,12 +1256,13 @@ impl DisplayState {
             &self.surface_manager,
             &mut self.xdg_manager,
         )?;
-        Ok(self.apply_geometry_changes(changes, clients, arena))
+        Ok(self.apply_geometry_changes(changes, clients))
     }
 
     /// Give keyboard focus and xdg activation to a window.
     ///
-    /// When `raise` is true, also move the window to the top of paint order.
+    /// When `raise` is true, also move the window to the top of paint order and
+    /// push the updated scene to the active [`RenderSink`].
     pub fn focus_window(
         &mut self,
         id: Option<u32>,
@@ -1073,6 +1289,8 @@ impl DisplayState {
         if raise {
             self.surface_manager
                 .record_painted_surface(client_id, wl_surface);
+            self.push_renderer_scenes();
+            self.render_mut().request_present();
             raised = true;
         }
         Ok(raised)
@@ -1083,6 +1301,8 @@ impl DisplayState {
         let (client_id, wl_surface) = self.window_manager.resolve_surface(id)?;
         self.surface_manager
             .record_painted_surface(client_id, wl_surface);
+        self.push_renderer_scenes();
+        self.render_mut().request_present();
         Ok(())
     }
 
@@ -1117,20 +1337,19 @@ impl DisplayState {
         self.window_manager.remove_zone(name)
     }
 
-    pub fn add_window_to_zone<'a>(
+    pub fn add_window_to_zone(
         &mut self,
         id: Option<u32>,
         zone: &str,
         clients: &mut ConnectedClients,
-        arena: &'a Arena,
-    ) -> Result<allocator_api2::vec::Vec<RendererLayoutSync, &'a Arena>, WindowError> {
+    ) -> Result<bool, WindowError> {
         let changes = self.window_manager.add_window_to_zone(
             id,
             zone,
             &self.surface_manager,
             &mut self.xdg_manager,
         )?;
-        Ok(self.apply_geometry_changes(changes, clients, arena))
+        Ok(self.apply_geometry_changes(changes, clients))
     }
 
     pub fn remove_window_from_zone(&mut self, id: Option<u32>) -> Result<(), WindowError> {
@@ -1166,16 +1385,12 @@ impl DisplayState {
         self.window_manager.unregister_toplevel(client_id, toplevel);
     }
 
-    pub fn drain_pending_geometry<'a>(
-        &mut self,
-        clients: &mut ConnectedClients,
-        arena: &'a Arena,
-    ) -> allocator_api2::vec::Vec<RendererLayoutSync, &'a Arena> {
+    pub fn drain_pending_geometry(&mut self, clients: &mut ConnectedClients) -> bool {
         if self.pending_geometry_changes.is_empty() {
-            return allocator_api2::vec::Vec::new_in(arena);
+            return false;
         }
         let changes = std::mem::take(&mut self.pending_geometry_changes);
-        self.apply_geometry_changes(changes, clients, arena)
+        self.apply_geometry_changes(changes, clients)
     }
 
     pub(crate) fn queue_rule_geometry_for_toplevel(
@@ -1437,13 +1652,12 @@ impl DisplayState {
         protocols::xdg_shell::write_configure_snapshot(writer, xdg_surface_id, snapshot);
     }
 
-    fn apply_geometry_changes<'a>(
+    fn apply_geometry_changes(
         &mut self,
         changes: Vec<WindowGeometryChange>,
         clients: &mut ConnectedClients,
-        arena: &'a Arena,
-    ) -> allocator_api2::vec::Vec<RendererLayoutSync, &'a Arena> {
-        let mut renderer_syncs = allocator_api2::vec::Vec::new_in(arena);
+    ) -> bool {
+        let mut changed = false;
         for change in changes {
             if let Some((x, y)) = change.position {
                 let _ = self.surface_manager.set_surface_layout(
@@ -1452,16 +1666,15 @@ impl DisplayState {
                     x,
                     y,
                 );
-                renderer_syncs.push(RendererLayoutSync {
-                    owner_id: change.client_id.get(),
-                    surface_id: change.wl_surface.get(),
-                    x,
-                    y,
-                });
+                changed = true;
             }
         }
         self.flush_pending_window_configures(clients);
-        renderer_syncs
+        if changed {
+            self.push_renderer_scenes();
+            self.render_mut().request_present();
+        }
+        changed
     }
 }
 

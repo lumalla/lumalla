@@ -9,8 +9,8 @@ use ash::vk;
 use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
-    BufferTransform, CapturedImage, DrmDeviceState, Guide, Output, OutputConfig, View,
-    view_at_source,
+    BufferTransform, CapturedImage, DrmDeviceState, Guide, Output, OutputConfig, RenderSink,
+    SurfaceSubmit, SurfaceSubmitRole, View, view_at_source,
 };
 use stumpalo::Arena;
 
@@ -879,12 +879,12 @@ impl RendererState {
     }
 
     /// Replace or insert a surface frame without presenting.
+    ///
+    /// Order/placement come only from [`Self::sync_surface_scene`] /
+    /// [`Self::sync_output_layer_scenes`] (pushed by display).
     pub fn set_surface_frame(&mut self, frame: SurfaceFrame) -> anyhow::Result<()> {
         frame.validate()?;
         let key = (frame.owner_id, frame.surface_id);
-        if !self.surface_frames.contains_key(&key) && !self.layer_surface_keys.contains(&key) {
-            self.surface_order.push(key);
-        }
         if frame.full_surface {
             self.pending_full_redraw = true;
             self.pending_damage.clear();
@@ -936,19 +936,14 @@ impl RendererState {
 
     /// Replace cached placement and z-order from the display's authoritative
     /// back-to-front desktop scene (excludes layer-shell surfaces).
-    pub fn sync_surface_scene(&mut self, scene: &[(u32, u32, i32, i32)], arena: &Arena) {
+    pub fn sync_surface_scene(&mut self, scene: &[(u32, u32, i32, i32)]) {
         let new_order: Vec<(u32, u32)> = scene
             .iter()
             .map(|(owner, surface, _, _)| (*owner, *surface))
-            .filter(|key| {
-                self.surface_frames.contains_key(key) && !self.layer_surface_keys.contains(key)
-            })
+            .filter(|key| self.surface_frames.contains_key(key))
             .collect();
         let mut changed = new_order != self.surface_order;
         for &(owner, surface, x, y) in scene {
-            if self.layer_surface_keys.contains(&(owner, surface)) {
-                continue;
-            }
             if let Some(frame) = self.surface_frames.get_mut(&(owner, surface))
                 && (frame.x != x || frame.y != y)
             {
@@ -957,21 +952,15 @@ impl RendererState {
                 changed = true;
             }
         }
-        let mut visible = allocator_api2::vec::Vec::new_in(arena);
-        visible.extend(new_order.iter().copied());
-        visible.extend(self.layer_surface_keys.iter().copied());
-        let mut removed = allocator_api2::vec::Vec::new_in(arena);
-        for key in self.surface_frames.keys().copied() {
-            if !visible.contains(&key) {
-                removed.push(key);
+        let old_order = std::mem::take(&mut self.surface_order);
+        for key in old_order {
+            if !new_order.contains(&key) && !self.layer_surface_keys.contains(&key) {
+                self.surface_frames.remove(&key);
+                self.gpu.surface_textures.remove(key);
+                self.dirty_surface_keys.remove(&key);
+                self.pending_surface_buffer_damage.remove(&key);
+                changed = true;
             }
-        }
-        for key in removed {
-            self.surface_frames.remove(&key);
-            self.gpu.surface_textures.remove(key);
-            self.dirty_surface_keys.remove(&key);
-            self.pending_surface_buffer_damage.remove(&key);
-            changed = true;
         }
         self.surface_order = new_order;
         if changed {
@@ -986,6 +975,9 @@ impl RendererState {
     ///
     /// Each entry is `(owner, surface, x, y, band)` with band
     /// `0=background, 1=bottom, 2=top, 3=overlay`.
+    ///
+    /// Independent of desktop sync order: textures are retained until they leave
+    /// both the desktop order and every layer scene.
     pub fn sync_output_layer_scenes(
         &mut self,
         scenes: &[(String, Vec<(u32, u32, i32, i32, u8)>)],
@@ -1019,26 +1011,18 @@ impl RendererState {
         if self.output_layer_scenes != new_map || self.layer_surface_keys != new_keys {
             changed = true;
         }
-        // Drop layer keys that vanished from every output scene.
-        for key in self.layer_surface_keys.difference(&new_keys).copied() {
+        let old_keys = std::mem::take(&mut self.layer_surface_keys);
+        for key in old_keys.difference(&new_keys).copied() {
             if !self.surface_order.contains(&key) {
                 self.surface_frames.remove(&key);
                 self.gpu.surface_textures.remove(key);
                 self.dirty_surface_keys.remove(&key);
                 self.pending_surface_buffer_damage.remove(&key);
+                changed = true;
             }
-            self.surface_order.retain(|k| *k != key);
-            changed = true;
         }
         self.layer_surface_keys = new_keys;
         self.output_layer_scenes = new_map;
-        // Keep layer keys out of the desktop order.
-        let before = self.surface_order.len();
-        self.surface_order
-            .retain(|key| !self.layer_surface_keys.contains(key));
-        if self.surface_order.len() != before {
-            changed = true;
-        }
         if changed {
             let _ = self.flush_retired_textures();
             self.pending_full_redraw = true;
@@ -1231,7 +1215,118 @@ impl RendererState {
     pub fn flip_idle(&self) -> bool {
         self.present_status().idle
     }
+}
 
+impl RenderSink for RendererState {
+    fn submit_surface(&mut self, submit: SurfaceSubmit) -> anyhow::Result<()> {
+        let dmabuf = submit.dmabuf.map(|exported| DmabufAttachment {
+            buffer_id: exported.buffer_id,
+            fd: exported.fd,
+            drm_fourcc: exported.drm_fourcc,
+            offset: exported.offset,
+            modifier: exported.modifier,
+        });
+        match submit.role {
+            SurfaceSubmitRole::Content => self.set_surface_frame(SurfaceFrame {
+                owner_id: submit.owner_id,
+                surface_id: submit.surface_id,
+                buffer_id: submit.buffer_id,
+                pixels: submit.pixels,
+                width: submit.width,
+                height: submit.height,
+                stride: submit.stride,
+                format: submit.format,
+                x: submit.x,
+                y: submit.y,
+                buffer_scale: submit.buffer_scale,
+                buffer_transform: submit.buffer_transform,
+                surface_width: submit.surface_width,
+                surface_height: submit.surface_height,
+                viewport_src: submit.viewport_src,
+                dmabuf,
+                damage: submit.damage.map(|rect| DamageRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                }),
+                buffer_damage: submit.buffer_damage.map(|rect| DamageRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                }),
+                full_surface: submit.full_surface,
+            }),
+            SurfaceSubmitRole::Cursor {
+                hotspot_x,
+                hotspot_y,
+            } => self.set_cursor_frame(CursorFrame {
+                owner_id: submit.owner_id,
+                surface_id: submit.surface_id,
+                buffer_id: submit.buffer_id,
+                pixels: submit.pixels,
+                width: submit.width,
+                height: submit.height,
+                stride: submit.stride,
+                format: submit.format,
+                hotspot_x,
+                hotspot_y,
+                buffer_scale: submit.buffer_scale,
+                buffer_transform: submit.buffer_transform,
+                dmabuf,
+            }),
+        }
+    }
+
+    fn remove_surface(&mut self, owner_id: u32, surface_id: u32) -> anyhow::Result<()> {
+        self.remove_surface_frame(owner_id, surface_id)
+    }
+
+    fn remove_buffer(&mut self, owner_id: u32, buffer_id: u32) -> anyhow::Result<()> {
+        self.remove_dmabuf_buffer(owner_id, buffer_id)
+    }
+
+    fn remove_client(&mut self, owner_id: u32) -> anyhow::Result<()> {
+        self.remove_client_frames(owner_id)
+    }
+
+    fn set_desktop_scene(&mut self, scene: &[(u32, u32, i32, i32)]) {
+        self.sync_surface_scene(scene);
+    }
+
+    fn set_output_layer_scenes(&mut self, scenes: &[(String, Vec<(u32, u32, i32, i32, u8)>)]) {
+        self.sync_output_layer_scenes(scenes);
+    }
+
+    fn update_surface_position(
+        &mut self,
+        owner_id: u32,
+        surface_id: u32,
+        x: i32,
+        y: i32,
+    ) -> anyhow::Result<()> {
+        self.update_surface_frame_position(owner_id, surface_id, x, y)
+    }
+
+    fn update_cursor_hotspot(&mut self, hotspot_x: i32, hotspot_y: i32) -> anyhow::Result<()> {
+        RendererState::update_cursor_hotspot(self, hotspot_x, hotspot_y)
+    }
+
+    fn hide_cursor(&mut self) -> anyhow::Result<()> {
+        RendererState::hide_cursor(self)
+    }
+
+    fn clear_cursor(&mut self) -> anyhow::Result<()> {
+        self.clear_cursor_frame()
+    }
+
+    fn request_present(&mut self) {
+        self.mark_dirty_if_active();
+    }
+}
+
+impl RendererState {
     /// Geometry of the first enabled present target (physical or virtual).
     pub fn primary_output_geometry(&self) -> Option<(String, i32, i32, i32)> {
         let target = self.collect_present_targets().into_iter().next()?;
@@ -3248,7 +3343,6 @@ impl RendererState {
         let layers: Vec<&SurfaceFrame> = self
             .surface_order
             .iter()
-            .filter(|key| !self.layer_surface_keys.contains(*key))
             .filter_map(|key| self.surface_frames.get(key))
             .collect();
         let empty_layer_scene = Vec::new();
@@ -4296,8 +4390,7 @@ mod tests {
         state.set_surface_frame(first).unwrap();
         state.set_surface_frame(second).unwrap();
 
-        let arena = Arena::new();
-        state.sync_surface_scene(&[(1, 3, 40, 50), (1, 2, 10, 20)], &arena);
+        state.sync_surface_scene(&[(1, 3, 40, 50), (1, 2, 10, 20)]);
 
         assert_eq!(state.surface_order, vec![(1, 3), (1, 2)]);
         assert_eq!(
@@ -4321,14 +4414,15 @@ mod tests {
     fn authoritative_scene_sync_removes_invisible_frames() {
         let mut state = RendererState::new().unwrap();
         state.set_surface_frame(frame()).unwrap();
-        let arena = Arena::new();
-        state.sync_surface_scene(&[], &arena);
+        // Must enter desktop order before empty sync can GC the frame.
+        state.sync_surface_scene(&[(1, 2, 0, 0)]);
+        state.sync_surface_scene(&[]);
         assert!(state.surface_frames.is_empty());
         assert!(state.surface_order.is_empty());
     }
 
     #[test]
-    fn layer_scene_sync_keeps_frames_out_of_desktop_order() {
+    fn layer_and_desktop_scene_sync_are_order_independent() {
         let mut state = RendererState::new().unwrap();
         let mut layer = frame();
         layer.surface_id = 9;
@@ -4336,9 +4430,9 @@ mod tests {
         state.set_surface_frame(layer).unwrap();
         state.set_surface_frame(frame()).unwrap();
 
+        // Layer-first then desktop (and the reverse) must both keep layer frames.
         state.sync_output_layer_scenes(&[("HDMI-A-1".into(), vec![(1, 9, 0, 0, 2)])]);
-        let arena = Arena::new();
-        state.sync_surface_scene(&[(1, 2, 10, 20)], &arena);
+        state.sync_surface_scene(&[(1, 2, 10, 20)]);
 
         assert!(state.layer_surface_keys.contains(&(1, 9)));
         assert!(state.surface_frames.contains_key(&(1, 9)));
@@ -4348,6 +4442,18 @@ mod tests {
             state.output_layer_scenes["HDMI-A-1"],
             vec![(1, 9, 0, 0, 2)]
         );
+
+        // Desktop-first then layer.
+        let mut state = RendererState::new().unwrap();
+        let mut layer = frame();
+        layer.surface_id = 9;
+        layer.buffer_id = 9;
+        state.set_surface_frame(layer).unwrap();
+        state.set_surface_frame(frame()).unwrap();
+        state.sync_surface_scene(&[(1, 2, 10, 20)]);
+        state.sync_output_layer_scenes(&[("HDMI-A-1".into(), vec![(1, 9, 0, 0, 2)])]);
+        assert!(state.surface_frames.contains_key(&(1, 9)));
+        assert_eq!(state.surface_order, vec![(1, 2)]);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use log::{debug, error, warn};
 use lumalla_shared::{
-    EventLoop, monotonic_deadline_after,
+    EventLoop, PresentationFlipInfo, PresentationNotify, monotonic_deadline_after,
 };
 use stumpalo::Arena;
 
@@ -109,10 +109,12 @@ impl RendererState {
     pub fn arm_presents(
         &mut self,
         event_loop: &mut EventLoop,
-        pending_protocol_work: bool,
+        notify: &mut dyn PresentationNotify,
         seat_enabled: bool,
+        frame_time_msec: u32,
         arena: &Arena,
     ) -> io::Result<PresentTickResult> {
+        let pending_protocol_work = notify.pending_present_work();
         self.sync_output_present_controls(Some(event_loop), arena)?;
         let mut names = allocator_api2::vec::Vec::new_in(arena);
         names.extend(self.outputs.keys().cloned());
@@ -137,12 +139,14 @@ impl RendererState {
         let presented_without_pending_flip = presented_outputs
             .iter()
             .any(|name| self.output_flip_idle(name));
-        Ok(PresentTickResult {
+        let result = PresentTickResult {
             presented_outputs,
             status: self.present_status(),
             timings: last_timings,
             presented_without_pending_flip,
-        })
+        };
+        self.deliver_tick_notifications(&result, notify, frame_time_msec);
+        Ok(result)
     }
 
     /// Handle a fired present-wake timeout for a single output.
@@ -150,9 +154,11 @@ impl RendererState {
         &mut self,
         event_loop: &mut EventLoop,
         wake_token: u64,
-        pending_protocol_work: bool,
+        notify: &mut dyn PresentationNotify,
         seat_enabled: bool,
+        frame_time_msec: u32,
     ) -> io::Result<PresentTickResult> {
+        let pending_protocol_work = notify.pending_present_work();
         let Some(name) = self
             .outputs
             .iter()
@@ -187,22 +193,26 @@ impl RendererState {
         let presented_without_pending_flip = presented_outputs
             .iter()
             .any(|name| self.output_flip_idle(name));
-        Ok(PresentTickResult {
+        let result = PresentTickResult {
             presented_outputs,
             status: self.present_status(),
             timings: tick.timings,
             presented_without_pending_flip,
-        })
+        };
+        self.deliver_tick_notifications(&result, notify, frame_time_msec);
+        Ok(result)
     }
 
     /// Drain DRM page-flips, update per-output schedulers, and re-arm affected wakes.
     pub fn on_drm_events(
         &mut self,
         event_loop: &mut EventLoop,
-        pending_protocol_work: bool,
+        notify: &mut dyn PresentationNotify,
         seat_enabled: bool,
+        frame_time_msec: u32,
         arena: &Arena,
     ) -> io::Result<FlipSideEffects> {
+        let pending_protocol_work = notify.pending_present_work();
         let outcome = match self.dispatch_page_flips_named(arena) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -259,10 +269,70 @@ impl RendererState {
             }
         }
 
-        Ok(FlipSideEffects {
+        let effects = FlipSideEffects {
             status: outcome.status,
             completed: completed_effects.into_iter().collect(),
-        })
+        };
+        self.deliver_flip_notifications(&effects, notify, frame_time_msec);
+        Ok(effects)
+    }
+
+    /// Complete Wayland presentation/frame objects after a present tick (virtual/blocking).
+    fn deliver_tick_notifications(
+        &self,
+        result: &PresentTickResult,
+        notify: &mut dyn PresentationNotify,
+        frame_time_msec: u32,
+    ) {
+        if !result.presented_outputs.is_empty()
+            && result
+                .presented_outputs
+                .iter()
+                .any(|name| self.output_is_virtual(name))
+            && notify.pending_presentation_feedback()
+        {
+            let refresh_ns = result
+                .presented_outputs
+                .iter()
+                .find_map(|name| self.output_refresh_ns(name))
+                .unwrap_or(16_666_666);
+            let (tv_sec, tv_usec) = monotonic_time_sec_usec();
+            notify.presentation_completed(PresentationFlipInfo {
+                tv_sec,
+                tv_usec,
+                sequence: 0,
+                refresh_ns,
+            });
+        }
+        // Virtual/blocking present finished, or paced wake with nothing in flight.
+        if (result.presented_without_pending_flip || result.status.idle)
+            && notify.pending_frame_callbacks()
+        {
+            notify.frames_completed(frame_time_msec.max(1));
+        }
+    }
+
+    /// Complete Wayland presentation/frame objects after DRM page-flips.
+    fn deliver_flip_notifications(
+        &self,
+        effects: &FlipSideEffects,
+        notify: &mut dyn PresentationNotify,
+        frame_time_msec: u32,
+    ) {
+        for completed in &effects.completed {
+            notify.presentation_completed(PresentationFlipInfo {
+                tv_sec: completed.flip.tv_sec,
+                tv_usec: completed.flip.tv_usec,
+                sequence: completed.flip.sequence,
+                refresh_ns: completed.refresh_ns,
+            });
+        }
+        // A completed flip is enough even if another flip is already in flight.
+        if (!effects.completed.is_empty() || effects.status.idle)
+            && notify.pending_frame_callbacks()
+        {
+            notify.frames_completed(frame_time_msec.max(1));
+        }
     }
 
     fn arm_or_tick_output(
@@ -547,6 +617,21 @@ impl RendererState {
 struct OutputTick {
     presented: bool,
     timings: Option<FrameTimings>,
+}
+
+fn monotonic_time_sec_usec() -> (u32, u32) {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec out-parameter.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 {
+        return (0, 0);
+    }
+    let sec = u32::try_from(ts.tv_sec.max(0)).unwrap_or(u32::MAX);
+    let usec = u32::try_from(ts.tv_nsec.max(0) / 1000).unwrap_or(u32::MAX);
+    (sec, usec)
 }
 
 /// Named flip completions from [`RendererState::dispatch_page_flips_named`].

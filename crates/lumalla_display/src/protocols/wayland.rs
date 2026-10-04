@@ -7,7 +7,7 @@ use lumalla_wayland_protocol::{
 };
 
 use crate::{
-    CommittedFrame, DisplayState, GlobalId, SurfaceUpdate,
+    CommittedFrame, DisplayState, GlobalId,
     data_device::DataDeviceError,
     shm::{ShmDamageRect, ShmError, ShmErrorKind},
     surface::{Rectangle, ShellMode, SurfaceCommit, SurfaceError, effective_surface_size},
@@ -549,13 +549,7 @@ fn process_surface_commit_body(
                     buffer_damage: if is_cursor { None } else { buffer_damage },
                     full_surface,
                 };
-                if is_cursor {
-                    state
-                        .surface_updates
-                        .push_back(SurfaceUpdate::Cursor(frame));
-                } else {
-                    state.surface_updates.push_back(SurfaceUpdate::Frame(frame));
-                }
+                state.submit_committed_frame(frame, is_cursor);
                 if commit.newly_mapped {
                     if let Some(shell_id) = commit.shell_id {
                         let serial = state.seat_manager.next_serial();
@@ -616,10 +610,7 @@ fn process_surface_commit_body(
                 commit.surface_id,
                 ctx.writer,
             );
-            state.surface_updates.push_back(SurfaceUpdate::Unmapped {
-                client_id: ctx.client_id,
-                surface_id: commit.surface_id,
-            });
+            state.emit_surface_unmapped(ctx.client_id, commit.surface_id);
             state
                 .shm_manager
                 .clear_surface_backing(ctx.client_id, commit.surface_id);
@@ -756,13 +747,7 @@ fn process_surface_commit_body(
                     buffer_damage,
                     full_surface,
                 };
-                if is_cursor {
-                    state
-                        .surface_updates
-                        .push_back(SurfaceUpdate::Cursor(frame));
-                } else {
-                    state.surface_updates.push_back(SurfaceUpdate::Frame(frame));
-                }
+                state.submit_committed_frame(frame, is_cursor);
             }
         }
     }
@@ -995,11 +980,7 @@ impl WlBuffer for DisplayState {
         ctx.registry.free_object(object_id, &mut ctx.writer);
         self.shm_manager.delete_buffer(ctx.client_id, object_id);
         self.dmabuf_manager.delete_buffer(ctx.client_id, object_id);
-        self.surface_updates
-            .push_back(SurfaceUpdate::BufferDestroyed {
-                client_id: ctx.client_id,
-                buffer_id: object_id,
-            });
+        self.emit_buffer_destroyed(ctx.client_id, object_id);
     }
 }
 
@@ -1536,10 +1517,7 @@ impl WlSurface for DisplayState {
                     for output in self.output_manager.bound_outputs_for_client(ctx.client_id) {
                         ctx.writer.wl_surface_leave(object_id).output(output);
                     }
-                    self.surface_updates.push_back(SurfaceUpdate::Unmapped {
-                        client_id: ctx.client_id,
-                        surface_id: object_id,
-                    });
+                    self.emit_surface_unmapped(ctx.client_id, object_id);
                 }
                 self.shm_manager
                     .clear_surface_backing(ctx.client_id, object_id);
@@ -1554,10 +1532,7 @@ impl WlSurface for DisplayState {
                         .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
                     self.shm_manager
                         .clear_surface_backing(ctx.client_id, child);
-                    self.surface_updates.push_back(SurfaceUpdate::Unmapped {
-                        client_id: ctx.client_id,
-                        surface_id: child,
-                    });
+                    self.emit_surface_unmapped(ctx.client_id, child);
                 }
             }
             Err(error) => {
@@ -1740,10 +1715,7 @@ impl WlSurface for DisplayState {
                 .leave_pointers_on_surface(ctx.client_id, child, ctx.writer);
             self.shm_manager
                 .clear_surface_backing(ctx.client_id, child);
-            self.surface_updates.push_back(SurfaceUpdate::Unmapped {
-                client_id: ctx.client_id,
-                surface_id: child,
-            });
+            self.emit_surface_unmapped(ctx.client_id, child);
         }
     }
 
@@ -2029,10 +2001,7 @@ impl WlSubsurface for DisplayState {
                     );
                     self.shm_manager
                         .clear_surface_backing(ctx.client_id, surface_id);
-                    self.surface_updates.push_back(SurfaceUpdate::Unmapped {
-                        client_id: ctx.client_id,
-                        surface_id,
-                    });
+                    self.emit_surface_unmapped(ctx.client_id, surface_id);
                 }
                 ctx.registry.free_object(object_id, ctx.writer);
             }
@@ -2618,17 +2587,15 @@ mod tests {
             "frame callback must remain until present"
         );
         assert_eq!(state.pending_frame_callback_count(), 1);
-        let updates: Vec<_> = state.take_surface_updates().collect();
-        assert_eq!(updates.len(), 1);
-        let SurfaceUpdate::Frame(frame) = &updates[0] else {
-            panic!("expected a committed frame");
-        };
-        assert_eq!(frame.surface_id, surface_id);
-        assert_eq!(frame.buffer_id, buffer_id);
+        let submits = state.take_recorded_submits();
+        assert_eq!(submits.len(), 1);
+        let frame = &submits[0];
+        assert_eq!(frame.surface_id, surface_id.get());
+        assert_eq!(frame.buffer_id, buffer_id.get());
         assert_eq!(frame.pixels.as_slice(), [1, 2, 3, 4]);
         assert_eq!(frame.buffer_scale, 1);
         assert_eq!(frame.buffer_transform, 0);
-        assert_eq!((frame.offset_x, frame.offset_y), (0, 0));
+        assert_eq!((frame.x, frame.y), (0, 0));
         assert!(
             state
                 .surface_manager
@@ -2662,30 +2629,23 @@ mod tests {
             )
             .unwrap();
         WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
-        let updates: Vec<_> = state.take_surface_updates().collect();
-        let [SurfaceUpdate::Frame(frame)] = updates.as_slice() else {
-            panic!("damage-only commit must refresh the existing buffer");
-        };
-        assert_eq!(frame.buffer_id, buffer_id);
+        let submits = state.take_recorded_submits();
+        assert_eq!(submits.len(), 1);
+        let frame = &submits[0];
+        assert_eq!(frame.buffer_id, buffer_id.get());
         assert!(!frame.full_surface);
 
         // A commit containing no visual state must not force a renderer update.
         WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
-        assert_eq!(state.take_surface_updates().count(), 0);
+        assert_eq!(state.take_recorded_submits().len(), 0);
 
         state
             .surface_manager
             .attach(client_id, surface_id, None, 0, 0, 1)
             .unwrap();
         WlSurface::commit(&mut state, &mut ctx, surface_id, &params);
-        let updates: Vec<_> = state.take_surface_updates().collect();
-        assert!(matches!(
-            updates.as_slice(),
-            [SurfaceUpdate::Unmapped {
-                client_id: owner,
-                surface_id: unmapped,
-            }] if *owner == client_id && *unmapped == surface_id
-        ));
+        let removals = state.take_recorded_removals();
+        assert_eq!(removals, [(client_id.get(), surface_id.get())]);
     }
 
     #[test]
@@ -2880,13 +2840,12 @@ mod tests {
         }
         client.handle_messages(&mut state).unwrap();
 
-        let updates: Vec<_> = state.take_surface_updates().collect();
-        let [SurfaceUpdate::Frame(frame)] = updates.as_slice() else {
-            panic!("expected one committed frame");
-        };
-        assert_eq!(frame.client_id, client.client_id());
-        assert_eq!(frame.surface_id, object_id(6));
-        assert_eq!(frame.buffer_id, object_id(8));
+        let submits = state.take_recorded_submits();
+        assert_eq!(submits.len(), 1);
+        let frame = &submits[0];
+        assert_eq!(frame.owner_id, client.client_id().get());
+        assert_eq!(frame.surface_id, 6);
+        assert_eq!(frame.buffer_id, 8);
         assert_eq!(frame.pixels.as_slice(), [1, 2, 3, 0xff]);
         assert_eq!((frame.width, frame.height, frame.stride), (1, 1, 4));
         assert_eq!(frame.format, WL_SHM_FORMAT_XRGB8888);
@@ -2949,7 +2908,7 @@ mod tests {
         }
         client.handle_messages(&mut state).unwrap();
         assert!(
-            state.take_surface_updates().next().is_none(),
+            state.take_recorded_submits().is_empty(),
             "must not map before ack_configure"
         );
 
@@ -2961,11 +2920,10 @@ mod tests {
         client_stream.write_all(&wire).unwrap();
         client.handle_messages(&mut state).unwrap();
 
-        let updates: Vec<_> = state.take_surface_updates().collect();
-        let [SurfaceUpdate::Frame(frame)] = updates.as_slice() else {
-            panic!("expected one committed xdg frame, got {updates:?}");
-        };
-        assert_eq!(frame.surface_id, object_id(6));
+        let submits = state.take_recorded_submits();
+        assert_eq!(submits.len(), 1, "expected one committed xdg frame, got {submits:?}");
+        let frame = &submits[0];
+        assert_eq!(frame.surface_id, 6);
         assert_eq!(frame.pixels.as_slice(), [1, 2, 3, 0xff]);
     }
 
@@ -3063,22 +3021,21 @@ mod tests {
         }
         client.handle_messages(&mut state).unwrap();
 
-        let updates: Vec<_> = state.take_surface_updates().collect();
-        let [SurfaceUpdate::Frame(frame)] = updates.as_slice() else {
-            panic!("expected one committed dmabuf frame, got {updates:?}");
-        };
-        assert_eq!(frame.surface_id, object_id(6));
-        assert_eq!(frame.buffer_id, object_id(10));
+        let submits = state.take_recorded_submits();
+        assert_eq!(submits.len(), 1, "expected one committed dmabuf frame, got {submits:?}");
+        let frame = &submits[0];
+        assert_eq!(frame.surface_id, 6);
+        assert_eq!(frame.buffer_id, 10);
         assert!(frame.pixels.is_empty());
         let exported = frame.dmabuf.as_ref().expect("dmabuf export");
-        assert_eq!(exported.width, 1);
-        assert_eq!(exported.height, 1);
-        assert_eq!(exported.stride, 4);
         assert_eq!(exported.drm_fourcc, DRM_FORMAT_XRGB8888);
         assert_eq!(frame.format, WL_SHM_FORMAT_XRGB8888);
         let snap = state
             .dmabuf_manager
-            .snapshot_buffer(frame.client_id, frame.buffer_id)
+            .snapshot_buffer(
+                client.client_id(),
+                object_id(frame.buffer_id),
+            )
             .unwrap();
         assert_eq!(snap.pixels, [0xaa, 0xbb, 0xcc, 0xff]);
     }

@@ -17,16 +17,13 @@ use log::{debug, error, info, warn};
 use stumpalo::Arena;
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::{
-    ClientId, ConnectedClients, DisplayState, KeyboardModifiers, OutputInfo, PointerCursor,
-    PresentationFlipInfo, ReadResult, SurfaceUpdate, Wayland, create_wayland_display,
+    ClientId, ConnectedClients, DisplayHandler, DisplayPresentationNotify, DisplayState,
+    KeyboardModifiers, OutputInfo, ReadResult, Wayland, create_wayland_display,
 };
 use lumalla_input::{
     BTN_LEFT, InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent, mods_is_subset,
 };
-use lumalla_renderer::{
-    CursorFrame, DmabufAttachment, OutputDamageRect, RendererState, SurfaceFrame,
-    is_present_wake_token,
-};
+use lumalla_renderer::{RendererState, is_present_wake_token};
 use lumalla_screencast::{
     DmaBufferExport, FormatOffer, ScreencastManager, ScreencastSource, ScreencastWake, VideoFrame,
     fit_memfd_output_size, fit_output_size,
@@ -68,7 +65,12 @@ struct DrmDeviceRegistration {
     token: u64,
 }
 
-/// Represents the data for the main app thread
+/// Main event-loop owner.
+///
+/// Display ↔ renderer collaboration is phase-local (`DisplayHandler` on client
+/// dispatch, `DisplayPresentationNotify` on present/flip). Residual mediation
+/// that still lives here: pointer position, DRM↔Wayland output geometry,
+/// dmabuf format advertising, and screencast capture.
 struct AppData {
     comms: Comms,
     _dbus_thread_completion_fd: OwnedFd,
@@ -437,7 +439,10 @@ impl AppData {
                 self.arm_client_recv(event_loop, client_id, arena);
             }
             ReadResult::ReadData => {
-                if let Err(err) = client.dispatch_pending(&mut self.display_state) {
+                if let Err(err) = client.dispatch_pending(&mut DisplayHandler {
+                    state: &mut self.display_state,
+                    render: &mut self.renderer_state,
+                }) {
                     error!(
                         "Unable to handle messages for client {:?}: {err}",
                         client_id
@@ -456,19 +461,31 @@ impl AppData {
                         .flush_pending_data_device(&mut self.clients);
                     self.display_state
                         .flush_pending_activation_configures(&mut self.clients);
-                    self.submit_committed_frames(event_loop, arena);
+                    let content_changed = self.display_state.take_render_content_changed();
                     // Mapping / get_pointer can change who should own the cursor
                     // without a motion event; sync enter/leave now.
                     self.display_state
                         .refresh_pointer_focus(&mut self.clients, arena);
-                    let layout_syncs = self
-                        .display_state
-                        .drain_pending_geometry(&mut self.clients, arena);
-                    self.apply_renderer_layout_syncs(event_loop, &layout_syncs, arena);
-                    if !layout_syncs.is_empty() {
+                    let clients = &mut self.clients;
+                    let layout_changed = self.display_state.with_render(
+                        &mut self.renderer_state,
+                        |display| display.drain_pending_geometry(clients),
+                    );
+                    if content_changed {
+                        self.display_state.with_render(&mut self.renderer_state, |display| {
+                            display.push_renderer_scenes();
+                        });
+                    }
+                    if content_changed || layout_changed {
                         self.sync_windows_to_dbus();
                     }
                     self.sync_pointer_cursor(event_loop, arena);
+                    if self.renderer_state.scene_dirty()
+                        || self.display_state.pending_frame_callback_count() > 0
+                        || self.display_state.pending_presentation_feedback_count() > 0
+                    {
+                        self.mark_present_dirty(event_loop, arena);
+                    }
                     self.flush_client_sends(event_loop, arena);
                     self.arm_client_recv(event_loop, client_id, arena);
                 }
@@ -541,10 +558,11 @@ impl AppData {
         if let Err(err) = event_loop.cancel_fd_all(fd) {
             error!("Unable to cancel I/O for client {:?}: {err}", client_id);
         }
-        self.display_state.remove_client(client_id, &mut self.clients);
-        if let Err(err) = self.renderer_state.remove_client_frames(client_id.get()) {
-            error!("Unable to clear frames for disconnected client: {err:#}");
-        } else if self.renderer_state.scene_dirty() {
+        let clients = &mut self.clients;
+        self.display_state.with_render(&mut self.renderer_state, |display| {
+            display.remove_client(client_id, clients);
+        });
+        if self.renderer_state.scene_dirty() {
             self.mark_present_dirty(event_loop, arena);
         }
         self.sync_windows_to_dbus();
@@ -847,14 +865,15 @@ impl AppData {
                     self.request_present_immediate(event_loop, arena);
                 }
                 MainMessage::AddWindowToZone { window, zone } => {
-                    match self
-                        .display_state
-                        .add_window_to_zone(window, &zone, &mut self.clients, arena)
-                    {
-                        Ok(layout_syncs) => {
-                            self.apply_renderer_layout_syncs(event_loop, &layout_syncs, arena);
+                    let clients = &mut self.clients;
+                    match self.display_state.with_render(&mut self.renderer_state, |display| {
+                        display.add_window_to_zone(window, &zone, clients)
+                    }) {
+                        Ok(changed) => {
                             self.sync_windows_to_dbus();
-                            self.request_present_immediate(event_loop, arena);
+                            if changed {
+                                self.request_present_immediate(event_loop, arena);
+                            }
                         }
                         Err(err) => error!("Unable to add window to zone {zone}: {err}"),
                     }
@@ -1221,43 +1240,41 @@ impl AppData {
                     geometry,
                     user_initiated,
                 } => {
-                    match self.display_state.set_window(
-                        id,
-                        geometry,
-                        user_initiated,
-                        &mut self.clients,
-                        arena,
-                    ) {
-                        Ok(layout_syncs) => {
-                            self.apply_renderer_layout_syncs(event_loop, &layout_syncs, arena);
+                    let clients = &mut self.clients;
+                    match self.display_state.with_render(&mut self.renderer_state, |display| {
+                        display.set_window(id, geometry, user_initiated, clients)
+                    }) {
+                        Ok(changed) => {
                             self.sync_windows_to_dbus();
-                            self.request_present_immediate(event_loop, arena);
+                            if changed {
+                                self.request_present_immediate(event_loop, arena);
+                            }
                         }
                         Err(err) => error!("Unable to set window geometry: {err}"),
                     }
                 }
                 MainMessage::FocusWindow { id, raise } => {
-                    match self
-                        .display_state
-                        .focus_window(id, raise, &mut self.clients)
-                    {
-                        Ok(raised) => {
-                            if raised {
-                                self.sync_renderer_scene(arena);
-                            }
+                    let clients = &mut self.clients;
+                    match self.display_state.with_render(&mut self.renderer_state, |display| {
+                        display.focus_window(id, raise, clients)
+                    }) {
+                        Ok(_raised) => {
                             self.sync_windows_to_dbus();
                             self.request_present_immediate(event_loop, arena);
                         }
                         Err(err) => error!("Unable to focus window: {err}"),
                     }
                 }
-                MainMessage::RaiseWindow { id } => match self.display_state.raise_window(id) {
-                    Ok(()) => {
-                        self.sync_renderer_scene(arena);
-                        self.request_present_immediate(event_loop, arena);
+                MainMessage::RaiseWindow { id } => {
+                    match self.display_state.with_render(&mut self.renderer_state, |display| {
+                        display.raise_window(id)
+                    }) {
+                        Ok(()) => {
+                            self.request_present_immediate(event_loop, arena);
+                        }
+                        Err(err) => error!("Unable to raise window: {err}"),
                     }
-                    Err(err) => error!("Unable to raise window: {err}"),
-                },
+                }
                 MainMessage::CloseWindow { id } => {
                     if let Err(err) = self.display_state.close_window(id, &mut self.clients) {
                         error!("Unable to close window: {err}");
@@ -1622,55 +1639,11 @@ impl AppData {
     }
 
     fn sync_pointer_cursor(&mut self, event_loop: &mut EventLoop, arena: &Arena) {
-        match self.display_state.pointer_cursor() {
-            PointerCursor::Surface(active) => {
-                let key = (active.client_id.get(), active.surface_id.get());
-                if self.renderer_state.cursor_surface_key() == Some(key) {
-                    if let Err(err) = self
-                        .renderer_state
-                        .update_cursor_hotspot(active.hotspot_x, active.hotspot_y)
-                    {
-                        error!("Unable to update cursor hotspot: {err:#}");
-                    } else if self.renderer_state.scene_dirty() {
-                        self.mark_present_dirty(event_loop, arena);
-                    }
-                }
-            }
-            PointerCursor::Hidden => {
-                if let Err(err) = self.renderer_state.hide_cursor() {
-                    error!("Unable to hide pointer cursor: {err:#}");
-                } else if self.renderer_state.scene_dirty() {
-                    self.mark_present_dirty(event_loop, arena);
-                }
-            }
-            PointerCursor::Default => {
-                if let Err(err) = self.renderer_state.clear_cursor_frame() {
-                    error!("Unable to restore default cursor: {err:#}");
-                } else if self.renderer_state.scene_dirty() {
-                    self.mark_present_dirty(event_loop, arena);
-                }
-            }
-        }
-    }
-
-    fn apply_renderer_layout_syncs(
-        &mut self,
-        event_loop: &mut EventLoop,
-        layout_syncs: &[lumalla_display::RendererLayoutSync],
-        arena: &Arena,
-    ) {
-        for sync in layout_syncs {
-            if let Err(err) = self.renderer_state.update_surface_frame_position(
-                sync.owner_id,
-                sync.surface_id,
-                sync.x,
-                sync.y,
-            ) {
-                error!("Unable to update surface frame position: {err:#}");
-            }
-        }
-        self.sync_renderer_scene(arena);
-        if !layout_syncs.is_empty() && self.renderer_state.scene_dirty() {
+        self.display_state
+            .with_render(&mut self.renderer_state, |display| {
+                display.sync_pointer_cursor_to_render();
+            });
+        if self.renderer_state.scene_dirty() {
             self.mark_present_dirty(event_loop, arena);
         }
     }
@@ -1678,149 +1651,6 @@ impl AppData {
     fn sync_windows_to_dbus(&mut self) {
         self.comms
             .dbus(DbusMessage::SetWindows(self.display_state.window_states()));
-    }
-
-    fn sync_renderer_scene(&mut self, arena: &Arena) {
-        // Layer scenes must be synced before the desktop scene so
-        // `sync_surface_scene` preserves layer-shell frames (it drops any
-        // surface_frames key not listed in the desktop scene or layer keys).
-        let layer_scenes = self.display_state.collect_output_layer_scenes();
-        self.renderer_state
-            .sync_output_layer_scenes(&layer_scenes);
-
-        let mut surfaces = ArenaVec::new_in(arena);
-        self.display_state.collect_scene_surfaces(&mut surfaces);
-        let mut scene = ArenaVec::with_capacity_in(surfaces.len(), arena);
-        for surface in &surfaces {
-            scene.push((
-                surface.client_id.get(),
-                surface.surface_id.get(),
-                surface.x,
-                surface.y,
-            ));
-        }
-        self.renderer_state.sync_surface_scene(&scene, arena);
-    }
-
-    fn submit_committed_frames(&mut self, event_loop: &mut EventLoop, arena: &Arena) {
-        let mut updates = ArenaVec::new_in(arena);
-        updates.extend(self.display_state.take_surface_updates());
-        let had_updates = !updates.is_empty();
-        for update in updates {
-            match update {
-                SurfaceUpdate::Frame(frame) => {
-                    let dmabuf = frame.dmabuf.map(|exported| DmabufAttachment {
-                        buffer_id: frame.buffer_id.get(),
-                        fd: exported.fd,
-                        drm_fourcc: exported.drm_fourcc,
-                        offset: exported.offset,
-                        modifier: exported.modifier,
-                    });
-                    let surface = SurfaceFrame {
-                        owner_id: frame.client_id.get(),
-                        surface_id: frame.surface_id.get(),
-                        buffer_id: frame.buffer_id.get(),
-                        pixels: frame.pixels,
-                        width: frame.width,
-                        height: frame.height,
-                        stride: frame.stride,
-                        format: frame.format,
-                        x: frame.x,
-                        y: frame.y,
-                        buffer_scale: frame.buffer_scale,
-                        buffer_transform: frame.buffer_transform,
-                        surface_width: frame.surface_width,
-                        surface_height: frame.surface_height,
-                        viewport_src: frame.viewport_src,
-                        dmabuf,
-                        damage: frame.damage.map(|rect| OutputDamageRect {
-                            x: rect.x,
-                            y: rect.y,
-                            width: rect.width,
-                            height: rect.height,
-                        }),
-                        buffer_damage: frame.buffer_damage.map(|rect| OutputDamageRect {
-                            x: rect.x,
-                            y: rect.y,
-                            width: rect.width,
-                            height: rect.height,
-                        }),
-                        full_surface: frame.full_surface,
-                    };
-                    if let Err(err) = self.renderer_state.set_surface_frame(surface) {
-                        error!("Unable to queue committed Wayland surface: {err:#}");
-                    }
-                }
-                SurfaceUpdate::Cursor(frame) => {
-                    let hotspot = self
-                        .display_state
-                        .active_cursor()
-                        .filter(|cursor| {
-                            cursor.client_id == frame.client_id
-                                && cursor.surface_id == frame.surface_id
-                        })
-                        .map(|cursor| (cursor.hotspot_x, cursor.hotspot_y))
-                        .unwrap_or((0, 0));
-                    let dmabuf = frame.dmabuf.map(|exported| DmabufAttachment {
-                        buffer_id: frame.buffer_id.get(),
-                        fd: exported.fd,
-                        drm_fourcc: exported.drm_fourcc,
-                        offset: exported.offset,
-                        modifier: exported.modifier,
-                    });
-                    let cursor = CursorFrame {
-                        owner_id: frame.client_id.get(),
-                        surface_id: frame.surface_id.get(),
-                        buffer_id: frame.buffer_id.get(),
-                        pixels: frame.pixels,
-                        width: frame.width,
-                        height: frame.height,
-                        stride: frame.stride,
-                        format: frame.format,
-                        hotspot_x: hotspot.0,
-                        hotspot_y: hotspot.1,
-                        buffer_scale: frame.buffer_scale,
-                        buffer_transform: frame.buffer_transform,
-                        dmabuf,
-                    };
-                    if let Err(err) = self.renderer_state.set_cursor_frame(cursor) {
-                        error!("Unable to queue committed cursor surface: {err:#}");
-                    }
-                }
-                SurfaceUpdate::Unmapped {
-                    client_id,
-                    surface_id,
-                } => {
-                    if let Err(err) = self
-                        .renderer_state
-                        .remove_surface_frame(client_id.get(), surface_id.get())
-                    {
-                        error!("Unable to clear unmapped Wayland surface: {err:#}");
-                    }
-                }
-                SurfaceUpdate::BufferDestroyed {
-                    client_id,
-                    buffer_id,
-                } => {
-                    if let Err(err) = self
-                        .renderer_state
-                        .remove_dmabuf_buffer(client_id.get(), buffer_id.get())
-                    {
-                        error!("Unable to drop destroyed wl_buffer GPU import: {err:#}");
-                    }
-                }
-            }
-        }
-        self.sync_renderer_scene(arena);
-        if had_updates {
-            self.sync_windows_to_dbus();
-        }
-        if self.renderer_state.scene_dirty()
-            || self.display_state.pending_frame_callback_count() > 0
-            || self.display_state.pending_presentation_feedback_count() > 0
-        {
-            self.mark_present_dirty(event_loop, arena);
-        }
     }
 
     /// Mark all outputs dirty and arm their present wakes.
@@ -1835,21 +1665,29 @@ impl AppData {
         self.arm_presents(event_loop, arena);
     }
 
+    fn frame_time_msec(&self) -> u32 {
+        self.frame_clock
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32
+    }
+
     fn arm_presents(&mut self, event_loop: &mut EventLoop, arena: &Arena) {
+        let seat_enabled = self.seat_state.is_enabled();
+        let frame_time_msec = self.frame_time_msec();
+        let mut notify = DisplayPresentationNotify {
+            state: &mut self.display_state,
+            clients: &mut self.clients,
+        };
         match self.renderer_state.arm_presents(
             event_loop,
-            self.pending_present_work(),
-            self.seat_state.is_enabled(),
+            &mut notify,
+            seat_enabled,
+            frame_time_msec,
             arena,
         ) {
             Ok(result) => {
-                self.maybe_complete_virtual_presentation_feedback(&result.presented_outputs);
-                self.maybe_complete_frame_callbacks(
-                    event_loop,
-                    result.presented_without_pending_flip,
-                    result.status.idle,
-                    arena,
-                );
+                self.flush_client_sends(event_loop, arena);
                 if !result.presented_outputs.is_empty() && !self.screencast_push_active {
                     self.push_screencast_frames(event_loop, arena);
                 }
@@ -1863,33 +1701,20 @@ impl AppData {
         event_loop: &mut EventLoop,
         arena: &Arena,
     ) -> anyhow::Result<()> {
+        let seat_enabled = self.seat_state.is_enabled();
+        let frame_time_msec = self.frame_time_msec();
+        let mut notify = DisplayPresentationNotify {
+            state: &mut self.display_state,
+            clients: &mut self.clients,
+        };
         match self.renderer_state.on_drm_events(
             event_loop,
-            self.pending_present_work(),
-            self.seat_state.is_enabled(),
+            &mut notify,
+            seat_enabled,
+            frame_time_msec,
             arena,
         ) {
-            Ok(effects) => {
-                for completed in &effects.completed {
-                    self.display_state.complete_presentation_feedbacks(
-                        &mut self.clients,
-                        PresentationFlipInfo {
-                            tv_sec: completed.flip.tv_sec,
-                            tv_usec: completed.flip.tv_usec,
-                            sequence: completed.flip.sequence,
-                            refresh_ns: completed.refresh_ns,
-                        },
-                    );
-                }
-                // A completed flip is enough even if another (or queued) flip is
-                // already in flight — requiring global idle starves wl_surface.frame
-                // under continuous cursor presents.
-                self.maybe_complete_frame_callbacks(
-                    event_loop,
-                    !effects.completed.is_empty(),
-                    effects.status.idle,
-                    arena,
-                );
+            Ok(_effects) => {
                 self.flush_client_sends(event_loop, arena);
             }
             Err(err) => error!("Unable to handle DRM device events: {err}"),
@@ -1909,22 +1734,21 @@ impl AppData {
                 self.shutdown_now = true;
             }
             token if is_present_wake_token(token) => {
+                let seat_enabled = self.seat_state.is_enabled();
+                let frame_time_msec = self.frame_time_msec();
+                let mut notify = DisplayPresentationNotify {
+                    state: &mut self.display_state,
+                    clients: &mut self.clients,
+                };
                 match self.renderer_state.on_present_timeout(
                     event_loop,
                     token,
-                    self.pending_present_work(),
-                    self.seat_state.is_enabled(),
+                    &mut notify,
+                    seat_enabled,
+                    frame_time_msec,
                 ) {
                     Ok(result) => {
-                        self.maybe_complete_virtual_presentation_feedback(
-                            &result.presented_outputs,
-                        );
-                        self.maybe_complete_frame_callbacks(
-                            event_loop,
-                            result.presented_without_pending_flip,
-                            result.status.idle,
-                            arena,
-                        );
+                        self.flush_client_sends(event_loop, arena);
                         if !result.presented_outputs.is_empty() && !self.screencast_push_active {
                             self.push_screencast_frames(event_loop, arena);
                         }
@@ -1941,68 +1765,6 @@ impl AppData {
                 warn!("Ignoring unexpected timeout completion id={other}");
             }
         }
-    }
-
-    /// Complete deferred `wl_surface.frame` callbacks after presentation.
-    ///
-    /// `presentation_done` is true when content was shown this cycle (a DRM
-    /// page-flip completed, or a virtual/blocking present finished). `flip_idle`
-    /// covers the paced-wake case where nothing is in flight yet. Requiring only
-    /// global idle would block callbacks whenever cursor motion keeps a flip queued.
-    fn maybe_complete_frame_callbacks(
-        &mut self,
-        event_loop: &mut EventLoop,
-        presentation_done: bool,
-        flip_idle: bool,
-        arena: &Arena,
-    ) {
-        if self.display_state.pending_frame_callback_count() == 0 {
-            return;
-        }
-        if !presentation_done && !flip_idle {
-            return;
-        }
-        let time_msec = self
-            .frame_clock
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u32::MAX)) as u32;
-        let time_msec = time_msec.max(1);
-        self.display_state
-            .complete_frame_callbacks(&mut self.clients, time_msec);
-        self.flush_client_sends(event_loop, arena);
-    }
-
-    /// Virtual presents have no KMS page-flip, so complete `wp_presentation_feedback`
-    /// immediately after a successful present (same client-visible result as DRM flips).
-    fn maybe_complete_virtual_presentation_feedback(&mut self, presented_outputs: &[String]) {
-        if presented_outputs.is_empty() {
-            return;
-        }
-        if !presented_outputs
-            .iter()
-            .any(|name| self.renderer_state.output_is_virtual(name))
-        {
-            return;
-        }
-        if self.display_state.pending_presentation_feedback_count() == 0 {
-            return;
-        }
-
-        let refresh_ns = presented_outputs
-            .iter()
-            .find_map(|name| self.renderer_state.output_refresh_ns(name))
-            .unwrap_or(16_666_666);
-        let (tv_sec, tv_usec) = monotonic_time_sec_usec();
-        self.display_state.complete_presentation_feedbacks(
-            &mut self.clients,
-            PresentationFlipInfo {
-                tv_sec,
-                tv_usec,
-                sequence: 0,
-                refresh_ns,
-            },
-        );
     }
 
     fn sync_drm_device_poll(
@@ -2069,13 +1831,6 @@ impl AppData {
             error!("Unable to schedule shutdown timeout: {err}. Shutting down now",);
             self.shutdown_now = true;
         }
-    }
-
-    fn pending_present_work(&self) -> bool {
-        self.display_state.pending_frame_callback_count() > 0
-            || self.display_state.pending_presentation_feedback_count() > 0
-        // Screencast captures are paced by ScreencastBlitNeeded (PipeWire thread),
-        // not by forcing continuous presents (that recreated a 5K busy-loop).
     }
 
     fn start_window_screencast(
@@ -2598,20 +2353,4 @@ fn start_dbus_service(
         )
         .context("Unable to poll dbus thread completion pid")?;
     Ok(unsafe { OwnedFd::from_raw_fd(thread_complete_fd) })
-}
-
-/// `CLOCK_MONOTONIC` as `(sec, usec)` for synthetic virtual-present feedback.
-fn monotonic_time_sec_usec() -> (u32, u32) {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid timespec out-parameter.
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    if rc != 0 {
-        return (0, 0);
-    }
-    let sec = u32::try_from(ts.tv_sec.max(0)).unwrap_or(u32::MAX);
-    let usec = u32::try_from(ts.tv_nsec.max(0) / 1000).unwrap_or(u32::MAX);
-    (sec, usec)
 }

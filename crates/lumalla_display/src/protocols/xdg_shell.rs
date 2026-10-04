@@ -560,11 +560,7 @@ impl XdgToplevel for DisplayState {
                             .set_xdg_map_ready(ctx.client_id, wl_surface, false);
                     self.shm_manager
                         .clear_surface_backing(ctx.client_id, wl_surface);
-                    self.surface_updates
-                        .push_back(crate::SurfaceUpdate::Unmapped {
-                            client_id: ctx.client_id,
-                            surface_id: wl_surface,
-                        });
+                    self.emit_surface_unmapped(ctx.client_id, wl_surface);
                 }
                 self.unregister_toplevel(ctx.client_id, object_id);
                 ctx.registry.free_object(object_id, ctx.writer);
@@ -778,11 +774,7 @@ impl XdgPopup for DisplayState {
                         .clear_role_parent(ctx.client_id, wl_surface);
                     self.shm_manager
                         .clear_surface_backing(ctx.client_id, wl_surface);
-                    self.surface_updates
-                        .push_back(crate::SurfaceUpdate::Unmapped {
-                            client_id: ctx.client_id,
-                            surface_id: wl_surface,
-                        });
+                    self.emit_surface_unmapped(ctx.client_id, wl_surface);
                 }
                 ctx.registry.free_object(object_id, ctx.writer);
             }

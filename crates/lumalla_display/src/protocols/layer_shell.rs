@@ -359,11 +359,7 @@ impl ZwlrLayerSurfaceV1 for DisplayState {
                     .clear_layer_role(ctx.client_id, wl_surface);
                 self.shm_manager
                     .clear_surface_backing(ctx.client_id, wl_surface);
-                self.surface_updates
-                    .push_back(crate::SurfaceUpdate::Unmapped {
-                        client_id: ctx.client_id,
-                        surface_id: wl_surface,
-                    });
+                self.emit_surface_unmapped(ctx.client_id, wl_surface);
                 ctx.registry.free_object(object_id, ctx.writer);
             }
             Err(error) => report_layer_error(ctx, object_id, error),

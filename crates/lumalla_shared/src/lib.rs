@@ -8,6 +8,7 @@ mod keymap_memfd;
 mod main_message;
 mod mods;
 mod output;
+pub mod render_collab;
 pub mod ring;
 mod screencast_cursor;
 mod screencast_size;
@@ -30,6 +31,10 @@ pub use main_message::{InjectedInput, MainMessage, MutterScreenCastTarget};
 pub use mods::Mods;
 pub use output::{
     Output, View, map_dest_to_source, map_source_to_dest, view_at_dest, view_at_source,
+};
+pub use render_collab::{
+    DamageRect, PresentationFlipInfo, PresentationNotify, RenderSink, SurfaceDmabuf,
+    SurfaceSubmit, SurfaceSubmitRole,
 };
 pub use ring::{
     Completion, EventLoop, Interest, OpKind, SharedWaker, Waker, decode_user_data,
