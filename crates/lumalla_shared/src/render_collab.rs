@@ -95,6 +95,9 @@ pub trait RenderSink {
     fn hide_cursor(&mut self) -> Result<()>;
     fn clear_cursor(&mut self) -> Result<()>;
 
+    /// Software / HW cursor position in global compositor space.
+    fn update_pointer_position(&mut self, x: i32, y: i32) -> Result<()>;
+
     /// Mark that a present is needed (content change and/or pending frame callbacks).
     fn request_present(&mut self);
 }

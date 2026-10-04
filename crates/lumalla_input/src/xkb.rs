@@ -121,14 +121,8 @@ pub struct KeysymPress {
     pub shift: bool,
 }
 
-/// Modifier and layout state from xkb.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct XkbModifiers {
-    pub depressed: u32,
-    pub latched: u32,
-    pub locked: u32,
-    pub group: u32,
-}
+/// Modifier and layout state from xkb (shared with Wayland seat).
+pub use lumalla_shared::KeyboardModifiers as XkbModifiers;
 
 /// Seat keyboard state backed by libxkbcommon.
 pub struct Xkb {

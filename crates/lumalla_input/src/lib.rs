@@ -12,7 +12,9 @@ use lumalla_shared::{Comms, DbusMessage, KeymapMemfd, MainMessage, Mods, XkbConf
 use crate::libinput::{InputEvent, KEY_STATE_PRESSED, LibInput, is_modifier_key, update_modifier};
 use crate::xkb::Xkb;
 
-pub use xkb::XkbModifiers as KeyboardModifiers;
+pub use lumalla_shared::{
+    BTN_LEFT, KeyboardEvent, KeyboardModifiers, PointerEvent, SeatEvent, TouchEvent, mods_is_subset,
+};
 
 /// Resolve a key name (e.g. `"m"`, `"Return"`, `"F1"`) to a Linux evdev keycode.
 ///
@@ -82,79 +84,6 @@ struct KeyBinding {
     on_release: bool,
     consume: bool,
 }
-
-/// Keyboard updates for the Wayland seat after libinput dispatch.
-#[derive(Debug, Clone, Copy)]
-pub enum KeyboardEvent {
-    Key {
-        time_msec: u32,
-        /// Linux/evdev keycode (libinput / `wl_keyboard.key`).
-        key: u32,
-        pressed: bool,
-    },
-    Modifiers(KeyboardModifiers),
-}
-
-/// Pointer updates for the Wayland seat after libinput dispatch.
-#[derive(Debug, Clone, Copy)]
-pub enum PointerEvent {
-    Motion {
-        time_msec: u32,
-        dx: f64,
-        dy: f64,
-        dx_unaccel: f64,
-        dy_unaccel: f64,
-    },
-    Absolute {
-        time_msec: u32,
-        x: f64,
-        y: f64,
-    },
-    Button {
-        time_msec: u32,
-        button: u32,
-        pressed: bool,
-    },
-    Axis {
-        time_msec: u32,
-        axis: u32,
-        value: f32,
-    },
-}
-
-/// Touch updates for the Wayland seat after libinput dispatch.
-#[derive(Debug, Clone, Copy)]
-pub enum TouchEvent {
-    Down {
-        time_msec: u32,
-        id: i32,
-        x: f64,
-        y: f64,
-    },
-    Up {
-        time_msec: u32,
-        id: i32,
-    },
-    Motion {
-        time_msec: u32,
-        id: i32,
-        x: f64,
-        y: f64,
-    },
-    Frame,
-    Cancel,
-}
-
-/// Aggregated seat input events forwarded to the compositor.
-#[derive(Debug, Clone, Copy)]
-pub enum SeatEvent {
-    Keyboard(KeyboardEvent),
-    Pointer(PointerEvent),
-    Touch(TouchEvent),
-}
-
-/// Linux input button code for the left mouse button.
-pub const BTN_LEFT: u32 = 0x110;
 
 pub struct InputState {
     comms: Comms,
@@ -570,16 +499,6 @@ fn mods_for_binding_match(key: u32, mods: Mods) -> Mods {
         update_modifier(key, false, &mut match_mods);
     }
     match_mods
-}
-
-/// True when every modifier required by `required` is present in `pressed`.
-///
-/// Extra pressed modifiers are allowed (i3/sway-style subset match).
-pub fn mods_is_subset(required: Mods, pressed: Mods) -> bool {
-    (!required.ctrl || pressed.ctrl)
-        && (!required.alt || pressed.alt)
-        && (!required.shift || pressed.shift)
-        && (!required.logo || pressed.logo)
 }
 
 fn mod_count(mods: Mods) -> u32 {

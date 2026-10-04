@@ -93,13 +93,7 @@ pub struct SeatManager {
     serial: Serial,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KeyboardModifiers {
-    pub depressed: u32,
-    pub latched: u32,
-    pub locked: u32,
-    pub group: u32,
-}
+pub use lumalla_shared::KeyboardModifiers;
 
 struct SeatKeyboard {
     client_id: ClientId,

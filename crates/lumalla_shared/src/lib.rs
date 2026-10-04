@@ -4,6 +4,7 @@ mod comms;
 mod dbus_message;
 mod drm;
 mod guide;
+pub mod input_collab;
 mod keymap_memfd;
 mod main_message;
 mod mods;
@@ -26,6 +27,10 @@ pub use comms::{Comms, MessageSender, message_loop_with_channel};
 pub use dbus_message::DbusMessage;
 pub use drm::{DrmConnector, DrmDeviceState, DrmMode, OutputConfig};
 pub use guide::{ColorRgba, Guide, GuideKind, GuideLayer};
+pub use input_collab::{
+    BTN_LEFT, CursorListenKind, CursorListenPolicy, CursorListenSink, KeyboardEvent,
+    KeyboardModifiers, PointerEvent, SeatEvent, TouchEvent, mods_is_subset,
+};
 pub use keymap_memfd::KeymapMemfd;
 pub use main_message::{InjectedInput, MainMessage, MutterScreenCastTarget};
 pub use mods::Mods;

@@ -45,6 +45,7 @@ mod protocols;
 mod recording_sink;
 mod relative_pointer;
 mod seat;
+mod seat_input;
 mod shm;
 mod surface;
 mod window_manager;
@@ -57,6 +58,7 @@ pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland, buffer::
 pub use output::OutputInfo;
 pub use recording_sink::RecordingRenderSink;
 pub use seat::{ActiveCursor, KeyboardModifiers, PointerCursor};
+pub use seat_input::SeatInputHandler;
 pub use surface::{Rectangle, SceneSurface};
 pub use window_manager::{WindowError, WindowGeometryChange};
 

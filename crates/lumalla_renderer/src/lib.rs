@@ -1321,6 +1321,10 @@ impl RenderSink for RendererState {
         self.clear_cursor_frame()
     }
 
+    fn update_pointer_position(&mut self, x: i32, y: i32) -> anyhow::Result<()> {
+        RendererState::update_pointer_position(self, x, y)
+    }
+
     fn request_present(&mut self) {
         self.mark_dirty_if_active();
     }

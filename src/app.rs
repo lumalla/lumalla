@@ -18,11 +18,9 @@ use stumpalo::Arena;
 use lumalla_dbus::{DbusService, run_thread as run_dbus_thread};
 use lumalla_display::{
     ClientId, ConnectedClients, DisplayHandler, DisplayPresentationNotify, DisplayState,
-    KeyboardModifiers, OutputInfo, ReadResult, Wayland, create_wayland_display,
+    OutputInfo, ReadResult, SeatInputHandler, Wayland, create_wayland_display,
 };
-use lumalla_input::{
-    BTN_LEFT, InputState, KeyboardEvent, PointerEvent, SeatEvent, TouchEvent, mods_is_subset,
-};
+use lumalla_input::{BTN_LEFT, InputState, SeatEvent};
 use lumalla_renderer::{RendererState, is_present_wake_token};
 use lumalla_screencast::{
     DmaBufferExport, FormatOffer, ScreencastManager, ScreencastSource, ScreencastWake, VideoFrame,
@@ -30,10 +28,37 @@ use lumalla_screencast::{
 };
 use lumalla_seat::SeatState;
 use lumalla_shared::{
-    Comms, Completion, DbusMessage, EventLoop, InjectedInput, Interest, MainMessage, MessageSender,
-    Mods, MutterScreenCastTarget, OpKind, ScreencastCursorMode, encode_user_data,
-    message_loop_with_channel, monotonic_deadline_after, ring::MESSAGE_CHANNEL_TOKEN,
+    Comms, Completion, CursorListenPolicy, CursorListenSink, DbusMessage, EventLoop, InjectedInput,
+    Interest, MainMessage, MessageSender, MutterScreenCastTarget, OpKind, ScreencastCursorMode,
+    encode_user_data, message_loop_with_channel, monotonic_deadline_after,
+    ring::MESSAGE_CHANNEL_TOKEN,
 };
+
+/// Cursor-listen side effects over dbus/config.
+struct CommsCursorListen<'a> {
+    comms: &'a Comms,
+}
+
+impl CursorListenSink for CommsCursorListen<'_> {
+    fn cursor_moved(&mut self, x: f64, y: f64, dx: f64, dy: f64) {
+        self.comms
+            .dbus(DbusMessage::EmitCursorMoved { x, y, dx, dy });
+    }
+
+    fn cursor_clicked(&mut self, x: f64, y: f64, button: u32, pressed: bool) {
+        self.comms.dbus(DbusMessage::EmitCursorClicked {
+            x,
+            y,
+            button,
+            pressed,
+        });
+    }
+
+    fn cursor_scrolled(&mut self, x: f64, y: f64, axis: u32, value: f64) {
+        self.comms
+            .dbus(DbusMessage::EmitCursorScrolled { x, y, axis, value });
+    }
+}
 
 use crate::args::Args;
 
@@ -68,9 +93,10 @@ struct DrmDeviceRegistration {
 /// Main event-loop owner.
 ///
 /// Display ↔ renderer collaboration is phase-local (`DisplayHandler` on client
-/// dispatch, `DisplayPresentationNotify` on present/flip). Residual mediation
-/// that still lives here: pointer position, DRM↔Wayland output geometry,
-/// dmabuf format advertising, and screencast capture.
+/// dispatch, `DisplayPresentationNotify` on present/flip). Seat input is
+/// phase-local via `SeatInputHandler`. Residual mediation that still lives
+/// here: DRM↔Wayland output geometry, dmabuf format advertising, screencast,
+/// and seat enable/disable wiring.
 struct AppData {
     comms: Comms,
     _dbus_thread_completion_fd: OwnedFd,
@@ -97,28 +123,8 @@ struct AppData {
     frame_clock: Instant,
     drm_device_poll: HashMap<PathBuf, DrmDeviceRegistration>,
     next_drm_device_token: usize,
-    /// Emit CursorMoved to config when true.
-    listen_cursor_move: bool,
-    /// Emit CursorClicked to config when true.
-    listen_cursor_click: bool,
-    /// Emit CursorScrolled to config when true.
-    listen_cursor_scroll: bool,
-    /// Withhold pointer motion from Wayland clients while listening.
-    consume_cursor_move: bool,
-    /// Withhold pointer buttons from Wayland clients while listening.
-    consume_cursor_click: bool,
-    /// Withhold pointer axis from Wayland clients while listening.
-    consume_cursor_scroll: bool,
-    /// Required mods for move listener (empty = always active while listening).
-    cursor_move_mods: Mods,
-    /// Required mods for click listener (empty = always active while listening).
-    cursor_click_mods: Mods,
-    /// Required mods for scroll listener (empty = always active while listening).
-    cursor_scroll_mods: Mods,
-    /// Accumulated relative pointer delta for the current input batch.
-    pending_cursor_dx: f64,
-    /// Accumulated relative pointer delta for the current input batch.
-    pending_cursor_dy: f64,
+    /// Config cursor-listen / consume policy for the seat-input phase.
+    cursor_listen: CursorListenPolicy,
 }
 
 impl AppData {
@@ -163,17 +169,7 @@ impl AppData {
             frame_clock: Instant::now(),
             drm_device_poll: HashMap::new(),
             next_drm_device_token: 0,
-            listen_cursor_move: false,
-            listen_cursor_click: false,
-            listen_cursor_scroll: false,
-            consume_cursor_move: false,
-            consume_cursor_click: false,
-            consume_cursor_scroll: false,
-            cursor_move_mods: Mods::default(),
-            cursor_click_mods: Mods::default(),
-            cursor_scroll_mods: Mods::default(),
-            pending_cursor_dx: 0.0,
-            pending_cursor_dy: 0.0,
+            cursor_listen: CursorListenPolicy::default(),
         }
     }
 
@@ -285,22 +281,7 @@ impl AppData {
                 if let Err(err) = self.input_state.dispatch(|event| events.push(event)) {
                     error!("Unable to dispatch libinput events: {err}");
                 } else {
-                    let mut pointer_changed = false;
-                    for event in events {
-                        pointer_changed |= self.handle_seat_event(event, arena);
-                    }
-                    self.flush_client_sends(event_loop, arena);
-                    if pointer_changed {
-                        self.maybe_emit_cursor_moved();
-                        if let Err(err) = self.renderer_state.update_pointer_position(
-                            self.display_state.pointer_position().0.round() as i32,
-                            self.display_state.pointer_position().1.round() as i32,
-                        ) {
-                            error!("Unable to update pointer position: {err:#}");
-                        } else if self.renderer_state.scene_dirty() {
-                            self.mark_present_dirty(event_loop, arena);
-                        }
-                    }
+                    self.apply_seat_events(&events, event_loop, arena);
                 }
             }
             UDEV_DRM_TOKEN => match self.renderer_state.dispatch() {
@@ -726,13 +707,7 @@ impl AppData {
                         match self.input_state.keymap_memfd() {
                             Ok(keymap) => {
                                 let mods = self.input_state.modifiers();
-                                self.display_state
-                                    .set_keyboard_modifiers(KeyboardModifiers {
-                                        depressed: mods.depressed,
-                                        latched: mods.latched,
-                                        locked: mods.locked,
-                                        group: mods.group,
-                                    });
+                                self.display_state.set_keyboard_modifiers(mods);
                                 if let Err(err) = self
                                     .display_state
                                     .update_keyboard_keymap(&mut self.clients, keymap)
@@ -1297,15 +1272,17 @@ impl AppData {
                     mods_click,
                     mods_scroll,
                 } => {
-                    self.listen_cursor_move = listen_move;
-                    self.listen_cursor_click = listen_click;
-                    self.listen_cursor_scroll = listen_scroll;
-                    self.consume_cursor_move = consume_move;
-                    self.consume_cursor_click = consume_click;
-                    self.consume_cursor_scroll = consume_scroll;
-                    self.cursor_move_mods = mods_move;
-                    self.cursor_click_mods = mods_click;
-                    self.cursor_scroll_mods = mods_scroll;
+                    self.cursor_listen.set_listening(
+                        listen_move,
+                        listen_click,
+                        listen_scroll,
+                        consume_move,
+                        consume_click,
+                        consume_scroll,
+                        mods_move,
+                        mods_click,
+                        mods_scroll,
+                    );
                 }
             }
         }
@@ -1344,224 +1321,47 @@ impl AppData {
                 Ok(())
             }
         };
-        let mut pointer_changed = false;
-        for event in events {
-            pointer_changed |= self.handle_seat_event(event, arena);
-        }
-        self.flush_client_sends(event_loop, arena);
-        if pointer_changed {
-            self.maybe_emit_cursor_moved();
-            if let Err(err) = self.renderer_state.update_pointer_position(
-                self.display_state.pointer_position().0.round() as i32,
-                self.display_state.pointer_position().1.round() as i32,
-            ) {
-                error!("Unable to update pointer position after input injection: {err:#}");
-            } else if self.renderer_state.scene_dirty() {
-                self.mark_present_dirty(event_loop, arena);
-            }
-        }
+        self.apply_seat_events(&events, event_loop, arena);
         result
     }
 
-    fn handle_seat_event(&mut self, event: SeatEvent, arena: &Arena) -> bool {
-        let mut pointer_changed = false;
-        match event {
-            SeatEvent::Keyboard(KeyboardEvent::Key {
-                time_msec,
-                key,
-                pressed,
-            }) => {
-                self.display_state.handle_keyboard_key(
-                    &mut self.clients,
-                    time_msec,
-                    key,
-                    pressed,
-                    arena,
-                );
-            }
-            SeatEvent::Keyboard(KeyboardEvent::Modifiers(modifiers)) => {
-                self.display_state.handle_keyboard_modifiers(
-                    &mut self.clients,
-                    KeyboardModifiers {
-                        depressed: modifiers.depressed,
-                        latched: modifiers.latched,
-                        locked: modifiers.locked,
-                        group: modifiers.group,
-                    },
-                );
-            }
-            SeatEvent::Pointer(PointerEvent::Motion {
-                time_msec,
-                dx,
-                dy,
-                dx_unaccel,
-                dy_unaccel,
-            }) => {
-                pointer_changed = true;
-                let active = self.cursor_listener_active(
-                    self.listen_cursor_move,
-                    self.cursor_move_mods,
-                );
-                if active {
-                    self.pending_cursor_dx += dx;
-                    self.pending_cursor_dy += dy;
-                }
-                if active && self.consume_cursor_move {
-                    self.display_state.nudge_pointer(dx, dy);
-                } else {
-                    self.display_state.handle_pointer_motion(
-                        &mut self.clients,
-                        time_msec,
-                        dx,
-                        dy,
-                        dx_unaccel,
-                        dy_unaccel,
-                        arena,
-                    );
-                }
-            }
-            SeatEvent::Pointer(PointerEvent::Absolute { time_msec, x, y }) => {
-                pointer_changed = true;
-                let active = self.cursor_listener_active(
-                    self.listen_cursor_move,
-                    self.cursor_move_mods,
-                );
-                let origin = active.then(|| self.display_state.pointer_position());
-                if active && self.consume_cursor_move {
-                    self.display_state.set_pointer_position(x, y);
-                } else {
-                    self.display_state.handle_pointer_absolute(
-                        &mut self.clients,
-                        time_msec,
-                        x,
-                        y,
-                        arena,
-                    );
-                }
-                if let Some((ox, oy)) = origin {
-                    let (nx, ny) = self.display_state.pointer_position();
-                    self.pending_cursor_dx += nx - ox;
-                    self.pending_cursor_dy += ny - oy;
-                }
-            }
-            SeatEvent::Pointer(PointerEvent::Button {
-                time_msec,
-                button,
-                pressed,
-            }) => {
-                let active = self.cursor_listener_active(
-                    self.listen_cursor_click,
-                    self.cursor_click_mods,
-                );
-                if !(active && self.consume_cursor_click) {
-                    self.display_state.handle_pointer_button(
-                        &mut self.clients,
-                        time_msec,
-                        button,
-                        pressed,
-                        arena,
-                    );
-                }
-                if active {
-                    let (x, y) = self.display_state.pointer_position();
-                    let lua_button = if button == BTN_LEFT { 0 } else { button };
-                    self.comms.dbus(DbusMessage::EmitCursorClicked {
-                        x,
-                        y,
-                        button: lua_button,
-                        pressed,
-                    });
-                }
-            }
-            SeatEvent::Pointer(PointerEvent::Axis {
-                time_msec,
-                axis,
-                value,
-            }) => {
-                let active = self.cursor_listener_active(
-                    self.listen_cursor_scroll,
-                    self.cursor_scroll_mods,
-                );
-                if !(active && self.consume_cursor_scroll) {
-                    self.display_state.handle_pointer_axis(
-                        &mut self.clients,
-                        time_msec,
-                        axis,
-                        value,
-                        arena,
-                    );
-                }
-                if active {
-                    let (x, y) = self.display_state.pointer_position();
-                    self.comms.dbus(DbusMessage::EmitCursorScrolled {
-                        x,
-                        y,
-                        axis,
-                        value: f64::from(value),
-                    });
-                }
-            }
-            SeatEvent::Touch(TouchEvent::Down {
-                time_msec,
-                id,
-                x,
-                y,
-            }) => {
-                self.display_state.handle_touch_down(
-                    &mut self.clients,
-                    time_msec,
-                    id,
-                    x,
-                    y,
-                    arena,
-                );
-            }
-            SeatEvent::Touch(TouchEvent::Up { time_msec, id }) => {
-                self.display_state
-                    .handle_touch_up(&mut self.clients, time_msec, id, arena);
-            }
-            SeatEvent::Touch(TouchEvent::Motion {
-                time_msec,
-                id,
-                x,
-                y,
-            }) => {
-                self.display_state.handle_touch_motion(
-                    &mut self.clients,
-                    time_msec,
-                    id,
-                    x,
-                    y,
-                    arena,
-                );
-            }
-            SeatEvent::Touch(TouchEvent::Frame) => {
-                self.display_state
-                    .handle_touch_frame(&mut self.clients, arena);
-            }
-            SeatEvent::Touch(TouchEvent::Cancel) => {
-                self.display_state
-                    .handle_touch_cancel(&mut self.clients, arena);
-            }
-        }
-        pointer_changed
-    }
-
-    fn cursor_listener_active(&self, listening: bool, required: Mods) -> bool {
-        listening && mods_is_subset(required, self.input_state.pressed_mods())
-    }
-
-    fn maybe_emit_cursor_moved(&mut self) {
-        if self.pending_cursor_dx == 0.0 && self.pending_cursor_dy == 0.0 {
+    /// Run a seat-input batch through [`SeatInputHandler`] (libinput or inject).
+    fn apply_seat_events(
+        &mut self,
+        events: &[SeatEvent],
+        event_loop: &mut EventLoop,
+        arena: &Arena,
+    ) {
+        if events.is_empty() {
             return;
         }
-        let (x, y) = self.display_state.pointer_position();
-        let dx = self.pending_cursor_dx;
-        let dy = self.pending_cursor_dy;
-        self.pending_cursor_dx = 0.0;
-        self.pending_cursor_dy = 0.0;
-        self.comms
-            .dbus(DbusMessage::EmitCursorMoved { x, y, dx, dy });
+        let pressed_mods = self.input_state.pressed_mods();
+        let pointer_changed = {
+            let mut cursor_notify = CommsCursorListen {
+                comms: &self.comms,
+            };
+            let mut handler = SeatInputHandler {
+                state: &mut self.display_state,
+                clients: &mut self.clients,
+                render: &mut self.renderer_state,
+                listen: &mut self.cursor_listen,
+                cursor_notify: &mut cursor_notify,
+                pressed_mods,
+            };
+            let mut pointer_changed = false;
+            for &event in events {
+                pointer_changed |= handler.handle(event, arena);
+            }
+            if pointer_changed {
+                handler.flush_cursor_moved();
+                let _ = handler.sync_pointer_to_render();
+            }
+            pointer_changed
+        };
+        self.flush_client_sends(event_loop, arena);
+        if pointer_changed && self.renderer_state.scene_dirty() {
+            self.mark_present_dirty(event_loop, arena);
+        }
     }
 
     fn emit_outputs_changed(&self) {
@@ -1596,6 +1396,15 @@ impl AppData {
         let height_u = height.max(1) as u32;
         self.input_state.set_output_geometry(width_u, height_u);
         self.display_state.set_output_geometry(width_u, height_u);
+        // Geometry clamp may move the display pointer; keep the renderer in sync.
+        let (px, py) = self.display_state.pointer_position();
+        if let Err(err) = lumalla_shared::RenderSink::update_pointer_position(
+            &mut self.renderer_state,
+            px.round() as i32,
+            py.round() as i32,
+        ) {
+            error!("Unable to sync pointer after output geometry change: {err:#}");
+        }
 
         // Only rewrite the primary Wayland output when it already exists and is physical
         // (DRM hotplug sync). Virtual outputs are owned entirely by config `add_output`.
@@ -2272,13 +2081,7 @@ fn init_display_state(
     match input_state.keymap_memfd() {
         Ok(keymap) => {
             display_state.set_keyboard_keymap(keymap);
-            let mods = input_state.modifiers();
-            display_state.set_keyboard_modifiers(KeyboardModifiers {
-                depressed: mods.depressed,
-                latched: mods.latched,
-                locked: mods.locked,
-                group: mods.group,
-            });
+            display_state.set_keyboard_modifiers(input_state.modifiers());
         }
         Err(err) => error!("Unable to load xkb keymap for Wayland: {err}"),
     }

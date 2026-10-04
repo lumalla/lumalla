@@ -15,6 +15,7 @@ pub struct RecordingRenderSink {
     pub cursor_hotspots: Vec<(i32, i32)>,
     pub hide_cursor_count: u32,
     pub clear_cursor_count: u32,
+    pub pointer_positions: Vec<(i32, i32)>,
     pub present_requests: u32,
 }
 
@@ -80,6 +81,11 @@ impl RenderSink for RecordingRenderSink {
 
     fn clear_cursor(&mut self) -> Result<()> {
         self.clear_cursor_count += 1;
+        Ok(())
+    }
+
+    fn update_pointer_position(&mut self, x: i32, y: i32) -> Result<()> {
+        self.pointer_positions.push((x, y));
         Ok(())
     }
 
