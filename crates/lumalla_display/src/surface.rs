@@ -94,6 +94,8 @@ pub struct DestroyedSurface {
     pub callbacks: Vec<ObjectId>,
     pub presentation_feedbacks: Vec<ObjectId>,
     pub was_mapped: bool,
+    /// True when `wl_surface.enter` was sent and `leave` has not been sent yet.
+    pub output_entered: bool,
     pub unmapped_descendants: Vec<ObjectId>,
 }
 
@@ -223,6 +225,7 @@ impl SurfaceManager {
             callbacks,
             presentation_feedbacks,
             was_mapped,
+            output_entered: surface.output_entered,
             unmapped_descendants,
         })
     }
@@ -926,10 +929,36 @@ impl SurfaceManager {
             .is_some_and(|surface| surface.role == Some(Role::Cursor))
     }
 
+    pub fn surface_role_is_dnd_icon(&self, client_id: ClientId, surface_id: ObjectId) -> bool {
+        self.surfaces
+            .get(&(client_id, surface_id))
+            .is_some_and(|surface| surface.role == Some(Role::DndIcon))
+    }
+
     pub fn surface_role_is_subsurface(&self, client_id: ClientId, surface_id: ObjectId) -> bool {
         self.surfaces
             .get(&(client_id, surface_id))
             .is_some_and(|surface| matches!(surface.role, Some(Role::Subsurface(_))))
+    }
+
+    /// Mark that `wl_surface.enter` has been sent. Returns true the first time.
+    pub fn mark_output_entered(&mut self, client_id: ClientId, surface_id: ObjectId) -> bool {
+        let Some(surface) = self.surfaces.get_mut(&(client_id, surface_id)) else {
+            return false;
+        };
+        if surface.output_entered {
+            return false;
+        }
+        surface.output_entered = true;
+        true
+    }
+
+    /// Clear output-enter state after `wl_surface.leave`. Returns prior value.
+    pub fn clear_output_entered(&mut self, client_id: ClientId, surface_id: ObjectId) -> bool {
+        let Some(surface) = self.surfaces.get_mut(&(client_id, surface_id)) else {
+            return false;
+        };
+        std::mem::take(&mut surface.output_entered)
     }
 
     pub fn assign_dnd_icon_role(
@@ -1011,6 +1040,12 @@ impl SurfaceManager {
             .get(&(client_id, id))
             .ok_or(SurfaceError::UnknownSurface)?;
         Ok(surface.current.buffer.is_some() || matches!(surface.pending.buffer, Some(Some(_))))
+    }
+
+    pub fn has_current_buffer(&self, client_id: ClientId, surface_id: ObjectId) -> bool {
+        self.surfaces
+            .get(&(client_id, surface_id))
+            .is_some_and(|surface| surface.current.buffer.is_some())
     }
 
     pub fn set_buffer_transform(
@@ -2321,6 +2356,8 @@ struct Surface {
     role_children: Vec<ObjectId>,
     /// Associated wp_viewport object, if any.
     viewport_id: Option<ObjectId>,
+    /// `wl_surface.enter` sent for bound outputs; cleared on matching leave.
+    output_entered: bool,
     current: SurfaceState,
     pending: PendingState,
     cache: Option<PendingState>,
@@ -2912,6 +2949,60 @@ mod tests {
         manager.create_surface(client(1), object(4));
         manager.assign_cursor_role(client(1), object(4)).unwrap();
         assert!(manager.surface_role_is_cursor(client(1), object(4)));
+    }
+
+    #[test]
+    fn dnd_icon_output_enter_is_tracked_and_reported_on_destroy() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.assign_dnd_icon_role(client(1), object(2)).unwrap();
+        assert!(manager.surface_role_is_dnd_icon(client(1), object(2)));
+        // DnD icons stay unmapped for window-management but can enter outputs.
+        manager
+            .attach(client(1), object(2), Some(object(3)), 0, 0, 1)
+            .unwrap();
+        let commit = manager.commit(client(1), object(2)).unwrap();
+        assert!(!commit.primary.mapped);
+        assert!(!commit.primary.newly_mapped);
+
+        assert!(manager.mark_output_entered(client(1), object(2)));
+        assert!(!manager.mark_output_entered(client(1), object(2)));
+
+        let destroyed = manager.destroy_surface(client(1), object(2)).unwrap();
+        assert!(!destroyed.was_mapped);
+        assert!(destroyed.output_entered);
+    }
+
+    #[test]
+    fn cursor_output_enter_is_tracked_and_reported_on_destroy() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.assign_cursor_role(client(1), object(2)).unwrap();
+        assert!(manager.surface_role_is_cursor(client(1), object(2)));
+        manager
+            .attach(client(1), object(2), Some(object(3)), 0, 0, 1)
+            .unwrap();
+        let commit = manager.commit(client(1), object(2)).unwrap();
+        assert!(!commit.primary.mapped);
+        assert!(!commit.primary.newly_mapped);
+
+        assert!(manager.mark_output_entered(client(1), object(2)));
+        assert!(!manager.mark_output_entered(client(1), object(2)));
+
+        let destroyed = manager.destroy_surface(client(1), object(2)).unwrap();
+        assert!(!destroyed.was_mapped);
+        assert!(destroyed.output_entered);
+    }
+
+    #[test]
+    fn clear_output_entered_resets_role_surface_enter_state() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager.assign_cursor_role(client(1), object(2)).unwrap();
+        assert!(manager.mark_output_entered(client(1), object(2)));
+        assert!(manager.clear_output_entered(client(1), object(2)));
+        assert!(!manager.clear_output_entered(client(1), object(2)));
+        assert!(manager.mark_output_entered(client(1), object(2)));
     }
 
     #[test]

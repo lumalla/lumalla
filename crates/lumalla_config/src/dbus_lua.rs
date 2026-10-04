@@ -738,6 +738,19 @@ fn init_dbus_input(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> Lu
         })?,
     )?;
 
+    let button_client = client.clone();
+    module.set(
+        "pointer_button",
+        lua.create_function(move |_, (pressed, button): (bool, Option<u32>)| {
+            dbus_result(
+                button_client
+                    .proxy
+                    .inject_pointer_button(button.unwrap_or(0), pressed),
+            )?;
+            Ok(())
+        })?,
+    )?;
+
     let screenshot_client = client;
     module.set(
         "screenshot",

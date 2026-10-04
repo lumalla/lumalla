@@ -253,6 +253,16 @@ impl InputState {
         self.inject_pointer_button(button, false, on_event);
     }
 
+    /// Press or release a pointer button without moving the pointer.
+    pub fn inject_pointer_button_state(
+        &mut self,
+        button: u32,
+        pressed: bool,
+        on_event: &mut impl FnMut(SeatEvent),
+    ) {
+        self.inject_pointer_button(button, pressed, on_event);
+    }
+
     fn inject_keysym(
         &mut self,
         keysym: u32,

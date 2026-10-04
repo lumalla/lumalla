@@ -421,6 +421,60 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, mut commit: S
     }
 }
 
+/// Cursor and DnD-icon surfaces are never `mapped` for window-management, but they
+/// are scanout content and must receive `wl_surface.enter` / `leave` while buffered.
+fn maybe_send_role_surface_output_enter(
+    state: &mut DisplayState,
+    ctx: &mut Ctx,
+    surface_id: ObjectId,
+    has_buffer: bool,
+) {
+    if !has_buffer {
+        return;
+    }
+    let is_role_surface = state
+        .surface_manager
+        .surface_role_is_cursor(ctx.client_id, surface_id)
+        || state
+            .surface_manager
+            .surface_role_is_dnd_icon(ctx.client_id, surface_id);
+    if !is_role_surface {
+        return;
+    }
+    send_surface_enter_outputs(state, ctx, surface_id);
+}
+
+/// Send `wl_surface.leave` for bound outputs. When `only_if_entered`, skip if
+/// this surface never received a matching enter (avoids Qt's unpaired-leave warning).
+fn send_surface_leave_outputs(
+    state: &mut DisplayState,
+    ctx: &mut Ctx,
+    surface_id: ObjectId,
+    only_if_entered: bool,
+) {
+    let was_entered = state
+        .surface_manager
+        .clear_output_entered(ctx.client_id, surface_id);
+    if only_if_entered && !was_entered {
+        return;
+    }
+    for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
+        ctx.writer.wl_surface_leave(surface_id).output(output);
+    }
+}
+
+fn send_surface_enter_outputs(state: &mut DisplayState, ctx: &mut Ctx, surface_id: ObjectId) {
+    if !state
+        .surface_manager
+        .mark_output_entered(ctx.client_id, surface_id)
+    {
+        return;
+    }
+    for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
+        ctx.writer.wl_surface_enter(surface_id).output(output);
+    }
+}
+
 /// Processes buffer/viewport side-effects of a surface commit.
 /// Returns `Err(())` when the commit failed after objects were already taken from pending state.
 fn process_surface_commit_body(
@@ -575,16 +629,17 @@ fn process_surface_commit_body(
                             .output_manager
                             .binding_for_global(ctx.client_id, info.output)
                         {
-                            ctx.writer
-                                .wl_surface_enter(commit.surface_id)
-                                .output(output);
+                            if state
+                                .surface_manager
+                                .mark_output_entered(ctx.client_id, commit.surface_id)
+                            {
+                                ctx.writer
+                                    .wl_surface_enter(commit.surface_id)
+                                    .output(output);
+                            }
                         }
                     } else {
-                        for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
-                            ctx.writer
-                                .wl_surface_enter(commit.surface_id)
-                                .output(output);
-                        }
+                        send_surface_enter_outputs(state, ctx, commit.surface_id);
                     }
                 }
             }
@@ -620,11 +675,9 @@ fn process_surface_commit_body(
             state
                 .shm_manager
                 .clear_surface_backing(ctx.client_id, commit.surface_id);
-            for output in state.output_manager.bound_outputs_for_client(ctx.client_id) {
-                ctx.writer
-                    .wl_surface_leave(commit.surface_id)
-                    .output(output);
-            }
+            // Only leave outputs we previously entered (null attach on never-entered
+            // surfaces is common for Qt drag icons before role assignment).
+            send_surface_leave_outputs(state, ctx, commit.surface_id, true);
             state.discard_presentation_feedbacks_for_surface(
                 ctx.client_id,
                 commit.surface_id,
@@ -757,6 +810,8 @@ fn process_surface_commit_body(
             }
         }
     }
+
+    maybe_send_role_surface_output_enter(state, ctx, commit.surface_id, commit.buffer.is_some());
 
     Ok(())
 }
@@ -1210,6 +1265,15 @@ impl WlDataDevice for DisplayState {
             report_data_device_error(ctx, object_id, error);
             return;
         }
+
+        // Qt commits the shaped-pixmap drag icon before start_drag assigns the
+        // DnD role; send enter now if that buffer is already present.
+        if let Some(icon) = params.icon() {
+            let has_buffer = self
+                .surface_manager
+                .has_current_buffer(ctx.client_id, icon);
+            maybe_send_role_surface_output_enter(self, ctx, icon, has_buffer);
+        }
     }
 
     fn set_selection(
@@ -1530,11 +1594,12 @@ impl WlSurface for DisplayState {
                 if let Some(shell_id) = destroyed.shell_id {
                     ctx.registry.free_object(shell_id, ctx.writer);
                 }
-                if destroyed.was_mapped {
-                    for output in self.output_manager.bound_outputs_for_client(ctx.client_id) {
-                        ctx.writer.wl_surface_leave(object_id).output(output);
+                if destroyed.was_mapped || destroyed.output_entered {
+                    // Destroy always pairs leave when the surface was on an output.
+                    send_surface_leave_outputs(self, ctx, object_id, false);
+                    if destroyed.was_mapped {
+                        self.emit_surface_unmapped(ctx.client_id, object_id);
                     }
-                    self.emit_surface_unmapped(ctx.client_id, object_id);
                 }
                 self.shm_manager
                     .clear_surface_backing(ctx.client_id, object_id);
@@ -1889,6 +1954,14 @@ impl WlPointer for DisplayState {
             &mut self.surface_manager,
         ) {
             report_surface_error(ctx, object_id, error);
+            return;
+        }
+        // Role may be assigned after the buffer was already committed; send enter now.
+        if let Some(surface) = params.surface() {
+            let has_buffer = self
+                .surface_manager
+                .has_current_buffer(ctx.client_id, surface);
+            maybe_send_role_surface_output_enter(self, ctx, surface, has_buffer);
         }
     }
 
@@ -3070,5 +3143,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(snap.pixels, [0xaa, 0xbb, 0xcc, 0xff]);
+    }
+
+    /// Qt commits the shaped-pixmap drag icon before `start_drag` assigns the DnD
+    /// role. Enter must be sent when the role is applied (or on the next commit),
+    /// and null-buffer leave must not fire without a prior enter.
+    #[test]
+    fn qt_style_dnd_icon_enter_leave_pairing() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let client_id = ClientId::new(NonZeroU32::new(1).unwrap());
+        let icon = object_id(20);
+        let mut registry = Registry::new();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id,
+        };
+
+        state.surface_manager.create_surface(client_id, icon);
+        // Buffer committed with no role yet (Qt shaped-pixmap window).
+        state
+            .surface_manager
+            .attach(client_id, icon, Some(object_id(21)), 0, 0, 1)
+            .unwrap();
+        let commit = state.surface_manager.commit(client_id, icon).unwrap().primary;
+        assert!(!commit.newly_mapped);
+        assert!(commit.buffer.is_some());
+        // No enter without a cursor/dnd role.
+        maybe_send_role_surface_output_enter(&mut state, &mut ctx, icon, true);
+        assert!(!state.surface_manager.clear_output_entered(client_id, icon));
+
+        // Null attach must not emit leave when enter was never sent.
+        send_surface_leave_outputs(&mut state, &mut ctx, icon, true);
+        assert!(!state.surface_manager.clear_output_entered(client_id, icon));
+
+        // Role assigned (start_drag) while buffer is already present.
+        state
+            .surface_manager
+            .assign_dnd_icon_role(client_id, icon)
+            .unwrap();
+        maybe_send_role_surface_output_enter(&mut state, &mut ctx, icon, true);
+        assert!(
+            state.surface_manager.clear_output_entered(client_id, icon),
+            "DnD icon with buffer must receive enter after role assignment"
+        );
+        // Restore entered state after the assertion consumed it.
+        assert!(state.surface_manager.mark_output_entered(client_id, icon));
+
+        // Matching leave on hide.
+        send_surface_leave_outputs(&mut state, &mut ctx, icon, true);
+        assert!(!state.surface_manager.clear_output_entered(client_id, icon));
     }
 }

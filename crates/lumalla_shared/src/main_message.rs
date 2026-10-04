@@ -40,6 +40,13 @@ pub enum InjectedInput {
         /// Linux input button code (defaults to left button).
         button: u32,
     },
+    /// Press or release a pointer button at the current pointer position.
+    PointerButton {
+        /// Linux input button code (defaults to left button).
+        button: u32,
+        /// True to press, false to release.
+        pressed: bool,
+    },
 }
 
 /// Target for a Mutter ScreenCast stream.

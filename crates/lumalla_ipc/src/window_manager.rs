@@ -162,6 +162,12 @@ pub trait WindowManagerHandler: Send + Sync {
     /// Click a pointer button at absolute compositor coordinates.
     fn inject_pointer_click(&mut self, x: f64, y: f64, button: u32) -> zbus::fdo::Result<()>;
 
+    /// Press or release a pointer button at the current pointer position.
+    ///
+    /// `button == 0` means the left button. Use with [`Self::inject_pointer_move`]
+    /// to synthesize drags.
+    fn inject_pointer_button(&mut self, button: u32, pressed: bool) -> zbus::fdo::Result<()>;
+
     /// Enable or disable cursor move / click / scroll signals to config clients.
     ///
     /// When disabled (default), the compositor does not emit
@@ -440,6 +446,10 @@ impl WindowManager {
 
     fn inject_pointer_click(&mut self, x: f64, y: f64, button: u32) -> zbus::fdo::Result<()> {
         self.handler.inject_pointer_click(x, y, button)
+    }
+
+    fn inject_pointer_button(&mut self, button: u32, pressed: bool) -> zbus::fdo::Result<()> {
+        self.handler.inject_pointer_button(button, pressed)
     }
 
     fn set_cursor_listening(

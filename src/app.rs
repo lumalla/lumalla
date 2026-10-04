@@ -1049,6 +1049,14 @@ impl AppData {
                 );
                 Ok(())
             }
+            InjectedInput::PointerButton { button, pressed } => {
+                self.input_state.inject_pointer_button_state(
+                    if button == 0 { BTN_LEFT } else { button },
+                    pressed,
+                    &mut |event| events.push(event),
+                );
+                Ok(())
+            }
         };
         self.apply_seat_events(&events, event_loop, arena);
         result

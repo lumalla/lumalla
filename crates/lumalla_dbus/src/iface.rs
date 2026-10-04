@@ -567,6 +567,16 @@ impl WindowManagerHandler for CompositorHandler {
         Ok(())
     }
 
+    fn inject_pointer_button(&mut self, button: u32, pressed: bool) -> zbus::fdo::Result<()> {
+        self.state
+            .comms
+            .main(MainMessage::InjectInput(InjectedInput::PointerButton {
+                button,
+                pressed,
+            }));
+        Ok(())
+    }
+
     fn set_cursor_listening(
         &mut self,
         listen_move: bool,
