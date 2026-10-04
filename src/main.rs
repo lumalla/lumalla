@@ -15,6 +15,7 @@ use crate::{app::run_app, args::Args, os_signal::handle_signals};
 mod app;
 mod args;
 mod os_signal;
+mod seat_lifecycle;
 
 fn main() -> anyhow::Result<()> {
     let Some(args) = Args::parse(args()) else {

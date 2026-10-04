@@ -61,6 +61,7 @@ impl CursorListenSink for CommsCursorListen<'_> {
 }
 
 use crate::args::Args;
+use crate::seat_lifecycle::{SeatDisableOutcome, SeatEnableOutcome, SeatSessionPeers};
 
 pub static SHUTDOWN_TIMEOUT_TIMESPEC: Timespec = Timespec::new().sec(1);
 pub const LIBSEAT_TOKEN: u64 = MESSAGE_CHANNEL_TOKEN + 1;
@@ -95,8 +96,9 @@ struct DrmDeviceRegistration {
 /// Display ↔ renderer collaboration is phase-local (`DisplayHandler` on client
 /// dispatch, `DisplayPresentationNotify` on present/flip, `DisplayConfigHost`
 /// for dmabuf / primary geometry). Seat input is phase-local via
-/// `SeatInputHandler`. Residual mediation that still lives here: screencast
-/// and seat enable/disable wiring.
+/// `SeatInputHandler`. Session enable/disable is sequenced by
+/// [`SeatSessionPeers`](crate::seat_lifecycle::SeatSessionPeers) (poll/dbus
+/// effects stay here). Residual mediation that still lives here: screencast.
 struct AppData {
     comms: Comms,
     _dbus_thread_completion_fd: OwnedFd,
@@ -198,14 +200,21 @@ impl AppData {
         if let Err(err) = event_loop.shutdown_drain() {
             warn!("Unable to drain event loop during shutdown: {err}");
         }
-        if let Err(err) = self.input_state.disable_seat() {
-            warn!("Unable to suspend libinput during shutdown: {err}");
+        {
+            let mut peers = SeatSessionPeers {
+                seat: self.seat_state.as_ref().get_ref(),
+                input: &mut self.input_state,
+                display: &mut self.display_state,
+                clients: &mut self.clients,
+                render: &mut self.renderer_state,
+            };
+            if let Err(err) = peers.suspend_devices() {
+                warn!("Unable to suspend libinput during shutdown: {err}");
+            }
         }
         if let Err(err) = self.clear_drm_device_poll(event_loop) {
             warn!("Unable to deregister DRM device fds during shutdown: {err}");
         }
-        self.renderer_state
-            .deactivate_drm(self.seat_state.as_ref().get_ref());
         Ok(())
     }
 
@@ -614,77 +623,56 @@ impl AppData {
         while let Ok(msg) = main_channel.try_recv() {
             match msg {
                 MainMessage::MainSeatEnabled => {
-                    if !self.seat_state.is_enabled() {
-                        debug!("Ignoring stale MainSeatEnabled (seat disabled)");
-                        continue;
-                    }
-                    if let Ok(seat_name) = self.seat_state.seat_name() {
-                        if self.seat_state.can_open_devices() {
-                            if let Err(err) = self.input_state.enable_seat(&seat_name) {
-                                error!("Unable to enable libinput: {err}");
-                            }
-                        } else {
-                            info!(
-                                "Skipping libinput seat assign (no session backend for device opens)"
-                            );
-                        }
-                        if let Err(err) = self
-                            .display_state
-                            .activate_main_seat(seat_name, &mut self.clients)
-                        {
-                            error!("Unable to activate Wayland seat: {err}");
-                        }
-                    }
-                    if self.seat_state.can_open_devices() {
-                        if let Err(err) = self
-                            .renderer_state
-                            .activate_drm(self.seat_state.as_ref().get_ref())
-                        {
-                            error!("Unable to activate DRM devices: {err}");
-                            // Keep waiting for a later successful activate; do not Ready yet.
-                            continue;
-                        }
-                        if let Err(err) = self.sync_drm_device_poll(event_loop, arena) {
-                            error!("Unable to register DRM device poll fds: {err}");
-                        }
-                        {
-                            let mut host = DisplayConfigHost {
-                                state: &mut self.display_state,
-                                clients: &mut self.clients,
-                            };
-                            if let Err(err) =
-                                self.renderer_state.advertise_dmabuf_formats(&mut host)
+                    let outcome = {
+                        let mut peers = SeatSessionPeers {
+                            seat: self.seat_state.as_ref().get_ref(),
+                            input: &mut self.input_state,
+                            display: &mut self.display_state,
+                            clients: &mut self.clients,
+                            render: &mut self.renderer_state,
+                        };
+                        peers.on_enabled()
+                    };
+                    match outcome {
+                        SeatEnableOutcome::IgnoredStale
+                        | SeatEnableOutcome::DrmActivateFailed => continue,
+                        SeatEnableOutcome::Enabled(effects) => {
+                            if effects.sync_drm_poll
+                                && let Err(err) = self.sync_drm_device_poll(event_loop, arena)
                             {
-                                warn!(
-                                    "Unable to refresh GPU dmabuf formats after DRM activate: {err:#}"
-                                );
+                                error!("Unable to register DRM device poll fds: {err}");
                             }
+                            if effects.outputs_changed {
+                                self.emit_outputs_changed();
+                            }
+                            if effects.set_drm_devices {
+                                self.comms.dbus(DbusMessage::SetDrmDevices(
+                                    self.renderer_state.drm_device_states(),
+                                ));
+                            }
+                            if effects.present_immediate {
+                                self.request_present_immediate(event_loop, arena);
+                            }
+                            self.comms.dbus(DbusMessage::EmitReady);
                         }
-                        self.sync_wayland_output_from_drm();
-                        self.comms.dbus(DbusMessage::SetDrmDevices(
-                            self.renderer_state.drm_device_states(),
-                        ));
-                        self.renderer_state.mark_scene_dirty();
-                        self.request_present_immediate(event_loop, arena);
-                    } else {
-                        info!("Skipping DRM activate (no session backend for device opens)");
-                        self.sync_primary_output_geometry();
                     }
-                    self.comms.dbus(DbusMessage::EmitReady);
                 }
                 MainMessage::MainSeatDisabled => {
-                    if self.seat_state.is_enabled() {
-                        debug!("Ignoring stale MainSeatDisabled (seat enabled)");
-                        continue;
-                    }
-                    if let Err(err) = self.input_state.disable_seat() {
-                        error!("Unable to disable libinput: {err}");
-                    }
-                    if let Err(err) = self.clear_drm_device_poll(event_loop) {
+                    let outcome = {
+                        let mut peers = SeatSessionPeers {
+                            seat: self.seat_state.as_ref().get_ref(),
+                            input: &mut self.input_state,
+                            display: &mut self.display_state,
+                            clients: &mut self.clients,
+                            render: &mut self.renderer_state,
+                        };
+                        peers.on_disabled()
+                    };
+                    if matches!(outcome, SeatDisableOutcome::Disabled)
+                        && let Err(err) = self.clear_drm_device_poll(event_loop)
+                    {
                         error!("Unable to deregister DRM device poll fds: {err}");
                     }
-                    self.renderer_state
-                        .deactivate_drm(self.seat_state.as_ref().get_ref());
                 }
                 MainMessage::SwitchVt(vt) => {
                     info!("Switching to VT {vt}");
