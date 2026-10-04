@@ -1842,10 +1842,14 @@ impl RendererState {
                         dest_py,
                     )?;
                 }
+                self.gpu
+                    .surface_textures
+                    .release_acquired_dmabufs(vulkan, &mut batch)?;
                 Ok(())
             })();
             self.gpu.compositor = Some(compositor);
             if let Err(error) = result {
+                self.gpu.surface_textures.discard_acquired_dmabufs();
                 if let Some(vulkan) = self.vulkan.as_mut() {
                     batch.abandon(vulkan);
                 }
@@ -2020,10 +2024,14 @@ impl RendererState {
                         linear_filter,
                     )?;
                 }
+                self.gpu
+                    .surface_textures
+                    .release_acquired_dmabufs(vulkan, &mut batch)?;
                 Ok(())
             })();
             self.gpu.compositor = Some(compositor);
             if let Err(error) = result {
+                self.gpu.surface_textures.discard_acquired_dmabufs();
                 if let Some(vulkan) = self.vulkan.as_mut() {
                     batch.abandon(vulkan);
                 }
@@ -3569,10 +3577,14 @@ impl RendererState {
                     pointer_y,
                 )
                 .context("Failed to GPU-composite scene to scanout buffer")?;
+                self.gpu
+                    .surface_textures
+                    .release_acquired_dmabufs(vulkan, &mut batch)?;
                 Ok(())
             })();
             if let Err(error) = gpu_result {
                 batch.abandon(vulkan);
+                self.gpu.surface_textures.discard_acquired_dmabufs();
                 self.gpu.surface_textures.clear();
                 self.gpu.compositor = Some(compositor);
                 // Finish other outputs' in-flight work so retired textures can free.

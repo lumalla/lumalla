@@ -501,6 +501,9 @@ pub struct SurfaceTextureCache {
     /// Epochs of GPU submits that have been installed but not yet finished.
     in_flight_epochs: HashSet<u64>,
     next_submit_epoch: u64,
+    /// DMA-BUF images acquired for sampling in the current GPU work batch.
+    /// Released back to `QUEUE_FAMILY_EXTERNAL` after composite (before submit).
+    acquired_dmabufs: Vec<vk::Image>,
 }
 
 /// Soft cap on parked DMA-BUF imports per client (beyond the currently bound ones).
@@ -515,6 +518,7 @@ impl SurfaceTextureCache {
             retired: Vec::new(),
             in_flight_epochs: HashSet::new(),
             next_submit_epoch: 1,
+            acquired_dmabufs: Vec::new(),
         }
     }
 
@@ -534,6 +538,7 @@ impl SurfaceTextureCache {
         }
         self.guide_label_uploaded.clear();
         self.in_flight_epochs.clear();
+        self.acquired_dmabufs.clear();
     }
 
     fn retire(&mut self, tex: SurfaceTexture) {
@@ -618,6 +623,7 @@ impl SurfaceTextureCache {
     pub fn forget_retired(&mut self) {
         self.retired.clear();
         self.in_flight_epochs.clear();
+        self.acquired_dmabufs.clear();
     }
 
     pub fn remove(&mut self, key: (u32, u32)) {
@@ -986,7 +992,7 @@ impl SurfaceTextureCache {
                     TextureBacking::Shm(_) => anyhow::bail!("Expected DMA-BUF backing"),
                 }
             };
-            acquire_dmabuf_for_sample(vulkan, batch, image, false)?;
+            self.acquire_dmabuf_image(vulkan, batch, image, false)?;
             return Ok(());
         }
 
@@ -1008,7 +1014,7 @@ impl SurfaceTextureCache {
                         TextureBacking::Shm(_) => anyhow::bail!("Expected DMA-BUF backing"),
                     }
                 };
-                acquire_dmabuf_for_sample(vulkan, batch, image, false)?;
+                self.acquire_dmabuf_image(vulkan, batch, image, false)?;
                 return Ok(());
             }
             self.retire(cached);
@@ -1028,7 +1034,7 @@ impl SurfaceTextureCache {
             dmabuf.offset as u64,
             stride,
         )?;
-        acquire_dmabuf_for_sample(vulkan, batch, imported.image(), true)?;
+        self.acquire_dmabuf_image(vulkan, batch, imported.image(), true)?;
 
         let (descriptor_set, descriptor_set_linear) =
             alloc_texture_descriptors(vulkan.device(), compositor, imported.view())?;
@@ -1229,12 +1235,73 @@ impl SurfaceTextureCache {
                     buffer_damage,
                     pending_output_damage,
                 )?;
+            } else if frame.dmabuf.is_some() {
+                // Undamaged DMA-BUFs are still sampled; re-acquire ownership each frame.
+                self.acquire_bound_dmabuf(vulkan, batch, key)?;
             }
         }
         if sync_all || sync_cursor {
             self.sync_cursor(vulkan, compositor, batch, cursor)?;
+        } else if matches!(cursor, CursorDraw::Client(frame) if frame.dmabuf.is_some()) {
+            self.acquire_bound_dmabuf(vulkan, batch, CURSOR_TEXTURE_KEY)?;
         }
         Ok(())
+    }
+
+    /// Acquire an already-bound DMA-BUF texture for sampling (no import/replace).
+    fn acquire_bound_dmabuf(
+        &mut self,
+        vulkan: &mut VulkanContext,
+        batch: &mut GpuWorkBatch,
+        key: (u32, u32),
+    ) -> anyhow::Result<()> {
+        let image = {
+            let Some(tex) = self.textures.get(&key) else {
+                return Ok(());
+            };
+            match &tex.backing {
+                TextureBacking::Dmabuf(image) => image.image(),
+                TextureBacking::Shm(_) => return Ok(()),
+            }
+        };
+        self.acquire_dmabuf_image(vulkan, batch, image, false)
+    }
+
+    fn acquire_dmabuf_image(
+        &mut self,
+        vulkan: &mut VulkanContext,
+        batch: &mut GpuWorkBatch,
+        image: vk::Image,
+        first_import: bool,
+    ) -> anyhow::Result<()> {
+        if self.acquired_dmabufs.contains(&image) {
+            return Ok(());
+        }
+        acquire_dmabuf_for_sample(vulkan, batch, image, first_import)?;
+        self.acquired_dmabufs.push(image);
+        Ok(())
+    }
+
+    /// Release every DMA-BUF acquired for this batch back to `QUEUE_FAMILY_EXTERNAL`.
+    ///
+    /// Must run after compositing (so fragment reads complete) and before submit.
+    /// Dropping the batch without this is safe only when the command buffer is abandoned.
+    pub fn release_acquired_dmabufs(
+        &mut self,
+        vulkan: &mut VulkanContext,
+        batch: &mut GpuWorkBatch,
+    ) -> anyhow::Result<()> {
+        if self.acquired_dmabufs.is_empty() {
+            return Ok(());
+        }
+        let images = std::mem::take(&mut self.acquired_dmabufs);
+        release_dmabufs_after_sample(vulkan, batch, &images)?;
+        Ok(())
+    }
+
+    /// Forget acquire tracking without recording release barriers (abandoned batch).
+    pub fn discard_acquired_dmabufs(&mut self) {
+        self.acquired_dmabufs.clear();
     }
 }
 
@@ -1317,28 +1384,18 @@ fn acquire_dmabuf_for_sample(
     vulkan: &mut VulkanContext,
     batch: &mut GpuWorkBatch,
     image: vk::Image,
-    first_import: bool,
+    _first_import: bool,
 ) -> anyhow::Result<()> {
     let command_buffer = batch.ensure_recording(vulkan)?;
     let device = vulkan.device();
     let graphics_family = device.graphics_queue_family();
-    let (old_layout, src_access, src_stage) = if first_import {
-        (
-            vk::ImageLayout::UNDEFINED,
-            vk::AccessFlags::empty(),
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-        )
-    } else {
-        (
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::AccessFlags::SHADER_READ,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-        )
-    };
+    // Always acquire from EXTERNAL. UNDEFINED is required on first import and also
+    // correct on reuse: the exporter may have rewritten the buffer since we last
+    // released ownership, so prior layout knowledge is not reliable.
     let barrier = vk::ImageMemoryBarrier::default()
-        .src_access_mask(src_access)
+        .src_access_mask(vk::AccessFlags::empty())
         .dst_access_mask(vk::AccessFlags::SHADER_READ)
-        .old_layout(old_layout)
+        .old_layout(vk::ImageLayout::UNDEFINED)
         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
         .dst_queue_family_index(graphics_family)
@@ -1347,12 +1404,52 @@ fn acquire_dmabuf_for_sample(
     unsafe {
         device.handle().cmd_pipeline_barrier(
             command_buffer,
-            src_stage,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::DependencyFlags::empty(),
             &[],
             &[],
             &[barrier],
+        );
+    }
+    Ok(())
+}
+
+fn release_dmabufs_after_sample(
+    vulkan: &mut VulkanContext,
+    batch: &mut GpuWorkBatch,
+    images: &[vk::Image],
+) -> anyhow::Result<()> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let command_buffer = batch.ensure_recording(vulkan)?;
+    let device = vulkan.device();
+    let graphics_family = device.graphics_queue_family();
+    let barriers: Vec<vk::ImageMemoryBarrier<'_>> = images
+        .iter()
+        .copied()
+        .map(|image| {
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(graphics_family)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                .image(image)
+                .subresource_range(color_subresource_range())
+        })
+        .collect();
+    unsafe {
+        device.handle().cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barriers,
         );
     }
     Ok(())

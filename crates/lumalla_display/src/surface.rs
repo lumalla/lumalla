@@ -56,6 +56,9 @@ pub struct SurfaceCommit {
     #[allow(dead_code)]
     pub buffer: Option<ObjectId>,
     pub attached_buffer: Option<Option<ObjectId>>,
+    /// Previous committed buffer that the compositor is done with and may
+    /// `wl_buffer.release`. Set when attach replaces or clears the buffer.
+    pub released_buffer: Option<ObjectId>,
     pub mapped: bool,
     /// True when this commit transitioned the surface from unmapped to mapped.
     pub newly_mapped: bool,
@@ -91,6 +94,8 @@ pub struct CommitResult {
 pub struct DestroyedSurface {
     /// Legacy `wl_shell_surface` is auto-destroyed with the surface (protocol).
     pub shell_id: Option<ObjectId>,
+    /// Buffer still held by the compositor when the surface was destroyed.
+    pub held_buffer: Option<ObjectId>,
     pub callbacks: Vec<ObjectId>,
     pub presentation_feedbacks: Vec<ObjectId>,
     pub was_mapped: bool,
@@ -222,6 +227,7 @@ impl SurfaceManager {
 
         Ok(DestroyedSurface {
             shell_id,
+            held_buffer: surface.current.buffer,
             callbacks,
             presentation_feedbacks,
             was_mapped,
@@ -1751,6 +1757,7 @@ impl SurfaceManager {
             surface_id: id,
             buffer: surface.current.buffer,
             attached_buffer: None,
+            released_buffer: None,
             mapped,
             newly_mapped: false,
             shell_id: None,
@@ -1791,10 +1798,19 @@ impl SurfaceManager {
 
         let viewport_changed = surface.pending.viewport_source.is_some()
             || surface.pending.viewport_destination.is_some();
+        let previous_buffer = surface.current.buffer;
         let attached_buffer = surface.pending.buffer.take();
-        if let Some(buffer) = attached_buffer {
-            surface.current.buffer = buffer;
-        }
+        let released_buffer = match attached_buffer {
+            Some(Some(new_buffer)) => {
+                surface.current.buffer = Some(new_buffer);
+                previous_buffer.filter(|old| *old != new_buffer)
+            }
+            Some(None) => {
+                surface.current.buffer = None;
+                previous_buffer
+            }
+            None => None,
+        };
         if let Some(offset) = surface.pending.offset.take() {
             surface.current.offset = offset;
         }
@@ -1863,6 +1879,7 @@ impl SurfaceManager {
             surface_id: id,
             buffer,
             attached_buffer,
+            released_buffer,
             mapped,
             newly_mapped,
             shell_id,
@@ -2623,9 +2640,56 @@ mod tests {
         let second = manager.commit(client(1), object(2)).unwrap().primary;
         assert_eq!(second.buffer, Some(object(4)));
         assert_eq!(second.attached_buffer, None);
+        assert!(second.released_buffer.is_none());
         assert!(!second.newly_mapped);
         assert!(second.frame_callbacks.is_empty());
         assert_eq!(second.buffer_scale, 2);
+    }
+
+    #[test]
+    fn commit_releases_previous_buffer_only_when_replaced() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .create_shell_surface(client(1), object(3), object(2))
+            .unwrap();
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
+            .unwrap();
+        let first = manager.commit(client(1), object(2)).unwrap().primary;
+        assert_eq!(first.released_buffer, None);
+
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
+            .unwrap();
+        let same = manager.commit(client(1), object(2)).unwrap().primary;
+        assert_eq!(same.released_buffer, None);
+
+        manager
+            .attach(client(1), object(2), Some(object(5)), 0, 0, 1)
+            .unwrap();
+        let swapped = manager.commit(client(1), object(2)).unwrap().primary;
+        assert_eq!(swapped.released_buffer, Some(object(4)));
+        assert_eq!(swapped.buffer, Some(object(5)));
+
+        manager
+            .attach(client(1), object(2), None, 0, 0, 1)
+            .unwrap();
+        let cleared = manager.commit(client(1), object(2)).unwrap().primary;
+        assert_eq!(cleared.released_buffer, Some(object(5)));
+        assert_eq!(cleared.buffer, None);
+    }
+
+    #[test]
+    fn destroy_surface_reports_held_buffer() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
+            .unwrap();
+        let _ = manager.commit(client(1), object(2)).unwrap();
+        let destroyed = manager.destroy_surface(client(1), object(2)).unwrap();
+        assert_eq!(destroyed.held_buffer, Some(object(4)));
     }
 
     #[test]

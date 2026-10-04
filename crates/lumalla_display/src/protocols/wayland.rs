@@ -643,7 +643,12 @@ fn process_surface_commit_body(
                     }
                 }
             }
-            ctx.writer.wl_buffer_release(buffer_id);
+            // Release the previous buffer only after a replacement is committed.
+            // Releasing the current buffer immediately lets double-buffered clients
+            // rewrite memory the compositor may still sample (esp. DMA-BUF).
+            if let Some(released) = commit.released_buffer {
+                ctx.writer.wl_buffer_release(released);
+            }
         }
         Some(None) => {
             if let Err((viewport_id, error)) = state.surface_manager.validate_viewport_commit(
@@ -685,6 +690,9 @@ fn process_surface_commit_body(
                 ctx.writer,
                 ctx.registry,
             );
+            if let Some(released) = commit.released_buffer {
+                ctx.writer.wl_buffer_release(released);
+            }
         }
         None => {
             let buffer_dims = state
@@ -1569,6 +1577,9 @@ impl WlSurface for DisplayState {
                     ctx.client_id,
                     object_id,
                 );
+                if let Some(held) = destroyed.held_buffer {
+                    ctx.writer.wl_buffer_release(held);
+                }
                 self.release_keyboard_focus_from_surface(
                     ctx.client_id,
                     object_id,
