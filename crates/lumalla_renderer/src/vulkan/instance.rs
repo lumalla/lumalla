@@ -328,6 +328,18 @@ impl VulkanContext {
             .expect("Memory allocator should always be present while VulkanContext is alive")
     }
 
+    /// Borrow device and allocator together (disjoint fields).
+    pub fn device_and_allocator_mut(&mut self) -> (&Device, &mut MemoryAllocator) {
+        (
+            self.device
+                .as_ref()
+                .expect("Device should always be present while VulkanContext is alive"),
+            self.memory_allocator
+                .as_mut()
+                .expect("Memory allocator should always be present while VulkanContext is alive"),
+        )
+    }
+
     /// Acquire a reusable host-visible staging buffer with at least `size` bytes.
     pub fn acquire_staging(&mut self, size: vk::DeviceSize) -> anyhow::Result<StagingBuffer> {
         let device = self

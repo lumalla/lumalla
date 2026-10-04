@@ -4,7 +4,7 @@ use anyhow::Context;
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
-use log::debug;
+use log::{debug, error};
 
 use super::{Device, MemoryAllocator};
 
@@ -14,6 +14,9 @@ use super::{Device, MemoryAllocator};
 /// - VkImage creation
 /// - Memory allocation via gpu-allocator
 /// - Image view creation for sampling/rendering
+///
+/// Prefer [`Self::destroy`] so the allocation is returned to [`MemoryAllocator`].
+/// Dropping without that path leaks the suballocation until the allocator itself is dropped.
 pub struct Image {
     /// The Vulkan image handle
     image: vk::Image,
@@ -150,6 +153,30 @@ impl Image {
         Ok(view)
     }
 
+    /// Destroy Vulkan objects and return the allocation to [`MemoryAllocator`].
+    pub fn destroy(mut self, allocator: &mut MemoryAllocator) {
+        self.destroy_vulkan_objects();
+        if let Some(allocation) = self.allocation.take() {
+            allocator.free(allocation);
+        }
+        debug!("Destroyed image");
+        // Skip Drop (objects already destroyed, allocation already freed).
+        std::mem::forget(self);
+    }
+
+    fn destroy_vulkan_objects(&mut self) {
+        if self.image == vk::Image::null() {
+            return;
+        }
+        unsafe {
+            self.device.destroy_image_view(self.view, None);
+            self.device.destroy_image(self.image, None);
+        }
+        // Prevent Drop from double-destroying if called from destroy().
+        self.view = vk::ImageView::null();
+        self.image = vk::Image::null();
+    }
+
     /// Returns the Vulkan image handle.
     pub fn image(&self) -> vk::Image {
         self.image
@@ -173,19 +200,13 @@ impl Image {
 
 impl Drop for Image {
     fn drop(&mut self) {
-        unsafe {
-            // Destroy image view first
-            self.device.destroy_image_view(self.view, None);
-
-            // Destroy image (must happen before freeing memory)
-            self.device.destroy_image(self.image, None);
-
-            // Free memory allocation
-            // The Allocation type from gpu-allocator handles cleanup automatically when dropped.
-            // It internally holds a reference to the allocator, so dropping it will free the memory.
-            if let Some(allocation) = self.allocation.take() {
-                drop(allocation);
-            }
+        if self.image != vk::Image::null() {
+            self.destroy_vulkan_objects();
+        }
+        if self.allocation.take().is_some() {
+            // gpu-allocator requires Allocator::free; without it the suballocation
+            // stays reserved until the allocator is dropped (VRAM leak / leak report).
+            error!("Image dropped without MemoryAllocator::free; GPU allocation leaked");
         }
         debug!("Destroyed image");
     }

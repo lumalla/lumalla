@@ -20,11 +20,14 @@ const WL_SHM_FORMAT_ARGB8888: u32 = 0;
 
 use super::{
     CommandBufferRecorder, DescriptorPool, DescriptorSetLayout, Device, DmaBufImage, Fence,
-    Framebuffer, GraphicsPipeline, GraphicsPipelineBuilder, Image, RenderPass, Sampler,
-    ShaderModule, StagingBuffer, VulkanContext, drm_fourcc_to_vulkan,
+    Framebuffer, GraphicsPipeline, GraphicsPipelineBuilder, Image, MemoryAllocator, RenderPass,
+    Sampler, ShaderModule, StagingBuffer, VulkanContext, drm_fourcc_to_vulkan,
 };
 
+/// Soft cap on cached surface textures. Each texture owns two descriptor sets
+/// (nearest + linear), so the pool is sized for `2 * MAX_SURFACE_TEXTURES`.
 const MAX_SURFACE_TEXTURES: u32 = 320;
+const MAX_DESCRIPTOR_SETS: u32 = MAX_SURFACE_TEXTURES * 2;
 const CURSOR_TEXTURE_KEY: (u32, u32) = (u32::MAX, u32::MAX);
 /// Synthetic owner id for guide label textures (`surface_id` = guide index).
 const GUIDE_LABEL_OWNER: u32 = u32::MAX - 1;
@@ -262,21 +265,6 @@ pub struct GpuCompositor {
     sampler_linear: Sampler,
 }
 
-/// Restores nearest-neighbor sampling when dropped after a linear screencast composite.
-pub struct LinearSampleGuard<'a> {
-    device: &'a Device,
-    nearest: vk::Sampler,
-    rebound: Vec<(vk::DescriptorSet, vk::ImageView)>,
-}
-
-impl Drop for LinearSampleGuard<'_> {
-    fn drop(&mut self) {
-        for &(descriptor_set, view) in &self.rebound {
-            write_texture_descriptor(self.device, descriptor_set, view, self.nearest);
-        }
-    }
-}
-
 impl GpuCompositor {
     pub fn new(device: &Device, render_pass: &RenderPass) -> anyhow::Result<Self> {
         let vert_spv = spv_from_bytes(include_bytes!(concat!(
@@ -302,7 +290,7 @@ impl GpuCompositor {
         let solid_frag_shader = ShaderModule::from_spirv(device, &solid_frag_spv)?;
         let descriptor_layout = DescriptorSetLayout::new_texture_sampler(device)?;
         let descriptor_pool =
-            DescriptorPool::new_combined_image_sampler(device, MAX_SURFACE_TEXTURES)?;
+            DescriptorPool::new_combined_image_sampler(device, MAX_DESCRIPTOR_SETS)?;
         let sampler = Sampler::new_nearest(device)?;
         let sampler_linear = Sampler::new_linear(device)?;
 
@@ -342,43 +330,6 @@ impl GpuCompositor {
             sampler,
             sampler_linear,
         })
-    }
-
-    /// Rebind layer textures to bilinear sampling for a downscaled composite.
-    /// Drop the returned guard to restore nearest sampling for scanout.
-    pub fn bind_linear_sampling<'a>(
-        &'a self,
-        device: &'a Device,
-        cache: &SurfaceTextureCache,
-        layers: &[&SurfaceFrame],
-        cursor: CursorDraw<'_>,
-    ) -> LinearSampleGuard<'a> {
-        let mut rebound: Vec<(vk::DescriptorSet, vk::ImageView)> = Vec::new();
-        let mut rebind = |key: (u32, u32)| {
-            if let Some(texture) = cache.texture(key) {
-                let view = texture.backing.view();
-                write_texture_descriptor(
-                    device,
-                    texture.descriptor_set,
-                    view,
-                    self.sampler_linear.handle(),
-                );
-                rebound.push((texture.descriptor_set, view));
-            }
-        };
-        for frame in layers {
-            rebind((frame.owner_id, frame.surface_id));
-        }
-        match cursor {
-            CursorDraw::Client(frame) => rebind((frame.owner_id, frame.surface_id)),
-            CursorDraw::Default => rebind(CURSOR_TEXTURE_KEY),
-            CursorDraw::Hidden => {}
-        }
-        LinearSampleGuard {
-            device,
-            nearest: self.sampler.handle(),
-            rebound,
-        }
     }
 
     fn draw_layer(
@@ -509,7 +460,11 @@ impl GpuCompositor {
 
 struct SurfaceTexture {
     backing: TextureBacking,
+    /// Nearest-neighbor sampling (scanout / 1:1 composites).
     descriptor_set: vk::DescriptorSet,
+    /// Linear sampling (downscaled screencast). Separate set so scanout never
+    /// mutates a descriptor that may still be referenced by an in-flight submit.
+    descriptor_set_linear: vk::DescriptorSet,
     wl_format: u32,
     uploaded: bool,
     buffer_id: u32,
@@ -523,15 +478,6 @@ struct SurfaceTexture {
 enum TextureBacking {
     Shm(Image),
     Dmabuf(DmaBufImage),
-}
-
-impl TextureBacking {
-    fn view(&self) -> vk::ImageView {
-        match self {
-            Self::Shm(image) => image.view(),
-            Self::Dmabuf(image) => image.view(),
-        }
-    }
 }
 
 /// Texture kept alive until the GPU submits that may still sample it complete.
@@ -624,11 +570,13 @@ impl SurfaceTextureCache {
         !self.retired.is_empty()
     }
 
-    /// Free descriptor sets and drop retired textures whose blocking submits finished.
+    /// Free descriptor sets and GPU allocations for retired textures whose
+    /// blocking submits finished.
     pub fn flush_retired(
         &mut self,
         device: &Device,
         pool: &DescriptorPool,
+        allocator: &mut MemoryAllocator,
     ) -> anyhow::Result<()> {
         let mut i = 0;
         while i < self.retired.len() {
@@ -638,7 +586,7 @@ impl SurfaceTextureCache {
                 .all(|epoch| !self.in_flight_epochs.contains(epoch));
             if unblocked {
                 let retired = self.retired.swap_remove(i);
-                pool.free_set(device, retired.texture.descriptor_set)?;
+                destroy_texture(retired.texture, device, pool, allocator)?;
             } else {
                 i += 1;
             }
@@ -646,7 +594,27 @@ impl SurfaceTextureCache {
         Ok(())
     }
 
-    /// Drop retired textures without touching the descriptor pool (device gone).
+    /// Destroy every cached/parked/retired texture (pool still valid).
+    pub fn destroy_all(
+        &mut self,
+        device: &Device,
+        pool: &DescriptorPool,
+        allocator: &mut MemoryAllocator,
+    ) -> anyhow::Result<()> {
+        self.clear();
+        self.flush_retired(device, pool, allocator)
+    }
+
+    /// Destroy image allocations after the descriptor pool is already gone.
+    pub fn abandon_all(&mut self, allocator: &mut MemoryAllocator) {
+        self.clear();
+        for retired in self.retired.drain(..) {
+            destroy_texture_backing(retired.texture.backing, allocator);
+        }
+        self.in_flight_epochs.clear();
+    }
+
+    /// Drop retired textures without freeing GPU allocations (allocator gone).
     pub fn forget_retired(&mut self) {
         self.retired.clear();
         self.in_flight_epochs.clear();
@@ -658,7 +626,9 @@ impl SurfaceTextureCache {
         };
         if matches!(tex.backing, TextureBacking::Dmabuf(_)) {
             let buf_key = (key.0, tex.buffer_id);
-            self.dmabuf_by_buffer.insert(buf_key, tex);
+            if let Some(dup) = self.dmabuf_by_buffer.insert(buf_key, tex) {
+                self.retire(dup);
+            }
         } else {
             // SHM images may still be sampled by an in-flight submit.
             self.retire(tex);
@@ -726,7 +696,8 @@ impl SurfaceTextureCache {
 
     /// Drop cached DMA-BUF entries without freeing descriptor sets (Vulkan already gone).
     pub fn forget_dmabuf_buffer(&mut self, owner_id: u32, buffer_id: u32) {
-        if let Some(tex) = self.dmabuf_by_buffer.remove(&(owner_id, buffer_id)) {
+        let buf_key = (owner_id, buffer_id);
+        if let Some(tex) = self.dmabuf_by_buffer.remove(&buf_key) {
             self.retire(tex);
         }
         let doomed: Vec<(u32, u32)> = self
@@ -903,9 +874,8 @@ impl SurfaceTextureCache {
 
         if needs_create {
             let image = vulkan.create_sampled_image(width, height)?;
-            let descriptor_set = compositor
-                .descriptor_pool
-                .allocate_sampler_set(vulkan.device(), &compositor.descriptor_layout)?;
+            let (descriptor_set, descriptor_set_linear) =
+                alloc_texture_descriptors(vulkan.device(), compositor, image.view())?;
             self.replace_texture(
                 vulkan.device(),
                 &compositor.descriptor_pool,
@@ -913,6 +883,7 @@ impl SurfaceTextureCache {
                 SurfaceTexture {
                     backing: TextureBacking::Shm(image),
                     descriptor_set,
+                    descriptor_set_linear,
                     wl_format: frame.format,
                     uploaded: false,
                     buffer_id: frame.buffer_id,
@@ -978,13 +949,9 @@ impl SurfaceTextureCache {
             }
         }
         texture.uploaded = true;
-
-        write_texture_descriptor(
-            vulkan.device(),
-            texture.descriptor_set,
-            image.view(),
-            compositor.sampler.handle(),
-        );
+        // Descriptor sets already point at this image view + samplers; updating
+        // them while a prior submit may still sample is forbidden without
+        // UPDATE_AFTER_BIND, so skip rewrites on the reuse path.
 
         Ok(())
     }
@@ -1063,15 +1030,8 @@ impl SurfaceTextureCache {
         )?;
         acquire_dmabuf_for_sample(vulkan, batch, imported.image(), true)?;
 
-        let descriptor_set = compositor
-            .descriptor_pool
-            .allocate_sampler_set(vulkan.device(), &compositor.descriptor_layout)?;
-        write_texture_descriptor(
-            vulkan.device(),
-            descriptor_set,
-            imported.view(),
-            compositor.sampler.handle(),
-        );
+        let (descriptor_set, descriptor_set_linear) =
+            alloc_texture_descriptors(vulkan.device(), compositor, imported.view())?;
 
         self.replace_texture(
             vulkan.device(),
@@ -1080,6 +1040,7 @@ impl SurfaceTextureCache {
             SurfaceTexture {
                 backing: TextureBacking::Dmabuf(imported),
                 descriptor_set,
+                descriptor_set_linear,
                 wl_format: frame.format,
                 uploaded: true,
                 buffer_id: dmabuf.buffer_id,
@@ -1124,9 +1085,8 @@ impl SurfaceTextureCache {
 
         if needs_create {
             let image = vulkan.create_sampled_image(width, height)?;
-            let descriptor_set = compositor
-                .descriptor_pool
-                .allocate_sampler_set(vulkan.device(), &compositor.descriptor_layout)?;
+            let (descriptor_set, descriptor_set_linear) =
+                alloc_texture_descriptors(vulkan.device(), compositor, image.view())?;
             self.replace_texture(
                 vulkan.device(),
                 &compositor.descriptor_pool,
@@ -1134,6 +1094,7 @@ impl SurfaceTextureCache {
                 SurfaceTexture {
                     backing: TextureBacking::Shm(image),
                     descriptor_set,
+                    descriptor_set_linear,
                     wl_format,
                     uploaded: false,
                     buffer_id,
@@ -1169,13 +1130,6 @@ impl SurfaceTextureCache {
             None,
         )?;
         texture.uploaded = true;
-
-        write_texture_descriptor(
-            vulkan.device(),
-            texture.descriptor_set,
-            image.view(),
-            compositor.sampler.handle(),
-        );
 
         Ok(())
     }
@@ -1561,9 +1515,9 @@ pub fn composite_to_scanout(
         scanout_old_layout,
     )?;
     recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
-    let draw_list = build_layer_draw_list(cache, layers);
-    let below_list = build_layer_draw_list(cache, below_layers);
-    let above_list = build_layer_draw_list(cache, above_layers);
+    let draw_list = build_layer_draw_list(cache, layers, false);
+    let below_list = build_layer_draw_list(cache, below_layers, false);
+    let above_list = build_layer_draw_list(cache, above_layers, false);
 
     match composite_mode {
         CompositeMode::Full => {
@@ -1621,8 +1575,8 @@ pub fn composite_to_scanout(
 /// `cursor` / `pointer_*` are in destination (buffer) pixel space. Leaves the
 /// image in `GENERAL`.
 ///
-/// When `linear_filter` is true, textures are temporarily rebound to bilinear
-/// sampling (for downscaled MemFd captures) and restored afterward.
+/// When `linear_filter` is true, draws use each texture's dedicated linear
+/// descriptor set (scanout keeps using nearest sets concurrently).
 pub fn composite_layers_to_image(
     vulkan: &VulkanContext,
     batch: &mut GpuWorkBatch,
@@ -1643,11 +1597,6 @@ pub fn composite_layers_to_image(
     linear_filter: bool,
 ) -> anyhow::Result<()> {
     let device = vulkan.device();
-    let linear_guard = if linear_filter {
-        Some(compositor.bind_linear_sampling(device, cache, layers, cursor))
-    } else {
-        None
-    };
 
     let clear_value = vk::ClearValue {
         color: vk::ClearColorValue {
@@ -1664,7 +1613,7 @@ pub fn composite_layers_to_image(
         image_old_layout,
     )?;
     recorder.begin_render_pass(render_pass, framebuffer, &[clear_value])?;
-    let draw_list = build_layer_draw_list(cache, layers);
+    let draw_list = build_layer_draw_list(cache, layers, linear_filter);
     draw_scene_layers(
         compositor,
         device,
@@ -1686,6 +1635,7 @@ pub fn composite_layers_to_image(
         output_width,
         output_height,
         None,
+        linear_filter,
     );
     recorder.end_render_pass();
 
@@ -1710,7 +1660,6 @@ pub fn composite_layers_to_image(
             &[barrier],
         );
     }
-    drop(linear_guard);
     Ok(())
 }
 
@@ -1758,6 +1707,7 @@ pub fn overlay_cursor_on_image(
         output_width,
         output_height,
         None,
+        false,
     );
     recorder.end_render_pass();
 
@@ -1798,6 +1748,7 @@ struct LayerDrawItem {
 fn build_layer_draw_list(
     cache: &SurfaceTextureCache,
     layers: &[&SurfaceFrame],
+    use_linear: bool,
 ) -> Vec<LayerDrawItem> {
     let mut items = Vec::with_capacity(layers.len());
     for frame in layers {
@@ -1810,7 +1761,11 @@ fn build_layer_draw_list(
             continue;
         }
         items.push(LayerDrawItem {
-            descriptor_set: texture.descriptor_set,
+            descriptor_set: if use_linear {
+                texture.descriptor_set_linear
+            } else {
+                texture.descriptor_set
+            },
             scene_dest,
             src_uv: surface_src_uv(frame),
             force_opaque: frame.format == WL_SHM_FORMAT_XRGB8888,
@@ -1916,6 +1871,7 @@ fn draw_views(
         output_width,
         output_height,
         outer_clip,
+        false,
     );
 }
 
@@ -2209,6 +2165,7 @@ fn draw_cursor_layer(
     output_width: u32,
     output_height: u32,
     clip: Option<&vk::Rect2D>,
+    use_linear: bool,
 ) {
     let default_owned;
     let (cursor_key, cursor_frame) = match cursor {
@@ -2227,17 +2184,23 @@ fn draw_cursor_layer(
         && dest[3] > 0.0
         && clip.is_none_or(|clip| dest_intersects_clip(dest, clip))
     {
-        compositor.draw_layer(
+        let descriptor_set = if use_linear {
+            texture.descriptor_set_linear
+        } else {
+            texture.descriptor_set
+        };
+        recorder.bind_pipeline(&compositor.pipeline);
+        compositor.set_layer_viewport(recorder, output_width, output_height, clip);
+        compositor.draw_layer_prepared(
             device,
             recorder,
-            texture,
+            descriptor_set,
             dest,
             [0.0, 0.0, 1.0, 1.0],
             output_width,
             output_height,
             cursor_frame.format == WL_SHM_FORMAT_XRGB8888,
             BufferTransform::from_raw(cursor_frame.buffer_transform).unwrap_or_default(),
-            clip,
         );
     }
 }
@@ -2592,6 +2555,53 @@ fn record_bgra_texture_upload(
         );
     }
     Ok(())
+}
+
+fn alloc_texture_descriptors(
+    device: &Device,
+    compositor: &GpuCompositor,
+    image_view: vk::ImageView,
+) -> anyhow::Result<(vk::DescriptorSet, vk::DescriptorSet)> {
+    let nearest = compositor
+        .descriptor_pool
+        .allocate_sampler_set(device, &compositor.descriptor_layout)?;
+    let linear = match compositor
+        .descriptor_pool
+        .allocate_sampler_set(device, &compositor.descriptor_layout)
+    {
+        Ok(set) => set,
+        Err(err) => {
+            let _ = compositor.descriptor_pool.free_set(device, nearest);
+            return Err(err);
+        }
+    };
+    write_texture_descriptor(device, nearest, image_view, compositor.sampler.handle());
+    write_texture_descriptor(
+        device,
+        linear,
+        image_view,
+        compositor.sampler_linear.handle(),
+    );
+    Ok((nearest, linear))
+}
+
+fn destroy_texture(
+    texture: SurfaceTexture,
+    device: &Device,
+    pool: &DescriptorPool,
+    allocator: &mut MemoryAllocator,
+) -> anyhow::Result<()> {
+    pool.free_set(device, texture.descriptor_set)?;
+    pool.free_set(device, texture.descriptor_set_linear)?;
+    destroy_texture_backing(texture.backing, allocator);
+    Ok(())
+}
+
+fn destroy_texture_backing(backing: TextureBacking, allocator: &mut MemoryAllocator) {
+    match backing {
+        TextureBacking::Shm(image) => image.destroy(allocator),
+        TextureBacking::Dmabuf(image) => drop(image),
+    }
 }
 
 fn write_texture_descriptor(

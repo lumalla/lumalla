@@ -2,9 +2,9 @@
 
 use anyhow::Context;
 use ash::vk;
-use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
+use gpu_allocator::vulkan::{Allocation, Allocator, AllocatorCreateDesc};
 use gpu_allocator::{AllocationSizes, AllocatorDebugSettings};
-use log::info;
+use log::{info, warn};
 
 use super::Device;
 
@@ -46,11 +46,19 @@ impl MemoryAllocator {
     pub fn inner_mut(&mut self) -> &mut Allocator {
         &mut self.allocator
     }
+
+    /// Return a suballocation to the pool. Must be called instead of dropping [`Allocation`].
+    pub fn free(&mut self, allocation: Allocation) {
+        if let Err(err) = self.allocator.free(allocation) {
+            warn!("Failed to free GPU allocation: {err}");
+        }
+    }
 }
 
 impl Drop for MemoryAllocator {
     fn drop(&mut self) {
         info!("Destroying GPU memory allocator");
-        // gpu-allocator handles cleanup internally
+        // Remaining DeviceMemory blocks are freed by gpu-allocator; call
+        // [`Self::free`] on every live [`Allocation`] first to avoid leak reports.
     }
 }

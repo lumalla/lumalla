@@ -71,10 +71,28 @@ impl GpuRenderResources {
         }
     }
 
-    fn clear(&mut self) {
-        self.compositor = None;
-        self.surface_textures.clear();
-        self.surface_textures.forget_retired();
+    /// Tear down GPU compositor state and free texture memory into `vulkan`'s allocator.
+    fn clear(&mut self, vulkan: Option<&mut VulkanContext>) {
+        match (vulkan, self.compositor.take()) {
+            (Some(vulkan), Some(compositor)) => {
+                let (device, allocator) = vulkan.device_and_allocator_mut();
+                let _ = self.surface_textures.destroy_all(
+                    device,
+                    &compositor.descriptor_pool,
+                    allocator,
+                );
+                drop(compositor);
+            }
+            (Some(vulkan), None) => {
+                self.surface_textures
+                    .abandon_all(vulkan.memory_allocator_mut());
+            }
+            (None, compositor) => {
+                drop(compositor);
+                self.surface_textures.clear();
+                self.surface_textures.forget_retired();
+            }
+        }
         self.guide_labels.clear();
     }
 
@@ -349,12 +367,18 @@ struct VirtualOutput {
 }
 
 pub struct RendererState {
-    // Drop order: outputs → scanout_pool → vulkan → drm_devices.
-    drm_devices: DrmDevices,
+    // Drop order (declaration order): Vulkan-dependent resources first, then
+    // vulkan, then DRM. Fields are dropped first-to-last.
+    /// Per-output plane pipelines + present pacing.
+    outputs: HashMap<String, OutputState>,
+    /// PipeWire DMA-BUF capture buffers keyed by stream id.
+    screencast_buffers: HashMap<u32, Vec<ScreencastDmaSlot>>,
+    gpu: GpuRenderResources,
+    scanout_pool: ScanoutBufferPool,
+    vulkan: Option<VulkanContext>,
     /// CRTC/plane inventory per open DRM card.
     topologies: HashMap<PathBuf, DrmDeviceTopology>,
-    vulkan: Option<VulkanContext>,
-    scanout_pool: ScanoutBufferPool,
+    drm_devices: DrmDevices,
     /// Configured render device (`None` = auto).
     render_device: Option<PathBuf>,
     /// Per-connector overrides; missing names use defaults (enabled if connected).
@@ -365,8 +389,6 @@ pub struct RendererState {
     output_views: HashMap<String, Vec<View>>,
     /// Compositor-drawn guides (scene space), back-to-front within each layer.
     guides: Vec<Guide>,
-    /// Per-output plane pipelines + present pacing.
-    outputs: HashMap<String, OutputState>,
     next_present_wake_token: u64,
     free_present_wake_tokens: Vec<u64>,
     /// Cached modeset-resolved present targets; invalidated on hotplug/config.
@@ -385,7 +407,6 @@ pub struct RendererState {
     pointer_x: i32,
     pointer_y: i32,
     scene_dirty: bool,
-    gpu: GpuRenderResources,
     pending_damage: Vec<DamageRect>,
     pending_surface_buffer_damage: HashMap<(u32, u32), DamageRect>,
     pending_full_redraw: bool,
@@ -394,8 +415,6 @@ pub struct RendererState {
     cursor_buffer_dirty: bool,
     /// When set, presents are skipped until DRM is reactivated (e.g. after VT return).
     present_halted: Option<String>,
-    /// PipeWire DMA-BUF capture buffers keyed by stream id.
-    screencast_buffers: HashMap<u32, Vec<ScreencastDmaSlot>>,
     /// Bumped when captured scene content may have changed (windows, cursor, guides…).
     screencast_content_serial: u64,
 }
@@ -448,16 +467,18 @@ fn dup_owned_fd(fd: RawFd) -> anyhow::Result<OwnedFd> {
 impl RendererState {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            drm_devices: DrmDevices::new()?,
-            topologies: HashMap::new(),
-            vulkan: None,
+            outputs: HashMap::new(),
+            screencast_buffers: HashMap::new(),
+            gpu: GpuRenderResources::new(),
             scanout_pool: ScanoutBufferPool::new(),
+            vulkan: None,
+            topologies: HashMap::new(),
+            drm_devices: DrmDevices::new()?,
             render_device: None,
             output_configs: HashMap::new(),
             virtual_outputs: HashMap::new(),
             output_views: HashMap::new(),
             guides: Vec::new(),
-            outputs: HashMap::new(),
             next_present_wake_token: 0,
             free_present_wake_tokens: Vec::new(),
             cached_present_targets: None,
@@ -470,7 +491,6 @@ impl RendererState {
             pointer_x: 0,
             pointer_y: 0,
             scene_dirty: false,
-            gpu: GpuRenderResources::new(),
             pending_damage: Vec::new(),
             pending_surface_buffer_damage: HashMap::new(),
             pending_full_redraw: false,
@@ -478,7 +498,6 @@ impl RendererState {
             dirty_surface_keys: HashSet::new(),
             cursor_buffer_dirty: false,
             present_halted: None,
-            screencast_buffers: HashMap::new(),
             screencast_content_serial: 1,
         })
     }
@@ -487,7 +506,7 @@ impl RendererState {
         if let Err(err) = self.wait_all_pending_gpu() {
             warn!("Failed waiting for GPU work before invalidating textures: {err:#}");
         }
-        self.gpu.clear();
+        self.gpu.clear(self.vulkan.as_mut());
         self.pending_damage.clear();
         self.pending_surface_buffer_damage.clear();
         self.pending_full_redraw = true;
@@ -576,15 +595,30 @@ impl RendererState {
         }
         let live = self.live_texture_epochs();
         self.gpu.surface_textures.retain_in_flight(&live);
-        let (Some(vulkan), Some(compositor)) =
-            (self.vulkan.as_ref(), self.gpu.compositor.as_ref())
-        else {
-            self.gpu.surface_textures.forget_retired();
+        let Some(compositor) = self.gpu.compositor.take() else {
+            if let Some(vulkan) = self.vulkan.as_mut() {
+                self.gpu
+                    .surface_textures
+                    .abandon_all(vulkan.memory_allocator_mut());
+            } else {
+                self.gpu.surface_textures.forget_retired();
+            }
             return Ok(());
         };
-        self.gpu
-            .surface_textures
-            .flush_retired(vulkan.device(), &compositor.descriptor_pool)
+        let result = (|| -> anyhow::Result<()> {
+            let vulkan = self
+                .vulkan
+                .as_mut()
+                .context("Vulkan missing while flushing retired textures")?;
+            let (device, allocator) = vulkan.device_and_allocator_mut();
+            self.gpu.surface_textures.flush_retired(
+                device,
+                &compositor.descriptor_pool,
+                allocator,
+            )
+        })();
+        self.gpu.compositor = Some(compositor);
+        result
     }
 
     fn install_scanout_gpu_pending(
