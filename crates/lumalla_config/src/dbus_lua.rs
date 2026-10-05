@@ -69,11 +69,11 @@ pub(crate) fn init_dbus_module(
     lua: &Lua,
     client: DbusConfigClient,
     callback_state: CallbackState,
-    on_startup: Rc<RefCell<Option<CallbackRef>>>,
-    on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
-    on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
-    on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
-    on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
+    on_startup: Rc<RefCell<Vec<CallbackRef>>>,
+    on_connector_change: Rc<RefCell<Vec<CallbackRef>>>,
+    on_cursor_move: Rc<RefCell<Vec<CursorHook>>>,
+    on_cursor_click: Rc<RefCell<Vec<CursorHook>>>,
+    on_cursor_scroll: Rc<RefCell<Vec<CursorHook>>>,
     ui_host: UiHost,
 ) -> LuaResult<LuaTable> {
     let module = lua.create_table()?;
@@ -83,11 +83,8 @@ pub(crate) fn init_dbus_module(
     module.set(
         "on_startup",
         lua.create_function(move |_, callback: LuaFunction| {
-            if let Some(old) = on_startup_cb.borrow_mut().take() {
-                cb_state.forget_callback(old);
-            }
             let callback = cb_state.register_callback(callback);
-            *on_startup_cb.borrow_mut() = Some(callback);
+            on_startup_cb.borrow_mut().push(callback);
             Ok(callback.callback_id)
         })?,
     )?;
@@ -98,63 +95,50 @@ pub(crate) fn init_dbus_module(
     module.set(
         "on_connector_change",
         lua.create_function(move |_, callback: LuaFunction| {
-            if let Some(old) = on_connector_change_cb.borrow_mut().take() {
-                cb_state.forget_callback(old);
-            }
             let callback = cb_state.register_callback(callback);
-            *on_connector_change_cb.borrow_mut() = Some(callback);
+            on_connector_change_cb.borrow_mut().push(callback);
             Ok(callback.callback_id)
         })?,
     )?;
-
-    let consume_cursor_move = Rc::new(RefCell::new(false));
-    let consume_cursor_click = Rc::new(RefCell::new(false));
-    let consume_cursor_scroll = Rc::new(RefCell::new(false));
-    let mods_cursor_move = Rc::new(RefCell::new(Mods::default()));
-    let mods_cursor_click = Rc::new(RefCell::new(Mods::default()));
-    let mods_cursor_scroll = Rc::new(RefCell::new(Mods::default()));
 
     let sync_cursor_listening = {
         let move_cb = on_cursor_move.clone();
         let click_cb = on_cursor_click.clone();
         let scroll_cb = on_cursor_scroll.clone();
-        let consume_move = consume_cursor_move.clone();
-        let consume_click = consume_cursor_click.clone();
-        let consume_scroll = consume_cursor_scroll.clone();
-        let mods_move = mods_cursor_move.clone();
-        let mods_click = mods_cursor_click.clone();
-        let mods_scroll = mods_cursor_scroll.clone();
         let sync_client = client.clone();
         move || -> LuaResult<()> {
+            let (listen_move, consume_move, mods_move) =
+                merge_cursor_hooks(&move_cb.borrow());
+            let (listen_click, consume_click, mods_click) =
+                merge_cursor_hooks(&click_cb.borrow());
+            let (listen_scroll, consume_scroll, mods_scroll) =
+                merge_cursor_hooks(&scroll_cb.borrow());
             dbus_result(sync_client.proxy.set_cursor_listening(
-                move_cb.borrow().is_some(),
-                click_cb.borrow().is_some(),
-                scroll_cb.borrow().is_some(),
-                *consume_move.borrow(),
-                *consume_click.borrow(),
-                *consume_scroll.borrow(),
-                ModsInfo::from(*mods_move.borrow()),
-                ModsInfo::from(*mods_click.borrow()),
-                ModsInfo::from(*mods_scroll.borrow()),
+                listen_move,
+                listen_click,
+                listen_scroll,
+                consume_move,
+                consume_click,
+                consume_scroll,
+                ModsInfo::from(mods_move),
+                ModsInfo::from(mods_click),
+                ModsInfo::from(mods_scroll),
             ))
         }
     };
 
     let cb_state = callback_state.clone();
     let on_cursor_move_cb = on_cursor_move.clone();
-    let consume_move = consume_cursor_move.clone();
-    let mods_move = mods_cursor_move.clone();
     let sync_move = sync_cursor_listening.clone();
     module.set(
         "on_cursor_move",
         lua.create_function(move |_, listener: ConfigCursorListener| {
-            if let Some(old) = on_cursor_move_cb.borrow_mut().take() {
-                cb_state.forget_callback(old);
-            }
             let callback = cb_state.register_callback(listener.callback);
-            *on_cursor_move_cb.borrow_mut() = Some(callback);
-            *consume_move.borrow_mut() = listener.consume;
-            *mods_move.borrow_mut() = listener.mods;
+            on_cursor_move_cb.borrow_mut().push(CursorHook {
+                callback,
+                consume: listener.consume,
+                mods: listener.mods,
+            });
             sync_move()?;
             Ok(callback.callback_id)
         })?,
@@ -162,19 +146,16 @@ pub(crate) fn init_dbus_module(
 
     let cb_state = callback_state.clone();
     let on_cursor_click_cb = on_cursor_click.clone();
-    let consume_click = consume_cursor_click.clone();
-    let mods_click = mods_cursor_click.clone();
     let sync_click = sync_cursor_listening.clone();
     module.set(
         "on_cursor_click",
         lua.create_function(move |_, listener: ConfigCursorListener| {
-            if let Some(old) = on_cursor_click_cb.borrow_mut().take() {
-                cb_state.forget_callback(old);
-            }
             let callback = cb_state.register_callback(listener.callback);
-            *on_cursor_click_cb.borrow_mut() = Some(callback);
-            *consume_click.borrow_mut() = listener.consume;
-            *mods_click.borrow_mut() = listener.mods;
+            on_cursor_click_cb.borrow_mut().push(CursorHook {
+                callback,
+                consume: listener.consume,
+                mods: listener.mods,
+            });
             sync_click()?;
             Ok(callback.callback_id)
         })?,
@@ -182,19 +163,16 @@ pub(crate) fn init_dbus_module(
 
     let cb_state = callback_state.clone();
     let on_cursor_scroll_cb = on_cursor_scroll.clone();
-    let consume_scroll = consume_cursor_scroll.clone();
-    let mods_scroll = mods_cursor_scroll.clone();
     let sync_scroll = sync_cursor_listening.clone();
     module.set(
         "on_cursor_scroll",
         lua.create_function(move |_, listener: ConfigCursorListener| {
-            if let Some(old) = on_cursor_scroll_cb.borrow_mut().take() {
-                cb_state.forget_callback(old);
-            }
             let callback = cb_state.register_callback(listener.callback);
-            *on_cursor_scroll_cb.borrow_mut() = Some(callback);
-            *consume_scroll.borrow_mut() = listener.consume;
-            *mods_scroll.borrow_mut() = listener.mods;
+            on_cursor_scroll_cb.borrow_mut().push(CursorHook {
+                callback,
+                consume: listener.consume,
+                mods: listener.mods,
+            });
             sync_scroll()?;
             Ok(callback.callback_id)
         })?,
@@ -208,45 +186,36 @@ pub(crate) fn init_dbus_module(
     let off_move = on_cursor_move.clone();
     let off_click = on_cursor_click.clone();
     let off_scroll = on_cursor_scroll.clone();
-    let off_consume_move = consume_cursor_move;
-    let off_consume_click = consume_cursor_click;
-    let off_consume_scroll = consume_cursor_scroll;
-    let off_mods_move = mods_cursor_move;
-    let off_mods_click = mods_cursor_click;
-    let off_mods_scroll = mods_cursor_scroll;
     let off_sync = sync_cursor_listening;
     module.set(
         "off",
         lua.create_function(move |_, callback_id: usize| {
             let callback_ref = CallbackRef { callback_id };
-            let clear_slot = |slot: &RefCell<Option<CallbackRef>>| -> bool {
-                let mut slot = slot.borrow_mut();
-                if slot.as_ref().is_some_and(|r| r.callback_id == callback_id) {
-                    slot.take();
-                    true
-                } else {
-                    false
-                }
+            let remove_hook = |hooks: &RefCell<Vec<CallbackRef>>| -> bool {
+                let mut hooks = hooks.borrow_mut();
+                let before = hooks.len();
+                hooks.retain(|r| r.callback_id != callback_id);
+                hooks.len() != before
+            };
+            let remove_cursor_hook = |hooks: &RefCell<Vec<CursorHook>>| -> bool {
+                let mut hooks = hooks.borrow_mut();
+                let before = hooks.len();
+                hooks.retain(|h| h.callback.callback_id != callback_id);
+                hooks.len() != before
             };
 
             let mut sync_cursor = false;
-            if clear_slot(&off_move) {
-                *off_consume_move.borrow_mut() = false;
-                *off_mods_move.borrow_mut() = Mods::default();
+            if remove_cursor_hook(&off_move) {
                 sync_cursor = true;
             }
-            if clear_slot(&off_click) {
-                *off_consume_click.borrow_mut() = false;
-                *off_mods_click.borrow_mut() = Mods::default();
+            if remove_cursor_hook(&off_click) {
                 sync_cursor = true;
             }
-            if clear_slot(&off_scroll) {
-                *off_consume_scroll.borrow_mut() = false;
-                *off_mods_scroll.borrow_mut() = Mods::default();
+            if remove_cursor_hook(&off_scroll) {
                 sync_cursor = true;
             }
-            let _ = clear_slot(&off_startup);
-            let _ = clear_slot(&off_connector);
+            let _ = remove_hook(&off_startup);
+            let _ = remove_hook(&off_connector);
 
             let was_keymap = off_cb_state.forget_callback(callback_ref);
             if was_keymap {
@@ -373,11 +342,11 @@ pub(crate) fn register_dbus_module(
     lua: &Lua,
     client: DbusConfigClient,
     callback_state: CallbackState,
-    on_startup: Rc<RefCell<Option<CallbackRef>>>,
-    on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
-    on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
-    on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
-    on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
+    on_startup: Rc<RefCell<Vec<CallbackRef>>>,
+    on_connector_change: Rc<RefCell<Vec<CallbackRef>>>,
+    on_cursor_move: Rc<RefCell<Vec<CursorHook>>>,
+    on_cursor_click: Rc<RefCell<Vec<CursorHook>>>,
+    on_cursor_scroll: Rc<RefCell<Vec<CursorHook>>>,
     ui_host: UiHost,
 ) -> anyhow::Result<()> {
     lua.register_module(
@@ -1111,6 +1080,34 @@ struct ConfigKeymap {
     on_release: bool,
     consume: bool,
     callback: LuaFunction,
+}
+
+/// One registered cursor listener, including compositor consume/mods metadata.
+#[derive(Clone, Copy)]
+pub(crate) struct CursorHook {
+    pub callback: CallbackRef,
+    pub consume: bool,
+    pub mods: Mods,
+}
+
+/// Merge multiple cursor hooks into the single compositor listening config.
+///
+/// `consume` is OR'd across hooks. `mods` is kept when every hook agrees; otherwise
+/// empty (always) so every listener can still be invoked.
+pub(crate) fn merge_cursor_hooks(hooks: &[CursorHook]) -> (bool, bool, Mods) {
+    let listen = !hooks.is_empty();
+    let consume = hooks.iter().any(|hook| hook.consume);
+    let mods = match hooks.first() {
+        None => Mods::default(),
+        Some(first) => {
+            if hooks.iter().all(|hook| hook.mods == first.mods) {
+                first.mods
+            } else {
+                Mods::default()
+            }
+        }
+    };
+    (listen, consume, mods)
 }
 
 /// Cursor listener: a bare function, or `{ callback = fn, consume?, mods? }`.

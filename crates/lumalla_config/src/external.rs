@@ -20,8 +20,9 @@ use crate::args::Args;
 use crate::callback::CallbackState;
 use crate::config_watcher::ConfigWatcher;
 use crate::dbus_lua::{
-    DbusConfigClient, eval_repl_chunk, load_config_files, outputs_from_infos, prepare_repl_env,
-    register_dbus_module, reload_config_file, set_default_keymaps, watch_config_files,
+    CursorHook, DbusConfigClient, eval_repl_chunk, load_config_files, outputs_from_infos,
+    prepare_repl_env, register_dbus_module, reload_config_file, set_default_keymaps,
+    watch_config_files,
 };
 use crate::repl::{ReplRequest, ReplResponse, start_repl_server};
 use crate::ui::{self, UiHost, UiHostEvent};
@@ -37,11 +38,11 @@ pub struct ExternalConfig {
     client: DbusConfigClient,
     lua: Lua,
     callback_state: CallbackState,
-    on_startup: Rc<RefCell<Option<CallbackRef>>>,
-    on_connector_change: Rc<RefCell<Option<CallbackRef>>>,
-    on_cursor_move: Rc<RefCell<Option<CallbackRef>>>,
-    on_cursor_click: Rc<RefCell<Option<CallbackRef>>>,
-    on_cursor_scroll: Rc<RefCell<Option<CallbackRef>>>,
+    on_startup: Rc<RefCell<Vec<CallbackRef>>>,
+    on_connector_change: Rc<RefCell<Vec<CallbackRef>>>,
+    on_cursor_move: Rc<RefCell<Vec<CursorHook>>>,
+    on_cursor_click: Rc<RefCell<Vec<CursorHook>>>,
+    on_cursor_scroll: Rc<RefCell<Vec<CursorHook>>>,
     outputs: HashMap<String, Output>,
     config_watcher: ConfigWatcher,
     reload_receiver: mpsc::Receiver<PathBuf>,
@@ -57,11 +58,11 @@ impl ExternalConfig {
         let client = DbusConfigClient::connect().context("Failed to connect to compositor")?;
         let lua = Lua::new();
         let callback_state = CallbackState::default();
-        let on_startup = Rc::new(RefCell::new(None));
-        let on_connector_change = Rc::new(RefCell::new(None));
-        let on_cursor_move = Rc::new(RefCell::new(None));
-        let on_cursor_click = Rc::new(RefCell::new(None));
-        let on_cursor_scroll = Rc::new(RefCell::new(None));
+        let on_startup = Rc::new(RefCell::new(Vec::new()));
+        let on_connector_change = Rc::new(RefCell::new(Vec::new()));
+        let on_cursor_move = Rc::new(RefCell::new(Vec::new()));
+        let on_cursor_click = Rc::new(RefCell::new(Vec::new()));
+        let on_cursor_scroll = Rc::new(RefCell::new(Vec::new()));
         let (reload_tx, reload_receiver) = mpsc::channel();
         let config_watcher = ConfigWatcher::new(reload_tx)?;
         let repl_socket = args.repl_socket_path()?;
@@ -173,9 +174,7 @@ impl ExternalConfig {
             }
 
             while let Ok(path) = self.reload_receiver.try_recv() {
-                *self.on_cursor_move.borrow_mut() = None;
-                *self.on_cursor_click.borrow_mut() = None;
-                *self.on_cursor_scroll.borrow_mut() = None;
+                self.clear_hooks();
                 if let Err(err) =
                     reload_config_file(&self.lua, &self.client, &self.callback_state, &path)
                 {
@@ -333,7 +332,8 @@ impl ExternalConfig {
             return Ok(());
         }
         self.startup_done = true;
-        if let Some(on_startup) = *self.on_startup.borrow() {
+        let startup_hooks: Vec<_> = self.on_startup.borrow().clone();
+        for on_startup in startup_hooks {
             self.callback_state.run_callback::<(), ()>(on_startup, ())?;
         }
         // One-shot connector snapshot so configs can build outputs without waiting for hotplug.
@@ -366,10 +366,11 @@ impl ExternalConfig {
     }
 
     fn handle_cursor_moved(&mut self, x: f64, y: f64, dx: f64, dy: f64) -> anyhow::Result<()> {
-        if let Some(on_cursor_move) = *self.on_cursor_move.borrow() {
+        let hooks: Vec<_> = self.on_cursor_move.borrow().clone();
+        for hook in hooks {
             if let Err(err) = self
                 .callback_state
-                .run_callback::<(f64, f64, f64, f64), ()>(on_cursor_move, (x, y, dx, dy))
+                .run_callback::<(f64, f64, f64, f64), ()>(hook.callback, (x, y, dx, dy))
             {
                 warn!("Cursor move callback failed: {err:#}");
             }
@@ -384,11 +385,12 @@ impl ExternalConfig {
         button: u32,
         pressed: bool,
     ) -> anyhow::Result<()> {
-        if let Some(on_cursor_click) = *self.on_cursor_click.borrow() {
-            if let Err(err) = self
-                .callback_state
-                .run_callback::<(f64, f64, u32, bool), ()>(on_cursor_click, (x, y, button, pressed))
-            {
+        let hooks: Vec<_> = self.on_cursor_click.borrow().clone();
+        for hook in hooks {
+            if let Err(err) = self.callback_state.run_callback::<(f64, f64, u32, bool), ()>(
+                hook.callback,
+                (x, y, button, pressed),
+            ) {
                 warn!("Cursor click callback failed: {err:#}");
             }
         }
@@ -402,11 +404,12 @@ impl ExternalConfig {
         axis: u32,
         value: f64,
     ) -> anyhow::Result<()> {
-        if let Some(on_cursor_scroll) = *self.on_cursor_scroll.borrow() {
-            if let Err(err) = self
-                .callback_state
-                .run_callback::<(f64, f64, u32, f64), ()>(on_cursor_scroll, (x, y, axis, value))
-            {
+        let hooks: Vec<_> = self.on_cursor_scroll.borrow().clone();
+        for hook in hooks {
+            if let Err(err) = self.callback_state.run_callback::<(f64, f64, u32, f64), ()>(
+                hook.callback,
+                (x, y, axis, value),
+            ) {
                 warn!("Cursor scroll callback failed: {err:#}");
             }
         }
@@ -414,7 +417,7 @@ impl ExternalConfig {
     }
 
     fn on_connector_change_from_proxy(&mut self) -> anyhow::Result<()> {
-        if self.on_connector_change.borrow().is_none() {
+        if self.on_connector_change.borrow().is_empty() {
             return Ok(());
         }
         let devices = self
@@ -426,13 +429,45 @@ impl ExternalConfig {
     }
 
     fn run_on_connector_change(&mut self, devices: Vec<DrmDeviceInfo>) -> anyhow::Result<()> {
-        if let Some(on_connector_change) = *self.on_connector_change.borrow() {
-            let devices_lua = crate::dbus_lua::drm_devices_to_lua(&self.lua, devices)
-                .map_err(|err| anyhow::anyhow!("Unable to convert DRM devices for Lua: {err}"))?;
+        let hooks: Vec<_> = self.on_connector_change.borrow().clone();
+        if hooks.is_empty() {
+            return Ok(());
+        }
+        let devices_lua = crate::dbus_lua::drm_devices_to_lua(&self.lua, devices)
+            .map_err(|err| anyhow::anyhow!("Unable to convert DRM devices for Lua: {err}"))?;
+        for on_connector_change in hooks {
             self.callback_state
-                .run_callback::<mlua::Value, ()>(on_connector_change, devices_lua)?;
+                .run_callback::<mlua::Value, ()>(on_connector_change, devices_lua.clone())?;
         }
         Ok(())
+    }
+
+    fn clear_hooks(&mut self) {
+        let forget = |hooks: Vec<CallbackRef>| {
+            for callback in hooks {
+                self.callback_state.forget_callback(callback);
+            }
+        };
+        forget(std::mem::take(&mut *self.on_startup.borrow_mut()));
+        forget(std::mem::take(&mut *self.on_connector_change.borrow_mut()));
+        forget(
+            std::mem::take(&mut *self.on_cursor_move.borrow_mut())
+                .into_iter()
+                .map(|hook| hook.callback)
+                .collect(),
+        );
+        forget(
+            std::mem::take(&mut *self.on_cursor_click.borrow_mut())
+                .into_iter()
+                .map(|hook| hook.callback)
+                .collect(),
+        );
+        forget(
+            std::mem::take(&mut *self.on_cursor_scroll.borrow_mut())
+                .into_iter()
+                .map(|hook| hook.callback)
+                .collect(),
+        );
     }
 }
 
