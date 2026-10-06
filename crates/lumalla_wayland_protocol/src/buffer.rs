@@ -455,14 +455,73 @@ impl Writer {
 
     #[inline]
     pub fn write_message_length(&mut self) {
+        // Never leave a size-0 header on the wire: clients report that as
+        // "Protocol error 0 on object @0: Malformed Wayland message."
+        if self.last_err.is_some() {
+            self.abort_current_message();
+            return;
+        }
         let message_length = self.pending_stream_bytes() - self.message_start_offset;
         if message_length > MAX_MESSAGE_SIZE || !message_length.is_multiple_of(4) {
             self.last_err = Some(anyhow::anyhow!(
                 "Invalid outgoing Wayland message size {message_length}"
             ));
+            self.abort_current_message();
             return;
         }
         self.patch_stream_u16(self.message_start_offset + 6, message_length as u16);
+    }
+
+    /// Drop bytes/FDs written for the in-progress message so a failed arg write
+    /// cannot flush a truncated or size-0 event.
+    fn abort_current_message(&mut self) {
+        let start = self.message_start_offset;
+        let mut kept = VecDeque::new();
+        let mut to_recycle = Vec::new();
+        let mut remaining = start;
+        let mut dropped_fds = false;
+        for chunk in self.queue.drain(..) {
+            if remaining == 0 {
+                // Entire chunk belongs to the aborted message.
+                dropped_fds |= !chunk.fds.is_empty();
+                to_recycle.push(chunk);
+                continue;
+            }
+            if remaining < chunk.len {
+                // Message started inside this chunk; truncate and drop trailing FDs.
+                let mut chunk = chunk;
+                dropped_fds |= !chunk.fds.is_empty();
+                chunk.fds.clear();
+                chunk.len = remaining;
+                kept.push_back(chunk);
+                remaining = 0;
+                continue;
+            }
+            remaining -= chunk.len;
+            kept.push_back(chunk);
+        }
+        self.queue = kept;
+        if remaining == 0 {
+            dropped_fds |= !self.active.fds.is_empty();
+            let next = self.take_chunk();
+            let old_active = mem::replace(&mut self.active, next);
+            to_recycle.push(old_active);
+        } else {
+            debug_assert!(remaining <= self.active.len);
+            // Message started in `active`; keep prefix, drop FDs queued with it.
+            dropped_fds |= !self.active.fds.is_empty();
+            self.active.fds.clear();
+            self.active.len = remaining;
+        }
+        for chunk in to_recycle {
+            self.recycle_chunk(chunk);
+        }
+        if dropped_fds && self.last_err.is_none() {
+            self.last_err = Some(anyhow::anyhow!(
+                "Aborted incomplete Wayland message that had queued FDs"
+            ));
+        }
+        self.message_start_offset = self.pending_stream_bytes();
     }
 
     #[inline]
@@ -512,7 +571,8 @@ impl Writer {
         }
         let len = bytes.len() + 1;
         let padded_len = (len + 3) & !3;
-        if !self.ensure_room(padded_len) {
+        // Length prefix is 4 bytes in addition to the padded string payload.
+        if !self.ensure_room(padded_len + mem::size_of::<u32>()) {
             return;
         }
         let len_index_start = self.active.len;
@@ -1111,6 +1171,59 @@ mod tests {
         writer.write_message_length();
         assert!(!writer.protocol_error());
         assert!(!writer.should_disconnect());
+    }
+
+    #[test]
+    fn writer_write_str_fits_when_only_payload_room_remains() {
+        // Regression: ensure_room used to reserve only padded string bytes and
+        // omit the 4-byte length prefix, overflowing when remaining == padded_len.
+        let socket = UnixStream::pair().unwrap();
+        let mut writer = Writer::new(socket.1.as_raw_fd());
+
+        writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 1);
+        let words = (SEND_CHUNK_SIZE - HEADER_SIZE - 8) / mem::size_of::<u32>();
+        for _ in 0..words {
+            writer.write_u32(0);
+        }
+        // 8 bytes remain in the chunk: exactly length prefix + "a\0" padded to 4.
+        writer.write_str("a");
+        writer.write_message_length();
+        assert!(!writer.has_write_error());
+        assert_eq!(writer.active.len, SEND_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn writer_aborts_incomplete_message_instead_of_size_zero() {
+        let socket = UnixStream::pair().unwrap();
+        let mut writer = Writer::new(socket.1.as_raw_fd());
+
+        let fill_chunk = |writer: &mut Writer| {
+            writer.start_message(ObjectId::new(NonZeroU32::new(1).unwrap()), 1);
+            let words = (SEND_CHUNK_SIZE - HEADER_SIZE) / mem::size_of::<u32>();
+            for _ in 0..words {
+                writer.write_u32(0);
+            }
+            writer.write_message_length();
+        };
+        // Leave one buffer slot so the next message can start, then fail mid-payload.
+        for _ in 0..(MAX_SEND_BUFFERS - 1) {
+            fill_chunk(&mut writer);
+        }
+
+        let pending_before = writer.queue.iter().map(|c| c.len).sum::<usize>() + writer.active.len;
+        writer.start_message(ObjectId::new(NonZeroU32::new(7).unwrap()), 3);
+        // Fill the new chunk so only 4 bytes remain — not enough for write_str("a").
+        let words = (SEND_CHUNK_SIZE - HEADER_SIZE - 4) / mem::size_of::<u32>();
+        for _ in 0..words {
+            writer.write_u32(0);
+        }
+        writer.write_str("a");
+        writer.write_message_length();
+
+        assert!(writer.send_buffer_limit_exceeded());
+        let pending_after = writer.queue.iter().map(|c| c.len).sum::<usize>() + writer.active.len;
+        // Incomplete event must be discarded — never left as a size-0 header.
+        assert_eq!(pending_after, pending_before);
     }
 
     #[test]
