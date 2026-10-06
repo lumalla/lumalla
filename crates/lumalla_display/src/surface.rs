@@ -1024,6 +1024,28 @@ impl SurfaceManager {
         Ok(())
     }
 
+    /// Drop references to a destroyed `wl_buffer` so we never emit
+    /// `wl_buffer.release` after `wl_display.delete_id` for that object.
+    pub fn forget_buffer(&mut self, client_id: ClientId, buffer_id: ObjectId) {
+        for ((owner, _), surface) in self.surfaces.iter_mut() {
+            if *owner != client_id {
+                continue;
+            }
+            if surface.current.buffer == Some(buffer_id) {
+                surface.current.buffer = None;
+            }
+            if surface.pending.buffer == Some(Some(buffer_id)) {
+                // Cancel the pending attach; do not synthesize attach(null).
+                surface.pending.buffer = None;
+            }
+            if let Some(cache) = surface.cache.as_mut()
+                && cache.buffer == Some(Some(buffer_id))
+            {
+                cache.buffer = None;
+            }
+        }
+    }
+
     /// Pending buffer attachment for commit preflight, including explicit NULL.
     pub fn pending_buffer_attachment(
         &self,
@@ -2690,6 +2712,29 @@ mod tests {
         let _ = manager.commit(client(1), object(2)).unwrap();
         let destroyed = manager.destroy_surface(client(1), object(2)).unwrap();
         assert_eq!(destroyed.held_buffer, Some(object(4)));
+    }
+
+    #[test]
+    fn forget_buffer_clears_held_and_pending_attachments() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
+            .unwrap();
+        let _ = manager.commit(client(1), object(2)).unwrap();
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
+            .unwrap();
+
+        manager.forget_buffer(client(1), object(4));
+
+        assert!(!manager.has_current_buffer(client(1), object(2)));
+        assert_eq!(
+            manager.pending_buffer_attachment(client(1), object(2)).unwrap(),
+            None
+        );
+        let destroyed = manager.destroy_surface(client(1), object(2)).unwrap();
+        assert_eq!(destroyed.held_buffer, None);
     }
 
     #[test]

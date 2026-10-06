@@ -1046,6 +1046,9 @@ impl WlShmPool for DisplayState {
 
 impl WlBuffer for DisplayState {
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlBufferDestroy<'_>) {
+        // Detach before delete_id so surface teardown cannot release a dead id.
+        self.surface_manager
+            .forget_buffer(ctx.client_id, object_id);
         ctx.registry.free_object(object_id, &mut ctx.writer);
         self.shm_manager.delete_buffer(ctx.client_id, object_id);
         self.dmabuf_manager.delete_buffer(ctx.client_id, object_id);
