@@ -29,6 +29,8 @@ struct ManagedWindow {
     app_id: String,
     title: String,
     zone: Option<String>,
+    /// When true, paints and hit-tests above layer-shell top/overlay.
+    cover_overlays: bool,
     user_placed: UserPlaced,
 }
 
@@ -148,6 +150,7 @@ impl WindowManager {
                 app_id: String::new(),
                 title: String::new(),
                 zone: zone_name,
+                cover_overlays: false,
                 user_placed: UserPlaced::default(),
             },
         );
@@ -287,15 +290,39 @@ impl WindowManager {
         &mut self,
         id: Option<u32>,
         update: WindowGeometryUpdate,
+        cover_overlays: Option<bool>,
         user_initiated: bool,
         surface_manager: &SurfaceManager,
         xdg_manager: &mut XdgManager,
-    ) -> Result<Vec<WindowGeometryChange>, WindowError> {
-        if update.is_empty() {
-            return Ok(Vec::new());
+    ) -> Result<(Vec<WindowGeometryChange>, bool), WindowError> {
+        if update.is_empty() && cover_overlays.is_none() {
+            return Ok((Vec::new(), false));
         }
         let target = self.resolve_window_id(id)?;
-        Ok(self.apply_update(target, update, user_initiated, surface_manager, xdg_manager))
+        let mut cover_changed = false;
+        if let Some(cover) = cover_overlays
+            && let Some(window) = self.windows.get_mut(&target)
+            && window.cover_overlays != cover
+        {
+            window.cover_overlays = cover;
+            cover_changed = true;
+        }
+        if update.is_empty() {
+            return Ok((Vec::new(), cover_changed));
+        }
+        Ok((
+            self.apply_update(target, update, user_initiated, surface_manager, xdg_manager),
+            cover_changed,
+        ))
+    }
+
+    /// Whether the toplevel rooted at `wl_surface` covers layer-shell chrome.
+    pub fn covers_overlays(&self, client_id: ClientId, wl_surface: ObjectId) -> bool {
+        self.windows.values().any(|window| {
+            window.client_id == client_id
+                && window.wl_surface == wl_surface
+                && window.cover_overlays
+        })
     }
 
     pub fn add_window_to_zone(
@@ -578,6 +605,7 @@ impl WindowManager {
             focused: self.focused_id == Some(window.id),
             zone: window.zone.clone(),
             stack: surface_manager.paint_order_index(window.client_id, window.wl_surface),
+            cover_overlays: window.cover_overlays,
         }
     }
 }
@@ -941,5 +969,44 @@ mod tests {
         );
         assert_eq!(wm.window_zone(1), Some("side"));
         assert!(changes.iter().any(|c| c.position == Some((500, 0))));
+    }
+
+    #[test]
+    fn set_window_cover_overlays_toggles_without_geometry() {
+        let mut wm = WindowManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let mut xdg = XdgManager::default();
+        let _ = register_with_surface(&mut wm, &mut surfaces, &mut xdg);
+        wm.focused_id = Some(1);
+
+        assert!(!wm.covers_overlays(client(1), object(12)));
+        let (changes, cover_changed) = wm
+            .set_window(
+                None,
+                WindowGeometryUpdate::default(),
+                Some(true),
+                true,
+                &surfaces,
+                &mut xdg,
+            )
+            .unwrap();
+        assert!(changes.is_empty());
+        assert!(cover_changed);
+        assert!(wm.covers_overlays(client(1), object(12)));
+
+        let states = wm.window_states(&surfaces, &xdg);
+        assert!(states[0].cover_overlays);
+
+        let (_, cover_changed) = wm
+            .set_window(
+                Some(1),
+                WindowGeometryUpdate::default(),
+                Some(true),
+                true,
+                &surfaces,
+                &mut xdg,
+            )
+            .unwrap();
+        assert!(!cover_changed);
     }
 }

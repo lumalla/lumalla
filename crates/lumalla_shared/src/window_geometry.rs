@@ -11,7 +11,7 @@ pub struct WindowGeometryUpdate {
     pub height: Option<i32>,
 }
 
-/// Sentinel value for unset optional geometry fields over D-Bus.
+/// Sentinel value for unset optional geometry / flag fields over D-Bus.
 pub const WINDOW_GEOMETRY_UNSET: i32 = i32::MIN;
 
 /// Convert a D-Bus geometry field to an optional value.
@@ -26,6 +26,24 @@ pub fn geometry_field_from_dbus(value: i32) -> Option<i32> {
 /// Convert an optional geometry field to its D-Bus representation.
 pub fn geometry_field_to_dbus(value: Option<i32>) -> i32 {
     value.unwrap_or(WINDOW_GEOMETRY_UNSET)
+}
+
+/// Convert a D-Bus optional bool (`WINDOW_GEOMETRY_UNSET` = unset, else nonzero = true).
+pub fn flag_from_dbus(value: i32) -> Option<bool> {
+    if value == WINDOW_GEOMETRY_UNSET {
+        None
+    } else {
+        Some(value != 0)
+    }
+}
+
+/// Convert an optional bool to its D-Bus representation.
+pub fn flag_to_dbus(value: Option<bool>) -> i32 {
+    match value {
+        None => WINDOW_GEOMETRY_UNSET,
+        Some(false) => 0,
+        Some(true) => 1,
+    }
 }
 
 impl WindowGeometryUpdate {

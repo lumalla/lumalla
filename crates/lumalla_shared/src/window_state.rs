@@ -21,4 +21,6 @@ pub struct WindowState {
     pub zone: Option<String>,
     /// Paint-stack index (higher = closer to top / more recently raised).
     pub stack: u32,
+    /// When true, the window paints and hit-tests above layer-shell top/overlay.
+    pub cover_overlays: bool,
 }

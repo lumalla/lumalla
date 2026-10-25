@@ -1591,6 +1591,7 @@ pub fn composite_to_scanout(
     layers: &[&SurfaceFrame],
     below_layers: &[&SurfaceFrame],
     above_layers: &[&SurfaceFrame],
+    cover_layers: &[&SurfaceFrame],
     guides: &[Guide],
     cursor: CursorDraw<'_>,
     pointer_x: i32,
@@ -1615,6 +1616,7 @@ pub fn composite_to_scanout(
     let draw_list = build_layer_draw_list(cache, layers, false);
     let below_list = build_layer_draw_list(cache, below_layers, false);
     let above_list = build_layer_draw_list(cache, above_layers, false);
+    let cover_list = build_layer_draw_list(cache, cover_layers, false);
 
     match composite_mode {
         CompositeMode::Full => {
@@ -1627,6 +1629,7 @@ pub fn composite_to_scanout(
                 &draw_list,
                 &below_list,
                 &above_list,
+                &cover_list,
                 guides,
                 cursor,
                 pointer_x,
@@ -1651,6 +1654,7 @@ pub fn composite_to_scanout(
                     &draw_list,
                     &below_list,
                     &above_list,
+                    &cover_list,
                     guides,
                     cursor,
                     pointer_x,
@@ -1882,6 +1886,7 @@ fn draw_views(
     layers: &[LayerDrawItem],
     below_layers: &[LayerDrawItem],
     above_layers: &[LayerDrawItem],
+    cover_layers: &[LayerDrawItem],
     guides: &[Guide],
     cursor: CursorDraw<'_>,
     pointer_x: i32,
@@ -1956,6 +1961,29 @@ fn draw_views(
         output_height,
         outer_clip,
     );
+    // Cover-desktop windows paint above layer-shell chrome, still through views.
+    for view in views {
+        let Some(view_clip) = view_dest_clip(view, output_width, output_height) else {
+            continue;
+        };
+        let clip = match outer_clip {
+            Some(outer) => match intersect_vk_rects(outer, &view_clip) {
+                Some(combined) => combined,
+                None => continue,
+            },
+            None => view_clip,
+        };
+        draw_scene_layers(
+            compositor,
+            device,
+            recorder,
+            view,
+            cover_layers,
+            output_width,
+            output_height,
+            Some(&clip),
+        );
+    }
     // Cursor is monitor/dest-native: draw once in output pixels, never through a view.
     draw_cursor_layer(
         compositor,

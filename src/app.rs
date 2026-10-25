@@ -946,11 +946,12 @@ impl AppData {
                 MainMessage::SetWindow {
                     id,
                     geometry,
+                    cover_overlays,
                     user_initiated,
                 } => {
                     let clients = &mut self.clients;
                     match self.display_state.with_render(&mut self.renderer_state, |display| {
-                        display.set_window(id, geometry, user_initiated, clients)
+                        display.set_window(id, geometry, cover_overlays, user_initiated, clients)
                     }) {
                         Ok(changed) => {
                             self.sync_windows_to_dbus();

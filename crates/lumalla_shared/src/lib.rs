@@ -54,7 +54,8 @@ pub use screencast_size::{
 pub use surface_geometry::BufferTransform;
 pub use udev::{Udev, UdevDevice, UdevEnumerate, UdevMonitor};
 pub use window_geometry::{
-    WINDOW_GEOMETRY_UNSET, WindowGeometryUpdate, geometry_field_from_dbus, geometry_field_to_dbus,
+    WINDOW_GEOMETRY_UNSET, WindowGeometryUpdate, flag_from_dbus, flag_to_dbus,
+    geometry_field_from_dbus, geometry_field_to_dbus,
 };
 pub use window_rule::{TitleMatchKind, TitleMatcher, WindowRule};
 pub use window_state::WindowState;

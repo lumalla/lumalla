@@ -134,9 +134,9 @@ Default keymaps (not Lua-callable): Ctrl+Alt+Backspace quits; Ctrl+Alt+F1–F12 
 
 | Function | Description |
 | --- | --- |
-| `get_windows()` | Return `{id, app_id, title, x, y, width, height, focused, zone?, stack}` for each window. `zone` is the zone name when assigned, otherwise `nil`. `stack` is paint order (higher = closer to top). |
+| `get_windows()` | Return `{id, app_id, title, x, y, width, height, focused, zone?, stack, cover_overlays}` for each window. `zone` is the zone name when assigned, otherwise `nil`. `stack` is paint order (higher = closer to top). `cover_overlays` is true when the window paints above layer-shell top/overlay. |
 | `get_focused_window()` | Focused window id, or `nil`. |
-| `set_window({id?, x?, y?, width?, height?})` | Set geometry. Omitted fields stay unchanged; omit `id` (or pass `0`) for the focused window. |
+| `set_window({id?, x?, y?, width?, height?, cover_overlays?})` | Set geometry and/or whether the window covers layer-shell chrome. Omitted fields stay unchanged; omit `id` (or pass `0`) for the focused window. |
 | `focus_window({id?, raise?})` | Focus a window (`raise` defaults to `false`). |
 | `raise_window({id?})` | Raise without changing focus. |
 | `close_window({id?})` | Ask the client to close via `xdg_toplevel.close` (client may ignore / prompt). Omit `id` for the focused window. |

@@ -620,6 +620,8 @@ pub struct WindowInfo {
     pub zone: String,
     /// Paint-stack index (higher = closer to top / more recently raised).
     pub stack: u32,
+    /// When true, the window paints and hit-tests above layer-shell top/overlay.
+    pub cover_overlays: bool,
 }
 
 impl From<&WindowState> for WindowInfo {
@@ -635,6 +637,7 @@ impl From<&WindowState> for WindowInfo {
             focused: window.focused,
             zone: window.zone.clone().unwrap_or_default(),
             stack: window.stack,
+            cover_overlays: window.cover_overlays,
         }
     }
 }

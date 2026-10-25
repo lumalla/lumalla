@@ -398,6 +398,8 @@ pub struct RendererState {
     /// Mapped surfaces in paint order (back to front).
     surface_frames: HashMap<(u32, u32), SurfaceFrame>,
     surface_order: Vec<(u32, u32)>,
+    /// Desktop surfaces that paint above layer-shell top/overlay.
+    cover_surface_keys: HashSet<(u32, u32)>,
     /// Per-output layer-shell scene: `(owner, surface, x, y, band)` in output-local space.
     /// Band: 0=background, 1=bottom, 2=top, 3=overlay.
     output_layer_scenes: HashMap<String, Vec<(u32, u32, i32, i32, u8)>>,
@@ -485,6 +487,7 @@ impl RendererState {
             flip_events: Box::new(FlipEventQueue::new()),
             surface_frames: HashMap::new(),
             surface_order: Vec::new(),
+            cover_surface_keys: HashSet::new(),
             output_layer_scenes: HashMap::new(),
             layer_surface_keys: HashSet::new(),
             cursor_state: CursorState::Default,
@@ -971,14 +974,22 @@ impl RendererState {
 
     /// Replace cached placement and z-order from the display's authoritative
     /// back-to-front desktop scene (excludes layer-shell surfaces).
-    pub fn sync_surface_scene(&mut self, scene: &[(u32, u32, i32, i32)]) {
+    ///
+    /// Each entry is `(owner, surface, x, y, cover_overlays)`.
+    pub fn sync_surface_scene(&mut self, scene: &[(u32, u32, i32, i32, bool)]) {
         let new_order: Vec<(u32, u32)> = scene
             .iter()
-            .map(|(owner, surface, _, _)| (*owner, *surface))
+            .map(|(owner, surface, _, _, _)| (*owner, *surface))
             .filter(|key| self.surface_frames.contains_key(key))
             .collect();
-        let mut changed = new_order != self.surface_order;
-        for &(owner, surface, x, y) in scene {
+        let new_cover: HashSet<(u32, u32)> = scene
+            .iter()
+            .filter(|(_, _, _, _, cover)| *cover)
+            .map(|(owner, surface, _, _, _)| (*owner, *surface))
+            .filter(|key| self.surface_frames.contains_key(key))
+            .collect();
+        let mut changed = new_order != self.surface_order || new_cover != self.cover_surface_keys;
+        for &(owner, surface, x, y, _) in scene {
             if let Some(frame) = self.surface_frames.get_mut(&(owner, surface))
                 && (frame.x != x || frame.y != y)
             {
@@ -998,6 +1009,7 @@ impl RendererState {
             }
         }
         self.surface_order = new_order;
+        self.cover_surface_keys = new_cover;
         if changed {
             let _ = self.flush_retired_textures();
             self.pending_full_redraw = true;
@@ -1070,6 +1082,7 @@ impl RendererState {
         let key = (owner_id, surface_id);
         if self.surface_frames.remove(&key).is_some() {
             self.surface_order.retain(|k| *k != key);
+            self.cover_surface_keys.remove(&key);
             self.gpu.surface_textures.remove(key);
             self.dirty_surface_keys.remove(&key);
             self.pending_surface_buffer_damage.remove(&key);
@@ -1105,6 +1118,8 @@ impl RendererState {
         self.surface_frames
             .retain(|(owner, _), _| *owner != owner_id);
         self.surface_order.retain(|(owner, _)| *owner != owner_id);
+        self.cover_surface_keys
+            .retain(|(owner, _)| *owner != owner_id);
         self.gpu.surface_textures.remove_client(owner_id);
         let _ = self.flush_retired_textures();
         self.pending_surface_buffer_damage
@@ -1326,7 +1341,7 @@ impl RenderSink for RendererState {
         self.remove_client_frames(owner_id)
     }
 
-    fn set_desktop_scene(&mut self, scene: &[(u32, u32, i32, i32)]) {
+    fn set_desktop_scene(&mut self, scene: &[(u32, u32, i32, i32, bool)]) {
         self.sync_surface_scene(scene);
     }
 
@@ -3438,6 +3453,13 @@ impl RendererState {
         let layers: Vec<&SurfaceFrame> = self
             .surface_order
             .iter()
+            .filter(|key| !self.cover_surface_keys.contains(*key))
+            .filter_map(|key| self.surface_frames.get(key))
+            .collect();
+        let cover_layers: Vec<&SurfaceFrame> = self
+            .surface_order
+            .iter()
+            .filter(|key| self.cover_surface_keys.contains(*key))
             .filter_map(|key| self.surface_frames.get(key))
             .collect();
         let empty_layer_scene = Vec::new();
@@ -3456,6 +3478,7 @@ impl RendererState {
             .filter_map(|(owner, surface, _, _, _)| self.surface_frames.get(&(*owner, *surface)))
             .collect();
         let mut sync_layers = layers.clone();
+        sync_layers.extend(cover_layers.iter().copied());
         sync_layers.extend(below_layers.iter().copied());
         sync_layers.extend(above_layers.iter().copied());
         let cursor = if hw_cursor {
@@ -3571,6 +3594,7 @@ impl RendererState {
                     &layers,
                     &below_layers,
                     &above_layers,
+                    &cover_layers,
                     &self.guides,
                     cursor,
                     pointer_x,
@@ -4489,9 +4513,11 @@ mod tests {
         state.set_surface_frame(first).unwrap();
         state.set_surface_frame(second).unwrap();
 
-        state.sync_surface_scene(&[(1, 3, 40, 50), (1, 2, 10, 20)]);
+        state.sync_surface_scene(&[(1, 3, 40, 50, false), (1, 2, 10, 20, true)]);
 
         assert_eq!(state.surface_order, vec![(1, 3), (1, 2)]);
+        assert!(state.cover_surface_keys.contains(&(1, 2)));
+        assert!(!state.cover_surface_keys.contains(&(1, 3)));
         assert_eq!(
             (
                 state.surface_frames[&(1, 3)].x,
@@ -4514,10 +4540,11 @@ mod tests {
         let mut state = RendererState::new().unwrap();
         state.set_surface_frame(frame()).unwrap();
         // Must enter desktop order before empty sync can GC the frame.
-        state.sync_surface_scene(&[(1, 2, 0, 0)]);
+        state.sync_surface_scene(&[(1, 2, 0, 0, false)]);
         state.sync_surface_scene(&[]);
         assert!(state.surface_frames.is_empty());
         assert!(state.surface_order.is_empty());
+        assert!(state.cover_surface_keys.is_empty());
     }
 
     #[test]
@@ -4531,7 +4558,7 @@ mod tests {
 
         // Layer-first then desktop (and the reverse) must both keep layer frames.
         state.sync_output_layer_scenes(&[("HDMI-A-1".into(), vec![(1, 9, 0, 0, 2)])]);
-        state.sync_surface_scene(&[(1, 2, 10, 20)]);
+        state.sync_surface_scene(&[(1, 2, 10, 20, false)]);
 
         assert!(state.layer_surface_keys.contains(&(1, 9)));
         assert!(state.surface_frames.contains_key(&(1, 9)));
@@ -4549,7 +4576,7 @@ mod tests {
         layer.buffer_id = 9;
         state.set_surface_frame(layer).unwrap();
         state.set_surface_frame(frame()).unwrap();
-        state.sync_surface_scene(&[(1, 2, 10, 20)]);
+        state.sync_surface_scene(&[(1, 2, 10, 20, false)]);
         state.sync_output_layer_scenes(&[("HDMI-A-1".into(), vec![(1, 9, 0, 0, 2)])]);
         assert!(state.surface_frames.contains_key(&(1, 9)));
         assert_eq!(state.surface_order, vec![(1, 2)]);

@@ -23,7 +23,7 @@ use lumalla_ipc::{
 };
 use lumalla_shared::{
     CapturedImage, Comms, InjectedInput, MainMessage, Mods, Output, View, WindowGeometryUpdate,
-    WindowState, XkbConfig, geometry_field_from_dbus,
+    WindowState, XkbConfig, flag_from_dbus, geometry_field_from_dbus,
 };
 use std::path::PathBuf;
 use zbus::blocking::Connection;
@@ -286,6 +286,7 @@ impl WindowManagerHandler for CompositorHandler {
         y: i32,
         width: i32,
         height: i32,
+        cover_overlays: i32,
     ) -> zbus::fdo::Result<()> {
         self.state.comms.main(MainMessage::SetWindow {
             id: if id == 0 { None } else { Some(id) },
@@ -295,6 +296,7 @@ impl WindowManagerHandler for CompositorHandler {
                 width: geometry_field_from_dbus(width),
                 height: geometry_field_from_dbus(height),
             },
+            cover_overlays: flag_from_dbus(cover_overlays),
             user_initiated: true,
         });
         Ok(())

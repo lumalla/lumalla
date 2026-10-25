@@ -273,20 +273,23 @@ impl SurfaceManager {
         &self,
         scene: &mut allocator_api2::vec::Vec<SceneSurface, A>,
     ) {
-        for &(client_id, surface_id) in &self.paint_order {
-            let Some(surface) = self.surfaces.get(&(client_id, surface_id)) else {
-                continue;
-            };
-            if matches!(
-                surface.role,
-                Some(Role::Subsurface(_)) | Some(Role::Layer(_))
-            ) || surface.role_parent.is_some()
-                || !self.is_mapped(client_id, surface_id).unwrap_or(false)
-            {
-                continue;
-            }
+        for (client_id, surface_id) in self.desktop_paint_roots() {
             self.flatten_surface_tree(client_id, surface_id, scene);
         }
+    }
+
+    /// Desktop paint-order roots (back to front): mapped toplevels, not layers/subsurfaces.
+    pub fn desktop_paint_roots(&self) -> impl Iterator<Item = (ClientId, ObjectId)> + '_ {
+        self.paint_order.iter().copied().filter(|(client_id, surface_id)| {
+            let Some(surface) = self.surfaces.get(&(*client_id, *surface_id)) else {
+                return false;
+            };
+            !matches!(
+                surface.role,
+                Some(Role::Subsurface(_)) | Some(Role::Layer(_))
+            ) && surface.role_parent.is_none()
+                && self.is_mapped(*client_id, *surface_id).unwrap_or(false)
+        })
     }
 
     /// Flatten a mapped surface tree (used for output-local layer roots).

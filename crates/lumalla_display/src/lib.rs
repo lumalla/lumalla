@@ -457,19 +457,46 @@ impl DisplayState {
         let layer_scenes = self.collect_output_layer_scenes();
         self.render_mut().set_output_layer_scenes(&layer_scenes);
 
-        let surfaces = self.scene_surfaces();
-        let scene: Vec<(u32, u32, i32, i32)> = surfaces
-            .iter()
-            .map(|surface| {
-                (
+        let scene = self.collect_desktop_scene();
+        self.render_mut().set_desktop_scene(&scene);
+    }
+
+    /// Desktop scene entries `(owner, surface, x, y, cover_overlays)` back to front.
+    fn collect_desktop_scene(&self) -> Vec<(u32, u32, i32, i32, bool)> {
+        let mut scene = Vec::new();
+        let mut tree = allocator_api2::vec::Vec::new();
+        for (client_id, root) in self.surface_manager.desktop_paint_roots() {
+            let cover = self.window_manager.covers_overlays(client_id, root);
+            tree.clear();
+            self.surface_manager
+                .collect_mapped_tree(client_id, root, &mut tree);
+            for surface in &tree {
+                scene.push((
                     surface.client_id.get(),
                     surface.surface_id.get(),
                     surface.x,
                     surface.y,
-                )
-            })
-            .collect();
-        self.render_mut().set_desktop_scene(&scene);
+                    cover,
+                ));
+            }
+        }
+        scene
+    }
+
+    /// Desktop scene surfaces whose toplevel has `cover_overlays == cover`.
+    fn collect_desktop_scene_surfaces(&self, cover: bool) -> Vec<SceneSurface> {
+        let mut scene = Vec::new();
+        let mut tree = allocator_api2::vec::Vec::new();
+        for (client_id, root) in self.surface_manager.desktop_paint_roots() {
+            if self.window_manager.covers_overlays(client_id, root) != cover {
+                continue;
+            }
+            tree.clear();
+            self.surface_manager
+                .collect_mapped_tree(client_id, root, &mut tree);
+            scene.extend(tree.iter().cloned());
+        }
+        scene
     }
 
     pub fn set_keyboard_keymap(&mut self, keymap: lumalla_shared::KeymapMemfd) {
@@ -662,8 +689,9 @@ impl DisplayState {
             .or_else(|| self.output_manager.outputs().next())
     }
 
-    /// Resolve pointer target in output-local coordinates: overlay/top layers,
-    /// then desktop via views, then bottom/background layers.
+    /// Resolve pointer target in output-local coordinates: cover-desktop,
+    /// then overlay/top layers, then normal desktop via views, then
+    /// bottom/background layers.
     pub fn pointer_target_at_output_local(
         &self,
         px: f64,
@@ -685,14 +713,22 @@ impl DisplayState {
                 LayerBand::Bottom | LayerBand::Background => below.extend(tree),
             }
         }
+        let views = self.pointer_views();
+        let (scene_x, scene_y) = map_dest_to_source(&views, px, py);
+        let cover = self.collect_desktop_scene_surfaces(true);
+        if let Some(target) = self
+            .surface_manager
+            .hit_test_scene(&cover, scene_x, scene_y)
+        {
+            return Some(target);
+        }
         if let Some(target) = self.surface_manager.hit_test_scene(&above, px, py) {
             return Some(target);
         }
-        let views = self.pointer_views();
-        let (scene_x, scene_y) = map_dest_to_source(&views, px, py);
+        let normal = self.collect_desktop_scene_surfaces(false);
         if let Some(target) = self
             .surface_manager
-            .global_pointer_target(None, scene_x, scene_y)
+            .hit_test_scene(&normal, scene_x, scene_y)
         {
             return Some(target);
         }
@@ -1384,17 +1420,24 @@ impl DisplayState {
         &mut self,
         id: Option<u32>,
         geometry: WindowGeometryUpdate,
+        cover_overlays: Option<bool>,
         user_initiated: bool,
         clients: &mut ConnectedClients,
     ) -> Result<bool, WindowError> {
-        let changes = self.window_manager.set_window(
+        let (changes, cover_changed) = self.window_manager.set_window(
             id,
             geometry,
+            cover_overlays,
             user_initiated,
             &self.surface_manager,
             &mut self.xdg_manager,
         )?;
-        Ok(self.apply_geometry_changes(changes, clients))
+        let geometry_changed = self.apply_geometry_changes(changes, clients);
+        if cover_changed && !geometry_changed {
+            self.push_renderer_scenes();
+            self.render_mut().request_present();
+        }
+        Ok(geometry_changed || cover_changed)
     }
 
     /// Give keyboard focus and xdg activation to a window.

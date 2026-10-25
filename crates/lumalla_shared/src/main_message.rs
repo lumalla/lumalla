@@ -234,13 +234,15 @@ pub enum MainMessage {
     },
     /// PipeWire dequeued a DMA-BUF that needs a GPU blit on the main thread.
     ScreencastBlitNeeded,
-    /// Update window geometry. `id == None` targets the focused window.
+    /// Update window geometry and/or cover-overlays. `id == None` targets the focused window.
     SetWindow {
         /// Window id, or `None` for the focused window.
         id: Option<u32>,
-        /// Fields to update.
+        /// Geometry fields to update.
         geometry: WindowGeometryUpdate,
-        /// When true, updated fields are marked as user-placed and won't be overwritten by rules.
+        /// When set, whether the window covers layer-shell top/overlay chrome.
+        cover_overlays: Option<bool>,
+        /// When true, updated geometry fields are marked as user-placed and won't be overwritten by rules.
         user_initiated: bool,
     },
     /// Register a default placement rule for matching app ids.

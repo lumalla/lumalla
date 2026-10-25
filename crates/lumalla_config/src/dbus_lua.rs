@@ -13,7 +13,7 @@ use lumalla_ipc::{
     BUS_NAME, ColorInfo, DrmDeviceInfo, GuideInfo, KeyBindingInfo, ModsInfo, OutputConfigInfo,
     OutputInfo, ViewInfo, WindowInfo, WindowManagerProxy, WindowRuleInfo, XkbInfo, ZoneInfo,
 };
-use lumalla_shared::{CallbackRef, Mods, Output, geometry_field_to_dbus};
+use lumalla_shared::{CallbackRef, Mods, Output, flag_to_dbus, geometry_field_to_dbus};
 use mlua::{
     Error as LuaError, FromLua, Function as LuaFunction, IntoLua, Lua, Result as LuaResult,
     Table as LuaTable, Value as LuaValue,
@@ -749,6 +749,7 @@ fn init_dbus_window(lua: &Lua, module: &LuaTable, client: DbusConfigClient) -> L
                 geometry_field_to_dbus(window.y),
                 geometry_field_to_dbus(window.width),
                 geometry_field_to_dbus(window.height),
+                flag_to_dbus(window.cover_overlays),
             ))?;
             Ok(())
         })?,
@@ -1423,6 +1424,7 @@ struct ConfigWindowUpdate {
     y: Option<i32>,
     width: Option<i32>,
     height: Option<i32>,
+    cover_overlays: Option<bool>,
 }
 
 impl FromLua for ConfigWindowUpdate {
@@ -1440,6 +1442,7 @@ impl FromLua for ConfigWindowUpdate {
             y: table.get("y").unwrap_or(None),
             width: table.get("width").unwrap_or(None),
             height: table.get("height").unwrap_or(None),
+            cover_overlays: table.get("cover_overlays").unwrap_or(None),
         })
     }
 }
@@ -1495,6 +1498,7 @@ struct ConfigWindow {
     focused: bool,
     zone: Option<String>,
     stack: u32,
+    cover_overlays: bool,
 }
 
 impl From<WindowInfo> for ConfigWindow {
@@ -1514,6 +1518,7 @@ impl From<WindowInfo> for ConfigWindow {
                 Some(window.zone)
             },
             stack: window.stack,
+            cover_overlays: window.cover_overlays,
         }
     }
 }
@@ -1531,6 +1536,7 @@ impl IntoLua for ConfigWindow {
         table.set("focused", self.focused)?;
         table.set("zone", self.zone)?;
         table.set("stack", self.stack)?;
+        table.set("cover_overlays", self.cover_overlays)?;
         table.into_lua(lua)
     }
 }

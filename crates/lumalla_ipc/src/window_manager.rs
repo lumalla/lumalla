@@ -68,8 +68,9 @@ pub trait WindowManagerHandler: Send + Sync {
     /// Return the focused window id, if any.
     fn get_focused_window(&self) -> zbus::fdo::Result<u32>;
 
-    /// Update window geometry. Pass `id = 0` to target the focused window.
+    /// Update window geometry and/or cover-overlays. Pass `id = 0` to target the focused window.
     /// Use `WINDOW_GEOMETRY_UNSET` for fields that should not be changed.
+    /// `cover_overlays` uses the same unset sentinel; nonzero enables covering layer chrome.
     fn set_window(
         &mut self,
         id: u32,
@@ -77,6 +78,7 @@ pub trait WindowManagerHandler: Send + Sync {
         y: i32,
         width: i32,
         height: i32,
+        cover_overlays: i32,
     ) -> zbus::fdo::Result<()>;
 
     /// Assign a window to a zone. Pass `id = 0` to target the focused window.
@@ -349,8 +351,10 @@ impl WindowManager {
         y: i32,
         width: i32,
         height: i32,
+        cover_overlays: i32,
     ) -> zbus::fdo::Result<()> {
-        self.handler.set_window(id, x, y, width, height)
+        self.handler
+            .set_window(id, x, y, width, height, cover_overlays)
     }
 
     fn add_window_to_zone(&mut self, id: u32, zone: &str) -> zbus::fdo::Result<()> {

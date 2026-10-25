@@ -9,7 +9,7 @@ pub struct RecordingRenderSink {
     pub removed_surfaces: Vec<(u32, u32)>,
     pub removed_buffers: Vec<(u32, u32)>,
     pub removed_clients: Vec<u32>,
-    pub desktop_scenes: Vec<Vec<(u32, u32, i32, i32)>>,
+    pub desktop_scenes: Vec<Vec<(u32, u32, i32, i32, bool)>>,
     pub layer_scenes: Vec<Vec<(String, Vec<(u32, u32, i32, i32, u8)>)>>,
     pub positions: Vec<(u32, u32, i32, i32)>,
     pub cursor_hotspots: Vec<(i32, i32)>,
@@ -50,7 +50,7 @@ impl RenderSink for RecordingRenderSink {
         Ok(())
     }
 
-    fn set_desktop_scene(&mut self, scene: &[(u32, u32, i32, i32)]) {
+    fn set_desktop_scene(&mut self, scene: &[(u32, u32, i32, i32, bool)]) {
         self.desktop_scenes.push(scene.to_vec());
     }
 

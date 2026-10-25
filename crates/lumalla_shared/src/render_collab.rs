@@ -81,8 +81,8 @@ pub trait RenderSink {
     fn remove_buffer(&mut self, owner_id: u32, buffer_id: u32) -> Result<()>;
     fn remove_client(&mut self, owner_id: u32) -> Result<()>;
 
-    /// Authoritative back-to-front desktop scene: `(owner, surface, x, y)`.
-    fn set_desktop_scene(&mut self, scene: &[(u32, u32, i32, i32)]);
+    /// Authoritative back-to-front desktop scene: `(owner, surface, x, y, cover_overlays)`.
+    fn set_desktop_scene(&mut self, scene: &[(u32, u32, i32, i32, bool)]);
 
     /// Authoritative per-output layer scenes: `(owner, surface, x, y, band)`.
     fn set_output_layer_scenes(&mut self, scenes: &[(String, Vec<(u32, u32, i32, i32, u8)>)]);
