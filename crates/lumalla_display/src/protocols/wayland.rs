@@ -390,7 +390,16 @@ fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, mut commit: S
     let frame_callbacks = std::mem::take(&mut commit.frame_callbacks);
     let presentation_feedbacks = std::mem::take(&mut commit.presentation_feedbacks);
 
-    if process_surface_commit_body(state, ctx, &commit).is_err() {
+    let body_result = process_surface_commit_body(state, ctx, &commit);
+
+    // `apply_commit` already dropped the previous buffer from `current`, so release
+    // it even when body-side export/capture/viewport fails — otherwise the client
+    // never sees `wl_buffer.release` and can stall.
+    if let Some(released) = commit.released_buffer {
+        state.release_or_defer_buffer(ctx, released);
+    }
+
+    if body_result.is_err() {
         DisplayState::abandon_commit_timing_objects(
             ctx.writer,
             ctx.registry,
@@ -643,12 +652,8 @@ fn process_surface_commit_body(
                     }
                 }
             }
-            // Release the previous buffer only after a replacement is committed.
-            // SHM is released immediately (pixels already copied). DMA-BUF waits
-            // until in-flight GPU work that may sample it has finished.
-            if let Some(released) = commit.released_buffer {
-                state.release_or_defer_buffer(ctx, released);
-            }
+            // Previous-buffer release is handled in `process_surface_commit` so it
+            // still runs when export/capture/viewport fails after `apply_commit`.
         }
         Some(None) => {
             if let Err((viewport_id, error)) = state.surface_manager.validate_viewport_commit(
@@ -690,9 +695,7 @@ fn process_surface_commit_body(
                 ctx.writer,
                 ctx.registry,
             );
-            if let Some(released) = commit.released_buffer {
-                state.release_or_defer_buffer(ctx, released);
-            }
+            // Previous-buffer release is handled in `process_surface_commit`.
         }
         None => {
             let buffer_dims = state
@@ -3210,5 +3213,78 @@ mod tests {
         // Matching leave on hide.
         send_surface_leave_outputs(&mut state, &mut ctx, icon, true);
         assert!(!state.surface_manager.clear_output_entered(client_id, icon));
+    }
+
+    #[test]
+    fn failed_commit_body_still_releases_previous_buffer() {
+        use std::io::Read;
+
+        use crate::surface::{SurfaceCommit, ViewportState};
+
+        let (mut receiver, sender) = UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let mut state = display_state();
+        let mut registry = Registry::new();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let client_id = ClientId::new(NonZeroU32::new(1).unwrap());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id,
+        };
+
+        let surface_id = object_id(10);
+        let old_buffer = object_id(20);
+        // Unknown to shm/dmabuf managers → export/meta fails inside the body.
+        let new_buffer = object_id(21);
+        state.surface_manager.create_surface(client_id, surface_id);
+
+        let commit = SurfaceCommit {
+            surface_id,
+            buffer: Some(new_buffer),
+            attached_buffer: Some(Some(new_buffer)),
+            released_buffer: Some(old_buffer),
+            mapped: true,
+            newly_mapped: false,
+            shell_id: None,
+            frame_callbacks: Vec::new(),
+            presentation_feedbacks: Vec::new(),
+            deferred: false,
+            buffer_scale: 1,
+            buffer_transform: 0,
+            offset: (0, 0),
+            layout: (0, 0),
+            damage: None,
+            buffer_damage: None,
+            viewport: ViewportState::default(),
+            viewport_id: None,
+            viewport_changed: false,
+        };
+        process_surface_commit(&mut state, &mut ctx, commit);
+        ctx.writer.flush().unwrap();
+
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            match receiver.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("reading protocol output failed: {err}"),
+            }
+        }
+
+        // Scan for wl_buffer.release on the previous buffer (opcode 0, size 8).
+        let release = old_buffer
+            .get()
+            .to_ne_bytes()
+            .into_iter()
+            .chain(0u16.to_ne_bytes())
+            .chain(8u16.to_ne_bytes())
+            .collect::<Vec<_>>();
+        assert!(
+            bytes.windows(release.len()).any(|window| window == release),
+            "expected wl_buffer.release for previous buffer after failed commit body; got {bytes:?}"
+        );
     }
 }
