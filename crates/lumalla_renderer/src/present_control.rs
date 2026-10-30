@@ -146,6 +146,7 @@ impl RendererState {
             presented_without_pending_flip,
         };
         self.deliver_tick_notifications(&result, notify, frame_time_msec);
+        self.flush_dmabuf_release_notifications(notify);
         Ok(result)
     }
 
@@ -200,6 +201,7 @@ impl RendererState {
             presented_without_pending_flip,
         };
         self.deliver_tick_notifications(&result, notify, frame_time_msec);
+        self.flush_dmabuf_release_notifications(notify);
         Ok(result)
     }
 
@@ -274,6 +276,7 @@ impl RendererState {
             completed: completed_effects.into_iter().collect(),
         };
         self.deliver_flip_notifications(&effects, notify, frame_time_msec);
+        self.flush_dmabuf_release_notifications(notify);
         Ok(effects)
     }
 

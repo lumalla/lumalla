@@ -9,9 +9,9 @@ use ash::vk;
 use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
-    BufferTransform, CapturedImage, DisplayHost, DrmDeviceState, Guide, Output, OutputConfig,
-    PrimaryGeometryEffect, PrimaryOutputMode, RenderSink, SurfaceSubmit, SurfaceSubmitRole, View,
-    view_at_source,
+    BufferTransform, CapturedImage, DisplayHost, DmabufReleaseSchedule, DrmDeviceState, Guide,
+    Output, OutputConfig, PresentationNotify, PrimaryGeometryEffect, PrimaryOutputMode, RenderSink,
+    SurfaceSubmit, SurfaceSubmitRole, View, view_at_source,
 };
 use stumpalo::Arena;
 
@@ -419,6 +419,15 @@ pub struct RendererState {
     present_halted: Option<String>,
     /// Bumped when captured scene content may have changed (windows, cursor, guides…).
     screencast_content_serial: u64,
+    /// DMA-BUF `wl_buffer.release` deferred until texture submit epochs complete.
+    pending_dmabuf_releases: Vec<PendingDmabufRelease>,
+}
+
+/// Protocol release waiting for GPU work that may still sample a DMA-BUF.
+struct PendingDmabufRelease {
+    owner_id: u32,
+    buffer_id: u32,
+    blocked_by: HashSet<u64>,
 }
 
 /// DMA-BUF handle handed to the PipeWire thread for one capture slot.
@@ -502,7 +511,81 @@ impl RendererState {
             cursor_buffer_dirty: false,
             present_halted: None,
             screencast_content_serial: 1,
+            pending_dmabuf_releases: Vec::new(),
         })
+    }
+
+    /// Notify display of any DMA-BUF releases whose GPU barriers cleared.
+    pub(crate) fn flush_dmabuf_release_notifications(
+        &mut self,
+        notify: &mut dyn PresentationNotify,
+    ) {
+        let ready = self.take_ready_dmabuf_releases();
+        if !ready.is_empty() {
+            notify.dmabuf_buffers_ready_for_release(&ready);
+        }
+    }
+
+    fn schedule_dmabuf_release_inner(
+        &mut self,
+        owner_id: u32,
+        buffer_id: u32,
+    ) -> DmabufReleaseSchedule {
+        let blocked_by = self.gpu.surface_textures.snapshot_in_flight_epochs();
+        if let Some(existing) = self
+            .pending_dmabuf_releases
+            .iter_mut()
+            .find(|pending| pending.owner_id == owner_id && pending.buffer_id == buffer_id)
+        {
+            existing.blocked_by.extend(blocked_by);
+            if self
+                .gpu
+                .surface_textures
+                .epochs_complete(&existing.blocked_by)
+            {
+                self.pending_dmabuf_releases
+                    .retain(|pending| pending.owner_id != owner_id || pending.buffer_id != buffer_id);
+                return DmabufReleaseSchedule::ReadyNow;
+            }
+            return DmabufReleaseSchedule::Deferred;
+        }
+        if blocked_by.is_empty() {
+            return DmabufReleaseSchedule::ReadyNow;
+        }
+        self.pending_dmabuf_releases.push(PendingDmabufRelease {
+            owner_id,
+            buffer_id,
+            blocked_by,
+        });
+        DmabufReleaseSchedule::Deferred
+    }
+
+    fn cancel_dmabuf_release_inner(&mut self, owner_id: u32, buffer_id: u32) {
+        self.pending_dmabuf_releases
+            .retain(|pending| pending.owner_id != owner_id || pending.buffer_id != buffer_id);
+    }
+
+    fn cancel_dmabuf_releases_for_owner(&mut self, owner_id: u32) {
+        self.pending_dmabuf_releases
+            .retain(|pending| pending.owner_id != owner_id);
+    }
+
+    fn take_ready_dmabuf_releases_inner(&mut self) -> Vec<(u32, u32)> {
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < self.pending_dmabuf_releases.len() {
+            if self
+                .gpu
+                .surface_textures
+                .epochs_complete(&self.pending_dmabuf_releases[i].blocked_by)
+            {
+                let pending = self.pending_dmabuf_releases.swap_remove(i);
+                ready.push((pending.owner_id, pending.buffer_id));
+            } else {
+                i += 1;
+            }
+        }
+        ready
     }
 
     fn invalidate_surface_textures(&mut self) {
@@ -1276,6 +1359,10 @@ impl RenderSink for RendererState {
             offset: exported.offset,
             modifier: exported.modifier,
         });
+        // Re-holding a DMA-BUF cancels any deferred protocol release for it.
+        if dmabuf.is_some() {
+            self.cancel_dmabuf_release_inner(submit.owner_id, submit.buffer_id);
+        }
         match submit.role {
             SurfaceSubmitRole::Content => self.set_surface_frame(SurfaceFrame {
                 owner_id: submit.owner_id,
@@ -1334,11 +1421,25 @@ impl RenderSink for RendererState {
     }
 
     fn remove_buffer(&mut self, owner_id: u32, buffer_id: u32) -> anyhow::Result<()> {
+        self.cancel_dmabuf_release_inner(owner_id, buffer_id);
         self.remove_dmabuf_buffer(owner_id, buffer_id)
     }
 
     fn remove_client(&mut self, owner_id: u32) -> anyhow::Result<()> {
+        self.cancel_dmabuf_releases_for_owner(owner_id);
         self.remove_client_frames(owner_id)
+    }
+
+    fn schedule_dmabuf_release(&mut self, owner_id: u32, buffer_id: u32) -> DmabufReleaseSchedule {
+        self.schedule_dmabuf_release_inner(owner_id, buffer_id)
+    }
+
+    fn cancel_dmabuf_release(&mut self, owner_id: u32, buffer_id: u32) {
+        self.cancel_dmabuf_release_inner(owner_id, buffer_id);
+    }
+
+    fn take_ready_dmabuf_releases(&mut self) -> Vec<(u32, u32)> {
+        self.take_ready_dmabuf_releases_inner()
     }
 
     fn set_desktop_scene(&mut self, scene: &[(u32, u32, i32, i32, bool)]) {
@@ -4802,5 +4903,91 @@ mod tests {
         let crtc_x = local.0 - hotspot_x;
         let crtc_y = local.1 - hotspot_y;
         assert_eq!((crtc_x, crtc_y), (96, 194));
+    }
+
+    #[test]
+    fn dmabuf_release_is_ready_when_no_gpu_work_in_flight() {
+        let mut state = RendererState::new().unwrap();
+        assert_eq!(
+            state.schedule_dmabuf_release_inner(1, 10),
+            DmabufReleaseSchedule::ReadyNow
+        );
+        assert!(state.take_ready_dmabuf_releases_inner().is_empty());
+    }
+
+    #[test]
+    fn dmabuf_release_waits_for_in_flight_epochs() {
+        let mut state = RendererState::new().unwrap();
+        let epoch = state.gpu.surface_textures.begin_submit();
+        assert_eq!(
+            state.schedule_dmabuf_release_inner(1, 10),
+            DmabufReleaseSchedule::Deferred
+        );
+        assert!(state.take_ready_dmabuf_releases_inner().is_empty());
+
+        state.gpu.surface_textures.complete_submit(epoch);
+        assert_eq!(state.take_ready_dmabuf_releases_inner(), vec![(1, 10)]);
+    }
+
+    #[test]
+    fn dmabuf_release_cancel_drops_pending() {
+        let mut state = RendererState::new().unwrap();
+        let epoch = state.gpu.surface_textures.begin_submit();
+        assert_eq!(
+            state.schedule_dmabuf_release_inner(1, 10),
+            DmabufReleaseSchedule::Deferred
+        );
+        state.cancel_dmabuf_release_inner(1, 10);
+        state.gpu.surface_textures.complete_submit(epoch);
+        assert!(state.take_ready_dmabuf_releases_inner().is_empty());
+    }
+
+    #[test]
+    fn dmabuf_rehold_via_submit_cancels_deferred_release() {
+        use lumalla_shared::SurfaceDmabuf;
+
+        let mut state = RendererState::new().unwrap();
+        let epoch = state.gpu.surface_textures.begin_submit();
+        assert_eq!(
+            state.schedule_dmabuf_release_inner(1, 10),
+            DmabufReleaseSchedule::Deferred
+        );
+
+        let raw = unsafe {
+            libc::memfd_create(c"lumalla-dmabuf-release-test".as_ptr(), libc::MFD_CLOEXEC)
+        };
+        assert!(raw >= 0, "memfd_create failed");
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let submit = SurfaceSubmit {
+            owner_id: 1,
+            surface_id: 2,
+            buffer_id: 10,
+            pixels: Rc::new(Vec::new()),
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: 0,
+            x: 0,
+            y: 0,
+            buffer_scale: 1,
+            buffer_transform: 0,
+            surface_width: 1,
+            surface_height: 1,
+            viewport_src: None,
+            dmabuf: Some(SurfaceDmabuf {
+                buffer_id: 10,
+                fd,
+                drm_fourcc: 0x34325258,
+                offset: 0,
+                modifier: 0,
+            }),
+            damage: None,
+            buffer_damage: None,
+            full_surface: true,
+            role: SurfaceSubmitRole::Content,
+        };
+        RenderSink::submit_surface(&mut state, submit).unwrap();
+        state.gpu.surface_textures.complete_submit(epoch);
+        assert!(state.take_ready_dmabuf_releases_inner().is_empty());
     }
 }

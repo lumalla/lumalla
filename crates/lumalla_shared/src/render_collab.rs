@@ -74,6 +74,15 @@ pub struct PresentationFlipInfo {
     pub refresh_ns: u32,
 }
 
+/// Result of scheduling a deferred DMA-BUF `wl_buffer.release`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmabufReleaseSchedule {
+    /// No in-flight GPU work may sample the buffer; emit `wl_buffer.release` now.
+    ReadyNow,
+    /// GPU work may still sample the buffer; wait for [`RenderSink::take_ready_dmabuf_releases`].
+    Deferred,
+}
+
 /// Display → renderer sink used during protocol / layout handling.
 pub trait RenderSink {
     fn submit_surface(&mut self, submit: SurfaceSubmit) -> Result<()>;
@@ -104,6 +113,23 @@ pub trait RenderSink {
 
     /// Mark that a present is needed (content change and/or pending frame callbacks).
     fn request_present(&mut self);
+
+    /// Defer protocol release of a DMA-BUF until in-flight GPU submits that may
+    /// sample it have finished. SHM buffers should keep eager `wl_buffer.release`.
+    fn schedule_dmabuf_release(&mut self, owner_id: u32, buffer_id: u32) -> DmabufReleaseSchedule {
+        let _ = (owner_id, buffer_id);
+        DmabufReleaseSchedule::ReadyNow
+    }
+
+    /// Drop a deferred release (buffer destroyed, client gone, or buffer re-held).
+    fn cancel_dmabuf_release(&mut self, owner_id: u32, buffer_id: u32) {
+        let _ = (owner_id, buffer_id);
+    }
+
+    /// Drain DMA-BUF releases whose GPU barriers have cleared.
+    fn take_ready_dmabuf_releases(&mut self) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
 }
 
 /// Renderer → display notifications after present / flip.
@@ -114,6 +140,11 @@ pub trait PresentationNotify {
     fn pending_frame_callbacks(&self) -> bool;
     fn pending_present_work(&self) -> bool {
         self.pending_presentation_feedback() || self.pending_frame_callbacks()
+    }
+
+    /// Emit `wl_buffer.release` for DMA-BUFs the GPU is done sampling.
+    fn dmabuf_buffers_ready_for_release(&mut self, buffers: &[(u32, u32)]) {
+        let _ = buffers;
     }
 }
 

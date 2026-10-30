@@ -6,9 +6,9 @@ use std::rc::Rc;
 
 use anyhow::Context;
 use lumalla_shared::{
-    DisplayHost, PresentationNotify, PrimaryModeApply, PrimaryOutputMode, RenderSink,
-    SurfaceDmabuf, SurfaceSubmit, SurfaceSubmitRole, View, WindowGeometryUpdate, WindowRule,
-    WindowState, map_dest_to_source, map_source_to_dest,
+    DisplayHost, DmabufReleaseSchedule, PresentationNotify, PrimaryModeApply, PrimaryOutputMode,
+    RenderSink, SurfaceDmabuf, SurfaceSubmit, SurfaceSubmitRole, View, WindowGeometryUpdate,
+    WindowRule, WindowState, map_dest_to_source, map_source_to_dest,
 };
 use lumalla_wayland_protocol::buffer::MessageHeader;
 use lumalla_wayland_protocol::protocols::presentation_time::{
@@ -116,6 +116,11 @@ impl PresentationNotify for DisplayPresentationNotify<'_> {
 
     fn pending_frame_callbacks(&self) -> bool {
         self.state.pending_frame_callback_count() > 0
+    }
+
+    fn dmabuf_buffers_ready_for_release(&mut self, buffers: &[(u32, u32)]) {
+        self.state
+            .emit_dmabuf_buffer_releases(self.clients, buffers);
     }
 }
 
@@ -425,6 +430,69 @@ impl DisplayState {
             .remove_buffer(client_id.get(), buffer_id.get())
         {
             log::error!("Unable to drop destroyed buffer in renderer: {err:#}");
+        }
+    }
+
+    /// Release a client buffer now (SHM) or after GPU work finishes (DMA-BUF).
+    pub(crate) fn release_or_defer_buffer(&mut self, ctx: &mut Ctx, buffer_id: ObjectId) {
+        if !self.dmabuf_manager.has_buffer(ctx.client_id, buffer_id) {
+            ctx.writer.wl_buffer_release(buffer_id);
+            return;
+        }
+        match self
+            .render_mut()
+            .schedule_dmabuf_release(ctx.client_id.get(), buffer_id.get())
+        {
+            DmabufReleaseSchedule::ReadyNow => {
+                self.emit_dmabuf_release_on_writer(ctx, buffer_id);
+            }
+            DmabufReleaseSchedule::Deferred => {}
+        }
+    }
+
+    fn emit_dmabuf_release_on_writer(&mut self, ctx: &mut Ctx, buffer_id: ObjectId) {
+        if !self.dmabuf_manager.has_buffer(ctx.client_id, buffer_id) {
+            return;
+        }
+        if self
+            .surface_manager
+            .buffer_is_current(ctx.client_id, buffer_id)
+        {
+            return;
+        }
+        if ctx.registry.interface_index(buffer_id) != Some(InterfaceIndex::WlBuffer) {
+            return;
+        }
+        ctx.writer.wl_buffer_release(buffer_id);
+    }
+
+    /// Emit deferred DMA-BUF releases after the renderer reports GPU idle.
+    pub(crate) fn emit_dmabuf_buffer_releases(
+        &mut self,
+        clients: &mut ConnectedClients,
+        buffers: &[(u32, u32)],
+    ) {
+        for &(owner_id, buffer_raw) in buffers {
+            let Some(client_id) = std::num::NonZeroU32::new(owner_id).map(ClientId::new) else {
+                continue;
+            };
+            let Some(buffer_id) = std::num::NonZeroU32::new(buffer_raw).map(ObjectId::new) else {
+                continue;
+            };
+            if !self.dmabuf_manager.has_buffer(client_id, buffer_id) {
+                continue;
+            }
+            if self.surface_manager.buffer_is_current(client_id, buffer_id) {
+                continue;
+            }
+            let Some(client) = clients.get_mut(&client_id) else {
+                continue;
+            };
+            let (registry, writer) = client.registry_and_writer_mut();
+            if registry.interface_index(buffer_id) != Some(InterfaceIndex::WlBuffer) {
+                continue;
+            }
+            writer.wl_buffer_release(buffer_id);
         }
     }
 

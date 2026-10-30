@@ -1027,6 +1027,13 @@ impl SurfaceManager {
         Ok(())
     }
 
+    /// True when any surface for this client still holds `buffer_id` as current.
+    pub fn buffer_is_current(&self, client_id: ClientId, buffer_id: ObjectId) -> bool {
+        self.surfaces.iter().any(|((owner, _), surface)| {
+            *owner == client_id && surface.current.buffer == Some(buffer_id)
+        })
+    }
+
     /// Drop references to a destroyed `wl_buffer` so we never emit
     /// `wl_buffer.release` after `wl_display.delete_id` for that object.
     pub fn forget_buffer(&mut self, client_id: ClientId, buffer_id: ObjectId) {
@@ -2703,6 +2710,25 @@ mod tests {
         let cleared = manager.commit(client(1), object(2)).unwrap().primary;
         assert_eq!(cleared.released_buffer, Some(object(5)));
         assert_eq!(cleared.buffer, None);
+    }
+
+    #[test]
+    fn buffer_is_current_tracks_held_attachments() {
+        let mut manager = SurfaceManager::default();
+        manager.create_surface(client(1), object(2));
+        manager
+            .attach(client(1), object(2), Some(object(4)), 0, 0, 1)
+            .unwrap();
+        let _ = manager.commit(client(1), object(2)).unwrap();
+        assert!(manager.buffer_is_current(client(1), object(4)));
+        assert!(!manager.buffer_is_current(client(1), object(5)));
+
+        manager
+            .attach(client(1), object(2), Some(object(5)), 0, 0, 1)
+            .unwrap();
+        let _ = manager.commit(client(1), object(2)).unwrap();
+        assert!(!manager.buffer_is_current(client(1), object(4)));
+        assert!(manager.buffer_is_current(client(1), object(5)));
     }
 
     #[test]

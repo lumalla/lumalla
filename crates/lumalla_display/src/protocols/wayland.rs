@@ -644,10 +644,10 @@ fn process_surface_commit_body(
                 }
             }
             // Release the previous buffer only after a replacement is committed.
-            // Releasing the current buffer immediately lets double-buffered clients
-            // rewrite memory the compositor may still sample (esp. DMA-BUF).
+            // SHM is released immediately (pixels already copied). DMA-BUF waits
+            // until in-flight GPU work that may sample it has finished.
             if let Some(released) = commit.released_buffer {
-                ctx.writer.wl_buffer_release(released);
+                state.release_or_defer_buffer(ctx, released);
             }
         }
         Some(None) => {
@@ -691,7 +691,7 @@ fn process_surface_commit_body(
                 ctx.registry,
             );
             if let Some(released) = commit.released_buffer {
-                ctx.writer.wl_buffer_release(released);
+                state.release_or_defer_buffer(ctx, released);
             }
         }
         None => {
@@ -1581,7 +1581,8 @@ impl WlSurface for DisplayState {
                     object_id,
                 );
                 if let Some(held) = destroyed.held_buffer {
-                    ctx.writer.wl_buffer_release(held);
+                    // DMA-BUF may still be sampled by in-flight GPU work.
+                    self.release_or_defer_buffer(ctx, held);
                 }
                 self.release_keyboard_focus_from_surface(
                     ctx.client_id,

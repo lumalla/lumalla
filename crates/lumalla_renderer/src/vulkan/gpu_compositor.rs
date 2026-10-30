@@ -561,6 +561,18 @@ impl SurfaceTextureCache {
         self.in_flight_epochs.remove(&epoch);
     }
 
+    /// Snapshot of submit epochs that may still sample cached textures.
+    pub fn snapshot_in_flight_epochs(&self) -> HashSet<u64> {
+        self.in_flight_epochs.clone()
+    }
+
+    /// True when none of `epochs` remain in flight.
+    pub fn epochs_complete(&self, epochs: &HashSet<u64>) -> bool {
+        epochs
+            .iter()
+            .all(|epoch| !self.in_flight_epochs.contains(epoch))
+    }
+
     /// Drop tracking for epochs that are no longer referenced by any live pending submit.
     ///
     /// Handles the rare case where a [`PendingGpuSubmit`] is dropped without
