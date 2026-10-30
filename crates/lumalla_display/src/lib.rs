@@ -596,9 +596,38 @@ impl DisplayState {
         self.dmabuf_manager.send_all_feedback(clients.values_mut());
     }
 
-    pub fn flush_pending_keyboard_leaves(&mut self, clients: &mut ConnectedClients) {
+    pub fn flush_pending_keyboard_leaves(&mut self, clients: &mut ConnectedClients) -> bool {
         let left = self.seat_manager.flush_pending_keyboard_leaves(clients);
-        for client_id in left {
+        let mut released_capture = false;
+        let mut left_clients = Vec::new();
+        let mut hint_warps = Vec::new();
+        for (client_id, surface) in left {
+            let Some(client) = clients.get_mut(&client_id) else {
+                continue;
+            };
+            if let Some(hint) = self.pointer_constraints_manager.deactivate_for_surface(
+                client.writer_mut(),
+                client_id,
+                surface,
+            ) {
+                released_capture = true;
+                hint_warps.push((client_id, surface, hint));
+            }
+            if !left_clients.contains(&client_id) {
+                left_clients.push(client_id);
+            }
+        }
+        for (client_id, surface, (sx, sy)) in hint_warps {
+            if let Some((gx, gy)) = self
+                .surface_manager
+                .global_from_surface_local(client_id, surface, sx, sy)
+            {
+                let views = self.pointer_views();
+                let (dx, dy) = map_source_to_dest(&views, gx, gy);
+                self.seat_manager.set_pointer_position(dx, dy);
+            }
+        }
+        for client_id in left_clients {
             let Some(client) = clients.get_mut(&client_id) else {
                 continue;
             };
@@ -607,6 +636,7 @@ impl DisplayState {
                 .on_keyboard_leave(client_id, client.writer_mut());
             clients.mark_send_needed(client_id);
         }
+        released_capture
     }
 
     /// Deliver queued `wl_pointer.leave` events (e.g. after a DnD grab starts).
@@ -616,36 +646,80 @@ impl DisplayState {
         }
     }
 
+    /// Compositor-initiated unlock/unconfine when a surface can no longer hold a
+    /// capture. Applies any committed lock cursor hint. Returns whether an active
+    /// constraint was released.
+    pub(crate) fn release_pointer_constraint_for_surface(
+        &mut self,
+        client_id: ClientId,
+        surface: ObjectId,
+        writer: &mut Writer,
+    ) -> bool {
+        let Some((sx, sy)) = self.pointer_constraints_manager.deactivate_for_surface(
+            writer,
+            client_id,
+            surface,
+        ) else {
+            return false;
+        };
+        if let Some((gx, gy)) = self
+            .surface_manager
+            .global_from_surface_local(client_id, surface, sx, sy)
+        {
+            let views = self.pointer_views();
+            let (dx, dy) = map_source_to_dest(&views, gx, gy);
+            self.seat_manager.set_pointer_position(dx, dy);
+        }
+        true
+    }
+
     /// Focus keyboards on `surface`, advertising clipboard selection when the
     /// client newly gains keyboard focus (not on same-client surface switches).
+    ///
+    /// Returns whether an active pointer constraint was released because the
+    /// previous same-client surface lost keyboard focus.
     pub(crate) fn focus_keyboards_on_surface(
         &mut self,
         client_id: ClientId,
         surface: ObjectId,
         registry: &mut Registry,
         writer: &mut Writer,
-    ) {
-        let previous_client = self.seat_manager.focused_keyboard_surface().map(|(c, _)| c);
+    ) -> bool {
+        let previous = self.seat_manager.focused_keyboard_surface();
+        let previous_client = previous.map(|(c, _)| c);
         let newly_focused = previous_client != Some(client_id);
         self.seat_manager
             .focus_keyboards_on_surface(client_id, surface, writer);
+        let mut released_capture = false;
+        if let Some((prev_client, prev_surface)) = previous
+            && prev_client == client_id
+            && prev_surface != surface
+        {
+            released_capture =
+                self.release_pointer_constraint_for_surface(client_id, prev_surface, writer);
+        }
         if newly_focused {
             let _ = self
                 .data_device_manager
                 .on_keyboard_enter(client_id, registry, writer);
         }
+        released_capture
     }
 
     /// Leave keyboards on `surface`, clearing the selection offer if the client
     /// no longer has any keyboard focus.
+    ///
+    /// Returns whether an active pointer constraint was released for `surface`.
     pub(crate) fn leave_keyboards_on_surface(
         &mut self,
         client_id: ClientId,
         surface: ObjectId,
         writer: &mut Writer,
-    ) {
+    ) -> bool {
         self.seat_manager
             .leave_keyboards_on_surface(client_id, surface, writer);
+        let released_capture =
+            self.release_pointer_constraint_for_surface(client_id, surface, writer);
         let still_focused = self
             .seat_manager
             .focused_keyboard_surface()
@@ -653,6 +727,7 @@ impl DisplayState {
         if !still_focused {
             let _ = self.data_device_manager.on_keyboard_leave(client_id, writer);
         }
+        released_capture
     }
 
     pub fn flush_pending_data_device(&mut self, clients: &mut ConnectedClients) {
@@ -945,16 +1020,19 @@ impl DisplayState {
                     .unwrap_or(true);
                 if allow_keyboard {
                     let focus_surface = self.keyboard_focus_for_pointer_target(client_id, surface);
+                    let mut released_capture = false;
                     if let Some(client) = clients.get_mut(&client_id) {
                         let (registry, writer) = client.registry_and_writer_mut();
-                        self.focus_keyboards_on_surface(
+                        released_capture = self.focus_keyboards_on_surface(
                             client_id,
                             focus_surface,
                             registry,
                             writer,
                         );
                     }
-                    self.flush_pending_keyboard_leaves(clients);
+                    if self.flush_pending_keyboard_leaves(clients) {
+                        released_capture = true;
+                    }
                     self.data_device_manager.flush_pending(clients);
                     if !is_layer {
                         self.on_surface_focused(client_id, focus_surface);
@@ -962,6 +1040,9 @@ impl DisplayState {
                             self.apply_activation(client_id, focus_surface, client.writer_mut());
                         }
                         self.flush_pending_activation_configures(clients);
+                    }
+                    if released_capture {
+                        self.refresh_pointer_focus(clients, arena);
                     }
                 }
                 if !is_layer {
@@ -1517,19 +1598,27 @@ impl DisplayState {
         id: Option<u32>,
         raise: bool,
         clients: &mut ConnectedClients,
+        arena: &Arena,
     ) -> Result<bool, WindowError> {
         let (client_id, wl_surface) = self.window_manager.resolve_surface(id)?;
+        let mut released_capture = false;
         if let Some(client) = clients.get_mut(&client_id) {
             let (registry, writer) = client.registry_and_writer_mut();
-            self.focus_keyboards_on_surface(client_id, wl_surface, registry, writer);
+            released_capture =
+                self.focus_keyboards_on_surface(client_id, wl_surface, registry, writer);
         }
-        self.flush_pending_keyboard_leaves(clients);
+        if self.flush_pending_keyboard_leaves(clients) {
+            released_capture = true;
+        }
         self.data_device_manager.flush_pending(clients);
         self.on_surface_focused(client_id, wl_surface);
         if let Some(client) = clients.get_mut(&client_id) {
             self.apply_activation(client_id, wl_surface, client.writer_mut());
         }
         self.flush_pending_activation_configures(clients);
+        if released_capture {
+            self.refresh_pointer_focus(clients, arena);
+        }
 
         let mut raised = false;
         if raise {

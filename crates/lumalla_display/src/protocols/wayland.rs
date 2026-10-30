@@ -350,10 +350,12 @@ fn activate_pending_constraints_for_writer(state: &mut DisplayState, ctx: &mut C
     let (pointer_x, pointer_y) = state.seat_manager.pointer_position();
     let views = state.pointer_views();
     let (scene_x, scene_y) = lumalla_shared::map_dest_to_source(&views, pointer_x, pointer_y);
+    let keyboard_focus = state.seat_manager.focused_keyboard_surface();
     state.pointer_constraints_manager.activate_if_ready(
         ctx.client_id,
         focus_surface,
         focus_pointer,
+        keyboard_focus,
         scene_x,
         scene_y,
         &state.surface_manager,
@@ -362,28 +364,14 @@ fn activate_pending_constraints_for_writer(state: &mut DisplayState, ctx: &mut C
 }
 
 /// Compositor-initiated unlock/unconfine when a surface can no longer hold a capture
-/// (unmap, subsurface teardown, etc.). Applies any committed lock cursor hint.
+/// (unmap, subsurface teardown, keyboard focus loss, etc.). Applies any committed lock
+/// cursor hint.
 fn release_pointer_constraint_for_surface(
     state: &mut DisplayState,
     ctx: &mut Ctx,
     surface: ObjectId,
 ) {
-    let Some((sx, sy)) = state.pointer_constraints_manager.deactivate_for_surface(
-        ctx.writer,
-        ctx.client_id,
-        surface,
-    ) else {
-        return;
-    };
-    if let Some((gx, gy)) =
-        state
-            .surface_manager
-            .global_from_surface_local(ctx.client_id, surface, sx, sy)
-    {
-        let views = state.pointer_views();
-        let (dx, dy) = lumalla_shared::map_source_to_dest(&views, gx, gy);
-        state.seat_manager.set_pointer_position(dx, dy);
-    }
+    let _ = state.release_pointer_constraint_for_surface(ctx.client_id, surface, ctx.writer);
 }
 
 fn process_surface_commit(state: &mut DisplayState, ctx: &mut Ctx, mut commit: SurfaceCommit) {

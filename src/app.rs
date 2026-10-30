@@ -965,7 +965,7 @@ impl AppData {
                 MainMessage::FocusWindow { id, raise } => {
                     let clients = &mut self.clients;
                     match self.display_state.with_render(&mut self.renderer_state, |display| {
-                        display.focus_window(id, raise, clients)
+                        display.focus_window(id, raise, clients, arena)
                     }) {
                         Ok(_raised) => {
                             self.sync_windows_to_dbus();

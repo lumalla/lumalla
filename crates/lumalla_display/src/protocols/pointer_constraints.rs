@@ -191,15 +191,18 @@ fn create_constraint(
         return;
     }
 
-    // Activate immediately if the pointer is already focused inside the region.
+    // Activate immediately if the pointer is already focused inside the region
+    // and the surface currently has keyboard focus.
     let (px, py) = state.seat_manager.pointer_position();
     let views = state.pointer_views();
     let (scene_x, scene_y) = lumalla_shared::map_dest_to_source(&views, px, py);
     if state.seat_manager.pointer_focus(ctx.client_id, pointer) == Some(surface) {
+        let keyboard_focus = state.seat_manager.focused_keyboard_surface();
         state.pointer_constraints_manager.activate_if_ready(
             ctx.client_id,
             surface,
             pointer,
+            keyboard_focus,
             scene_x,
             scene_y,
             &state.surface_manager,

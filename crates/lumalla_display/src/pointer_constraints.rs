@@ -209,12 +209,13 @@ impl PointerConstraintsManager {
             .and_then(|c| c.region.as_ref())
     }
 
-    /// Try to activate pending constraints when pointer focus/position allows it.
+    /// Try to activate pending constraints when pointer + keyboard focus/position allow it.
     pub fn try_activate(
         &mut self,
         clients: &mut ConnectedClients,
         surface_manager: &SurfaceManager,
         pointer_focus: Option<(ClientId, ObjectId, ObjectId)>,
+        keyboard_focus: Option<(ClientId, ObjectId)>,
         pointer_x: f64,
         pointer_y: f64,
     ) {
@@ -228,6 +229,7 @@ impl PointerConstraintsManager {
             focus_client,
             focus_surface,
             focus_pointer,
+            keyboard_focus,
             pointer_x,
             pointer_y,
             surface_manager,
@@ -235,17 +237,22 @@ impl PointerConstraintsManager {
         );
     }
 
-    /// Activate a pending constraint for the given focus if the pointer is inside the region.
+    /// Activate a pending constraint for the given focus if the pointer is inside the region
+    /// and the constrained surface currently has keyboard focus.
     pub fn activate_if_ready(
         &mut self,
         client_id: ClientId,
         focus_surface: ObjectId,
         focus_pointer: ObjectId,
+        keyboard_focus: Option<(ClientId, ObjectId)>,
         pointer_x: f64,
         pointer_y: f64,
         surface_manager: &SurfaceManager,
         writer: &mut lumalla_wayland_protocol::buffer::Writer,
     ) {
+        if keyboard_focus != Some((client_id, focus_surface)) {
+            return;
+        }
         let pending: Vec<ObjectId> = self
             .constraints
             .iter()
@@ -628,6 +635,141 @@ mod tests {
         assert_eq!(
             manager.phase_for_test(client(1), object(10)),
             Some(ConstraintPhase::Pending)
+        );
+        assert!(manager.active_for_seat().is_none());
+    }
+
+    #[test]
+    fn activate_if_ready_requires_keyboard_focus_on_surface() {
+        let mut manager = PointerConstraintsManager::default();
+        manager
+            .create_constraint(
+                client(1),
+                object(10),
+                ConstraintKind::Locked,
+                object(2),
+                object(3),
+                None,
+                ConstraintLifetime::Persistent,
+            )
+            .unwrap();
+        let surfaces = SurfaceManager::default();
+        let (_keep, mut writer) = writer();
+
+        manager.activate_if_ready(
+            client(1),
+            object(2),
+            object(3),
+            None,
+            0.0,
+            0.0,
+            &surfaces,
+            &mut writer,
+        );
+        assert_eq!(
+            manager.phase_for_test(client(1), object(10)),
+            Some(ConstraintPhase::Pending)
+        );
+
+        manager.activate_if_ready(
+            client(1),
+            object(2),
+            object(3),
+            Some((client(1), object(99))),
+            0.0,
+            0.0,
+            &surfaces,
+            &mut writer,
+        );
+        assert_eq!(
+            manager.phase_for_test(client(1), object(10)),
+            Some(ConstraintPhase::Pending)
+        );
+        assert!(manager.active_for_seat().is_none());
+    }
+
+    #[test]
+    fn activate_if_ready_activates_with_matching_keyboard_focus() {
+        use crate::surface::ShellMode;
+
+        let mut manager = PointerConstraintsManager::default();
+        let mut surfaces = SurfaceManager::default();
+        let client_id = client(1);
+        let surface = object(2);
+        let pointer = object(3);
+
+        surfaces.create_surface(client_id, surface);
+        surfaces
+            .create_shell_surface(client_id, object(30), surface)
+            .unwrap();
+        surfaces
+            .set_shell_mode(client_id, object(30), ShellMode::Toplevel)
+            .unwrap();
+        surfaces
+            .attach(client_id, surface, Some(object(40)), 0, 0, 1)
+            .unwrap();
+        let _ = surfaces.commit(client_id, surface).unwrap();
+        surfaces
+            .set_committed_buffer_size(client_id, surface, 100, 100)
+            .unwrap();
+        surfaces
+            .set_surface_layout(client_id, surface, 0, 0)
+            .unwrap();
+
+        manager
+            .create_constraint(
+                client_id,
+                object(10),
+                ConstraintKind::Locked,
+                surface,
+                pointer,
+                None,
+                ConstraintLifetime::Oneshot,
+            )
+            .unwrap();
+
+        let (_keep, mut writer) = writer();
+        manager.activate_if_ready(
+            client_id,
+            surface,
+            pointer,
+            Some((client_id, surface)),
+            10.0,
+            10.0,
+            &surfaces,
+            &mut writer,
+        );
+        assert_eq!(
+            manager.phase_for_test(client_id, object(10)),
+            Some(ConstraintPhase::Active)
+        );
+        assert!(manager.active_for_seat().is_some());
+    }
+
+    #[test]
+    fn keyboard_focus_loss_deactivates_via_deactivate_for_surface() {
+        // DisplayState leave/focus paths call deactivate_for_surface when the
+        // constrained surface loses keyboard focus.
+        let mut manager = PointerConstraintsManager::default();
+        manager
+            .create_constraint(
+                client(1),
+                object(10),
+                ConstraintKind::Locked,
+                object(2),
+                object(3),
+                None,
+                ConstraintLifetime::Oneshot,
+            )
+            .unwrap();
+        manager.force_active_for_test(client(1), object(10));
+
+        let (_keep, mut writer) = writer();
+        let hint = manager.deactivate_for_surface(&mut writer, client(1), object(2));
+        assert_eq!(hint, None);
+        assert_eq!(
+            manager.phase_for_test(client(1), object(10)),
+            Some(ConstraintPhase::Defunct)
         );
         assert!(manager.active_for_seat().is_none());
     }
