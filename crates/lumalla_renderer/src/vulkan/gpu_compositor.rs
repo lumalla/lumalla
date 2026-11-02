@@ -537,7 +537,8 @@ impl SurfaceTextureCache {
             });
         }
         self.guide_label_uploaded.clear();
-        self.in_flight_epochs.clear();
+        // Keep in_flight_epochs so retired textures stay blocked until
+        // [`Self::complete_submit`] (or [`Self::destroy_all`] force-frees).
         self.acquired_dmabufs.clear();
     }
 
@@ -548,7 +549,11 @@ impl SurfaceTextureCache {
         });
     }
 
-    /// Allocate a submit epoch and mark it in flight. Pair with [`Self::complete_submit`].
+    /// Allocate a submit epoch and mark it in flight.
+    ///
+    /// Call this **before** recording/`sync_scene` so textures retired while
+    /// building the batch are blocked by this epoch. Pair with
+    /// [`Self::complete_submit`] after the fence signals.
     pub fn begin_submit(&mut self) -> u64 {
         let epoch = self.next_submit_epoch;
         self.next_submit_epoch = self.next_submit_epoch.wrapping_add(1).max(1);
@@ -571,15 +576,6 @@ impl SurfaceTextureCache {
         epochs
             .iter()
             .all(|epoch| !self.in_flight_epochs.contains(epoch))
-    }
-
-    /// Drop tracking for epochs that are no longer referenced by any live pending submit.
-    ///
-    /// Handles the rare case where a [`PendingGpuSubmit`] is dropped without
-    /// [`Self::complete_submit`] (epoch would otherwise pin retired textures forever).
-    pub fn retain_in_flight(&mut self, live_epochs: &HashSet<u64>) {
-        self.in_flight_epochs
-            .retain(|epoch| live_epochs.contains(epoch));
     }
 
     /// Whether any textures are waiting to be freed after GPU work completes.
@@ -612,6 +608,9 @@ impl SurfaceTextureCache {
     }
 
     /// Destroy every cached/parked/retired texture (pool still valid).
+    ///
+    /// Caller must have waited for in-flight GPU work first. Epochs are cleared
+    /// so every retired set can free immediately.
     pub fn destroy_all(
         &mut self,
         device: &Device,
@@ -619,6 +618,7 @@ impl SurfaceTextureCache {
         allocator: &mut MemoryAllocator,
     ) -> anyhow::Result<()> {
         self.clear();
+        self.in_flight_epochs.clear();
         self.flush_retired(device, pool, allocator)
     }
 
@@ -3209,5 +3209,18 @@ mod tests {
                 "{transform:?}"
             );
         }
+    }
+
+    #[test]
+    fn clear_keeps_in_flight_epochs_until_complete_or_destroy() {
+        let mut cache = SurfaceTextureCache::new();
+        let epoch = cache.begin_submit();
+        cache.clear();
+        assert!(
+            cache.snapshot_in_flight_epochs().contains(&epoch),
+            "clear must not drop open submit epochs (retired textures stay blocked)"
+        );
+        cache.complete_submit(epoch);
+        assert!(!cache.snapshot_in_flight_epochs().contains(&epoch));
     }
 }

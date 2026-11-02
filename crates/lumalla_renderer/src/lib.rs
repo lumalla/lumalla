@@ -601,41 +601,6 @@ impl RendererState {
         self.cursor_buffer_dirty = false;
     }
 
-    fn live_texture_epochs(&self) -> HashSet<u64> {
-        let mut live = HashSet::new();
-        for output in self.outputs.values() {
-            let Some(planes) = output.planes.as_ref() else {
-                continue;
-            };
-            for pipe in std::iter::once(&planes.primary)
-                .chain(planes.cursor.iter())
-                .chain(planes.overlays.iter())
-            {
-                for buffer in [&pipe.current, &pipe.pending, &pipe.queued]
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(epoch) = buffer
-                        .gpu_pending
-                        .as_ref()
-                        .and_then(|p| p.texture_epoch())
-                    {
-                        live.insert(epoch);
-                    }
-                }
-            }
-        }
-        for slots in self.screencast_buffers.values() {
-            for slot in slots {
-                if let Some(epoch) = slot.gpu_pending.as_ref().and_then(|p| p.texture_epoch())
-                {
-                    live.insert(epoch);
-                }
-            }
-        }
-        live
-    }
-
     /// Wait for every in-flight scanout/screencast GPU submit, then free retired textures.
     fn wait_all_pending_gpu(&mut self) -> anyhow::Result<()> {
         let mut pending = Vec::new();
@@ -679,8 +644,9 @@ impl RendererState {
         if !self.gpu.surface_textures.has_retired() {
             return Ok(());
         }
-        let live = self.live_texture_epochs();
-        self.gpu.surface_textures.retain_in_flight(&live);
+        // Epochs leave `in_flight` only via `complete_submit` after a fence wait.
+        // Do not prune them from a partial "live" set here — a just-submitted buffer
+        // may still be a local before it is parked on an output/screencast slot.
         let Some(compositor) = self.gpu.compositor.take() else {
             if let Some(vulkan) = self.vulkan.as_mut() {
                 self.gpu
@@ -711,12 +677,15 @@ impl RendererState {
         &mut self,
         buffer: &mut ScanoutBuffer,
         pending: crate::vulkan::PendingGpuSubmit,
+        texture_epoch: u64,
     ) -> anyhow::Result<()> {
-        if let Some(previous) = buffer.gpu_pending.take() {
+        // Attach the epoch opened before recording first so a failure finishing the
+        // previous submit cannot drop tracking for textures this batch still samples.
+        let previous = buffer.gpu_pending.take();
+        buffer.gpu_pending = Some(pending.with_texture_epoch(texture_epoch));
+        if let Some(previous) = previous {
             self.finish_gpu_pending(previous)?;
         }
-        let epoch = self.gpu.surface_textures.begin_submit();
-        buffer.gpu_pending = Some(pending.with_texture_epoch(epoch));
         Ok(())
     }
 
@@ -1808,127 +1777,14 @@ impl RendererState {
         }
 
         let mut batch = GpuWorkBatch::new();
-        // Clear so multi-region / partial coverage never leaves framebuffer garbage.
-        {
-            let dst_ptr = {
-                let slots = self
-                    .screencast_buffers
-                    .get(&stream_id)
-                    .context("screencast buffers missing")?;
-                let slot = slots
-                    .get(index)
-                    .context("screencast buffer index out of range")?;
-                &slot.image as *const DmaBufImage
-            };
-            let vulkan = self
-                .vulkan
-                .as_mut()
-                .context("Vulkan missing for screencast clear")?;
-            unsafe {
-                clear_dma_image_color(vulkan, &mut batch, &*dst_ptr, fresh, [0.0, 0.0, 0.0, 1.0])?;
-            }
-        }
-
-        let mut first = false; // dest already defined after clear
-        let src_w = width as u32;
-        let src_h = height as u32;
-        for region in &regions {
-            let src_ptr = {
-                let current = self
-                    .outputs
-                    .get(&region.name)
-                    .and_then(|o| o.primary())
-                    .and_then(|p| p.current.as_ref())
-                    .with_context(|| format!("missing primary buffer {}", region.name))?;
-                &current.dma_image as *const DmaBufImage
-            };
-            let dst_ptr = {
-                let slots = self
-                    .screencast_buffers
-                    .get(&stream_id)
-                    .context("screencast buffers missing")?;
-                let slot = slots
-                    .get(index)
-                    .context("screencast buffer index out of range")?;
-                &slot.image as *const DmaBufImage
-            };
-            let dest_x =
-                (u64::from(region.dest_x) * u64::from(out_w) / u64::from(src_w.max(1))) as u32;
-            let dest_y =
-                (u64::from(region.dest_y) * u64::from(out_h) / u64::from(src_h.max(1))) as u32;
-            let dest_w = (u64::from(region.logical_w) * u64::from(out_w) / u64::from(src_w.max(1)))
-                .max(1) as u32;
-            let dest_h = (u64::from(region.logical_h) * u64::from(out_h) / u64::from(src_h.max(1)))
-                .max(1) as u32;
-            let vulkan = self
-                .vulkan
-                .as_mut()
-                .context("Vulkan missing for screencast blit")?;
-            // Safety: both images are owned by self and live for this call.
-            unsafe {
-                blit_image_region(
-                    vulkan,
-                    &mut batch,
-                    &*src_ptr,
-                    &*dst_ptr,
-                    region.fb_x,
-                    region.fb_y,
-                    region.fb_w,
-                    region.fb_h,
-                    dest_x,
-                    dest_y,
-                    dest_w,
-                    dest_h,
-                    first,
-                )?;
-            }
-            first = false;
-        }
-
-        // HW cursor is not in the scanout FB — overlay a software cursor when requested.
-        let needs_cursor_overlay = embed_cursor
-            && regions.iter().any(|region| {
-                self.outputs
-                    .get(&region.name)
-                    .is_some_and(|o| o.hw_cursor_active())
-            })
-            && !matches!(self.cursor_state, CursorState::Hidden);
-
-        if needs_cursor_overlay {
-            let pointer_x = self.pointer_x;
-            let pointer_y = self.pointer_y;
-            let dest_px = ((i64::from(pointer_x) - i64::from(x)) * i64::from(out_w)
-                / i64::from(width.max(1))) as i32;
-            let dest_py = ((i64::from(pointer_y) - i64::from(y)) * i64::from(out_h)
-                / i64::from(height.max(1))) as i32;
-
-            let vulkan = self
-                .vulkan
-                .as_mut()
-                .context("Vulkan missing for screencast cursor overlay")?;
-            self.gpu.ensure_compositor(vulkan)?;
-            vulkan.ensure_scanout_render_pass_load()?;
-            let compositor = self
-                .gpu
-                .compositor
-                .take()
-                .context("GPU compositor missing")?;
-            let result = (|| -> anyhow::Result<()> {
-                self.gpu.surface_textures.sync_scene(
-                    vulkan,
-                    &compositor,
-                    &mut batch,
-                    &[],
-                    self.cursor_state.draw_ref(),
-                    &CompositeMode::Full,
-                    &HashSet::new(),
-                    &HashMap::new(),
-                    &[],
-                    false,
-                )?;
-                batch.ensure_recording(vulkan)?;
-                let render_pass = vulkan.scanout_render_pass_load()?;
-                let (image_ptr, fb_ptr) = {
+        // Open before any sync/retire so replacements stay blocked until this submit finishes.
+        let texture_epoch = self.gpu.surface_textures.begin_submit();
+        // Cleared after a successful install; otherwise Drop-path cleanup completes it.
+        let mut pending_epoch = Some(texture_epoch);
+        let result = (|| -> anyhow::Result<()> {
+            // Clear so multi-region / partial coverage never leaves framebuffer garbage.
+            {
+                let dst_ptr = {
                     let slots = self
                         .screencast_buffers
                         .get(&stream_id)
@@ -1936,51 +1792,188 @@ impl RendererState {
                     let slot = slots
                         .get(index)
                         .context("screencast buffer index out of range")?;
-                    (
-                        &slot.image as *const DmaBufImage,
-                        &slot.framebuffer as *const Framebuffer,
-                    )
+                    &slot.image as *const DmaBufImage
                 };
-                // Safety: owned by self for this call.
+                let vulkan = self
+                    .vulkan
+                    .as_mut()
+                    .context("Vulkan missing for screencast clear")?;
                 unsafe {
-                    overlay_cursor_on_image(
+                    clear_dma_image_color(
                         vulkan,
                         &mut batch,
-                        &compositor,
-                        &self.gpu.surface_textures,
-                        render_pass,
-                        &*image_ptr,
-                        &*fb_ptr,
-                        out_w,
-                        out_h,
-                        self.cursor_state.draw_ref(),
-                        dest_px,
-                        dest_py,
+                        &*dst_ptr,
+                        fresh,
+                        [0.0, 0.0, 0.0, 1.0],
                     )?;
                 }
-                self.gpu
-                    .surface_textures
-                    .release_acquired_dmabufs(vulkan, &mut batch)?;
-                Ok(())
-            })();
-            self.gpu.compositor = Some(compositor);
-            if let Err(error) = result {
-                self.gpu.surface_textures.discard_acquired_dmabufs();
-                if let Some(vulkan) = self.vulkan.as_mut() {
-                    batch.abandon(vulkan);
-                }
-                return Err(error);
             }
-        }
 
-        let vulkan = self
-            .vulkan
-            .as_mut()
-            .context("Vulkan missing for screencast submit")?;
-        let pending = batch.submit(vulkan)?;
-        let serial = self.screencast_content_serial;
-        self.install_screencast_gpu_pending(stream_id, index, pending, serial)?;
-        Ok(())
+            let mut first = false; // dest already defined after clear
+            let src_w = width as u32;
+            let src_h = height as u32;
+            for region in &regions {
+                let src_ptr = {
+                    let current = self
+                        .outputs
+                        .get(&region.name)
+                        .and_then(|o| o.primary())
+                        .and_then(|p| p.current.as_ref())
+                        .with_context(|| format!("missing primary buffer {}", region.name))?;
+                    &current.dma_image as *const DmaBufImage
+                };
+                let dst_ptr = {
+                    let slots = self
+                        .screencast_buffers
+                        .get(&stream_id)
+                        .context("screencast buffers missing")?;
+                    let slot = slots
+                        .get(index)
+                        .context("screencast buffer index out of range")?;
+                    &slot.image as *const DmaBufImage
+                };
+                let dest_x = (u64::from(region.dest_x) * u64::from(out_w)
+                    / u64::from(src_w.max(1))) as u32;
+                let dest_y = (u64::from(region.dest_y) * u64::from(out_h)
+                    / u64::from(src_h.max(1))) as u32;
+                let dest_w = (u64::from(region.logical_w) * u64::from(out_w)
+                    / u64::from(src_w.max(1)))
+                .max(1) as u32;
+                let dest_h = (u64::from(region.logical_h) * u64::from(out_h)
+                    / u64::from(src_h.max(1)))
+                .max(1) as u32;
+                let vulkan = self
+                    .vulkan
+                    .as_mut()
+                    .context("Vulkan missing for screencast blit")?;
+                // Safety: both images are owned by self and live for this call.
+                unsafe {
+                    blit_image_region(
+                        vulkan,
+                        &mut batch,
+                        &*src_ptr,
+                        &*dst_ptr,
+                        region.fb_x,
+                        region.fb_y,
+                        region.fb_w,
+                        region.fb_h,
+                        dest_x,
+                        dest_y,
+                        dest_w,
+                        dest_h,
+                        first,
+                    )?;
+                }
+                first = false;
+            }
+
+            // HW cursor is not in the scanout FB — overlay a software cursor when requested.
+            let needs_cursor_overlay = embed_cursor
+                && regions.iter().any(|region| {
+                    self.outputs
+                        .get(&region.name)
+                        .is_some_and(|o| o.hw_cursor_active())
+                })
+                && !matches!(self.cursor_state, CursorState::Hidden);
+
+            if needs_cursor_overlay {
+                let pointer_x = self.pointer_x;
+                let pointer_y = self.pointer_y;
+                let dest_px = ((i64::from(pointer_x) - i64::from(x)) * i64::from(out_w)
+                    / i64::from(width.max(1))) as i32;
+                let dest_py = ((i64::from(pointer_y) - i64::from(y)) * i64::from(out_h)
+                    / i64::from(height.max(1))) as i32;
+
+                let vulkan = self
+                    .vulkan
+                    .as_mut()
+                    .context("Vulkan missing for screencast cursor overlay")?;
+                self.gpu.ensure_compositor(vulkan)?;
+                vulkan.ensure_scanout_render_pass_load()?;
+                let compositor = self
+                    .gpu
+                    .compositor
+                    .take()
+                    .context("GPU compositor missing")?;
+                let overlay_result = (|| -> anyhow::Result<()> {
+                    self.gpu.surface_textures.sync_scene(
+                        vulkan,
+                        &compositor,
+                        &mut batch,
+                        &[],
+                        self.cursor_state.draw_ref(),
+                        &CompositeMode::Full,
+                        &HashSet::new(),
+                        &HashMap::new(),
+                        &[],
+                        false,
+                    )?;
+                    batch.ensure_recording(vulkan)?;
+                    let render_pass = vulkan.scanout_render_pass_load()?;
+                    let (image_ptr, fb_ptr) = {
+                        let slots = self
+                            .screencast_buffers
+                            .get(&stream_id)
+                            .context("screencast buffers missing")?;
+                        let slot = slots
+                            .get(index)
+                            .context("screencast buffer index out of range")?;
+                        (
+                            &slot.image as *const DmaBufImage,
+                            &slot.framebuffer as *const Framebuffer,
+                        )
+                    };
+                    // Safety: owned by self for this call.
+                    unsafe {
+                        overlay_cursor_on_image(
+                            vulkan,
+                            &mut batch,
+                            &compositor,
+                            &self.gpu.surface_textures,
+                            render_pass,
+                            &*image_ptr,
+                            &*fb_ptr,
+                            out_w,
+                            out_h,
+                            self.cursor_state.draw_ref(),
+                            dest_px,
+                            dest_py,
+                        )?;
+                    }
+                    self.gpu
+                        .surface_textures
+                        .release_acquired_dmabufs(vulkan, &mut batch)?;
+                    Ok(())
+                })();
+                self.gpu.compositor = Some(compositor);
+                overlay_result?;
+            }
+
+            let vulkan = self
+                .vulkan
+                .as_mut()
+                .context("Vulkan missing for screencast submit")?;
+            let pending = std::mem::replace(&mut batch, GpuWorkBatch::new()).submit(vulkan)?;
+            let serial = self.screencast_content_serial;
+            // install always takes ownership of the epoch (on the slot or via finish).
+            let _ = pending_epoch.take();
+            self.install_screencast_gpu_pending(
+                stream_id,
+                index,
+                pending,
+                serial,
+                texture_epoch,
+            )?;
+            Ok(())
+        })();
+        if let Some(epoch) = pending_epoch.take() {
+            self.gpu.surface_textures.discard_acquired_dmabufs();
+            if let Some(vulkan) = self.vulkan.as_mut() {
+                batch.abandon(vulkan);
+            }
+            self.gpu.surface_textures.complete_submit(epoch);
+        }
+        result
     }
 
     /// Composite only the given surface layers into screencast buffer `index` (does not wait).
@@ -2058,110 +2051,142 @@ impl RendererState {
         };
 
         let mut batch = GpuWorkBatch::new();
-        {
-            let vulkan = self
+        let texture_epoch = self.gpu.surface_textures.begin_submit();
+        let composite_result = {
+            let vulkan = match self
                 .vulkan
                 .as_mut()
-                .context("Vulkan missing for window screencast")?;
-            self.gpu.ensure_compositor(vulkan)?;
-            let compositor = self
-                .gpu
-                .compositor
-                .take()
-                .context("GPU compositor missing")?;
-
-            let result = (|| -> anyhow::Result<()> {
-                let cursor = if draw_cursor {
-                    self.cursor_state.draw_ref()
-                } else {
-                    CursorDraw::Hidden
-                };
-                self.gpu.surface_textures.sync_scene(
-                    vulkan,
-                    &compositor,
-                    &mut batch,
-                    &frame_layers,
-                    cursor,
-                    &CompositeMode::Full,
-                    &HashSet::new(),
-                    &HashMap::new(),
-                    &[],
-                    false,
-                )?;
-
-                vulkan.ensure_scanout_render_pass()?;
-                batch.ensure_recording(vulkan)?;
-                let render_pass = vulkan.scanout_render_pass()?;
-                let image_old_layout = if fresh {
-                    vk::ImageLayout::UNDEFINED
-                } else {
-                    vk::ImageLayout::GENERAL
+                .context("Vulkan missing for window screencast")
+            {
+                Ok(vulkan) => vulkan,
+                Err(error) => {
+                    self.gpu.surface_textures.complete_submit(texture_epoch);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.gpu.ensure_compositor(vulkan) {
+                // `vulkan` borrow ends when this block returns.
+                Err(error)
+            } else {
+                let Some(compositor) = self.gpu.compositor.take() else {
+                    return {
+                        self.gpu.surface_textures.complete_submit(texture_epoch);
+                        Err(anyhow::anyhow!("GPU compositor missing"))
+                    };
                 };
 
-                let (image_ptr, fb_ptr) = {
-                    let slots = self
-                        .screencast_buffers
-                        .get(&stream_id)
-                        .context("screencast buffers missing")?;
-                    let slot = slots
-                        .get(index)
-                        .context("screencast buffer index out of range")?;
-                    (
-                        &slot.image as *const DmaBufImage,
-                        &slot.framebuffer as *const Framebuffer,
-                    )
-                };
-
-                let cursor = if draw_cursor {
-                    self.cursor_state.draw_ref()
-                } else {
-                    CursorDraw::Hidden
-                };
-                // Safety: both are owned by self for this call.
-                unsafe {
-                    let linear_filter = dest_width < width as u32 || dest_height < height as u32;
-                    composite_layers_to_image(
+                let result = (|| -> anyhow::Result<()> {
+                    let cursor = if draw_cursor {
+                        self.cursor_state.draw_ref()
+                    } else {
+                        CursorDraw::Hidden
+                    };
+                    self.gpu.surface_textures.sync_scene(
                         vulkan,
-                        &mut batch,
                         &compositor,
-                        &self.gpu.surface_textures,
-                        render_pass,
-                        &*image_ptr,
-                        &*fb_ptr,
-                        image_old_layout,
-                        dest_width,
-                        dest_height,
-                        [0.0, 0.0, 0.0, 0.0],
-                        &view,
+                        &mut batch,
                         &frame_layers,
                         cursor,
-                        dest_px,
-                        dest_py,
-                        linear_filter,
+                        &CompositeMode::Full,
+                        &HashSet::new(),
+                        &HashMap::new(),
+                        &[],
+                        false,
                     )?;
-                }
-                self.gpu
-                    .surface_textures
-                    .release_acquired_dmabufs(vulkan, &mut batch)?;
-                Ok(())
-            })();
-            self.gpu.compositor = Some(compositor);
-            if let Err(error) = result {
-                self.gpu.surface_textures.discard_acquired_dmabufs();
-                if let Some(vulkan) = self.vulkan.as_mut() {
-                    batch.abandon(vulkan);
-                }
-                return Err(error);
-            }
-        }
 
-        let vulkan = self
-            .vulkan
-            .as_mut()
-            .context("Vulkan missing for window screencast submit")?;
-        let pending = batch.submit(vulkan)?;
+                    vulkan.ensure_scanout_render_pass()?;
+                    batch.ensure_recording(vulkan)?;
+                    let render_pass = vulkan.scanout_render_pass()?;
+                    let image_old_layout = if fresh {
+                        vk::ImageLayout::UNDEFINED
+                    } else {
+                        vk::ImageLayout::GENERAL
+                    };
+
+                    let (image_ptr, fb_ptr) = {
+                        let slots = self
+                            .screencast_buffers
+                            .get(&stream_id)
+                            .context("screencast buffers missing")?;
+                        let slot = slots
+                            .get(index)
+                            .context("screencast buffer index out of range")?;
+                        (
+                            &slot.image as *const DmaBufImage,
+                            &slot.framebuffer as *const Framebuffer,
+                        )
+                    };
+
+                    let cursor = if draw_cursor {
+                        self.cursor_state.draw_ref()
+                    } else {
+                        CursorDraw::Hidden
+                    };
+                    // Safety: both are owned by self for this call.
+                    unsafe {
+                        let linear_filter =
+                            dest_width < width as u32 || dest_height < height as u32;
+                        composite_layers_to_image(
+                            vulkan,
+                            &mut batch,
+                            &compositor,
+                            &self.gpu.surface_textures,
+                            render_pass,
+                            &*image_ptr,
+                            &*fb_ptr,
+                            image_old_layout,
+                            dest_width,
+                            dest_height,
+                            [0.0, 0.0, 0.0, 0.0],
+                            &view,
+                            &frame_layers,
+                            cursor,
+                            dest_px,
+                            dest_py,
+                            linear_filter,
+                        )?;
+                    }
+                    self.gpu
+                        .surface_textures
+                        .release_acquired_dmabufs(vulkan, &mut batch)?;
+                    Ok(())
+                })();
+                self.gpu.compositor = Some(compositor);
+                result
+            }
+        };
+        if let Err(error) = composite_result {
+            self.gpu.surface_textures.discard_acquired_dmabufs();
+            if let Some(vulkan) = self.vulkan.as_mut() {
+                batch.abandon(vulkan);
+            }
+            self.gpu.surface_textures.complete_submit(texture_epoch);
+            return Err(error);
+        }
+        drop(frame_layers);
+
+        let pending = {
+            let vulkan = match self
+                .vulkan
+                .as_mut()
+                .context("Vulkan missing for window screencast submit")
+            {
+                Ok(vulkan) => vulkan,
+                Err(error) => {
+                    self.gpu.surface_textures.complete_submit(texture_epoch);
+                    return Err(error);
+                }
+            };
+            match batch.submit(vulkan) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    self.gpu.surface_textures.complete_submit(texture_epoch);
+                    return Err(error);
+                }
+            }
+        };
         let serial = self.screencast_content_serial;
-        self.install_screencast_gpu_pending(stream_id, index, pending, serial)?;
+        self.install_screencast_gpu_pending(stream_id, index, pending, serial, texture_epoch)?;
         Ok(())
     }
 
@@ -2171,28 +2196,33 @@ impl RendererState {
         index: usize,
         pending: crate::vulkan::PendingGpuSubmit,
         serial: u64,
+        texture_epoch: u64,
     ) -> anyhow::Result<()> {
         let previous = self
             .screencast_buffers
             .get_mut(&stream_id)
             .and_then(|slots| slots.get_mut(index))
             .and_then(|slot| slot.gpu_pending.take());
-        if let Some(previous) = previous {
-            self.finish_gpu_pending(previous)?;
-        }
-        let epoch = self.gpu.surface_textures.begin_submit();
         if let Some(slot) = self
             .screencast_buffers
             .get_mut(&stream_id)
             .and_then(|slots| slots.get_mut(index))
         {
-            slot.gpu_pending = Some(pending.with_texture_epoch(epoch));
+            // Attach the pre-opened epoch before finishing prior work so tracking
+            // cannot be dropped while this batch's textures are still live.
+            slot.gpu_pending = Some(pending.with_texture_epoch(texture_epoch));
             slot.in_use = true;
             slot.fresh = false;
             slot.content_serial = Some(serial);
+            if let Some(previous) = previous {
+                self.finish_gpu_pending(previous)?;
+            }
         } else {
             // Slot vanished; finish immediately so the epoch does not leak.
-            self.finish_gpu_pending(pending.with_texture_epoch(epoch))?;
+            if let Some(previous) = previous {
+                self.finish_gpu_pending(previous)?;
+            }
+            self.finish_gpu_pending(pending.with_texture_epoch(texture_epoch))?;
         }
         Ok(())
     }
@@ -3617,6 +3647,10 @@ impl RendererState {
                     .collect();
                 self.gpu.guide_labels.retain(|key| live.contains(key));
             }
+            // Open before sync_scene so textures retired while recording stay blocked
+            // by this submit's epoch until the fence completes.
+            let texture_epoch = self.gpu.surface_textures.begin_submit();
+            let mut pending_epoch = Some(texture_epoch);
             let gpu_result = (|| -> anyhow::Result<()> {
                 self.gpu.surface_textures.sync_scene(
                     vulkan,
@@ -3710,16 +3744,31 @@ impl RendererState {
             if let Err(error) = gpu_result {
                 batch.abandon(vulkan);
                 self.gpu.surface_textures.discard_acquired_dmabufs();
-                self.gpu.surface_textures.clear();
+                if let Some(epoch) = pending_epoch.take() {
+                    self.gpu.surface_textures.complete_submit(epoch);
+                }
                 self.gpu.compositor = Some(compositor);
-                // Finish other outputs' in-flight work so retired textures can free.
+                // Finish other outputs' in-flight work, then wipe texture state.
                 let _ = self.wait_all_pending_gpu();
+                self.gpu.surface_textures.clear();
+                let _ = self.flush_retired_textures();
                 return Err(error);
             }
             self.gpu.compositor = Some(compositor);
 
-            let pending = batch.submit(vulkan)?;
-            self.install_scanout_gpu_pending(&mut buffer, pending)?;
+            let pending = match std::mem::replace(&mut batch, GpuWorkBatch::new()).submit(vulkan)
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    if let Some(epoch) = pending_epoch.take() {
+                        self.gpu.surface_textures.complete_submit(epoch);
+                    }
+                    return Err(error);
+                }
+            };
+            // install takes ownership of the epoch on the scanout buffer.
+            let _ = pending_epoch.take();
+            self.install_scanout_gpu_pending(&mut buffer, pending, texture_epoch)?;
             // sync_scene may have retired replaced textures; free any unblocked ones.
             let _ = self.flush_retired_textures();
             buffer.fresh = false;
@@ -4927,6 +4976,25 @@ mod tests {
 
         state.gpu.surface_textures.complete_submit(epoch);
         assert_eq!(state.take_ready_dmabuf_releases_inner(), vec![(1, 10)]);
+    }
+
+    #[test]
+    fn flush_retired_textures_does_not_drop_open_submit_epochs() {
+        // Regression: retain_in_flight used to prune epochs that were not yet
+        // parked on an output/screencast slot (e.g. local ScanoutBuffer), which
+        // freed descriptor sets still sampled by the in-flight submit.
+        let mut state = RendererState::new().unwrap();
+        let epoch = state.gpu.surface_textures.begin_submit();
+        state.flush_retired_textures().unwrap();
+        assert!(
+            state
+                .gpu
+                .surface_textures
+                .snapshot_in_flight_epochs()
+                .contains(&epoch),
+            "open epochs must survive flush_retired_textures"
+        );
+        state.gpu.surface_textures.complete_submit(epoch);
     }
 
     #[test]
