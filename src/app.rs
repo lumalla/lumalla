@@ -130,7 +130,7 @@ impl Drop for AppData {
             ManuallyDrop::drop(&mut self.input_state);
         }
         self.renderer_state
-            .deactivate_drm(self.seat_state.as_ref().get_ref());
+            .deactivate_drm(self.seat_state.as_ref().get_ref(), None);
         unsafe {
             ManuallyDrop::drop(&mut self.renderer_state);
             ManuallyDrop::drop(&mut self.seat_state);
@@ -215,7 +215,7 @@ impl AppData {
                 clients: &mut self.clients,
                 render: &mut *self.renderer_state,
             };
-            if let Err(err) = peers.suspend_devices() {
+            if let Err(err) = peers.suspend_devices(Some(event_loop)) {
                 warn!("Unable to suspend libinput during shutdown: {err}");
             }
         }
@@ -310,10 +310,10 @@ impl AppData {
                     );
                     if self.seat_state.is_enabled() && self.seat_state.can_open_devices() {
                         if result.devices_changed {
-                            if let Err(err) = self
-                                .renderer_state
-                                .reconcile_drm(self.seat_state.as_ref().get_ref())
-                            {
+                            if let Err(err) = self.renderer_state.reconcile_drm(
+                                self.seat_state.as_ref().get_ref(),
+                                event_loop,
+                            ) {
                                 error!("Unable to reconcile DRM devices: {err}");
                             }
                             if let Err(err) = self.sync_drm_device_poll(event_loop, arena) {
@@ -678,7 +678,7 @@ impl AppData {
                             clients: &mut self.clients,
                             render: &mut *self.renderer_state,
                         };
-                        peers.on_disabled()
+                        peers.on_disabled(event_loop)
                     };
                     if matches!(outcome, SeatDisableOutcome::Disabled)
                         && let Err(err) = self.clear_drm_device_poll(event_loop)
@@ -740,7 +740,10 @@ impl AppData {
                     ));
                 }
                 MainMessage::SetOutputConfigs(configs) => {
-                    if let Err(err) = self.renderer_state.set_output_configs(configs) {
+                    if let Err(err) = self
+                        .renderer_state
+                        .set_output_configs(configs, event_loop)
+                    {
                         error!("Unable to set output configs: {err:#}");
                     } else {
                         self.request_present_immediate(event_loop, arena);
@@ -779,7 +782,8 @@ impl AppData {
                     self.emit_outputs_changed();
                 }
                 MainMessage::RemoveOutput { name } => {
-                    self.renderer_state.remove_virtual_output(&name);
+                    self.renderer_state
+                        .remove_virtual_output(&name, event_loop);
                     self.renderer_state.clear_output_views(&name);
                     if let Err(err) = self
                         .display_state

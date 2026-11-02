@@ -362,6 +362,19 @@ impl OutputPresentControl {
         Ok(())
     }
 
+    /// Drop path when no [`EventLoop`] is available: leak the armed `Timespec` so
+    /// an in-flight io_uring timeout cannot UAF, then mark disarmed.
+    pub fn abandon_wake(&mut self) {
+        if !self.wake_armed {
+            self.wake_deadline = None;
+            return;
+        }
+        let ts = std::mem::replace(&mut self.wake_ts, Box::new(Timespec::new()));
+        std::mem::forget(ts);
+        self.wake_armed = false;
+        self.wake_deadline = None;
+    }
+
     pub fn set_wake(&mut self, event_loop: &mut EventLoop, sec: u64, nsec: u32) -> io::Result<()> {
         if self.wake_armed && self.wake_deadline == Some((sec, nsec)) {
             return Ok(());

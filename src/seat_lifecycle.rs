@@ -8,6 +8,7 @@ use lumalla_display::{ConnectedClients, DisplayConfigHost, DisplayState};
 use lumalla_input::InputState;
 use lumalla_renderer::RendererState;
 use lumalla_seat::SeatState;
+use lumalla_shared::EventLoop;
 
 /// Peers required to bring the session up or tear DRM/libinput down.
 pub struct SeatSessionPeers<'a> {
@@ -102,21 +103,24 @@ impl SeatSessionPeers<'_> {
         }
     }
 
-    pub fn on_disabled(&mut self) -> SeatDisableOutcome {
+    pub fn on_disabled(&mut self, event_loop: &mut EventLoop) -> SeatDisableOutcome {
         if self.seat.is_enabled() {
             debug!("Ignoring stale MainSeatDisabled (seat enabled)");
             return SeatDisableOutcome::IgnoredStale;
         }
-        if let Err(err) = self.suspend_devices() {
+        if let Err(err) = self.suspend_devices(Some(event_loop)) {
             error!("Unable to disable libinput: {err}");
         }
         SeatDisableOutcome::Disabled
     }
 
     /// Unconditional libinput suspend + DRM deactivate (shutdown / disable paths).
-    pub fn suspend_devices(&mut self) -> anyhow::Result<()> {
+    pub fn suspend_devices(
+        &mut self,
+        event_loop: Option<&mut EventLoop>,
+    ) -> anyhow::Result<()> {
         let result = self.input.disable_seat();
-        self.render.deactivate_drm(self.seat);
+        self.render.deactivate_drm(self.seat, event_loop);
         result
     }
 

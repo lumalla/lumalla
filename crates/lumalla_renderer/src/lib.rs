@@ -10,9 +10,9 @@ use ash::vk;
 use log::{debug, error, info, warn};
 use lumalla_seat::SeatState;
 use lumalla_shared::{
-    BufferTransform, CapturedImage, DisplayHost, DmabufReleaseSchedule, DrmDeviceState, Guide,
-    Output, OutputConfig, PresentationNotify, PrimaryGeometryEffect, PrimaryOutputMode, RenderSink,
-    SurfaceSubmit, SurfaceSubmitRole, View, view_at_source,
+    BufferTransform, CapturedImage, DisplayHost, DmabufReleaseSchedule, DrmDeviceState, EventLoop,
+    Guide, Output, OutputConfig, PresentationNotify, PrimaryGeometryEffect, PrimaryOutputMode,
+    RenderSink, SurfaceSubmit, SurfaceSubmitRole, View, view_at_source,
 };
 use stumpalo::Arena;
 
@@ -843,12 +843,13 @@ impl RendererState {
     }
 
     /// Remove a virtual output and release its scanout resources.
-    pub fn remove_virtual_output(&mut self, name: &str) {
+    pub fn remove_virtual_output(&mut self, name: &str, event_loop: &mut EventLoop) {
         if self.virtual_outputs.remove(name).is_some() {
             info!("Removed virtual output {name}");
             self.output_views.remove(name);
             self.invalidate_present_targets();
-            if let Some(output) = self.outputs.remove(name) {
+            if let Some(mut output) = self.outputs.remove(name) {
+                self.clear_present_wake(&mut output, event_loop);
                 self.release_output_state(output);
             }
         }
@@ -1632,9 +1633,9 @@ impl RendererState {
         self.free_screencast_buffers(stream_id);
 
         if let Some(path) = self.resolved_render_device_path() {
-            self.ensure_vulkan(Some(&path))?;
+            self.ensure_vulkan(Some(&path), None)?;
         } else {
-            self.ensure_vulkan(None)?;
+            self.ensure_vulkan(None, None)?;
         }
 
         let format = vk::Format::B8G8R8A8_UNORM;
@@ -2538,9 +2539,9 @@ impl RendererState {
     /// (headless / before virtual outputs or DRM activate).
     pub fn supported_dmabuf_formats(&mut self) -> anyhow::Result<Vec<(u32, u64)>> {
         if let Some(path) = self.resolved_render_device_path() {
-            self.ensure_vulkan(Some(&path))?;
+            self.ensure_vulkan(Some(&path), None)?;
         } else {
-            self.ensure_vulkan(None)?;
+            self.ensure_vulkan(None, None)?;
         }
         let vulkan = self
             .vulkan
@@ -2559,7 +2560,7 @@ impl RendererState {
             return Some(path);
         }
         if self.vulkan.is_none()
-            && let Err(err) = self.ensure_vulkan(None)
+            && let Err(err) = self.ensure_vulkan(None, None)
         {
             warn!("Unable to init Vulkan for dmabuf feedback device: {err:#}");
             return None;
@@ -2623,8 +2624,13 @@ impl RendererState {
     }
 
     /// Close seat-opened DRM devices after session disable was acknowledged.
-    pub fn deactivate_drm(&mut self, seat: &SeatState) {
-        self.drain_scanouts();
+    ///
+    /// Pass `event_loop` so armed present-wake timeouts are cancelled before
+    /// outputs (and their `wake_ts` boxes) are dropped. Use `None` only on
+    /// unwind/Drop paths where the loop is unavailable; armed timespecs are
+    /// leaked instead of cancelled.
+    pub fn deactivate_drm(&mut self, seat: &SeatState, event_loop: Option<&mut EventLoop>) {
+        self.drain_scanouts(event_loop);
         let _ = self.flip_events.drain();
         self.invalidate_present_targets();
         if seat.can_open_devices() {
@@ -2647,11 +2653,15 @@ impl RendererState {
     }
 
     /// Close removed / open newly discovered DRM devices while the seat is active.
-    pub fn reconcile_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
+    pub fn reconcile_drm(
+        &mut self,
+        seat: &SeatState,
+        event_loop: &mut EventLoop,
+    ) -> anyhow::Result<()> {
         if !seat.can_open_devices() {
             return Ok(());
         }
-        self.drain_scanouts();
+        self.drain_scanouts(Some(event_loop));
         let _ = self.flip_events.drain();
         self.invalidate_present_targets();
         self.drm_devices.reconcile(seat)?;
@@ -2681,14 +2691,35 @@ impl RendererState {
         Ok(())
     }
 
-    fn drain_scanouts(&mut self) {
+    fn drain_scanouts(&mut self, mut event_loop: Option<&mut EventLoop>) {
         let outputs: Vec<OutputState> = self.outputs.drain().map(|(_, s)| s).collect();
-        for output in outputs {
+        for mut output in outputs {
+            match event_loop.as_deref_mut() {
+                Some(event_loop) => self.clear_present_wake(&mut output, event_loop),
+                None => {
+                    output.present.abandon_wake();
+                    self.free_present_wake_tokens
+                        .push(output.present.wake_token);
+                }
+            }
             self.disable_and_release_output_state(output);
         }
         self.scanout_pool.clear();
         self.topologies.clear();
         self.invalidate_surface_textures();
+    }
+
+    /// Cancel (or abandon) a present wake and recycle its timeout token.
+    fn clear_present_wake(&mut self, output: &mut OutputState, event_loop: &mut EventLoop) {
+        if let Err(err) = output.present.clear_wake(event_loop) {
+            warn!(
+                "Unable to clear present wake token {}: {err}",
+                output.present.wake_token
+            );
+            output.present.abandon_wake();
+        }
+        self.free_present_wake_tokens
+            .push(output.present.wake_token);
     }
 
     /// Free plane buffers without touching KMS state (e.g. remode of the same CRTC).
@@ -2701,6 +2732,8 @@ impl RendererState {
     }
 
     /// Blank/power-down a physical output, then free its plane buffers.
+    ///
+    /// Caller must clear/abandon the present wake first.
     fn disable_and_release_output_state(&mut self, output: OutputState) {
         if let Some(physical) = output.physical.as_ref() {
             self.disable_hw_cursor_plane(&output);
@@ -2767,7 +2800,7 @@ impl RendererState {
     }
 
     /// Wait for any in-flight flip, then disable CRTC and drop the output planes.
-    fn disable_and_release_named_scanout(&mut self, name: &str) {
+    fn disable_and_release_named_scanout(&mut self, name: &str, event_loop: &mut EventLoop) {
         if self
             .outputs
             .get(name)
@@ -2777,7 +2810,8 @@ impl RendererState {
                 warn!("Waiting for flip before disabling {name}: {err:#}");
             }
         }
-        if let Some(output) = self.outputs.remove(name) {
+        if let Some(mut output) = self.outputs.remove(name) {
+            self.clear_present_wake(&mut output, event_loop);
             self.disable_and_release_output_state(output);
         }
     }
@@ -2786,7 +2820,7 @@ impl RendererState {
     ///
     /// Covers both scanouts we already own and connected connectors that were
     /// never presented (e.g. left active by firmware / a previous compositor).
-    fn apply_output_config_disables(&mut self) {
+    fn apply_output_config_disables(&mut self, event_loop: &mut EventLoop) {
         let scanout_disable: Vec<String> = self
             .outputs
             .keys()
@@ -2798,7 +2832,7 @@ impl RendererState {
             .cloned()
             .collect();
         for name in scanout_disable {
-            self.disable_and_release_named_scanout(&name);
+            self.disable_and_release_named_scanout(&name, event_loop);
         }
 
         let mut unresolved: Vec<(PathBuf, ConnectedOutput)> = Vec::new();
@@ -2867,7 +2901,11 @@ impl RendererState {
     }
 
     /// Merge per-connector output config.
-    pub fn set_output_configs(&mut self, configs: Vec<OutputConfig>) -> anyhow::Result<()> {
+    pub fn set_output_configs(
+        &mut self,
+        configs: Vec<OutputConfig>,
+        event_loop: &mut EventLoop,
+    ) -> anyhow::Result<()> {
         for config in configs {
             info!(
                 "Output config: {} enabled={} mode={:?}",
@@ -2876,7 +2914,7 @@ impl RendererState {
             self.output_configs.insert(config.name.clone(), config);
         }
         self.invalidate_present_targets();
-        self.apply_output_config_disables();
+        self.apply_output_config_disables(event_loop);
         self.mark_dirty_if_active();
         Ok(())
     }
@@ -2885,7 +2923,12 @@ impl RendererState {
     ///
     /// Presents every presentable output (legacy bulk path). Prefer
     /// [`Self::present_named`] / [`Self::arm_presents`] for per-output pacing.
-    pub fn present(&mut self, color: [f32; 4], force: bool) -> anyhow::Result<PresentOutcome> {
+    pub fn present(
+        &mut self,
+        color: [f32; 4],
+        force: bool,
+        event_loop: &mut EventLoop,
+    ) -> anyhow::Result<PresentOutcome> {
         if self.present_halted.is_some() {
             return Ok(PresentOutcome {
                 presented: false,
@@ -2905,7 +2948,7 @@ impl RendererState {
             output.present.content_dirty = false;
         }
         let started = Instant::now();
-        let status = self.present_enabled_outputs(color)?;
+        let status = self.present_enabled_outputs(color, event_loop)?;
         Ok(PresentOutcome {
             presented: self.present_halted.is_none(),
             status,
@@ -2921,6 +2964,7 @@ impl RendererState {
         name: &str,
         color: [f32; 4],
         force: bool,
+        event_loop: &mut EventLoop,
     ) -> anyhow::Result<PresentOutcome> {
         if self.present_halted.is_some() {
             return Ok(PresentOutcome {
@@ -2941,7 +2985,7 @@ impl RendererState {
             });
         }
         let started = Instant::now();
-        let presented = self.present_one_named(name, color)?;
+        let presented = self.present_one_named(name, color, event_loop)?;
         Ok(PresentOutcome {
             presented,
             status: self.present_status(),
@@ -2952,11 +2996,16 @@ impl RendererState {
     }
 
     /// Returns whether GPU/DRM work was submitted for `name`.
-    fn present_one_named(&mut self, name: &str, color: [f32; 4]) -> anyhow::Result<bool> {
+    fn present_one_named(
+        &mut self,
+        name: &str,
+        color: [f32; 4],
+        event_loop: &mut EventLoop,
+    ) -> anyhow::Result<bool> {
         if self.present_halted.is_some() {
             return Ok(false);
         }
-        if !self.ensure_vulkan_ready()? {
+        if !self.ensure_vulkan_ready(Some(event_loop))? {
             return Ok(false);
         }
         let _ = self.flush_hw_cursors();
@@ -3062,7 +3111,7 @@ impl RendererState {
             .cloned()
             .collect();
         for stale_name in stale {
-            self.disable_and_release_named_scanout(&stale_name);
+            self.disable_and_release_named_scanout(&stale_name, event_loop);
         }
 
         Ok(presented)
@@ -3077,11 +3126,15 @@ impl RendererState {
     /// Unchanged physical modes schedule a non-blocking page-flip; the previous FB
     /// stays alive until [`Self::dispatch_page_flips`] reports completion.
     /// Virtual presents complete after GPU work with no flip wait.
-    pub fn present_enabled_outputs(&mut self, color: [f32; 4]) -> anyhow::Result<PresentStatus> {
+    pub fn present_enabled_outputs(
+        &mut self,
+        color: [f32; 4],
+        event_loop: &mut EventLoop,
+    ) -> anyhow::Result<PresentStatus> {
         if self.present_halted.is_some() {
             return Ok(self.present_status());
         }
-        if !self.ensure_vulkan_ready()? {
+        if !self.ensure_vulkan_ready(Some(event_loop))? {
             return Ok(self.present_status());
         }
         let _ = self.flush_hw_cursors();
@@ -3092,7 +3145,7 @@ impl RendererState {
             warn!("No enabled connected or virtual outputs to present");
             let stale: Vec<String> = self.outputs.keys().cloned().collect();
             for name in stale {
-                self.disable_and_release_named_scanout(&name);
+                self.disable_and_release_named_scanout(&name, event_loop);
             }
             return Ok(self.present_status());
         }
@@ -3147,7 +3200,7 @@ impl RendererState {
             .cloned()
             .collect();
         for name in stale {
-            self.disable_and_release_named_scanout(&name);
+            self.disable_and_release_named_scanout(&name, event_loop);
         }
         debug!("Presented {presented} output(s)");
         Ok(self.present_status())
@@ -4320,21 +4373,28 @@ impl RendererState {
     ///
     /// Prefers a seat-opened DRM primary node when available; otherwise initializes
     /// Vulkan without a preferred path for virtual-only presentation.
-    fn ensure_vulkan_ready(&mut self) -> anyhow::Result<bool> {
+    fn ensure_vulkan_ready(
+        &mut self,
+        event_loop: Option<&mut EventLoop>,
+    ) -> anyhow::Result<bool> {
         if let Some(render_path) = self.resolved_render_device_path() {
             debug!("Using render device {}", render_path.display());
-            self.ensure_vulkan(Some(&render_path))?;
+            self.ensure_vulkan(Some(&render_path), event_loop)?;
             return Ok(true);
         }
         if !self.virtual_outputs.is_empty() {
-            self.ensure_vulkan(None)?;
+            self.ensure_vulkan(None, event_loop)?;
             return Ok(true);
         }
         warn!("No render device or virtual outputs available; skipping presentation");
         Ok(false)
     }
 
-    fn ensure_vulkan(&mut self, preferred_drm_path: Option<&Path>) -> anyhow::Result<()> {
+    fn ensure_vulkan(
+        &mut self,
+        preferred_drm_path: Option<&Path>,
+        event_loop: Option<&mut EventLoop>,
+    ) -> anyhow::Result<()> {
         let needs_recreate = match &self.vulkan {
             None => true,
             Some(vk) => match (preferred_drm_path, vk.drm_device_path()) {
@@ -4347,7 +4407,7 @@ impl RendererState {
         };
 
         if needs_recreate {
-            self.drain_scanouts();
+            self.drain_scanouts(event_loop);
             self.invalidate_surface_textures();
             match preferred_drm_path {
                 Some(path) => info!("Initializing Vulkan for DRM device {}", path.display()),

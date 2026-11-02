@@ -382,7 +382,12 @@ impl RendererState {
                 if let Some(control) = self.outputs.get_mut(name).map(|o| &mut o.present) {
                     control.clear_wake(event_loop)?;
                 }
-                let tick = self.tick_output(name, pending_protocol_work, seat_enabled);
+                let tick = self.tick_output(
+                    event_loop,
+                    name,
+                    pending_protocol_work,
+                    seat_enabled,
+                );
                 // After present, re-arm a future deadline for this output only.
                 let now = Instant::now();
                 let flip_idle = self.output_flip_idle(name);
@@ -425,6 +430,7 @@ impl RendererState {
 
     fn tick_output(
         &mut self,
+        event_loop: &mut EventLoop,
         name: &str,
         pending_protocol_work: bool,
         seat_enabled: bool,
@@ -463,7 +469,7 @@ impl RendererState {
         }
 
         let force = pending_protocol_work && !scene_or_content;
-        match self.present_named(name, SOLID_CLEAR_COLOR, force) {
+        match self.present_named(name, SOLID_CLEAR_COLOR, force, event_loop) {
             Ok(outcome) => {
                 if outcome.presented {
                     if let Some(control) = self.outputs.get_mut(name).map(|o| &mut o.present) {
