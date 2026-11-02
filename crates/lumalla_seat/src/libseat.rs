@@ -137,7 +137,7 @@ impl LibSeat {
             unsafe {
                 let data = &mut *(userdata as *mut SeatUserdata);
                 data.enabled.store(false, Ordering::SeqCst);
-                // Acknowledge immediately (wlroots/libseat requirement). Deferring
+                // Acknowledge immediately (libseat requirement). Deferring
                 // via the main loop races with enable and leaves VT switch stuck.
                 let result = bindings::libseat_disable_seat(seat);
                 if result < 0 {

@@ -61,20 +61,27 @@ fn candidate_key_names(name: &str) -> Vec<String> {
     candidates
 }
 
-/// Split an optional Control chord prefix from a key name.
+/// Split an optional modifier chord prefix from a key name.
 ///
-/// Accepts `C-c`, `Ctrl+c`, and `Control+c` (any ASCII case on the prefix).
-fn split_ctrl_chord(name: &str) -> (bool, &str) {
+/// Accepts Control (`C-c`, `Ctrl+c`, `Control+c`) and Alt (`A-m`, `Alt+m`).
+fn split_mod_chord(name: &str) -> (bool, bool, &str) {
     for prefix in [
         "C-", "c-", "Ctrl+", "ctrl+", "CTRL+", "Control+", "control+", "CONTROL+",
     ] {
         if let Some(rest) = name.strip_prefix(prefix) {
             if !rest.is_empty() {
-                return (true, rest);
+                return (true, false, rest);
             }
         }
     }
-    (false, name)
+    for prefix in ["A-", "a-", "Alt+", "alt+", "ALT+"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if !rest.is_empty() {
+                return (false, true, rest);
+            }
+        }
+    }
+    (false, false, name)
 }
 
 struct KeyBinding {
@@ -197,20 +204,27 @@ impl InputState {
         Ok(())
     }
 
-    /// Inject a named key press and release (e.g. `"Return"`, `"a"`, `"C-c"`).
+    /// Inject a named key press and release (e.g. `"Return"`, `"a"`, `"C-c"`, `"Alt+m"`).
     ///
-    /// Control chords are accepted as `C-<key>`, `Ctrl+<key>`, or `Control+<key>`.
+    /// Control chords: `C-<key>`, `Ctrl+<key>`, or `Control+<key>`.
+    /// Alt chords: `A-<key>` or `Alt+<key>`.
     pub fn inject_key_name(
         &mut self,
         name: &str,
         on_event: &mut impl FnMut(SeatEvent),
     ) -> anyhow::Result<()> {
-        let (ctrl, key_name) = split_ctrl_chord(name);
+        let (ctrl, alt, key_name) = split_mod_chord(name);
         let keysym = Xkb::keysym_from_name(key_name)?;
         if ctrl {
             self.inject_key(libinput::bindings::KEY_LEFTCTRL, true, on_event);
         }
+        if alt {
+            self.inject_key(libinput::bindings::KEY_LEFTALT, true, on_event);
+        }
         let result = self.inject_keysym(keysym, on_event);
+        if alt {
+            self.inject_key(libinput::bindings::KEY_LEFTALT, false, on_event);
+        }
         if ctrl {
             self.inject_key(libinput::bindings::KEY_LEFTCTRL, false, on_event);
         }
@@ -597,11 +611,13 @@ mod tests {
 
     #[test]
     fn splits_control_chord_prefixes() {
-        assert_eq!(split_ctrl_chord("C-c"), (true, "c"));
-        assert_eq!(split_ctrl_chord("Ctrl+c"), (true, "c"));
-        assert_eq!(split_ctrl_chord("Control+Return"), (true, "Return"));
-        assert_eq!(split_ctrl_chord("Return"), (false, "Return"));
-        assert_eq!(split_ctrl_chord("c"), (false, "c"));
+        assert_eq!(split_mod_chord("C-c"), (true, false, "c"));
+        assert_eq!(split_mod_chord("Ctrl+c"), (true, false, "c"));
+        assert_eq!(split_mod_chord("Control+Return"), (true, false, "Return"));
+        assert_eq!(split_mod_chord("Alt+m"), (false, true, "m"));
+        assert_eq!(split_mod_chord("A-m"), (false, true, "m"));
+        assert_eq!(split_mod_chord("Return"), (false, false, "Return"));
+        assert_eq!(split_mod_chord("c"), (false, false, "c"));
     }
 
     #[test]

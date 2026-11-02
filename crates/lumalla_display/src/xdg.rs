@@ -847,9 +847,7 @@ impl XdgManager {
         // Protocol forbids negatives, but some clients (Xwayland size hints)
         // send them. Ignoring avoids a fatal disconnect.
         if width < 0 || height < 0 {
-            log::warn!(
-                "xdg_toplevel.set_min_size with invalid size {width}x{height}; ignoring"
-            );
+            log::warn!("xdg_toplevel.set_min_size with invalid size {width}x{height}; ignoring");
             return Ok(());
         }
         // Min/max are double-buffered; consistency is checked on commit so a
@@ -870,9 +868,7 @@ impl XdgManager {
             .get_mut(&(client_id, toplevel_id))
             .ok_or(XdgError::UnknownToplevel)?;
         if width < 0 || height < 0 {
-            log::warn!(
-                "xdg_toplevel.set_max_size with invalid size {width}x{height}; ignoring"
-            );
+            log::warn!("xdg_toplevel.set_max_size with invalid size {width}x{height}; ignoring");
             return Ok(());
         }
         state.pending_max_size = (width, height);
@@ -923,8 +919,10 @@ impl XdgManager {
             .get(&(client_id, positioner))
             .ok_or(XdgError::UnknownPositioner)?
             .clone();
+        // Only require a complete positioner. Anchors may lie
+        // outside the parent (Qt does this when nesting menus on another popup);
+        // constraint adjustment still places the surface.
         positioner_state.validate_complete()?;
-        positioner_state.validate_anchor_bounds()?;
         if let Some(parent) = parent {
             let parent_surface = self
                 .xdg_surfaces
@@ -932,26 +930,6 @@ impl XdgManager {
                 .ok_or(XdgError::InvalidPopupParent)?;
             if !parent_surface.role_alive || !parent_surface.mapped {
                 return Err(XdgError::InvalidPopupParent);
-            }
-            let parent_size = parent_surface.current_window_geometry.map_or_else(
-                || match parent_surface
-                    .current_configure
-                    .map(|snapshot| snapshot.payload)
-                {
-                    Some(ConfigurePayload::Toplevel { width, height, .. })
-                        if width > 0 && height > 0 =>
-                    {
-                        Some((width, height))
-                    }
-                    Some(ConfigurePayload::Popup { geometry, .. }) => {
-                        Some((geometry.width, geometry.height))
-                    }
-                    _ => None,
-                },
-                |geometry| Some((geometry.width, geometry.height)),
-            );
-            if let Some((width, height)) = parent_size {
-                positioner_state.validate_anchor_with_size(width, height)?;
             }
             // parent_configure is copied into PopupState below for reactive
             // constraints. Do not reject when the serial is no longer
@@ -1032,18 +1010,6 @@ impl XdgManager {
             .ok_or(XdgError::UnknownPositioner)?
             .clone();
         positioner_state.validate_complete()?;
-        positioner_state.validate_anchor_bounds()?;
-        let parent = self
-            .popups
-            .get(&(client_id, popup_id))
-            .ok_or(XdgError::UnknownPopup)?
-            .parent;
-        if let Some(parent) = parent
-            && let Some(parent_surface) = self.xdg_surfaces.get(&(client_id, parent))
-            && let Some(geometry) = parent_surface.current_window_geometry
-        {
-            positioner_state.validate_anchor_with_size(geometry.width, geometry.height)?;
-        }
         let geometry = positioner_state.compute_geometry_with_bounds(constraint_bounds);
         let popup = self
             .popups
@@ -1278,13 +1244,9 @@ impl XdgManager {
             .popups
             .get(&(client_id, popup_id))
             .ok_or(XdgError::UnknownPopup)?;
-        if self
-            .popups
-            .iter()
-            .any(|((owner, _), child)| {
-                *owner == client_id && child.parent == Some(popup.xdg_surface)
-            })
-        {
+        if self.popups.iter().any(|((owner, _), child)| {
+            *owner == client_id && child.parent == Some(popup.xdg_surface)
+        }) {
             return Err(XdgError::NotTopmostPopup);
         }
         let popup = self
@@ -1595,33 +1557,14 @@ impl PositionerState {
     }
 
     pub fn validate_complete(&self) -> Result<(), XdgError> {
-        // Match wlroots: size must be non-zero, and set_anchor_rect must have been
+        // Size must be non-zero, and set_anchor_rect must have been
         // called with a non-zero width. Height may be zero (cursor-sized anchors).
+        // Anchors are not required to lie inside the parent surface.
         if !self.size_set
             || !self.anchor_rect_set
             || self.width <= 0
             || self.height <= 0
             || self.anchor_width <= 0
-        {
-            return Err(XdgError::InvalidPositioner);
-        }
-        Ok(())
-    }
-
-    fn validate_anchor_bounds(&self) -> Result<(), XdgError> {
-        let Some((width, height)) = self.parent_size else {
-            return Ok(());
-        };
-        self.validate_anchor_with_size(width, height)
-    }
-
-    fn validate_anchor_with_size(&self, width: i32, height: i32) -> Result<(), XdgError> {
-        let right = self.anchor_x.checked_add(self.anchor_width);
-        let bottom = self.anchor_y.checked_add(self.anchor_height);
-        if self.anchor_x < 0
-            || self.anchor_y < 0
-            || right.is_none_or(|right| right > width)
-            || bottom.is_none_or(|bottom| bottom > height)
         {
             return Err(XdgError::InvalidPositioner);
         }
@@ -2006,18 +1949,17 @@ mod tests {
             positioner.validate_complete(),
             Err(XdgError::InvalidPositioner)
         );
-        let mut out_of_bounds = complete_positioner();
-        out_of_bounds.set_parent_size(15, 15).unwrap();
-        assert_eq!(
-            out_of_bounds.validate_anchor_bounds(),
-            Err(XdgError::InvalidPositioner)
-        );
-        // Zero-height anchors are accepted once set_anchor_rect has a non-zero width
-        // (matches wlroots completeness).
+        // Zero-height anchors are accepted once set_anchor_rect has a non-zero width.
         let mut zero_height = PositionerState::default();
         zero_height.set_size(10, 10).unwrap();
         zero_height.set_anchor_rect(0, 0, 1, 0).unwrap();
         assert_eq!(zero_height.validate_complete(), Ok(()));
+        // Anchors outside the parent (including negatives) are complete and valid;
+        // Qt uses this when nesting a menu on another popup (qalculate Mode/Alt+M).
+        let mut outside = complete_positioner();
+        outside.set_anchor_rect(-1, -106, 1, 1).unwrap();
+        outside.set_parent_size(567, 223).unwrap();
+        assert_eq!(outside.validate_complete(), Ok(()));
     }
 
     #[test]
@@ -2032,9 +1974,7 @@ mod tests {
             object_id(4),
         );
         // Issue a second configure so the first serial is no longer current/pending.
-        let second = manager
-            .send_configure_serial(client, object_id(2))
-            .unwrap();
+        let second = manager.send_configure_serial(client, object_id(2)).unwrap();
         manager.ack_configure(client, object_id(2), second).unwrap();
         manager
             .on_wl_surface_commit_with_buffer(client, object_id(3), Some(true))
@@ -2059,6 +1999,77 @@ mod tests {
         assert!(
             manager
                 .create_popup(client, object_id(7), object_id(5), object_id(2), positioner)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn popup_accepts_negative_anchor_on_nested_parent() {
+        // qalculate-qt Mode/Alt+M while completion is open: Qt parents the Mode
+        // menu to the completion popup with anchor_rect=(-1, -106, 1, 1).
+        let client = client_id(1);
+        let mut manager = XdgManager::default();
+        mapped_toplevel(
+            &mut manager,
+            client,
+            object_id(2),
+            object_id(3),
+            object_id(4),
+        );
+
+        manager.create_positioner(client, object_id(20));
+        manager
+            .positioner_set_size(client, object_id(20), 567, 223)
+            .unwrap();
+        manager
+            .positioner_set_anchor_rect(client, object_id(20), 7, 171, 1, 1)
+            .unwrap();
+        manager
+            .create_xdg_surface(client, object_id(5), object_id(6))
+            .unwrap();
+        manager
+            .create_popup(
+                client,
+                object_id(7),
+                object_id(5),
+                object_id(2),
+                object_id(20),
+            )
+            .unwrap();
+        let completion_initial = manager
+            .on_wl_surface_commit_with_buffer(client, object_id(6), Some(false))
+            .unwrap()
+            .initial_configure
+            .unwrap();
+        manager
+            .ack_configure(client, object_id(5), completion_initial.serial)
+            .unwrap();
+        manager
+            .set_window_geometry(client, object_id(5), 0, 0, 567, 223)
+            .unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, object_id(6), Some(true))
+            .unwrap();
+
+        manager.create_positioner(client, object_id(21));
+        manager
+            .positioner_set_size(client, object_id(21), 343, 834)
+            .unwrap();
+        manager
+            .positioner_set_anchor_rect(client, object_id(21), -1, -106, 1, 1)
+            .unwrap();
+        manager
+            .create_xdg_surface(client, object_id(8), object_id(9))
+            .unwrap();
+        assert!(
+            manager
+                .create_popup(
+                    client,
+                    object_id(10),
+                    object_id(8),
+                    object_id(5),
+                    object_id(21),
+                )
                 .is_ok()
         );
     }
@@ -2234,15 +2245,11 @@ mod tests {
         );
 
         // Negatives are ignored; a later valid update still applies.
-        manager
-            .set_toplevel_min_size(client, top, -1, 10)
-            .unwrap();
+        manager.set_toplevel_min_size(client, top, -1, 10).unwrap();
         manager
             .set_toplevel_min_size(client, top, 800, 600)
             .unwrap();
-        manager
-            .set_toplevel_max_size(client, top, 0, 0)
-            .unwrap();
+        manager.set_toplevel_max_size(client, top, 0, 0).unwrap();
         manager
             .on_wl_surface_commit_with_buffer(client, wl, None)
             .unwrap();

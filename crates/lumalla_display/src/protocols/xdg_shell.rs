@@ -794,7 +794,7 @@ impl XdgPopup for DisplayState {
         }
         // Protocol allows denying a grab (which dismisses the popup). Rejecting
         // unknown serials breaks toolkits that work on compositors which never
-        // validate (wlroots). Prefer allowing the grab and only warn.
+        // validate. Prefer allowing the grab and only warn.
         if !self.seat_manager.is_valid_grab_serial(params.serial()) {
             log::warn!(
                 "xdg_popup.grab serial {} was not issued by this seat; allowing grab anyway",
