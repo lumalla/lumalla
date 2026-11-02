@@ -1,3 +1,4 @@
+pub mod data_control;
 pub mod foreign_toplevel_list;
 pub mod image_capture_source;
 pub mod image_copy_capture;
@@ -11,6 +12,7 @@ pub mod wlr_layer_shell;
 pub mod xdg_output;
 pub mod xdg_shell;
 
+pub use data_control::ExtDataControlV1Protocol;
 pub use foreign_toplevel_list::ExtForeignToplevelListV1Protocol;
 pub use image_capture_source::ExtImageCaptureSourceV1Protocol;
 pub use image_copy_capture::ExtImageCopyCaptureV1Protocol;

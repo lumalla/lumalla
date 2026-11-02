@@ -22,6 +22,7 @@ use lumalla_wayland_protocol::{
 use stumpalo::Arena;
 
 use crate::{
+    data_control::DataControlManager,
     data_device::DataDeviceManager,
     dmabuf::DmabufManager,
     foreign_toplevel::ForeignToplevelListManager,
@@ -38,6 +39,7 @@ use crate::{
 };
 
 mod clients;
+mod data_control;
 mod data_device;
 mod dmabuf;
 mod foreign_toplevel;
@@ -261,6 +263,7 @@ pub struct DisplayState {
     relative_pointer_manager: RelativePointerManager,
     output_manager: OutputManager,
     data_device_manager: DataDeviceManager,
+    data_control_manager: DataControlManager,
     xdg_manager: XdgManager,
     layer_shell_manager: LayerShellManager,
     window_manager: WindowManager,
@@ -294,6 +297,7 @@ impl Default for DisplayState {
             relative_pointer_manager: RelativePointerManager::default(),
             output_manager: OutputManager::default(),
             data_device_manager: DataDeviceManager::default(),
+            data_control_manager: DataControlManager::default(),
             xdg_manager: XdgManager::default(),
             layer_shell_manager: LayerShellManager::default(),
             window_manager: WindowManager::default(),
@@ -766,6 +770,7 @@ impl DisplayState {
 
     pub fn flush_pending_data_device(&mut self, clients: &mut ConnectedClients) {
         self.data_device_manager.flush_pending(clients);
+        self.data_control_manager.flush_pending(clients);
     }
 
     pub fn flush_pending_activation_configures(&mut self, clients: &mut ConnectedClients) {
@@ -1245,8 +1250,17 @@ impl DisplayState {
         self.pointer_constraints_manager.delete_client(client_id);
         self.relative_pointer_manager.delete_client(client_id);
         self.output_manager.remove_client(client_id);
+        let was_selection_owner = self
+            .data_device_manager
+            .selection_state()
+            .is_some_and(|s| s.source_client == client_id);
         self.data_device_manager.remove_client(client_id);
+        self.data_control_manager.remove_client(client_id);
+        if was_selection_owner {
+            self.data_control_manager.queue_selection_changed(None);
+        }
         self.data_device_manager.flush_pending(clients);
+        self.data_control_manager.flush_pending(clients);
         self.xdg_manager.delete_client(client_id);
         self.layer_shell_manager.delete_client(client_id);
         self.window_manager.delete_client(client_id);
@@ -2251,6 +2265,7 @@ impl Default for Globals {
             [].into_iter(),
         );
         globals.register_version(InterfaceIndex::ExtForeignToplevelListV1, 1, [].into_iter());
+        globals.register_version(InterfaceIndex::ExtDataControlManagerV1, 1, [].into_iter());
         globals
     }
 }

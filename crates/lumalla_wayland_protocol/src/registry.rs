@@ -9,12 +9,12 @@ use crate::{
     buffer::{MessageHeader, Writer},
     client::Ctx,
     protocols::{
-        ExtForeignToplevelListV1Protocol, ExtImageCaptureSourceV1Protocol,
-        ExtImageCopyCaptureV1Protocol, LinuxDmabufV1Protocol,
+        ExtDataControlV1Protocol, ExtForeignToplevelListV1Protocol,
+        ExtImageCaptureSourceV1Protocol, ExtImageCopyCaptureV1Protocol, LinuxDmabufV1Protocol,
         PointerConstraintsUnstableV1Protocol, PresentationTimeProtocol,
         RelativePointerUnstableV1Protocol, ViewporterProtocol, WaylandProtocol, WlDisplay,
         WlrLayerShellUnstableV1Protocol, XdgOutputUnstableV1Protocol, XdgShellProtocol,
-        foreign_toplevel_list::*, image_capture_source::*, image_copy_capture::*,
+        data_control::*, foreign_toplevel_list::*, image_capture_source::*, image_copy_capture::*,
         linux_dmabuf::*, pointer_constraints::*, presentation_time::*, relative_pointer::*,
         viewporter::*, wayland::*, wlr_layer_shell::*, xdg_output::*, xdg_shell::*,
     },
@@ -75,6 +75,10 @@ pub enum InterfaceIndex {
     ExtForeignToplevelImageCaptureSourceManagerV1,
     ExtForeignToplevelListV1,
     ExtForeignToplevelHandleV1,
+    ExtDataControlManagerV1,
+    ExtDataControlDeviceV1,
+    ExtDataControlSourceV1,
+    ExtDataControlOfferV1,
 }
 
 impl InterfaceIndex {
@@ -143,6 +147,10 @@ impl InterfaceIndex {
             }
             InterfaceIndex::ExtForeignToplevelListV1 => EXT_FOREIGN_TOPLEVEL_LIST_V1_NAME,
             InterfaceIndex::ExtForeignToplevelHandleV1 => EXT_FOREIGN_TOPLEVEL_HANDLE_V1_NAME,
+            InterfaceIndex::ExtDataControlManagerV1 => EXT_DATA_CONTROL_MANAGER_V1_NAME,
+            InterfaceIndex::ExtDataControlDeviceV1 => EXT_DATA_CONTROL_DEVICE_V1_NAME,
+            InterfaceIndex::ExtDataControlSourceV1 => EXT_DATA_CONTROL_SOURCE_V1_NAME,
+            InterfaceIndex::ExtDataControlOfferV1 => EXT_DATA_CONTROL_OFFER_V1_NAME,
         }
     }
 
@@ -215,6 +223,10 @@ impl InterfaceIndex {
             InterfaceIndex::ExtForeignToplevelHandleV1 => {
                 EXT_FOREIGN_TOPLEVEL_HANDLE_V1_VERSION
             }
+            InterfaceIndex::ExtDataControlManagerV1 => EXT_DATA_CONTROL_MANAGER_V1_VERSION,
+            InterfaceIndex::ExtDataControlDeviceV1 => EXT_DATA_CONTROL_DEVICE_V1_VERSION,
+            InterfaceIndex::ExtDataControlSourceV1 => EXT_DATA_CONTROL_SOURCE_V1_VERSION,
+            InterfaceIndex::ExtDataControlOfferV1 => EXT_DATA_CONTROL_OFFER_V1_VERSION,
         }
     }
 }
@@ -390,7 +402,8 @@ where
         + XdgOutputUnstableV1Protocol
         + ExtImageCopyCaptureV1Protocol
         + ExtImageCaptureSourceV1Protocol
-        + ExtForeignToplevelListV1Protocol,
+        + ExtForeignToplevelListV1Protocol
+        + ExtDataControlV1Protocol,
 {
     fn handle_request(
         &mut self,
@@ -636,6 +649,46 @@ where
             }
             InterfaceIndex::ExtForeignToplevelHandleV1 => {
                 ExtForeignToplevelHandleV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtDataControlManagerV1 => {
+                ExtDataControlManagerV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtDataControlDeviceV1 => {
+                ExtDataControlDeviceV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtDataControlSourceV1 => {
+                ExtDataControlSourceV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtDataControlOfferV1 => {
+                ExtDataControlOfferV1::handle_request(
                     self,
                     ctx,
                     header,

@@ -1144,15 +1144,27 @@ impl WlDataSource for DisplayState {
 
     fn destroy(&mut self, ctx: &mut Ctx, object_id: ObjectId, _params: &WlDataSourceDestroy<'_>) {
         let focused = self.seat_manager.focused_keyboard_surface().map(|(c, _)| c);
-        if let Err(error) = self.data_device_manager.destroy_source(
+        match self.data_device_manager.destroy_source(
             ctx.client_id,
             object_id,
             focused,
             ctx.registry,
             ctx.writer,
         ) {
-            report_data_device_error(ctx, object_id, error);
-            return;
+            Ok(cleared) => {
+                if cleared.is_some() {
+                    let _ = self.data_control_manager.notify_selection_changed(
+                        None,
+                        Some(ctx.client_id),
+                        ctx.registry,
+                        ctx.writer,
+                    );
+                }
+            }
+            Err(error) => {
+                report_data_device_error(ctx, object_id, error);
+                return;
+            }
         }
         ctx.registry.free_object(object_id, ctx.writer);
     }
@@ -1303,7 +1315,7 @@ impl WlDataDevice for DisplayState {
             return;
         }
         let focused = self.seat_manager.focused_keyboard_surface().map(|(c, _)| c);
-        if let Err(error) = self.data_device_manager.set_selection(
+        match self.data_device_manager.set_selection(
             ctx.client_id,
             object_id,
             params.source(),
@@ -1312,7 +1324,26 @@ impl WlDataDevice for DisplayState {
             ctx.registry,
             ctx.writer,
         ) {
-            report_data_device_error(ctx, object_id, error);
+            Ok(previous) => {
+                if let Some(prev) = previous
+                    && prev.kind
+                        == crate::data_device::SelectionSourceKind::ExtDataControlSource
+                {
+                    self.data_control_manager.cancel_control_source(
+                        prev.source_client,
+                        prev.source,
+                        Some(ctx.client_id),
+                        ctx.writer,
+                    );
+                }
+                let _ = self.data_control_manager.notify_selection_changed(
+                    self.data_device_manager.selection_state(),
+                    Some(ctx.client_id),
+                    ctx.registry,
+                    ctx.writer,
+                );
+            }
+            Err(error) => report_data_device_error(ctx, object_id, error),
         }
     }
 
@@ -2417,6 +2448,10 @@ mod tests {
         )));
         assert!(globals.contains(&(
             lumalla_wayland_protocol::protocols::foreign_toplevel_list::EXT_FOREIGN_TOPLEVEL_LIST_V1_NAME,
+            1
+        )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::data_control::EXT_DATA_CONTROL_MANAGER_V1_NAME,
             1
         )));
     }

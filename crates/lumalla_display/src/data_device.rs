@@ -59,7 +59,7 @@ pub struct DataDeviceManager {
     sources: HashMap<(ClientId, ObjectId), DataSource>,
     devices: HashMap<(ClientId, ObjectId), DataDevice>,
     offers: HashMap<(ClientId, ObjectId), DataOffer>,
-    selection: Option<Selection>,
+    selection: Option<SelectionState>,
     drag: Option<ActiveDrag>,
     pending_selection_notifies: Vec<PendingSelectionNotify>,
     pending_source_cancels: Vec<PendingSourceCancel>,
@@ -98,6 +98,7 @@ enum OfferKind {
 struct DataOffer {
     device: ObjectId,
     source: Option<(ClientId, ObjectId)>,
+    source_kind: SelectionSourceKind,
     mime_types: Vec<String>,
     kind: OfferKind,
     accepted_mime: Option<Option<String>>,
@@ -111,12 +112,22 @@ struct DataOffer {
     version: u32,
 }
 
-#[derive(Debug, Clone)]
-struct Selection {
-    source_client: ClientId,
-    source: ObjectId,
+/// Which protocol object currently owns the compositor selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionSourceKind {
+    WlDataSource,
+    ExtDataControlSource,
+}
+
+/// Snapshot of the current clipboard selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionState {
+    pub source_client: ClientId,
+    pub source: ObjectId,
+    pub kind: SelectionSourceKind,
+    pub mime_types: Vec<String>,
     #[allow(dead_code)]
-    serial: u32,
+    pub serial: u32,
 }
 
 #[derive(Debug)]
@@ -141,19 +152,21 @@ struct ActiveDrag {
 struct PendingSelectionNotify {
     client_id: ClientId,
     device_id: ObjectId,
-    source: Option<(ClientId, ObjectId)>,
+    selection: Option<SelectionState>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PendingSourceCancel {
     client_id: ClientId,
     source_id: ObjectId,
+    kind: SelectionSourceKind,
 }
 
 #[derive(Debug)]
 struct PendingSourceSend {
     client_id: ClientId,
     source_id: ObjectId,
+    kind: SelectionSourceKind,
     mime_type: String,
     fd: RawFd,
 }
@@ -304,16 +317,16 @@ impl DataDeviceManager {
         focused_client: Option<ClientId>,
         registry: &mut Registry,
         writer: &mut Writer,
-    ) -> Result<(), DataDeviceError> {
+    ) -> Result<Option<SelectionState>, DataDeviceError> {
         if self.sources.remove(&(client_id, source_id)).is_none() {
             return Err(DataDeviceError::UnknownSource);
         }
-        if self
-            .selection
-            .as_ref()
-            .is_some_and(|s| s.source_client == client_id && s.source == source_id)
-        {
-            self.selection = None;
+        let cleared = if self.selection.as_ref().is_some_and(|s| {
+            s.source_client == client_id
+                && s.source == source_id
+                && s.kind == SelectionSourceKind::WlDataSource
+        }) {
+            let cleared = self.selection.take();
             self.advertise_selection_to_focused(
                 None,
                 focused_client,
@@ -321,13 +334,16 @@ impl DataDeviceManager {
                 registry,
                 writer,
             )?;
-        }
+            cleared
+        } else {
+            None
+        };
         if let Some(drag) = self.drag.as_ref()
             && drag.source == Some((client_id, source_id))
         {
             self.cancel_drag(Some(client_id), writer);
         }
-        Ok(())
+        Ok(cleared)
     }
 
     pub fn set_selection(
@@ -339,12 +355,12 @@ impl DataDeviceManager {
         focused_client: Option<ClientId>,
         registry: &mut Registry,
         writer: &mut Writer,
-    ) -> Result<(), DataDeviceError> {
+    ) -> Result<Option<SelectionState>, DataDeviceError> {
         if !self.devices.contains_key(&(client_id, device_id)) {
             return Err(DataDeviceError::UnknownDevice);
         }
 
-        let new_source = match source {
+        let new_selection = match source {
             Some(source_id) => {
                 let source_state = self
                     .sources
@@ -357,38 +373,78 @@ impl DataDeviceManager {
                     return Err(DataDeviceError::InvalidSource);
                 }
                 source_state.used = true;
-                Some((client_id, source_id))
+                Some(SelectionState {
+                    source_client: client_id,
+                    source: source_id,
+                    kind: SelectionSourceKind::WlDataSource,
+                    mime_types: source_state.mime_types.clone(),
+                    serial,
+                })
             }
             None => None,
         };
 
-        if let Some(previous) = self.selection.take() {
-            let same = new_source == Some((previous.source_client, previous.source));
-            if !same {
-                self.cancel_source(
-                    previous.source_client,
-                    previous.source,
-                    Some(client_id),
-                    writer,
-                );
-            }
-        }
-
-        self.selection = new_source.map(|(source_client, source_id)| Selection {
-            source_client,
-            source: source_id,
-            serial,
-        });
-
-        // Only the keyboard-focused client receives selection events.
-        self.advertise_selection_to_focused(
-            new_source,
+        let previous = self.replace_selection(
+            new_selection.clone(),
             focused_client,
             Some(client_id),
             registry,
             writer,
         )?;
-        Ok(())
+        Ok(previous)
+    }
+
+    /// Replace the shared selection and advertise to the focused `wl_data_device` client.
+    ///
+    /// Returns the previous selection so the caller can cancel non-`wl_data_source` owners
+    /// (and so control devices can be notified). Same-source replacements are not cancelled.
+    pub fn replace_selection(
+        &mut self,
+        new_selection: Option<SelectionState>,
+        focused_client: Option<ClientId>,
+        immediate_client: Option<ClientId>,
+        registry: &mut Registry,
+        writer: &mut Writer,
+    ) -> Result<Option<SelectionState>, DataDeviceError> {
+        let previous = self.selection.take();
+        if let Some(ref prev) = previous {
+            let same = new_selection.as_ref().is_some_and(|n| {
+                n.source_client == prev.source_client
+                    && n.source == prev.source
+                    && n.kind == prev.kind
+            });
+            if !same && prev.kind == SelectionSourceKind::WlDataSource {
+                self.cancel_source(
+                    prev.source_client,
+                    prev.source,
+                    SelectionSourceKind::WlDataSource,
+                    immediate_client,
+                    writer,
+                );
+            }
+        }
+
+        self.selection = new_selection.clone();
+
+        // Only the keyboard-focused client receives wl_data_device selection events.
+        self.advertise_selection_to_focused(
+            new_selection.clone(),
+            focused_client,
+            immediate_client,
+            registry,
+            writer,
+        )?;
+        Ok(previous.filter(|prev| {
+            new_selection.as_ref().is_none_or(|n| {
+                !(n.source_client == prev.source_client
+                    && n.source == prev.source
+                    && n.kind == prev.kind)
+            })
+        }))
+    }
+
+    pub fn selection_state(&self) -> Option<&SelectionState> {
+        self.selection.as_ref()
     }
 
     /// Advertise the current selection after a client gains keyboard focus.
@@ -398,11 +454,8 @@ impl DataDeviceManager {
         registry: &mut Registry,
         writer: &mut Writer,
     ) -> Result<(), DataDeviceError> {
-        let source = self
-            .selection
-            .as_ref()
-            .map(|s| (s.source_client, s.source));
-        self.advertise_selection_to_client(client_id, source, registry, writer)
+        let selection = self.selection.clone();
+        self.advertise_selection_to_client(client_id, selection, registry, writer)
     }
 
     /// Clear the selection offer when a client loses keyboard focus.
@@ -490,6 +543,7 @@ impl DataDeviceManager {
                         client_id,
                         device_id,
                         source_key,
+                        SelectionSourceKind::WlDataSource,
                         mime_types.clone(),
                         OfferKind::Drag,
                         source_actions,
@@ -639,6 +693,7 @@ impl DataDeviceManager {
                 tid,
                 tdevice,
                 source_key,
+                SelectionSourceKind::WlDataSource,
                 mime_types,
                 OfferKind::Drag,
                 source_actions,
@@ -780,6 +835,7 @@ impl DataDeviceManager {
         let Some((source_client, source_id)) = offer.source else {
             return Ok(());
         };
+        let source_kind = offer.source_kind;
         if !offer.mime_types.iter().any(|m| m == mime_type) {
             return Ok(());
         }
@@ -787,6 +843,7 @@ impl DataDeviceManager {
             self.pending_source_sends.push(PendingSourceSend {
                 client_id: source_client,
                 source_id,
+                kind: source_kind,
                 mime_type: mime_type.to_owned(),
                 fd: fd.into_raw_fd(),
             });
@@ -795,7 +852,13 @@ impl DataDeviceManager {
 
         // Forward the destination FD directly to the source — correct Wayland
         // semantics while the FD lives in the compositor process.
-        forward_receive_to_source(writer, source_id, mime_type, fd.into_raw_fd());
+        forward_receive_to_source(
+            writer,
+            source_id,
+            source_kind,
+            mime_type,
+            fd.into_raw_fd(),
+        );
         Ok(())
     }
 
@@ -1020,7 +1083,7 @@ impl DataDeviceManager {
             let _ = self.send_selection_to_device(
                 notify.client_id,
                 notify.device_id,
-                notify.source,
+                notify.selection,
                 registry,
                 writer,
             );
@@ -1032,9 +1095,7 @@ impl DataDeviceManager {
             let Some(client) = clients.get_mut(&cancel.client_id) else {
                 continue;
             };
-            client
-                .writer_mut()
-                .wl_data_source_cancelled(cancel.source_id);
+            emit_source_cancelled(client.writer_mut(), cancel.source_id, cancel.kind);
             clients.mark_send_needed(cancel.client_id);
         }
 
@@ -1047,6 +1108,7 @@ impl DataDeviceManager {
             forward_receive_to_source(
                 client.writer_mut(),
                 send.source_id,
+                send.kind,
                 &send.mime_type,
                 fd,
             );
@@ -1138,6 +1200,7 @@ impl DataDeviceManager {
                     enter.client_id,
                     enter.device_id,
                     enter.source,
+                    SelectionSourceKind::WlDataSource,
                     enter.mime_types,
                     OfferKind::Drag,
                     enter.source_actions,
@@ -1207,7 +1270,7 @@ impl DataDeviceManager {
             let _ = self.send_selection_to_device(
                 notify.client_id,
                 notify.device_id,
-                notify.source,
+                notify.selection,
                 registry,
                 writer,
             );
@@ -1218,7 +1281,7 @@ impl DataDeviceManager {
             .extract_if(.., |c| c.client_id == client_id)
             .collect();
         for cancel in cancels {
-            writer.wl_data_source_cancelled(cancel.source_id);
+            emit_source_cancelled(writer, cancel.source_id, cancel.kind);
         }
 
         let sends: Vec<_> = self
@@ -1227,7 +1290,7 @@ impl DataDeviceManager {
             .collect();
         for mut send in sends {
             let fd = std::mem::replace(&mut send.fd, -1);
-            forward_receive_to_source(writer, send.source_id, &send.mime_type, fd);
+            forward_receive_to_source(writer, send.source_id, send.kind, &send.mime_type, fd);
         }
 
         let events: Vec<_> = self
@@ -1287,6 +1350,7 @@ impl DataDeviceManager {
                     enter.client_id,
                     enter.device_id,
                     enter.source,
+                    SelectionSourceKind::WlDataSource,
                     enter.mime_types,
                     OfferKind::Drag,
                     enter.source_actions,
@@ -1319,6 +1383,11 @@ impl DataDeviceManager {
     #[cfg(test)]
     pub fn selection_source(&self) -> Option<(ClientId, ObjectId)> {
         self.selection.as_ref().map(|s| (s.source_client, s.source))
+    }
+
+    #[cfg(test)]
+    pub fn selection_kind(&self) -> Option<SelectionSourceKind> {
+        self.selection.as_ref().map(|s| s.kind)
     }
 
     #[cfg(test)]
@@ -1372,22 +1441,36 @@ impl DataDeviceManager {
         &mut self,
         source_client: ClientId,
         source_id: ObjectId,
+        kind: SelectionSourceKind,
         immediate_client: Option<ClientId>,
         writer: &mut Writer,
     ) {
         if immediate_client == Some(source_client) {
-            writer.wl_data_source_cancelled(source_id);
+            emit_source_cancelled(writer, source_id, kind);
         } else {
             self.pending_source_cancels.push(PendingSourceCancel {
                 client_id: source_client,
                 source_id,
+                kind,
             });
         }
     }
 
+    /// Queue a cancel for a selection source owned by another protocol (e.g. data-control).
+    pub fn queue_source_cancel(
+        &mut self,
+        source_client: ClientId,
+        source_id: ObjectId,
+        kind: SelectionSourceKind,
+        immediate_client: Option<ClientId>,
+        writer: &mut Writer,
+    ) {
+        self.cancel_source(source_client, source_id, kind, immediate_client, writer);
+    }
+
     fn advertise_selection_to_focused(
         &mut self,
-        source: Option<(ClientId, ObjectId)>,
+        selection: Option<SelectionState>,
         focused_client: Option<ClientId>,
         immediate_client: Option<ClientId>,
         registry: &mut Registry,
@@ -1397,9 +1480,9 @@ impl DataDeviceManager {
             return Ok(());
         };
         if Some(focused) == immediate_client {
-            self.advertise_selection_to_client(focused, source, registry, writer)
+            self.advertise_selection_to_client(focused, selection, registry, writer)
         } else {
-            self.queue_selection_notifies_for_client(focused, source);
+            self.queue_selection_notifies_for_client(focused, selection);
             Ok(())
         }
     }
@@ -1407,7 +1490,7 @@ impl DataDeviceManager {
     fn advertise_selection_to_client(
         &mut self,
         client_id: ClientId,
-        source: Option<(ClientId, ObjectId)>,
+        selection: Option<SelectionState>,
         registry: &mut Registry,
         writer: &mut Writer,
     ) -> Result<(), DataDeviceError> {
@@ -1417,7 +1500,7 @@ impl DataDeviceManager {
             .filter_map(|((owner, id), _)| (*owner == client_id).then_some(*id))
             .collect();
         for device_id in devices {
-            self.send_selection_to_device(client_id, device_id, source, registry, writer)?;
+            self.send_selection_to_device(client_id, device_id, selection.clone(), registry, writer)?;
         }
         Ok(())
     }
@@ -1425,7 +1508,7 @@ impl DataDeviceManager {
     fn queue_selection_notifies_for_client(
         &mut self,
         client_id: ClientId,
-        source: Option<(ClientId, ObjectId)>,
+        selection: Option<SelectionState>,
     ) {
         let devices: Vec<ObjectId> = self
             .devices
@@ -1437,12 +1520,12 @@ impl DataDeviceManager {
                 .push(PendingSelectionNotify {
                     client_id,
                     device_id,
-                    source,
+                    selection: selection.clone(),
                 });
         }
     }
 
-    fn queue_selection_notifies(&mut self, source: Option<(ClientId, ObjectId)>) {
+    fn queue_selection_notifies(&mut self, selection: Option<SelectionState>) {
         let devices: Vec<(ClientId, ObjectId)> = self
             .devices
             .keys()
@@ -1453,7 +1536,7 @@ impl DataDeviceManager {
                 .push(PendingSelectionNotify {
                     client_id: owner,
                     device_id: id,
-                    source,
+                    selection: selection.clone(),
                 });
         }
     }
@@ -1462,7 +1545,7 @@ impl DataDeviceManager {
         &mut self,
         client_id: ClientId,
         device_id: ObjectId,
-        source: Option<(ClientId, ObjectId)>,
+        selection: Option<SelectionState>,
         registry: &mut Registry,
         writer: &mut Writer,
     ) -> Result<(), DataDeviceError> {
@@ -1472,18 +1555,14 @@ impl DataDeviceManager {
             .map(|d| d.version)
             .ok_or(DataDeviceError::UnknownDevice)?;
 
-        let offer_id = match source {
-            Some((source_client, source_id)) => {
-                let mime_types = self
-                    .sources
-                    .get(&(source_client, source_id))
-                    .map(|s| s.mime_types.clone())
-                    .unwrap_or_default();
+        let offer_id = match selection {
+            Some(sel) => {
                 let offer = self.create_offer(
                     client_id,
                     device_id,
-                    Some((source_client, source_id)),
-                    mime_types,
+                    Some((sel.source_client, sel.source)),
+                    sel.kind,
+                    sel.mime_types,
                     OfferKind::Selection,
                     WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE,
                     version,
@@ -1511,6 +1590,7 @@ impl DataDeviceManager {
         client_id: ClientId,
         device_id: ObjectId,
         source: Option<(ClientId, ObjectId)>,
+        source_kind: SelectionSourceKind,
         mime_types: Vec<String>,
         kind: OfferKind,
         source_actions: u32,
@@ -1541,6 +1621,7 @@ impl DataDeviceManager {
             DataOffer {
                 device: device_id,
                 source,
+                source_kind,
                 mime_types,
                 kind,
                 accepted_mime: None,
@@ -1587,7 +1668,13 @@ impl DataDeviceManager {
             }
         }
         if let Some((source_client, source_id)) = drag.source {
-            self.cancel_source(source_client, source_id, immediate_client, writer);
+            self.cancel_source(
+                source_client,
+                source_id,
+                SelectionSourceKind::WlDataSource,
+                immediate_client,
+                writer,
+            );
         }
     }
 }
@@ -1627,7 +1714,7 @@ fn negotiate_action(source_actions: u32, dest_actions: u32, preferred: u32) -> u
     first_action(available)
 }
 
-/// Forward a client-provided receive FD to the data source via `wl_data_source.send`.
+/// Forward a client-provided receive FD to the owning data source.
 ///
 /// Takes ownership of `fd`: the writer duplicates it into the send queue, then this
 /// closes the caller's copy. The queued duplicate is closed after send (or on drop).
@@ -1636,17 +1723,39 @@ fn negotiate_action(source_actions: u32, dest_actions: u32, preferred: u32) -> u
 pub fn forward_receive_to_source(
     writer: &mut Writer,
     source_id: ObjectId,
+    kind: SelectionSourceKind,
     mime_type: &str,
     fd: RawFd,
 ) {
-    writer
-        .wl_data_source_send(source_id)
-        .mime_type(mime_type)
-        .fd(fd);
+    match kind {
+        SelectionSourceKind::WlDataSource => {
+            writer
+                .wl_data_source_send(source_id)
+                .mime_type(mime_type)
+                .fd(fd);
+        }
+        SelectionSourceKind::ExtDataControlSource => {
+            writer
+                .ext_data_control_source_v1_send(source_id)
+                .mime_type(mime_type)
+                .fd(fd);
+        }
+    }
     unsafe {
         libc::close(fd);
     }
     let _ = writer.flush();
+}
+
+fn emit_source_cancelled(writer: &mut Writer, source_id: ObjectId, kind: SelectionSourceKind) {
+    match kind {
+        SelectionSourceKind::WlDataSource => {
+            writer.wl_data_source_cancelled(source_id);
+        }
+        SelectionSourceKind::ExtDataControlSource => {
+            writer.ext_data_control_source_v1_cancelled(source_id);
+        }
+    }
 }
 
 #[cfg(test)]

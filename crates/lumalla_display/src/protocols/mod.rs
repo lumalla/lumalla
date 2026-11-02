@@ -1,3 +1,4 @@
+mod data_control;
 pub(crate) mod foreign_toplevel;
 mod image_capture_source;
 mod image_copy_capture;
