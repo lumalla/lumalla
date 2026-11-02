@@ -8,7 +8,8 @@ use std::{
 };
 
 use libc::{
-    F_GET_SEALS, MAP_FAILED, MAP_PRIVATE, MAP_SHARED, PROT_READ, fcntl, fstat, mmap, munmap, stat,
+    F_GET_SEALS, MAP_FAILED, MAP_PRIVATE, MAP_SHARED, PROT_READ, PROT_WRITE, fcntl, fstat, mmap,
+    munmap, stat,
 };
 use log::error;
 use lumalla_wayland_protocol::{
@@ -282,6 +283,59 @@ impl ShmManager {
         ))
     }
 
+    /// Whether a SHM buffer exists for this client/object.
+    pub fn has_buffer(&self, client_id: ClientId, buffer_id: ObjectId) -> bool {
+        self.buffers.contains_key(&(client_id, buffer_id))
+    }
+
+    /// Write tightly packed RGBA/XRGB pixels into a client SHM buffer.
+    ///
+    /// `pixels` must contain `width * height * 4` bytes in the buffer's wl_shm
+    /// channel order (little-endian ARGB/XRGB as stored by clients). Source is
+    /// treated as tightly packed (`width * 4` stride).
+    pub fn write_buffer_pixels(
+        &mut self,
+        client_id: ClientId,
+        buffer_id: ObjectId,
+        pixels: &[u8],
+    ) -> Result<()> {
+        let buffer = *self.buffers.get(&(client_id, buffer_id)).ok_or_else(|| {
+            ShmError::new(ShmErrorKind::InvalidObject, "Unknown shared-memory buffer")
+        })?;
+        let packed = buffer
+            .width
+            .checked_mul(buffer.height)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                ShmError::new(
+                    ShmErrorKind::InvalidStride,
+                    "Shared-memory buffer size overflows",
+                )
+            })?;
+        if pixels.len() < packed {
+            return Err(ShmError::new(
+                ShmErrorKind::InvalidStride,
+                "Pixel buffer is smaller than the SHM buffer",
+            ));
+        }
+        let pool = self.pool_mut(buffer.pool_index)?;
+        let dst = pool.bytes_mut()?;
+        let src_stride = buffer.width * 4;
+        for row in 0..buffer.height {
+            let dst_start = buffer.offset + row * buffer.stride;
+            let src_start = row * src_stride;
+            let end = dst_start + src_stride;
+            if end > dst.len() {
+                return Err(ShmError::new(
+                    ShmErrorKind::InvalidStride,
+                    "Shared-memory buffer write exceeds pool",
+                ));
+            }
+            dst[dst_start..end].copy_from_slice(&pixels[src_start..src_start + src_stride]);
+        }
+        Ok(())
+    }
+
     /// Capture SHM pixels into a per-surface double-buffer.
     ///
     /// When `damage` is `Some` and the surface backing already matches this
@@ -473,6 +527,8 @@ struct ShmPool {
     fd: ManuallyDrop<OwnedFd>,
     size: usize,
     address: *mut c_void,
+    /// False when the pool could only be mapped read-only (write-sealed memfd).
+    writable: bool,
     ref_count: usize,
 }
 
@@ -482,8 +538,8 @@ impl ShmPool {
             close_owned_fd(fd);
             return Err(error);
         }
-        let address = match map_region(fd.as_raw_fd(), size) {
-            Ok(address) => address,
+        let (address, writable) = match map_region(fd.as_raw_fd(), size) {
+            Ok(mapped) => mapped,
             Err(error) => {
                 close_owned_fd(fd);
                 return Err(error);
@@ -493,6 +549,7 @@ impl ShmPool {
             fd: ManuallyDrop::new(fd),
             size,
             address,
+            writable,
             ref_count: 1,
         })
     }
@@ -505,18 +562,28 @@ impl ShmPool {
             ));
         }
         ensure_file_size(&self.fd, size)?;
-        let address = map_region(self.fd.as_raw_fd(), size)?;
+        let (address, writable) = map_region(self.fd.as_raw_fd(), size)?;
         unsafe {
             munmap(self.address, self.size);
         }
         self.address = address;
+        self.writable = writable;
         self.size = size;
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.address.cast(), self.size) }
+    }
+
+    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+        if !self.writable {
+            return Err(ShmError::new(
+                ShmErrorKind::InvalidFd,
+                "Shared-memory pool is not writable",
+            ));
+        }
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.address.cast(), self.size) })
     }
 }
 
@@ -598,7 +665,22 @@ fn ensure_file_size(fd: &OwnedFd, size: usize) -> Result<()> {
     Ok(())
 }
 
-fn map_region(fd: RawFd, size: usize) -> Result<*mut c_void> {
+fn map_region(fd: RawFd, size: usize) -> Result<(*mut c_void, bool)> {
+    // Prefer a writable map so image-copy-capture can fill client buffers. Fall
+    // back to read-only for write-sealed client content pools.
+    let writable = unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            size,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if writable != MAP_FAILED {
+        return Ok((writable, true));
+    }
     let address = unsafe { mmap(std::ptr::null_mut(), size, PROT_READ, MAP_SHARED, fd, 0) };
     if address == MAP_FAILED {
         let errno = std::io::Error::last_os_error();
@@ -642,7 +724,7 @@ fn map_region(fd: RawFd, size: usize) -> Result<*mut c_void> {
             "Unable to map shared-memory file descriptor",
         ));
     }
-    Ok(address)
+    Ok((address, false))
 }
 
 #[cfg(test)]

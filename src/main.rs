@@ -14,6 +14,7 @@ use crate::{app::run_app, args::Args, os_signal::handle_signals};
 
 mod app;
 mod args;
+mod image_copy_capture;
 mod os_signal;
 mod screencast_capture;
 mod screencast_lifecycle;

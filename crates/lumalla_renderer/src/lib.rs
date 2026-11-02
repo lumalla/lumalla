@@ -1587,6 +1587,28 @@ impl RendererState {
 
     /// Allocate exportable buffers for a PipeWire DMA-BUF stream.
     ///
+    /// Capture the current pointer image as RGBA8 (for cursor capture sessions).
+    pub fn capture_cursor_rgba(&self) -> anyhow::Result<CapturedImage> {
+        let Some((_hx, _hy, argb, width, height)) = self.hw_cursor_image_pixels() else {
+            // Hidden / incompatible cursor → 1x1 transparent.
+            return Ok(CapturedImage {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 0],
+            });
+        };
+        let mut rgba = argb;
+        // ARGB little-endian bytes are B,G,R,A → swap to R,G,B,A.
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        Ok(CapturedImage {
+            width,
+            height,
+            rgba,
+        })
+    }
+
     /// Prefers a single-plane tiled DRM modifier when the GPU supports render+blit
     /// usage; falls back to LINEAR. Returns one [`ScreencastDmaExport`] per buffer
     /// (duplicated fds for the PW thread). Images stay owned by [`RendererState`]

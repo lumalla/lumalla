@@ -17,14 +17,15 @@ use lumalla_wayland_protocol::protocols::presentation_time::{
 };
 use lumalla_wayland_protocol::registry::InterfaceIndex;
 use lumalla_wayland_protocol::{
-    Ctx, ObjectId, buffer::Writer, registry::ObjectMetadata, registry::Registry,
-    registry::RequestHandler,
+    Ctx, buffer::Writer, registry::ObjectMetadata, registry::Registry, registry::RequestHandler,
 };
 use stumpalo::Arena;
 
 use crate::{
     data_device::DataDeviceManager,
     dmabuf::DmabufManager,
+    foreign_toplevel::ForeignToplevelListManager,
+    image_copy_capture::ImageCopyCaptureManager,
     layer_shell::LayerShellManager,
     output::OutputManager,
     pointer_constraints::PointerConstraintsManager,
@@ -39,6 +40,8 @@ use crate::{
 mod clients;
 mod data_device;
 mod dmabuf;
+mod foreign_toplevel;
+mod image_copy_capture;
 mod layer_shell;
 mod output;
 mod pointer_constraints;
@@ -55,13 +58,25 @@ mod xdg;
 pub use clients::ConnectedClients;
 pub use dmabuf::ExportedDmabuf;
 pub use lumalla_shared::PresentationFlipInfo;
-pub use lumalla_wayland_protocol::{ClientConnection, ClientId, Wayland, buffer::ReadResult};
+pub use lumalla_wayland_protocol::{
+    ClientConnection, ClientId, ObjectId, Wayland, buffer::ReadResult,
+};
+pub use image_copy_capture::{
+    CaptureBufferSize, CaptureDamageRect, CaptureSourceKind, PendingCapture,
+};
 pub use output::OutputInfo;
 pub use recording_sink::RecordingRenderSink;
 pub use seat::{ActiveCursor, KeyboardModifiers, PointerCursor};
 pub use seat_input::SeatInputHandler;
 pub use surface::{Rectangle, SceneSurface};
 pub use window_manager::{WindowError, WindowGeometryChange};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingFtlEvent {
+    Mapped(u32),
+    Unmapped(u32),
+    Props(u32),
+}
 
 /// Short-lived protocol handler that gives display a [`RenderSink`] for the dispatch phase.
 ///
@@ -249,6 +264,9 @@ pub struct DisplayState {
     xdg_manager: XdgManager,
     layer_shell_manager: LayerShellManager,
     window_manager: WindowManager,
+    pub(crate) foreign_toplevel_manager: ForeignToplevelListManager,
+    pub image_copy_capture: ImageCopyCaptureManager,
+    pending_ftl_events: Vec<PendingFtlEvent>,
     pending_geometry_changes: Vec<WindowGeometryChange>,
     pub(crate) pending_frame_callbacks: VecDeque<PendingFrameCallback>,
     pending_presentation_feedbacks: VecDeque<PendingPresentationFeedback>,
@@ -279,6 +297,9 @@ impl Default for DisplayState {
             xdg_manager: XdgManager::default(),
             layer_shell_manager: LayerShellManager::default(),
             window_manager: WindowManager::default(),
+            foreign_toplevel_manager: ForeignToplevelListManager::default(),
+            image_copy_capture: ImageCopyCaptureManager::default(),
+            pending_ftl_events: Vec::new(),
             pending_geometry_changes: Vec::new(),
             pending_frame_callbacks: VecDeque::new(),
             pending_presentation_feedbacks: VecDeque::new(),
@@ -407,6 +428,7 @@ impl DisplayState {
         }
         self.render_mut().request_present();
         self.render_content_changed = true;
+        self.image_copy_capture.bump_content_serial();
     }
 
     pub(crate) fn emit_surface_unmapped(
@@ -414,6 +436,14 @@ impl DisplayState {
         client_id: ClientId,
         surface_id: ObjectId,
     ) {
+        if let Some(window_id) = self
+            .window_manager
+            .window_id_for_surface(client_id, surface_id)
+        {
+            self.pending_ftl_events
+                .push(PendingFtlEvent::Unmapped(window_id));
+            self.image_copy_capture.stop_sources_for_window(window_id);
+        }
         if let Err(err) = self
             .render_mut()
             .remove_surface(client_id.get(), surface_id.get())
@@ -422,6 +452,7 @@ impl DisplayState {
         }
         self.render_mut().request_present();
         self.render_content_changed = true;
+        self.image_copy_capture.bump_content_serial();
     }
 
     pub(crate) fn emit_buffer_destroyed(&mut self, client_id: ClientId, buffer_id: ObjectId) {
@@ -594,6 +625,9 @@ impl DisplayState {
         self.dmabuf_manager
             .set_supported_formats(formats, device_path);
         self.dmabuf_manager.send_all_feedback(clients.values_mut());
+        let (device, grouped) = self.dmabuf_manager.capture_advertise();
+        self.image_copy_capture
+            .set_dmabuf_advertise(device, grouped);
     }
 
     pub fn flush_pending_keyboard_leaves(&mut self, clients: &mut ConnectedClients) -> bool {
@@ -1216,6 +1250,8 @@ impl DisplayState {
         self.xdg_manager.delete_client(client_id);
         self.layer_shell_manager.delete_client(client_id);
         self.window_manager.delete_client(client_id);
+        self.foreign_toplevel_manager.delete_client(client_id);
+        self.image_copy_capture.delete_client(client_id);
         self.pending_frame_callbacks
             .retain(|pending| pending.client_id != client_id);
         self.pending_presentation_feedbacks
@@ -1555,6 +1591,59 @@ impl DisplayState {
         self.output_manager.outputs()
     }
 
+    /// Logical rect `(x, y, width, height)` for a client-bound `wl_output`.
+    pub fn output_rect_for_binding(
+        &self,
+        client_id: ClientId,
+        wl_output: ObjectId,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let global = self
+            .output_manager
+            .global_for_binding(client_id, wl_output)?;
+        let info = self.output_manager.get(global)?;
+        Some((info.x, info.y, info.width, info.height))
+    }
+
+    pub fn shm_has_buffer(&self, client_id: ClientId, buffer: ObjectId) -> bool {
+        self.shm_manager.has_buffer(client_id, buffer)
+    }
+
+    pub fn shm_buffer_meta(
+        &self,
+        client_id: ClientId,
+        buffer: ObjectId,
+    ) -> anyhow::Result<(usize, usize, usize, u32)> {
+        self.shm_manager
+            .buffer_meta(client_id, buffer)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
+    pub fn shm_write_buffer_pixels(
+        &mut self,
+        client_id: ClientId,
+        buffer: ObjectId,
+        pixels: &[u8],
+    ) -> anyhow::Result<()> {
+        self.shm_manager
+            .write_buffer_pixels(client_id, buffer, pixels)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
+    pub fn dmabuf_has_buffer(&self, client_id: ClientId, buffer: ObjectId) -> bool {
+        self.dmabuf_manager.has_buffer(client_id, buffer)
+    }
+
+    pub fn dmabuf_write_linear_buffer_pixels(
+        &mut self,
+        client_id: ClientId,
+        buffer: ObjectId,
+        pixels: &[u8],
+    ) -> anyhow::Result<()> {
+        self.dmabuf_manager
+            .write_linear_buffer_pixels(client_id, buffer, pixels)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
     pub fn activate_main_seat(
         &mut self,
         seat_name: String,
@@ -1738,10 +1827,19 @@ impl DisplayState {
         let changes = self.window_manager.on_app_id_set(
             client_id,
             toplevel,
-            app_id,
+            app_id.clone(),
             surface_manager,
             &mut self.xdg_manager,
         );
+        if let Some(window_id) = self
+            .window_manager
+            .window_id_for_toplevel(client_id, toplevel)
+        {
+            self.foreign_toplevel_manager
+                .set_app_id(window_id, app_id);
+            self.pending_ftl_events
+                .push(PendingFtlEvent::Props(window_id));
+        }
         self.pending_geometry_changes.extend(changes);
     }
 
@@ -1755,11 +1853,62 @@ impl DisplayState {
         let changes = self.window_manager.on_title_set(
             client_id,
             toplevel,
-            title,
+            title.clone(),
             surface_manager,
             &mut self.xdg_manager,
         );
+        if let Some(window_id) = self
+            .window_manager
+            .window_id_for_toplevel(client_id, toplevel)
+        {
+            self.foreign_toplevel_manager.set_title(window_id, title);
+            self.pending_ftl_events
+                .push(PendingFtlEvent::Props(window_id));
+        }
         self.pending_geometry_changes.extend(changes);
+    }
+
+    /// Flush queued foreign-toplevel list events to subscribed clients.
+    pub fn flush_foreign_toplevel(&mut self, clients: &mut ConnectedClients) -> bool {
+        if self.pending_ftl_events.is_empty() {
+            return false;
+        }
+        let events = std::mem::take(&mut self.pending_ftl_events);
+        for event in events {
+            match event {
+                PendingFtlEvent::Mapped(window_id) => {
+                    let (title, app_id) = self
+                        .window_manager
+                        .window_title_app_id(window_id)
+                        .unwrap_or_default();
+                    self.foreign_toplevel_manager.notify_mapped(
+                        window_id,
+                        &title,
+                        &app_id,
+                        clients,
+                    );
+                }
+                PendingFtlEvent::Unmapped(window_id) => {
+                    self.foreign_toplevel_manager
+                        .notify_unmapped(window_id, clients);
+                }
+                PendingFtlEvent::Props(window_id) => {
+                    let (title, app_id) = self
+                        .window_manager
+                        .window_title_app_id(window_id)
+                        .unwrap_or_default();
+                    self.foreign_toplevel_manager
+                        .ensure_window(window_id, &title, &app_id);
+                    self.foreign_toplevel_manager
+                        .set_title(window_id, title);
+                    self.foreign_toplevel_manager
+                        .set_app_id(window_id, app_id);
+                    self.foreign_toplevel_manager
+                        .broadcast_properties(window_id, clients);
+                }
+            }
+        }
+        true
     }
 
     pub(crate) fn on_surface_focused(&mut self, client_id: ClientId, wl_surface: ObjectId) {
@@ -1784,6 +1933,14 @@ impl DisplayState {
         registry: &mut Registry,
         writer: &mut Writer,
     ) {
+        if let Some(window_id) = self
+            .window_manager
+            .window_id_for_surface(client_id, surface_id)
+        {
+            self.pending_ftl_events
+                .push(PendingFtlEvent::Mapped(window_id));
+        }
+
         if self
             .surface_manager
             .surface_role_is_subsurface(client_id, surface_id)
@@ -2082,6 +2239,18 @@ impl Default for Globals {
         );
         globals.register_version(InterfaceIndex::ZwlrLayerShellV1, 5, [].into_iter());
         globals.register_version(InterfaceIndex::ZxdgOutputManagerV1, 3, [].into_iter());
+        globals.register_version(InterfaceIndex::ExtImageCopyCaptureManagerV1, 1, [].into_iter());
+        globals.register_version(
+            InterfaceIndex::ExtOutputImageCaptureSourceManagerV1,
+            1,
+            [].into_iter(),
+        );
+        globals.register_version(
+            InterfaceIndex::ExtForeignToplevelImageCaptureSourceManagerV1,
+            1,
+            [].into_iter(),
+        );
+        globals.register_version(InterfaceIndex::ExtForeignToplevelListV1, 1, [].into_iter());
         globals
     }
 }

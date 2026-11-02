@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, fstat, mmap, munmap, stat};
+use libc::{MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE, fstat, mmap, munmap, stat};
 use lumalla_wayland_protocol::{
     ClientId, ObjectId,
     buffer::Writer,
@@ -192,6 +192,98 @@ impl DmabufManager {
         } else {
             &self.supported
         }
+    }
+
+    /// Device + formats for `ext_image_copy_capture_session_v1` constraint events.
+    pub fn capture_advertise(&self) -> (Option<Vec<u8>>, Vec<(u32, Vec<u64>)>) {
+        let device = self.main_device.map(encode_dev_t);
+        let mut by_format: HashMap<u32, Vec<u64>> = HashMap::new();
+        for &(fourcc, modifier) in self.supported_formats() {
+            by_format.entry(fourcc).or_default().push(modifier);
+        }
+        let mut formats: Vec<(u32, Vec<u64>)> = by_format.into_iter().collect();
+        formats.sort_by_key(|(fourcc, _)| *fourcc);
+        (device, formats)
+    }
+
+    /// Write tightly packed little-endian XR24/AR24 pixels into a linear client DMA-BUF.
+    pub fn write_linear_buffer_pixels(
+        &self,
+        client_id: ClientId,
+        buffer_id: ObjectId,
+        pixels: &[u8],
+    ) -> Result<()> {
+        let buffer = self.buffers.get(&(client_id, buffer_id)).ok_or_else(|| {
+            DmabufError::new(DmabufErrorKind::InvalidObject, "Unknown dmabuf buffer")
+        })?;
+        if buffer.planes.len() != 1 {
+            return Err(DmabufError::new(
+                DmabufErrorKind::Incomplete,
+                "Only single-plane dmabuf capture destinations are supported",
+            ));
+        }
+        let plane = &buffer.planes[0];
+        if plane.modifier != DRM_FORMAT_MOD_LINEAR && plane.modifier != u64::MAX {
+            return Err(DmabufError::new(
+                DmabufErrorKind::InvalidFormat,
+                "Only linear dmabuf capture destinations are supported",
+            ));
+        }
+        let width = buffer.width as usize;
+        let height = buffer.height as usize;
+        let stride = plane.stride as usize;
+        let offset = plane.offset as usize;
+        let packed = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                DmabufError::new(DmabufErrorKind::OutOfBounds, "dmabuf size overflows")
+            })?;
+        if pixels.len() < packed {
+            return Err(DmabufError::new(
+                DmabufErrorKind::OutOfBounds,
+                "Pixel buffer is smaller than the dmabuf",
+            ));
+        }
+        let map_size = offset
+            .checked_add(stride.checked_mul(height).unwrap_or(usize::MAX))
+            .ok_or_else(|| {
+                DmabufError::new(DmabufErrorKind::OutOfBounds, "dmabuf map size overflows")
+            })?;
+        let addr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                map_size,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                plane.fd.as_raw_fd(),
+                0,
+            )
+        };
+        if addr == MAP_FAILED {
+            return Err(DmabufError::new(
+                DmabufErrorKind::InvalidFd,
+                "Unable to map dmabuf for capture write",
+            ));
+        }
+        let dst = unsafe { std::slice::from_raw_parts_mut(addr.cast::<u8>(), map_size) };
+        let src_stride = width * 4;
+        let abgr = drm_fourcc_is_abgr_order(buffer.format);
+        for row in 0..height {
+            let dst_start = offset + row * stride;
+            let src_start = row * src_stride;
+            let row_dst = &mut dst[dst_start..dst_start + src_stride];
+            row_dst.copy_from_slice(&pixels[src_start..src_start + src_stride]);
+            if abgr {
+                for px in row_dst.chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                }
+            }
+        }
+        unsafe {
+            munmap(addr, map_size);
+        }
+        Ok(())
     }
 
     /// Update advertised formats and optional main DRM device for feedback.

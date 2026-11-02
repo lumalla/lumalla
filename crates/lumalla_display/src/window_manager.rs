@@ -370,6 +370,24 @@ impl WindowManager {
         self.focused_id
     }
 
+    /// Resolve a managed toplevel rooted at `wl_surface`.
+    pub fn window_id_for_surface(&self, client_id: ClientId, wl_surface: ObjectId) -> Option<u32> {
+        self.windows
+            .values()
+            .find(|window| window.client_id == client_id && window.wl_surface == wl_surface)
+            .map(|window| window.id)
+    }
+
+    pub fn window_id_for_toplevel(&self, client_id: ClientId, toplevel: ObjectId) -> Option<u32> {
+        self.by_toplevel.get(&(client_id, toplevel)).copied()
+    }
+
+    pub fn window_title_app_id(&self, window_id: u32) -> Option<(String, String)> {
+        self.windows
+            .get(&window_id)
+            .map(|window| (window.title.clone(), window.app_id.clone()))
+    }
+
     /// Resolve a window id to its Wayland surface. `None` / `0` → focused window.
     pub fn resolve_surface(&self, id: Option<u32>) -> Result<(ClientId, ObjectId), WindowError> {
         let target = self.resolve_window_id(id)?;

@@ -1,3 +1,6 @@
+pub mod foreign_toplevel_list;
+pub mod image_capture_source;
+pub mod image_copy_capture;
 pub mod linux_dmabuf;
 pub mod pointer_constraints;
 pub mod presentation_time;
@@ -8,6 +11,9 @@ pub mod wlr_layer_shell;
 pub mod xdg_output;
 pub mod xdg_shell;
 
+pub use foreign_toplevel_list::ExtForeignToplevelListV1Protocol;
+pub use image_capture_source::ExtImageCaptureSourceV1Protocol;
+pub use image_copy_capture::ExtImageCopyCaptureV1Protocol;
 pub use linux_dmabuf::LinuxDmabufV1Protocol;
 pub use pointer_constraints::PointerConstraintsUnstableV1Protocol;
 pub use presentation_time::PresentationTimeProtocol;

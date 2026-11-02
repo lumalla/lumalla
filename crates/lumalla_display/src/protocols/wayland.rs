@@ -921,6 +921,14 @@ impl WlRegistry for DisplayState {
                     .wp_presentation_clock_id(*id)
                     .clk_id(libc::CLOCK_MONOTONIC as u32);
             }
+            _ if interface_name == InterfaceIndex::ExtForeignToplevelListV1.interface_name() => {
+                self.foreign_toplevel_manager.bind_list(
+                    ctx.client_id,
+                    *id,
+                    ctx.registry,
+                    ctx.writer,
+                );
+            }
             _ => {}
         }
     }
@@ -2395,6 +2403,22 @@ mod tests {
             lumalla_wayland_protocol::protocols::xdg_output::ZXDG_OUTPUT_MANAGER_V1_NAME,
             3
         )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::image_copy_capture::EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_NAME,
+            1
+        )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::image_capture_source::EXT_OUTPUT_IMAGE_CAPTURE_SOURCE_MANAGER_V1_NAME,
+            1
+        )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::image_capture_source::EXT_FOREIGN_TOPLEVEL_IMAGE_CAPTURE_SOURCE_MANAGER_V1_NAME,
+            1
+        )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::foreign_toplevel_list::EXT_FOREIGN_TOPLEVEL_LIST_V1_NAME,
+            1
+        )));
     }
 
     #[test]
@@ -2589,6 +2613,62 @@ mod tests {
         assert_eq!(
             ctx.registry.interface_index(object_id(20)),
             Some(InterfaceIndex::ZwpPointerConstraintsV1)
+        );
+    }
+
+    #[test]
+    fn registry_bind_ext_image_copy_capture_manager_registers_object() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let mut registry = Registry::new();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
+        };
+        let global_name = state
+            .globals
+            .iter()
+            .find(|(_, global)| {
+                global.interface_index == InterfaceIndex::ExtImageCopyCaptureManagerV1
+            })
+            .map(|(id, _)| *id)
+            .expect("ext_image_copy_capture_manager_v1 global");
+        let data = bind_data(global_name, "ext_image_copy_capture_manager_v1", 1, 20);
+        let mut fds = VecDeque::new();
+        let params = WlRegistryBind::new(&data, &mut fds);
+        WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
+        assert_eq!(
+            ctx.registry.interface_index(object_id(20)),
+            Some(InterfaceIndex::ExtImageCopyCaptureManagerV1)
+        );
+    }
+
+    #[test]
+    fn registry_bind_ext_foreign_toplevel_list_registers_object() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let mut registry = Registry::new();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
+        };
+        let global_name = state
+            .globals
+            .iter()
+            .find(|(_, global)| global.interface_index == InterfaceIndex::ExtForeignToplevelListV1)
+            .map(|(id, _)| *id)
+            .expect("ext_foreign_toplevel_list_v1 global");
+        let data = bind_data(global_name, "ext_foreign_toplevel_list_v1", 1, 20);
+        let mut fds = VecDeque::new();
+        let params = WlRegistryBind::new(&data, &mut fds);
+        WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
+        assert_eq!(
+            ctx.registry.interface_index(object_id(20)),
+            Some(InterfaceIndex::ExtForeignToplevelListV1)
         );
     }
 

@@ -9,9 +9,12 @@ use crate::{
     buffer::{MessageHeader, Writer},
     client::Ctx,
     protocols::{
-        LinuxDmabufV1Protocol, PointerConstraintsUnstableV1Protocol, PresentationTimeProtocol,
+        ExtForeignToplevelListV1Protocol, ExtImageCaptureSourceV1Protocol,
+        ExtImageCopyCaptureV1Protocol, LinuxDmabufV1Protocol,
+        PointerConstraintsUnstableV1Protocol, PresentationTimeProtocol,
         RelativePointerUnstableV1Protocol, ViewporterProtocol, WaylandProtocol, WlDisplay,
         WlrLayerShellUnstableV1Protocol, XdgOutputUnstableV1Protocol, XdgShellProtocol,
+        foreign_toplevel_list::*, image_capture_source::*, image_copy_capture::*,
         linux_dmabuf::*, pointer_constraints::*, presentation_time::*, relative_pointer::*,
         viewporter::*, wayland::*, wlr_layer_shell::*, xdg_output::*, xdg_shell::*,
     },
@@ -63,6 +66,15 @@ pub enum InterfaceIndex {
     ZwlrLayerSurfaceV1,
     ZxdgOutputManagerV1,
     ZxdgOutputV1,
+    ExtImageCopyCaptureManagerV1,
+    ExtImageCopyCaptureSessionV1,
+    ExtImageCopyCaptureFrameV1,
+    ExtImageCopyCaptureCursorSessionV1,
+    ExtImageCaptureSourceV1,
+    ExtOutputImageCaptureSourceManagerV1,
+    ExtForeignToplevelImageCaptureSourceManagerV1,
+    ExtForeignToplevelListV1,
+    ExtForeignToplevelHandleV1,
 }
 
 impl InterfaceIndex {
@@ -112,6 +124,25 @@ impl InterfaceIndex {
             InterfaceIndex::ZwlrLayerSurfaceV1 => ZWLR_LAYER_SURFACE_V1_NAME,
             InterfaceIndex::ZxdgOutputManagerV1 => ZXDG_OUTPUT_MANAGER_V1_NAME,
             InterfaceIndex::ZxdgOutputV1 => ZXDG_OUTPUT_V1_NAME,
+            InterfaceIndex::ExtImageCopyCaptureManagerV1 => {
+                EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_NAME
+            }
+            InterfaceIndex::ExtImageCopyCaptureSessionV1 => {
+                EXT_IMAGE_COPY_CAPTURE_SESSION_V1_NAME
+            }
+            InterfaceIndex::ExtImageCopyCaptureFrameV1 => EXT_IMAGE_COPY_CAPTURE_FRAME_V1_NAME,
+            InterfaceIndex::ExtImageCopyCaptureCursorSessionV1 => {
+                EXT_IMAGE_COPY_CAPTURE_CURSOR_SESSION_V1_NAME
+            }
+            InterfaceIndex::ExtImageCaptureSourceV1 => EXT_IMAGE_CAPTURE_SOURCE_V1_NAME,
+            InterfaceIndex::ExtOutputImageCaptureSourceManagerV1 => {
+                EXT_OUTPUT_IMAGE_CAPTURE_SOURCE_MANAGER_V1_NAME
+            }
+            InterfaceIndex::ExtForeignToplevelImageCaptureSourceManagerV1 => {
+                EXT_FOREIGN_TOPLEVEL_IMAGE_CAPTURE_SOURCE_MANAGER_V1_NAME
+            }
+            InterfaceIndex::ExtForeignToplevelListV1 => EXT_FOREIGN_TOPLEVEL_LIST_V1_NAME,
+            InterfaceIndex::ExtForeignToplevelHandleV1 => EXT_FOREIGN_TOPLEVEL_HANDLE_V1_NAME,
         }
     }
 
@@ -161,6 +192,29 @@ impl InterfaceIndex {
             InterfaceIndex::ZwlrLayerSurfaceV1 => ZWLR_LAYER_SURFACE_V1_VERSION,
             InterfaceIndex::ZxdgOutputManagerV1 => ZXDG_OUTPUT_MANAGER_V1_VERSION,
             InterfaceIndex::ZxdgOutputV1 => ZXDG_OUTPUT_V1_VERSION,
+            InterfaceIndex::ExtImageCopyCaptureManagerV1 => {
+                EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_VERSION
+            }
+            InterfaceIndex::ExtImageCopyCaptureSessionV1 => {
+                EXT_IMAGE_COPY_CAPTURE_SESSION_V1_VERSION
+            }
+            InterfaceIndex::ExtImageCopyCaptureFrameV1 => {
+                EXT_IMAGE_COPY_CAPTURE_FRAME_V1_VERSION
+            }
+            InterfaceIndex::ExtImageCopyCaptureCursorSessionV1 => {
+                EXT_IMAGE_COPY_CAPTURE_CURSOR_SESSION_V1_VERSION
+            }
+            InterfaceIndex::ExtImageCaptureSourceV1 => EXT_IMAGE_CAPTURE_SOURCE_V1_VERSION,
+            InterfaceIndex::ExtOutputImageCaptureSourceManagerV1 => {
+                EXT_OUTPUT_IMAGE_CAPTURE_SOURCE_MANAGER_V1_VERSION
+            }
+            InterfaceIndex::ExtForeignToplevelImageCaptureSourceManagerV1 => {
+                EXT_FOREIGN_TOPLEVEL_IMAGE_CAPTURE_SOURCE_MANAGER_V1_VERSION
+            }
+            InterfaceIndex::ExtForeignToplevelListV1 => EXT_FOREIGN_TOPLEVEL_LIST_V1_VERSION,
+            InterfaceIndex::ExtForeignToplevelHandleV1 => {
+                EXT_FOREIGN_TOPLEVEL_HANDLE_V1_VERSION
+            }
         }
     }
 }
@@ -333,7 +387,10 @@ where
         + PointerConstraintsUnstableV1Protocol
         + RelativePointerUnstableV1Protocol
         + WlrLayerShellUnstableV1Protocol
-        + XdgOutputUnstableV1Protocol,
+        + XdgOutputUnstableV1Protocol
+        + ExtImageCopyCaptureV1Protocol
+        + ExtImageCaptureSourceV1Protocol
+        + ExtForeignToplevelListV1Protocol,
 {
     fn handle_request(
         &mut self,
@@ -496,6 +553,96 @@ where
             }
             InterfaceIndex::ZxdgOutputV1 => {
                 ZxdgOutputV1::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ExtImageCopyCaptureManagerV1 => {
+                ExtImageCopyCaptureManagerV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtImageCopyCaptureSessionV1 => {
+                ExtImageCopyCaptureSessionV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtImageCopyCaptureFrameV1 => {
+                ExtImageCopyCaptureFrameV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtImageCopyCaptureCursorSessionV1 => {
+                ExtImageCopyCaptureCursorSessionV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtImageCaptureSourceV1 => {
+                ExtImageCaptureSourceV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtOutputImageCaptureSourceManagerV1 => {
+                ExtOutputImageCaptureSourceManagerV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtForeignToplevelImageCaptureSourceManagerV1 => {
+                ExtForeignToplevelImageCaptureSourceManagerV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtForeignToplevelListV1 => {
+                ExtForeignToplevelListV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
+            }
+            InterfaceIndex::ExtForeignToplevelHandleV1 => {
+                ExtForeignToplevelHandleV1::handle_request(
+                    self,
+                    ctx,
+                    header,
+                    data,
+                    fds,
+                    object.version,
+                )
             }
         }
     }

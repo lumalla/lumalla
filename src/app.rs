@@ -57,6 +57,7 @@ impl CursorListenSink for CommsCursorListen<'_> {
 }
 
 use crate::args::Args;
+use crate::image_copy_capture::ImageCopyCapturePhase;
 use crate::screencast_capture::ScreencastCapturePhase;
 use crate::screencast_lifecycle::{
     ScreencastLifecycleEffects, ScreencastSessionPeers, ScreencastSessionState,
@@ -456,6 +457,7 @@ impl AppData {
                         &mut self.renderer_state,
                         |display| display.drain_pending_geometry(clients),
                     );
+                    let _ = self.display_state.flush_foreign_toplevel(&mut self.clients);
                     if content_changed {
                         self.display_state.with_render(&mut self.renderer_state, |display| {
                             display.push_renderer_scenes();
@@ -1256,6 +1258,8 @@ impl AppData {
                         self.flush_client_sends(event_loop, arena);
                         if !result.presented_outputs.is_empty() {
                             self.push_screencast_frames(event_loop, arena);
+                            self.fulfill_image_copy_capture();
+                            self.flush_client_sends(event_loop, arena);
                         }
                     }
                     Err(err) => warn!("Unable to handle present wake timeout: {err}"),
@@ -1412,6 +1416,15 @@ impl AppData {
         if effects.arm_gpu_wake {
             self.arm_screencast_gpu_wake(event_loop);
         }
+    }
+
+    fn fulfill_image_copy_capture(&mut self) {
+        ImageCopyCapturePhase {
+            display: &mut self.display_state,
+            render: &mut self.renderer_state,
+            clients: &mut self.clients,
+        }
+        .fulfill();
     }
 }
 
