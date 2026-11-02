@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io,
+    mem::ManuallyDrop,
     num::NonZeroU32,
     os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
@@ -97,9 +98,10 @@ struct DrmDeviceRegistration {
 struct AppData {
     comms: Comms,
     _dbus_thread_completion_fd: OwnedFd,
-    // `seat_state` must outlive `input_state`; fields drop in reverse declaration order.
-    seat_state: Pin<Box<SeatState>>,
-    input_state: InputState,
+    /// Must outlive [`Self::input_state`] (libinput userdata). Dropped explicitly
+    /// after input in [`Drop`]; do not rely on field declaration order.
+    seat_state: ManuallyDrop<Pin<Box<SeatState>>>,
+    input_state: ManuallyDrop<InputState>,
     shutting_down: bool,
     shutdown_now: bool,
     dbus_thread_finished: bool,
@@ -117,6 +119,17 @@ struct AppData {
     next_drm_device_token: usize,
     /// Config cursor-listen / consume policy for the seat-input phase.
     cursor_listen: CursorListenPolicy,
+}
+
+impl Drop for AppData {
+    fn drop(&mut self) {
+        // SAFETY: each ManuallyDrop field is dropped exactly once here.
+        // LibInput userdata points at SeatState, so input must be destroyed first.
+        unsafe {
+            ManuallyDrop::drop(&mut self.input_state);
+            ManuallyDrop::drop(&mut self.seat_state);
+        }
+    }
 }
 
 impl AppData {
@@ -143,8 +156,8 @@ impl AppData {
         Self {
             comms,
             _dbus_thread_completion_fd,
-            seat_state,
-            input_state,
+            seat_state: ManuallyDrop::new(seat_state),
+            input_state: ManuallyDrop::new(input_state),
             shutting_down: false,
             shutdown_now: false,
             dbus_thread_finished: false,
