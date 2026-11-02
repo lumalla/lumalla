@@ -98,8 +98,9 @@ struct DrmDeviceRegistration {
 struct AppData {
     comms: Comms,
     _dbus_thread_completion_fd: OwnedFd,
-    /// Must outlive [`Self::input_state`] (libinput userdata). Dropped explicitly
-    /// after input in [`Drop`]; do not rely on field declaration order.
+    /// Must outlive [`Self::input_state`] (libinput userdata) and
+    /// [`Self::renderer_state`] (seat-opened DRM fds). Dropped last among these
+    /// in [`Drop`]; do not rely on field declaration order.
     seat_state: ManuallyDrop<Pin<Box<SeatState>>>,
     input_state: ManuallyDrop<InputState>,
     shutting_down: bool,
@@ -108,7 +109,7 @@ struct AppData {
     wayland: Wayland,
     clients: ConnectedClients,
     display_state: DisplayState,
-    renderer_state: RendererState,
+    renderer_state: ManuallyDrop<RendererState>,
     screencast: ScreencastManager,
     screencast_session: ScreencastSessionState,
     /// Absolute timeout armed while screencast DMA fills are in flight.
@@ -123,10 +124,15 @@ struct AppData {
 
 impl Drop for AppData {
     fn drop(&mut self) {
-        // SAFETY: each ManuallyDrop field is dropped exactly once here.
-        // LibInput userdata points at SeatState, so input must be destroyed first.
+        // LibInput userdata points at SeatState; DRM primaries are seat-opened.
+        // Tear both down while the seat is still alive, then close the seat.
         unsafe {
             ManuallyDrop::drop(&mut self.input_state);
+        }
+        self.renderer_state
+            .deactivate_drm(self.seat_state.as_ref().get_ref());
+        unsafe {
+            ManuallyDrop::drop(&mut self.renderer_state);
             ManuallyDrop::drop(&mut self.seat_state);
         }
     }
@@ -164,7 +170,7 @@ impl AppData {
             wayland,
             clients: ConnectedClients::new(),
             display_state,
-            renderer_state,
+            renderer_state: ManuallyDrop::new(renderer_state),
             screencast,
             screencast_session: ScreencastSessionState::default(),
             screencast_gpu_wake_armed: false,
@@ -207,7 +213,7 @@ impl AppData {
                 input: &mut self.input_state,
                 display: &mut self.display_state,
                 clients: &mut self.clients,
-                render: &mut self.renderer_state,
+                render: &mut *self.renderer_state,
             };
             if let Err(err) = peers.suspend_devices() {
                 warn!("Unable to suspend libinput during shutdown: {err}");
@@ -436,7 +442,7 @@ impl AppData {
             ReadResult::ReadData => {
                 if let Err(err) = client.dispatch_pending(&mut DisplayHandler {
                     state: &mut self.display_state,
-                    render: &mut self.renderer_state,
+                    render: &mut *self.renderer_state,
                 }) {
                     error!(
                         "Unable to handle messages for client {:?}: {err}",
@@ -467,12 +473,12 @@ impl AppData {
                         .refresh_pointer_focus(&mut self.clients, arena);
                     let clients = &mut self.clients;
                     let layout_changed = self.display_state.with_render(
-                        &mut self.renderer_state,
+                        &mut *self.renderer_state,
                         |display| display.drain_pending_geometry(clients),
                     );
                     let _ = self.display_state.flush_foreign_toplevel(&mut self.clients);
                     if content_changed {
-                        self.display_state.with_render(&mut self.renderer_state, |display| {
+                        self.display_state.with_render(&mut *self.renderer_state, |display| {
                             display.push_renderer_scenes();
                         });
                     }
@@ -559,7 +565,7 @@ impl AppData {
             error!("Unable to cancel I/O for client {:?}: {err}", client_id);
         }
         let clients = &mut self.clients;
-        self.display_state.with_render(&mut self.renderer_state, |display| {
+        self.display_state.with_render(&mut *self.renderer_state, |display| {
             display.remove_client(client_id, clients);
         });
         if self.renderer_state.scene_dirty() {
@@ -635,7 +641,7 @@ impl AppData {
                             input: &mut self.input_state,
                             display: &mut self.display_state,
                             clients: &mut self.clients,
-                            render: &mut self.renderer_state,
+                            render: &mut *self.renderer_state,
                         };
                         peers.on_enabled()
                     };
@@ -670,7 +676,7 @@ impl AppData {
                             input: &mut self.input_state,
                             display: &mut self.display_state,
                             clients: &mut self.clients,
-                            render: &mut self.renderer_state,
+                            render: &mut *self.renderer_state,
                         };
                         peers.on_disabled()
                     };
@@ -790,8 +796,8 @@ impl AppData {
                         .add_view(&output, view.clone(), &mut self.clients)
                     {
                         Ok(true) => {
-                            self.renderer_state
-                                .set_output_views(&output, self.views_for_output(&output));
+                            let views = self.views_for_output(&output);
+                            self.renderer_state.set_output_views(&output, views);
                             self.display_state
                                 .refresh_pointer_focus(&mut self.clients, arena);
                             self.request_present_immediate(event_loop, arena);
@@ -810,8 +816,8 @@ impl AppData {
                     {
                         error!("Unable to remove view {output}/{view}: {err:#}");
                     } else {
-                        self.renderer_state
-                            .set_output_views(&output, self.views_for_output(&output));
+                        let views = self.views_for_output(&output);
+                        self.renderer_state.set_output_views(&output, views);
                         self.display_state
                             .refresh_pointer_focus(&mut self.clients, arena);
                         self.request_present_immediate(event_loop, arena);
@@ -843,7 +849,7 @@ impl AppData {
                 }
                 MainMessage::AddWindowToZone { window, zone } => {
                     let clients = &mut self.clients;
-                    match self.display_state.with_render(&mut self.renderer_state, |display| {
+                    match self.display_state.with_render(&mut *self.renderer_state, |display| {
                         display.add_window_to_zone(window, &zone, clients)
                     }) {
                         Ok(changed) => {
@@ -965,7 +971,7 @@ impl AppData {
                     user_initiated,
                 } => {
                     let clients = &mut self.clients;
-                    match self.display_state.with_render(&mut self.renderer_state, |display| {
+                    match self.display_state.with_render(&mut *self.renderer_state, |display| {
                         display.set_window(id, geometry, cover_overlays, user_initiated, clients)
                     }) {
                         Ok(changed) => {
@@ -979,7 +985,7 @@ impl AppData {
                 }
                 MainMessage::FocusWindow { id, raise } => {
                     let clients = &mut self.clients;
-                    match self.display_state.with_render(&mut self.renderer_state, |display| {
+                    match self.display_state.with_render(&mut *self.renderer_state, |display| {
                         display.focus_window(id, raise, clients, arena)
                     }) {
                         Ok(_raised) => {
@@ -990,7 +996,7 @@ impl AppData {
                     }
                 }
                 MainMessage::RaiseWindow { id } => {
-                    match self.display_state.with_render(&mut self.renderer_state, |display| {
+                    match self.display_state.with_render(&mut *self.renderer_state, |display| {
                         display.raise_window(id)
                     }) {
                         Ok(()) => {
@@ -1100,7 +1106,7 @@ impl AppData {
             let mut handler = SeatInputHandler {
                 state: &mut self.display_state,
                 clients: &mut self.clients,
-                render: &mut self.renderer_state,
+                render: &mut *self.renderer_state,
                 listen: &mut self.cursor_listen,
                 cursor_notify: &mut cursor_notify,
                 pressed_mods,
@@ -1160,7 +1166,7 @@ impl AppData {
 
     fn sync_pointer_cursor(&mut self, event_loop: &mut EventLoop, arena: &Arena) {
         self.display_state
-            .with_render(&mut self.renderer_state, |display| {
+            .with_render(&mut *self.renderer_state, |display| {
                 display.sync_pointer_cursor_to_render();
             });
         if self.renderer_state.scene_dirty() {
@@ -1359,7 +1365,7 @@ impl AppData {
         ScreencastSessionPeers {
             state: &mut self.screencast_session,
             screencast: &mut self.screencast,
-            render: &mut self.renderer_state,
+            render: &mut *self.renderer_state,
             display: &self.display_state,
         }
     }
@@ -1368,7 +1374,7 @@ impl AppData {
         ScreencastCapturePhase {
             session: &mut self.screencast_session,
             screencast: &mut self.screencast,
-            render: &mut self.renderer_state,
+            render: &mut *self.renderer_state,
             display: &self.display_state,
         }
     }
@@ -1434,7 +1440,7 @@ impl AppData {
     fn fulfill_image_copy_capture(&mut self) {
         ImageCopyCapturePhase {
             display: &mut self.display_state,
-            render: &mut self.renderer_state,
+            render: &mut *self.renderer_state,
             clients: &mut self.clients,
         }
         .fulfill();
