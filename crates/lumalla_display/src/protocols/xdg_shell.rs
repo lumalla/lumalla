@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, warn};
 use lumalla_wayland_protocol::{
     Ctx, NewObjectId, ObjectId,
     buffer::Writer,
@@ -94,7 +94,7 @@ pub(crate) fn report_xdg_error(ctx: &mut Ctx, object_id: ObjectId, error: XdgErr
         | XdgError::UnknownPopup
         | XdgError::UnknownSurface => (WL_DISPLAY_ERROR_INVALID_OBJECT, "Unknown object"),
     };
-    debug!("xdg-shell protocol error: {error:?}");
+    warn!("xdg-shell protocol error on object {object_id:?}: {error:?} ({message})");
     ctx.writer
         .wl_display_error(DISPLAY_OBJECT_ID)
         .object_id(object_id)

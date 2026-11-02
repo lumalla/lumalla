@@ -953,18 +953,9 @@ impl XdgManager {
             if let Some((width, height)) = parent_size {
                 positioner_state.validate_anchor_with_size(width, height)?;
             }
-            if let Some(serial) = positioner_state.parent_configure {
-                let valid = parent_surface
-                    .current_configure
-                    .is_some_and(|snapshot| snapshot.serial == serial)
-                    || parent_surface
-                        .pending_configures
-                        .iter()
-                        .any(|snapshot| snapshot.serial == serial);
-                if !valid {
-                    return Err(XdgError::InvalidPositioner);
-                }
-            }
+            // parent_configure is copied into PopupState below for reactive
+            // constraints. Do not reject when the serial is no longer
+            // current/pending — GTK often references an older configure.
         }
         let geometry = positioner_state.compute_geometry_with_bounds(constraint_bounds);
         let surface = self
@@ -1604,12 +1595,13 @@ impl PositionerState {
     }
 
     pub fn validate_complete(&self) -> Result<(), XdgError> {
+        // Match wlroots: size must be non-zero, and set_anchor_rect must have been
+        // called with a non-zero width. Height may be zero (cursor-sized anchors).
         if !self.size_set
             || !self.anchor_rect_set
             || self.width <= 0
             || self.height <= 0
             || self.anchor_width <= 0
-            || self.anchor_height <= 0
         {
             return Err(XdgError::InvalidPositioner);
         }
@@ -2019,6 +2011,55 @@ mod tests {
         assert_eq!(
             out_of_bounds.validate_anchor_bounds(),
             Err(XdgError::InvalidPositioner)
+        );
+        // Zero-height anchors are accepted once set_anchor_rect has a non-zero width
+        // (matches wlroots completeness).
+        let mut zero_height = PositionerState::default();
+        zero_height.set_size(10, 10).unwrap();
+        zero_height.set_anchor_rect(0, 0, 1, 0).unwrap();
+        assert_eq!(zero_height.validate_complete(), Ok(()));
+    }
+
+    #[test]
+    fn popup_accepts_stale_parent_configure_serial() {
+        let client = client_id(1);
+        let mut manager = XdgManager::default();
+        mapped_toplevel(
+            &mut manager,
+            client,
+            object_id(2),
+            object_id(3),
+            object_id(4),
+        );
+        // Issue a second configure so the first serial is no longer current/pending.
+        let second = manager
+            .send_configure_serial(client, object_id(2))
+            .unwrap();
+        manager.ack_configure(client, object_id(2), second).unwrap();
+        manager
+            .on_wl_surface_commit_with_buffer(client, object_id(3), Some(true))
+            .unwrap();
+
+        let positioner = object_id(8);
+        manager.create_positioner(client, positioner);
+        manager
+            .positioner_set_size(client, positioner, 20, 10)
+            .unwrap();
+        manager
+            .positioner_set_anchor_rect(client, positioner, 10, 10, 10, 10)
+            .unwrap();
+        // Serial 1 was the initial configure — no longer current after the second ack.
+        manager
+            .positioner_set_parent_configure(client, positioner, 1)
+            .unwrap();
+
+        manager
+            .create_xdg_surface(client, object_id(5), object_id(6))
+            .unwrap();
+        assert!(
+            manager
+                .create_popup(client, object_id(7), object_id(5), object_id(2), positioner)
+                .is_ok()
         );
     }
 
