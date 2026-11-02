@@ -258,11 +258,24 @@ pub struct GpuCompositor {
     _frag_shader: ShaderModule,
     _solid_vert_shader: ShaderModule,
     _solid_frag_shader: ShaderModule,
-    descriptor_layout: DescriptorSetLayout,
-    pub(crate) descriptor_pool: DescriptorPool,
+    /// Destroyed after [`Self::descriptor_pool`] in [`Drop`] (sets reference the layout).
+    descriptor_layout: mem::ManuallyDrop<DescriptorSetLayout>,
+    /// Destroyed before [`Self::descriptor_layout`] in [`Drop`].
+    pub(crate) descriptor_pool: mem::ManuallyDrop<DescriptorPool>,
     sampler: Sampler,
     /// Used when compositing a downscaled screencast so text stays readable.
     sampler_linear: Sampler,
+}
+
+impl Drop for GpuCompositor {
+    fn drop(&mut self) {
+        // SAFETY: each ManuallyDrop field is dropped exactly once here.
+        // Vulkan requires the pool (and its sets) to die before the set layout.
+        unsafe {
+            mem::ManuallyDrop::drop(&mut self.descriptor_pool);
+            mem::ManuallyDrop::drop(&mut self.descriptor_layout);
+        }
+    }
 }
 
 impl GpuCompositor {
@@ -325,8 +338,8 @@ impl GpuCompositor {
             _frag_shader: frag_shader,
             _solid_vert_shader: solid_vert_shader,
             _solid_frag_shader: solid_frag_shader,
-            descriptor_layout,
-            descriptor_pool,
+            descriptor_layout: mem::ManuallyDrop::new(descriptor_layout),
+            descriptor_pool: mem::ManuallyDrop::new(descriptor_pool),
             sampler,
             sampler_linear,
         })
