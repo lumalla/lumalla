@@ -5,6 +5,7 @@ pub mod relative_pointer;
 pub mod viewporter;
 pub mod wayland;
 pub mod wlr_layer_shell;
+pub mod xdg_output;
 pub mod xdg_shell;
 
 pub use linux_dmabuf::LinuxDmabufV1Protocol;
@@ -14,4 +15,5 @@ pub use relative_pointer::RelativePointerUnstableV1Protocol;
 pub use viewporter::ViewporterProtocol;
 pub use wayland::{WaylandProtocol, WlDisplay};
 pub use wlr_layer_shell::WlrLayerShellUnstableV1Protocol;
+pub use xdg_output::XdgOutputUnstableV1Protocol;
 pub use xdg_shell::XdgShellProtocol;

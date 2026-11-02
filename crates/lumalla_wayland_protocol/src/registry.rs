@@ -11,9 +11,9 @@ use crate::{
     protocols::{
         LinuxDmabufV1Protocol, PointerConstraintsUnstableV1Protocol, PresentationTimeProtocol,
         RelativePointerUnstableV1Protocol, ViewporterProtocol, WaylandProtocol, WlDisplay,
-        WlrLayerShellUnstableV1Protocol, XdgShellProtocol, linux_dmabuf::*,
-        pointer_constraints::*, presentation_time::*, relative_pointer::*, viewporter::*,
-        wayland::*, wlr_layer_shell::*, xdg_shell::*,
+        WlrLayerShellUnstableV1Protocol, XdgOutputUnstableV1Protocol, XdgShellProtocol,
+        linux_dmabuf::*, pointer_constraints::*, presentation_time::*, relative_pointer::*,
+        viewporter::*, wayland::*, wlr_layer_shell::*, xdg_output::*, xdg_shell::*,
     },
 };
 
@@ -61,6 +61,8 @@ pub enum InterfaceIndex {
     ZwpRelativePointerV1,
     ZwlrLayerShellV1,
     ZwlrLayerSurfaceV1,
+    ZxdgOutputManagerV1,
+    ZxdgOutputV1,
 }
 
 impl InterfaceIndex {
@@ -108,6 +110,8 @@ impl InterfaceIndex {
             InterfaceIndex::ZwpRelativePointerV1 => ZWP_RELATIVE_POINTER_V1_NAME,
             InterfaceIndex::ZwlrLayerShellV1 => ZWLR_LAYER_SHELL_V1_NAME,
             InterfaceIndex::ZwlrLayerSurfaceV1 => ZWLR_LAYER_SURFACE_V1_NAME,
+            InterfaceIndex::ZxdgOutputManagerV1 => ZXDG_OUTPUT_MANAGER_V1_NAME,
+            InterfaceIndex::ZxdgOutputV1 => ZXDG_OUTPUT_V1_NAME,
         }
     }
 
@@ -155,6 +159,8 @@ impl InterfaceIndex {
             InterfaceIndex::ZwpRelativePointerV1 => ZWP_RELATIVE_POINTER_V1_VERSION,
             InterfaceIndex::ZwlrLayerShellV1 => ZWLR_LAYER_SHELL_V1_VERSION,
             InterfaceIndex::ZwlrLayerSurfaceV1 => ZWLR_LAYER_SURFACE_V1_VERSION,
+            InterfaceIndex::ZxdgOutputManagerV1 => ZXDG_OUTPUT_MANAGER_V1_VERSION,
+            InterfaceIndex::ZxdgOutputV1 => ZXDG_OUTPUT_V1_VERSION,
         }
     }
 }
@@ -326,7 +332,8 @@ where
         + ViewporterProtocol
         + PointerConstraintsUnstableV1Protocol
         + RelativePointerUnstableV1Protocol
-        + WlrLayerShellUnstableV1Protocol,
+        + WlrLayerShellUnstableV1Protocol
+        + XdgOutputUnstableV1Protocol,
 {
     fn handle_request(
         &mut self,
@@ -483,6 +490,12 @@ where
             }
             InterfaceIndex::ZwlrLayerSurfaceV1 => {
                 ZwlrLayerSurfaceV1::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ZxdgOutputManagerV1 => {
+                ZxdgOutputManagerV1::handle_request(self, ctx, header, data, fds, object.version)
+            }
+            InterfaceIndex::ZxdgOutputV1 => {
+                ZxdgOutputV1::handle_request(self, ctx, header, data, fds, object.version)
             }
         }
     }

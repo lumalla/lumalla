@@ -5,4 +5,5 @@ mod presentation_time;
 mod relative_pointer;
 mod viewporter;
 mod wayland;
+mod xdg_output;
 pub(crate) mod xdg_shell;

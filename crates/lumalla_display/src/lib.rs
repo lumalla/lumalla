@@ -2081,6 +2081,7 @@ impl Default for Globals {
             [].into_iter(),
         );
         globals.register_version(InterfaceIndex::ZwlrLayerShellV1, 5, [].into_iter());
+        globals.register_version(InterfaceIndex::ZxdgOutputManagerV1, 3, [].into_iter());
         globals
     }
 }

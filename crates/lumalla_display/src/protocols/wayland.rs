@@ -2391,6 +2391,10 @@ mod tests {
             lumalla_wayland_protocol::protocols::wlr_layer_shell::ZWLR_LAYER_SHELL_V1_NAME,
             5
         )));
+        assert!(globals.contains(&(
+            lumalla_wayland_protocol::protocols::xdg_output::ZXDG_OUTPUT_MANAGER_V1_NAME,
+            3
+        )));
     }
 
     #[test]
@@ -2531,6 +2535,33 @@ mod tests {
         assert_eq!(
             ctx.registry.interface_index(object_id(20)),
             Some(InterfaceIndex::WpViewporter)
+        );
+    }
+
+    #[test]
+    fn registry_bind_zxdg_output_manager_registers_object() {
+        let (_receiver, sender) = UnixStream::pair().unwrap();
+        let mut state = display_state();
+        let mut registry = Registry::new();
+        let mut writer = Writer::new(sender.as_raw_fd());
+        let mut ctx = Ctx {
+            registry: &mut registry,
+            writer: &mut writer,
+            client_id: ClientId::new(NonZeroU32::new(1).unwrap()),
+        };
+        let global_name = state
+            .globals
+            .iter()
+            .find(|(_, global)| global.interface_index == InterfaceIndex::ZxdgOutputManagerV1)
+            .map(|(id, _)| *id)
+            .expect("zxdg_output_manager_v1 global");
+        let data = bind_data(global_name, "zxdg_output_manager_v1", 3, 20);
+        let mut fds = VecDeque::new();
+        let params = WlRegistryBind::new(&data, &mut fds);
+        WlRegistry::bind(&mut state, &mut ctx, object_id(10), &params);
+        assert_eq!(
+            ctx.registry.interface_index(object_id(20)),
+            Some(InterfaceIndex::ZxdgOutputManagerV1)
         );
     }
 
