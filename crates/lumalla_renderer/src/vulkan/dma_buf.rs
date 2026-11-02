@@ -487,12 +487,13 @@ impl ImportCleanup<'_> {
 
 impl Drop for ImportCleanup<'_> {
     fn drop(&mut self) {
+        // Image may already be bound to memory; destroy it before freeing.
         unsafe {
-            if let Some(memory) = self.memory.take() {
-                self.device.free_memory(memory, None);
-            }
             if let Some(image) = self.image.take() {
                 self.device.destroy_image(image, None);
+            }
+            if let Some(memory) = self.memory.take() {
+                self.device.free_memory(memory, None);
             }
         }
     }
