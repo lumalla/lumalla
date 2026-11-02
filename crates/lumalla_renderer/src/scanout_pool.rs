@@ -1,6 +1,7 @@
 //! Reusable scanout buffers: Vulkan images (optionally exported as DRM FBs).
 
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 
@@ -25,23 +26,41 @@ pub(crate) struct ScanoutBufferKey {
 }
 
 /// A scanout target with persistent Vulkan resources, and an optional DRM FB for KMS.
+///
+/// Vulkan requires `VkFramebuffer` to be destroyed before the `VkImageView` it
+/// references, and GPU work must finish before either. [`Drop`] tears fields down
+/// in that order via [`ManuallyDrop`] — do not rely on declaration order.
 pub(crate) struct ScanoutBuffer {
     pub key: ScanoutBufferKey,
     /// Present for physical/KMS outputs; `None` for virtual outputs.
-    pub drm_fb: Option<DrmFramebuffer>,
-    pub dma_image: DmaBufImage,
-    pub framebuffer: Framebuffer,
+    pub drm_fb: ManuallyDrop<Option<DrmFramebuffer>>,
+    pub dma_image: ManuallyDrop<DmaBufImage>,
+    pub framebuffer: ManuallyDrop<Framebuffer>,
     /// True until the first GPU upload fills the buffer.
     pub fresh: bool,
     /// Present serial last written into this buffer (`0` = never filled).
     pub content_serial: u64,
     /// GPU work that must finish before flip or reuse.
-    pub gpu_pending: Option<crate::vulkan::PendingGpuSubmit>,
+    pub gpu_pending: ManuallyDrop<Option<crate::vulkan::PendingGpuSubmit>>,
 }
 
 impl ScanoutBuffer {
     pub fn drm_fb_id(&self) -> Option<u32> {
         self.drm_fb.as_ref().map(|fb| fb.id())
+    }
+}
+
+impl Drop for ScanoutBuffer {
+    fn drop(&mut self) {
+        // SAFETY: each ManuallyDrop field is dropped exactly once here and not
+        // touched afterward. Order matters for Vulkan object lifetimes:
+        // pending GPU work → framebuffer → DRM FB → image/view/memory.
+        unsafe {
+            ManuallyDrop::drop(&mut self.gpu_pending);
+            ManuallyDrop::drop(&mut self.framebuffer);
+            ManuallyDrop::drop(&mut self.drm_fb);
+            ManuallyDrop::drop(&mut self.dma_image);
+        }
     }
 }
 
@@ -174,12 +193,12 @@ fn create_kms_scanout_buffer(
             height,
             fourcc,
         },
-        drm_fb: Some(drm_fb),
-        dma_image,
-        framebuffer,
+        drm_fb: ManuallyDrop::new(Some(drm_fb)),
+        dma_image: ManuallyDrop::new(dma_image),
+        framebuffer: ManuallyDrop::new(framebuffer),
         fresh: true,
         content_serial: 0,
-        gpu_pending: None,
+        gpu_pending: ManuallyDrop::new(None),
     })
 }
 
@@ -198,12 +217,12 @@ fn create_virtual_scanout_buffer(
             height,
             fourcc,
         },
-        drm_fb: None,
-        dma_image,
-        framebuffer,
+        drm_fb: ManuallyDrop::new(None),
+        dma_image: ManuallyDrop::new(dma_image),
+        framebuffer: ManuallyDrop::new(framebuffer),
         fresh: true,
         content_serial: 0,
-        gpu_pending: None,
+        gpu_pending: ManuallyDrop::new(None),
     })
 }
 

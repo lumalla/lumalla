@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -31,14 +32,14 @@ use crate::drm::{
     atomic_disable_output, atomic_modeset, atomic_page_flip, atomic_set_cursor_plane,
     atomic_set_plane_fb, dispatch_drm_events, probe_device_topology, resolve_connected_output,
 };
-pub use crate::present_control::{
-    CompletedFlipEffect, FlipSideEffects, PRESENT_WAKE_TOKEN_BASE, PRESENT_WAKE_TOKEN_COUNT,
-    PresentTickResult, is_present_wake_token,
-};
-use crate::present_control::NamedFlipDispatchOutcome;
 use crate::output::{
     DrmDeviceTopology, DrmPlaneInfo, HW_CURSOR_MAX_SIZE, OutputId, OutputPresentControl,
     OutputState, PhysicalOutput, PlaneGeometry,
+};
+use crate::present_control::NamedFlipDispatchOutcome;
+pub use crate::present_control::{
+    CompletedFlipEffect, FlipSideEffects, PRESENT_WAKE_TOKEN_BASE, PRESENT_WAKE_TOKEN_COUNT,
+    PresentTickResult, is_present_wake_token,
 };
 use crate::scanout_pool::{ScanoutBuffer, ScanoutBufferPool};
 use crate::scene_backing::DamageRect;
@@ -451,18 +452,33 @@ pub struct ScreencastDmaExport {
     pub modifier: u64,
 }
 
+/// Screencast capture slot. [`Drop`] destroys Vulkan objects in a safe order via
+/// [`ManuallyDrop`] (pending GPU work → framebuffer → image → export fd).
 struct ScreencastDmaSlot {
-    image: DmaBufImage,
-    framebuffer: Framebuffer,
+    image: ManuallyDrop<DmaBufImage>,
+    framebuffer: ManuallyDrop<Framebuffer>,
     /// Original export fd kept alive for the image memory.
-    _export_fd: OwnedFd,
+    _export_fd: ManuallyDrop<OwnedFd>,
     in_use: bool,
     /// True until the first GPU fill (layout still UNDEFINED).
     fresh: bool,
     /// In-flight GPU fill; must complete before PipeWire queues the buffer.
-    gpu_pending: Option<crate::vulkan::PendingGpuSubmit>,
+    gpu_pending: ManuallyDrop<Option<crate::vulkan::PendingGpuSubmit>>,
     /// Content serial last written into this slot (for unchanged-frame skip).
     content_serial: Option<u64>,
+}
+
+impl Drop for ScreencastDmaSlot {
+    fn drop(&mut self) {
+        // SAFETY: each ManuallyDrop field is dropped exactly once here.
+        // Order: finish GPU work, then FB (references image view), then image, then fd.
+        unsafe {
+            ManuallyDrop::drop(&mut self.gpu_pending);
+            ManuallyDrop::drop(&mut self.framebuffer);
+            ManuallyDrop::drop(&mut self.image);
+            ManuallyDrop::drop(&mut self._export_fd);
+        }
+    }
 }
 
 fn dup_owned_fd(fd: RawFd) -> anyhow::Result<OwnedFd> {
@@ -543,8 +559,9 @@ impl RendererState {
                 .surface_textures
                 .epochs_complete(&existing.blocked_by)
             {
-                self.pending_dmabuf_releases
-                    .retain(|pending| pending.owner_id != owner_id || pending.buffer_id != buffer_id);
+                self.pending_dmabuf_releases.retain(|pending| {
+                    pending.owner_id != owner_id || pending.buffer_id != buffer_id
+                });
                 return DmabufReleaseSchedule::ReadyNow;
             }
             return DmabufReleaseSchedule::Deferred;
@@ -610,11 +627,7 @@ impl RendererState {
                     .chain(planes.cursor.iter_mut())
                     .chain(planes.overlays.iter_mut())
                 {
-                    for slot in [
-                        &mut pipe.current,
-                        &mut pipe.pending,
-                        &mut pipe.queued,
-                    ] {
+                    for slot in [&mut pipe.current, &mut pipe.pending, &mut pipe.queued] {
                         if let Some(buffer) = slot.as_mut()
                             && let Some(submit) = buffer.gpu_pending.take()
                         {
@@ -663,11 +676,9 @@ impl RendererState {
                 .as_mut()
                 .context("Vulkan missing while flushing retired textures")?;
             let (device, allocator) = vulkan.device_and_allocator_mut();
-            self.gpu.surface_textures.flush_retired(
-                device,
-                &compositor.descriptor_pool,
-                allocator,
-            )
+            self.gpu
+                .surface_textures
+                .flush_retired(device, &compositor.descriptor_pool, allocator)
         })();
         self.gpu.compositor = Some(compositor);
         result
@@ -682,7 +693,7 @@ impl RendererState {
         // Attach the epoch opened before recording first so a failure finishing the
         // previous submit cannot drop tracking for textures this batch still samples.
         let previous = buffer.gpu_pending.take();
-        buffer.gpu_pending = Some(pending.with_texture_epoch(texture_epoch));
+        *buffer.gpu_pending = Some(pending.with_texture_epoch(texture_epoch));
         if let Some(previous) = previous {
             self.finish_gpu_pending(previous)?;
         }
@@ -778,11 +789,7 @@ impl RendererState {
     }
 
     /// Content serial last written into screencast slot `(stream_id, index)`, if any.
-    pub fn screencast_slot_content_serial(
-        &self,
-        stream_id: u32,
-        index: usize,
-    ) -> Option<u64> {
+    pub fn screencast_slot_content_serial(&self, stream_id: u32, index: usize) -> Option<u64> {
         self.screencast_buffers
             .get(&stream_id)?
             .get(index)?
@@ -1077,10 +1084,7 @@ impl RendererState {
     ///
     /// Independent of desktop sync order: textures are retained until they leave
     /// both the desktop order and every layer scene.
-    pub fn sync_output_layer_scenes(
-        &mut self,
-        scenes: &[(String, Vec<(u32, u32, i32, i32, u8)>)],
-    ) {
+    pub fn sync_output_layer_scenes(&mut self, scenes: &[(String, Vec<(u32, u32, i32, i32, u8)>)]) {
         let mut new_keys = HashSet::new();
         let mut changed = false;
         let mut new_map = HashMap::new();
@@ -1545,7 +1549,7 @@ impl RendererState {
                     .context("primary buffer missing during capture")?;
                 (
                     current.dma_image.format(),
-                    &current.dma_image as *const DmaBufImage,
+                    &*current.dma_image as *const DmaBufImage,
                 )
             };
             let bgra = download_bgra_region(
@@ -1694,12 +1698,12 @@ impl RendererState {
                 };
                 exports.push(info);
                 slots.push(ScreencastDmaSlot {
-                    image,
-                    framebuffer,
-                    _export_fd: export_fd,
+                    image: ManuallyDrop::new(image),
+                    framebuffer: ManuallyDrop::new(framebuffer),
+                    _export_fd: ManuallyDrop::new(export_fd),
                     in_use: false,
                     fresh: true,
-                    gpu_pending: None,
+                    gpu_pending: ManuallyDrop::new(None),
                     content_serial: None,
                 });
             }
@@ -1814,7 +1818,7 @@ impl RendererState {
                     let slot = slots
                         .get(index)
                         .context("screencast buffer index out of range")?;
-                    &slot.image as *const DmaBufImage
+                    &*slot.image as *const DmaBufImage
                 };
                 let vulkan = self
                     .vulkan
@@ -1842,7 +1846,7 @@ impl RendererState {
                         .and_then(|o| o.primary())
                         .and_then(|p| p.current.as_ref())
                         .with_context(|| format!("missing primary buffer {}", region.name))?;
-                    &current.dma_image as *const DmaBufImage
+                    &*current.dma_image as *const DmaBufImage
                 };
                 let dst_ptr = {
                     let slots = self
@@ -1852,12 +1856,12 @@ impl RendererState {
                     let slot = slots
                         .get(index)
                         .context("screencast buffer index out of range")?;
-                    &slot.image as *const DmaBufImage
+                    &*slot.image as *const DmaBufImage
                 };
-                let dest_x = (u64::from(region.dest_x) * u64::from(out_w)
-                    / u64::from(src_w.max(1))) as u32;
-                let dest_y = (u64::from(region.dest_y) * u64::from(out_h)
-                    / u64::from(src_h.max(1))) as u32;
+                let dest_x =
+                    (u64::from(region.dest_x) * u64::from(out_w) / u64::from(src_w.max(1))) as u32;
+                let dest_y =
+                    (u64::from(region.dest_y) * u64::from(out_h) / u64::from(src_h.max(1))) as u32;
                 let dest_w = (u64::from(region.logical_w) * u64::from(out_w)
                     / u64::from(src_w.max(1)))
                 .max(1) as u32;
@@ -1941,8 +1945,8 @@ impl RendererState {
                             .get(index)
                             .context("screencast buffer index out of range")?;
                         (
-                            &slot.image as *const DmaBufImage,
-                            &slot.framebuffer as *const Framebuffer,
+                            &*slot.image as *const DmaBufImage,
+                            &*slot.framebuffer as *const Framebuffer,
                         )
                     };
                     // Safety: owned by self for this call.
@@ -1979,13 +1983,7 @@ impl RendererState {
             let serial = self.screencast_content_serial;
             // install always takes ownership of the epoch (on the slot or via finish).
             let _ = pending_epoch.take();
-            self.install_screencast_gpu_pending(
-                stream_id,
-                index,
-                pending,
-                serial,
-                texture_epoch,
-            )?;
+            self.install_screencast_gpu_pending(stream_id, index, pending, serial, texture_epoch)?;
             Ok(())
         })();
         if let Some(epoch) = pending_epoch.take() {
@@ -2134,8 +2132,8 @@ impl RendererState {
                             .get(index)
                             .context("screencast buffer index out of range")?;
                         (
-                            &slot.image as *const DmaBufImage,
-                            &slot.framebuffer as *const Framebuffer,
+                            &*slot.image as *const DmaBufImage,
+                            &*slot.framebuffer as *const Framebuffer,
                         )
                     };
 
@@ -2232,7 +2230,7 @@ impl RendererState {
         {
             // Attach the pre-opened epoch before finishing prior work so tracking
             // cannot be dropped while this batch's textures are still live.
-            slot.gpu_pending = Some(pending.with_texture_epoch(texture_epoch));
+            *slot.gpu_pending = Some(pending.with_texture_epoch(texture_epoch));
             slot.in_use = true;
             slot.fresh = false;
             slot.content_serial = Some(serial);
@@ -2302,7 +2300,7 @@ impl RendererState {
             let slot = slots
                 .get(index)
                 .context("screencast buffer index out of range")?;
-            &slot.image as *const DmaBufImage
+            &*slot.image as *const DmaBufImage
         };
         let bgra =
             unsafe { download_bgra_region(vulkan, &*image_ptr, 0, 0, dest_width, dest_height)? };
@@ -2386,7 +2384,7 @@ impl RendererState {
             let slot = slots
                 .get(index)
                 .context("screencast buffer index out of range")?;
-            &slot.image as *const DmaBufImage
+            &*slot.image as *const DmaBufImage
         };
         // Safety: image is owned by self and lives for this call.
         let bgra =
@@ -2513,7 +2511,7 @@ impl RendererState {
                         .get_mut(&stream_id)
                         .and_then(|slots| slots.get_mut(index))
                     {
-                        slot.gpu_pending = Some(still);
+                        *slot.gpu_pending = Some(still);
                     } else {
                         // Slot gone while still pending — finish so textures can retire.
                         self.finish_gpu_pending(still)?;
@@ -2742,8 +2740,7 @@ impl RendererState {
         ) {
             warn!(
                 "Failed to disable cursor plane {} on {}: {err:#}",
-                cursor.plane_id,
-                physical.output.connector_name
+                cursor.plane_id, physical.output.connector_name
             );
         }
     }
@@ -2820,8 +2817,7 @@ impl RendererState {
                     .output_configs
                     .get(&connector.name)
                     .is_some_and(|config| !config.enabled);
-                if !disabled || !connector.connected || self.outputs.contains_key(&connector.name)
-                {
+                if !disabled || !connector.connected || self.outputs.contains_key(&connector.name) {
                     continue;
                 }
                 match resolve_connected_output(
@@ -3252,7 +3248,9 @@ impl RendererState {
     }
 
     fn has_pending_flips(&self) -> bool {
-        self.outputs.values().any(|output| output.primary_flip_busy())
+        self.outputs
+            .values()
+            .any(|output| output.primary_flip_busy())
     }
 
     fn present_one_output(
@@ -3778,8 +3776,7 @@ impl RendererState {
             }
             self.gpu.compositor = Some(compositor);
 
-            let pending = match std::mem::replace(&mut batch, GpuWorkBatch::new()).submit(vulkan)
-            {
+            let pending = match std::mem::replace(&mut batch, GpuWorkBatch::new()).submit(vulkan) {
                 Ok(pending) => pending,
                 Err(error) => {
                     if let Some(epoch) = pending_epoch.take() {
@@ -3896,10 +3893,7 @@ impl RendererState {
                     let dropped_queued = primary.queued.take();
                     (old, dropped_pending, dropped_queued)
                 };
-                for old in [old, dropped_pending, dropped_queued]
-                    .into_iter()
-                    .flatten()
-                {
+                for old in [old, dropped_pending, dropped_queued].into_iter().flatten() {
                     self.release_scanout_buffer(old);
                 }
                 Ok(())
@@ -3976,7 +3970,8 @@ impl RendererState {
             }
 
             let show_here = active_name.as_ref() == Some(&name) && !hidden;
-            if let Err(err) = self.commit_hw_cursor_on_output(&name, show_here, pointer_x, pointer_y)
+            if let Err(err) =
+                self.commit_hw_cursor_on_output(&name, show_here, pointer_x, pointer_y)
             {
                 if is_drm_busy(&err) {
                     // Pending primary flip / prior cursor update — retry next motion/present.
@@ -4079,30 +4074,20 @@ impl RendererState {
                 .get(&drm_path)
                 .with_context(|| format!("DRM device {} is not open", drm_path.display()))?;
             // Blocking: caller may release the current cursor FB after detach.
-            atomic_set_cursor_plane(
-                device.fd(),
-                plane_id,
-                &props,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                false,
-                true,
-            )?;
+            atomic_set_cursor_plane(device.fd(), plane_id, &props, 0, 0, 0, 0, 0, 0, false, true)?;
             if let Some(cursor) = self.outputs.get_mut(name).and_then(|o| o.cursor_mut()) {
                 cursor.geometry = PlaneGeometry::cursor(0, 0, 0, 0);
             }
             return Ok(());
         }
 
-        let (hotspot_x, hotspot_y, pixels, width, height) =
-            self.hw_cursor_image_pixels().context("cursor image not HW-compatible")?;
+        let (hotspot_x, hotspot_y, pixels, width, height) = self
+            .hw_cursor_image_pixels()
+            .context("cursor image not HW-compatible")?;
 
         let views = self.output_views.get(name).cloned().unwrap_or_default();
-        let (local_x, local_y) = pointer_to_output_local(&views, pointer_x, pointer_y, mode_w, mode_h);
+        let (local_x, local_y) =
+            pointer_to_output_local(&views, pointer_x, pointer_y, mode_w, mode_h);
         let crtc_x = local_x - hotspot_x;
         let crtc_y = local_y - hotspot_y;
 
@@ -4207,9 +4192,7 @@ impl RendererState {
         if frame.buffer_scale.max(1) != 1 {
             return None;
         }
-        if BufferTransform::from_raw(frame.buffer_transform)
-            != Some(BufferTransform::Normal)
-        {
+        if BufferTransform::from_raw(frame.buffer_transform) != Some(BufferTransform::Normal) {
             return None;
         }
         let width = frame.width as u32;
@@ -4249,7 +4232,6 @@ impl RendererState {
             format,
             fourcc,
         )?;
-        drop(vulkan);
         self.wait_scanout_gpu(&mut buffer)?;
         let vulkan = self
             .vulkan
@@ -4736,10 +4718,7 @@ mod tests {
         assert!(state.surface_frames.contains_key(&(1, 9)));
         assert!(!state.surface_order.contains(&(1, 9)));
         assert_eq!(state.surface_order, vec![(1, 2)]);
-        assert_eq!(
-            state.output_layer_scenes["HDMI-A-1"],
-            vec![(1, 9, 0, 0, 2)]
-        );
+        assert_eq!(state.output_layer_scenes["HDMI-A-1"], vec![(1, 9, 0, 0, 2)]);
 
         // Desktop-first then layer.
         let mut state = RendererState::new().unwrap();
