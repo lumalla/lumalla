@@ -287,7 +287,7 @@ impl OutputManager {
             .entry(client_id)
             .or_default()
             .insert(object_id);
-        Self::send_wl_output_properties(writer, object_id, version, &info);
+        Self::send_wl_output_properties(writer, object_id, version, &info, true);
         if version >= 2 {
             writer.wl_output_done(object_id);
         }
@@ -439,7 +439,7 @@ impl OutputManager {
                 .collect();
 
             for &(object_id, version) in &wl_objects {
-                Self::send_wl_output_properties(writer, object_id, version, &info);
+                Self::send_wl_output_properties(writer, object_id, version, &info, false);
             }
             for &(xdg_id, _, version) in &xdg_objects {
                 Self::send_xdg_output_properties(
@@ -499,6 +499,7 @@ impl OutputManager {
         object_id: ObjectId,
         version: u32,
         info: &OutputInfo,
+        is_create: bool,
     ) {
         writer
             .wl_output_geometry(object_id)
@@ -519,7 +520,8 @@ impl OutputManager {
         if version >= 2 {
             writer.wl_output_scale(object_id).factor(info.scale);
         }
-        if version >= 4 {
+        // wl_output.name/description are bind-once; never resend after the first done.
+        if is_create && version >= 4 {
             writer.wl_output_name(object_id).name(&info.name);
             writer
                 .wl_output_description(object_id)
@@ -1015,7 +1017,9 @@ mod tests {
 
         assert!(has_event(&bytes, 11, 0)); // logical_position
         assert!(has_event(&bytes, 11, 1)); // logical_size
-        assert!(!has_event(&bytes, 11, 3)); // name only on create
+        assert!(!has_event(&bytes, 11, 3)); // xdg name only on create
+        assert!(!has_event(&bytes, 10, 4)); // wl_output.name only on create
+        assert!(!has_event(&bytes, 10, 5)); // wl_output.description only on create
         assert!(has_event(&bytes, 10, 2)); // wl_output.done
     }
 }
