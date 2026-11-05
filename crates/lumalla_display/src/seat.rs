@@ -931,27 +931,146 @@ impl SeatManager {
             }
         }
 
-        let send_motion = !locked;
+        // Remember who already had focus so we only send absolute motion to them
+        // (matching the old already_focused branch; enter events are separate).
+        let mut focused_before = ArenaVec::new_in(arena);
+        focused_before.extend(self.pointers.iter().filter_map(|p| {
+            p.focus
+                .map(|surface| (p.client_id, p.id, surface, p.version))
+        }));
+
+        // Enter/leave only — absolute motion and frames are ordered below with
+        // relative_motion (relative → optional motion → frame).
         self.update_pointer_focus_and_motion_with_target(
             clients,
             surface_manager,
             constraints,
             views,
             time_msec,
-            send_motion,
+            false,
             override_target,
             arena,
         );
 
-        if let Some((dx, dy, dx_unaccel, dy_unaccel)) = relative {
-            let mut focused = ArenaVec::new_in(arena);
-            focused.extend(
-                self.pointers
-                    .iter()
-                    .filter_map(|p| p.focus.map(|_| (p.client_id, p.id))),
+        let mut focused_after = ArenaVec::new_in(arena);
+        focused_after.extend(
+            self.pointers
+                .iter()
+                .filter_map(|p| p.focus.map(|_| (p.client_id, p.id, p.version))),
+        );
+
+        let emitted_relative = if let Some((dx, dy, dx_unaccel, dy_unaccel)) = relative {
+            if focused_after.is_empty() {
+                false
+            } else {
+                let mut focused_ids = ArenaVec::new_in(arena);
+                focused_ids.extend(
+                    focused_after
+                        .iter()
+                        .map(|&(client_id, pointer_id, _)| (client_id, pointer_id)),
+                );
+                relative_pointers.emit_relative_motion(
+                    clients,
+                    &focused_ids,
+                    time_msec,
+                    dx,
+                    dy,
+                    dx_unaccel,
+                    dy_unaccel,
+                );
+                true
+            }
+        } else {
+            false
+        };
+
+        let send_motion = !locked;
+        let mut motion_targets = ArenaVec::new_in(arena);
+        if send_motion {
+            motion_targets.extend(focused_before.iter().filter_map(
+                |&(client_id, pointer_id, surface, version)| {
+                    self.pointers
+                        .iter()
+                        .any(|p| {
+                            p.client_id == client_id
+                                && p.id == pointer_id
+                                && p.focus == Some(surface)
+                        })
+                        .then_some((client_id, pointer_id, version))
+                },
+            ));
+            self.emit_absolute_motion_for(
+                clients,
+                surface_manager,
+                views,
+                time_msec,
+                &motion_targets,
             );
-            relative_pointers
-                .emit_relative_motion(clients, &focused, time_msec, dx, dy, dx_unaccel, dy_unaccel);
+        }
+
+        // Clients (notably Xwayland) flush relative motion on wl_pointer.frame.
+        if emitted_relative || send_motion {
+            let frame_targets: &[(ClientId, ObjectId, u32)] = if emitted_relative {
+                &focused_after
+            } else {
+                &motion_targets
+            };
+            Self::emit_pointer_frames(clients, frame_targets);
+        }
+    }
+
+    /// Send `wl_pointer.motion` (no frame) for the given focused pointers.
+    fn emit_absolute_motion_for(
+        &self,
+        clients: &mut ConnectedClients,
+        surface_manager: &SurfaceManager,
+        views: &[View],
+        time_msec: u32,
+        targets: &[(ClientId, ObjectId, u32)],
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+        let Some((target_client, target_surface)) = self.focused_pointer_surface() else {
+            return;
+        };
+        let (scene_x, scene_y) = map_dest_to_source(views, self.pointer_x, self.pointer_y);
+        let (hit_x, hit_y) = if surface_manager
+            .surface_in_layer_tree(target_client, target_surface)
+        {
+            (self.pointer_x, self.pointer_y)
+        } else {
+            (scene_x, scene_y)
+        };
+        let (sx, sy) = surface_manager
+            .surface_local_coords(target_client, target_surface, hit_x, hit_y)
+            .unwrap_or((hit_x as f32, hit_y as f32));
+
+        for &(client_id, pointer_id, _) in targets {
+            if client_id != target_client {
+                continue;
+            }
+            let Some(client) = clients.get_mut(&client_id) else {
+                continue;
+            };
+            client
+                .writer_mut()
+                .wl_pointer_motion(pointer_id)
+                .time(time_msec)
+                .surface_x(sx)
+                .surface_y(sy);
+        }
+    }
+
+    fn emit_pointer_frames(clients: &mut ConnectedClients, targets: &[(ClientId, ObjectId, u32)]) {
+        for &(client_id, pointer_id, version) in targets {
+            if version < 5 {
+                continue;
+            }
+            let Some(client) = clients.get_mut(&client_id) else {
+                continue;
+            };
+            client.writer_mut().wl_pointer_frame(pointer_id);
         }
     }
 
