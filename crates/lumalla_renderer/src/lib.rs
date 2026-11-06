@@ -591,6 +591,10 @@ impl RendererState {
     fn invalidate_surface_textures(&mut self) {
         if let Err(err) = self.wait_all_pending_gpu() {
             warn!("Failed waiting for GPU work before invalidating textures: {err:#}");
+            if classify_gpu_error(&err) == PresentFailureClass::DeviceLost {
+                self.begin_device_lost_recovery(&err, None);
+                return;
+            }
         }
         self.gpu.clear(self.vulkan.as_mut());
         self.pending_damage.clear();
@@ -630,8 +634,23 @@ impl RendererState {
         if pending.is_empty() {
             return self.flush_retired_textures();
         }
+        let mut device_lost = None;
         for submit in pending {
-            self.finish_gpu_pending(submit)?;
+            if device_lost.is_some() {
+                // Device is gone — drop remaining submits without further waits.
+                drop(submit);
+                continue;
+            }
+            if let Err(err) = self.finish_gpu_pending(submit) {
+                if classify_gpu_error(&err) == PresentFailureClass::DeviceLost {
+                    device_lost = Some(err);
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+        if let Some(err) = device_lost {
+            return Err(err);
         }
         self.flush_retired_textures()
     }
@@ -2653,7 +2672,7 @@ impl RendererState {
     }
 
     /// Handle a present/GPU error: skip frame, halt for session denial, or start device recovery.
-    fn handle_present_failure(
+    pub(crate) fn handle_present_failure(
         &mut self,
         err: &anyhow::Error,
         event_loop: Option<&mut EventLoop>,
@@ -3208,10 +3227,23 @@ impl RendererState {
         if self.presents_halted() {
             return Ok(false);
         }
-        if !self.ensure_vulkan_ready(Some(event_loop))? {
-            return Ok(false);
+        match self.ensure_vulkan_ready(Some(event_loop)) {
+            Ok(false) => return Ok(false),
+            Ok(true) => {}
+            Err(err) => {
+                error!("Unable to initialize Vulkan for present: {err:#}");
+                self.handle_present_failure(&err, Some(event_loop));
+                return Ok(false);
+            }
         }
-        let _ = self.flush_hw_cursors();
+        if let Err(err) = self.flush_hw_cursors() {
+            if is_unrecoverable_present_error(&err) {
+                error!("Hardware cursor flush failed: {err:#}");
+                self.handle_present_failure(&err, Some(event_loop));
+                return Ok(false);
+            }
+            warn!("Hardware cursor flush failed: {err:#}");
+        }
 
         self.ensure_present_targets_cached();
         let Some(target) = self
@@ -3336,10 +3368,23 @@ impl RendererState {
         if self.presents_halted() {
             return Ok(self.present_status());
         }
-        if !self.ensure_vulkan_ready(Some(event_loop))? {
-            return Ok(self.present_status());
+        match self.ensure_vulkan_ready(Some(event_loop)) {
+            Ok(false) => return Ok(self.present_status()),
+            Ok(true) => {}
+            Err(err) => {
+                error!("Unable to initialize Vulkan for present: {err:#}");
+                self.handle_present_failure(&err, Some(event_loop));
+                return Ok(self.present_status());
+            }
         }
-        let _ = self.flush_hw_cursors();
+        if let Err(err) = self.flush_hw_cursors() {
+            if is_unrecoverable_present_error(&err) {
+                error!("Hardware cursor flush failed: {err:#}");
+                self.handle_present_failure(&err, Some(event_loop));
+                return Ok(self.present_status());
+            }
+            warn!("Hardware cursor flush failed: {err:#}");
+        }
 
         self.ensure_present_targets_cached();
         let targets = self.collect_present_targets();
@@ -4024,7 +4069,15 @@ impl RendererState {
                 }
                 self.gpu.compositor = Some(compositor);
                 // Finish other outputs' in-flight work, then wipe texture state.
-                let _ = self.wait_all_pending_gpu();
+                if let Err(wait_err) = self.wait_all_pending_gpu() {
+                    if classify_gpu_error(&wait_err) == PresentFailureClass::DeviceLost {
+                        // Prefer the wait error so recovery classifies as device lost.
+                        self.gpu.surface_textures.clear();
+                        let _ = self.flush_retired_textures();
+                        return Err(wait_err);
+                    }
+                    warn!("Failed waiting for GPU work after composite error: {wait_err:#}");
+                }
                 self.gpu.surface_textures.clear();
                 let _ = self.flush_retired_textures();
                 return Err(error);

@@ -45,13 +45,13 @@ impl Fence {
     /// Waits for the fence to be signaled.
     ///
     /// This blocks the CPU until the GPU signals the fence.
+    /// Preserves `vk::Result` in the error chain so callers can classify device loss.
     pub fn wait(&self, timeout_ns: u64) -> anyhow::Result<()> {
         unsafe {
             self.device
                 .wait_for_fences(&[self.handle], true, timeout_ns)
         }
-        .context("Failed to wait for fence")?;
-        Ok(())
+        .map_err(|err| anyhow::Error::new(err).context("Failed to wait for fence"))
     }
 
     /// Waits for the fence with a default timeout of 1 second.
@@ -71,8 +71,8 @@ impl Fence {
 
     /// Resets the fence to the unsignaled state.
     pub fn reset(&self) -> anyhow::Result<()> {
-        unsafe { self.device.reset_fences(&[self.handle]) }.context("Failed to reset fence")?;
-        Ok(())
+        unsafe { self.device.reset_fences(&[self.handle]) }
+            .map_err(|err| anyhow::Error::new(err).context("Failed to reset fence"))
     }
 
     /// Returns the fence handle.

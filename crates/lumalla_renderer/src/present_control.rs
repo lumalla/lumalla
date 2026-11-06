@@ -524,6 +524,7 @@ impl RendererState {
                     control.scheduler.on_present_started(now);
                 }
                 error!("Unable to present output {name}: {err:#}");
+                self.handle_present_failure(&err, Some(event_loop));
                 OutputTick {
                     presented: false,
                     timings: None,

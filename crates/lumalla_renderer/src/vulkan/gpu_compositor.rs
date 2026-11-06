@@ -179,7 +179,12 @@ impl PendingGpuSubmit {
                 .wait_default()
                 .context("Timed out waiting for GPU frame work")
             {
-                let _ = vulkan.device().wait_idle();
+                // Skip wait_idle when the device is already lost — it only spam-fails.
+                if crate::gpu_error::classify_gpu_error(&error)
+                    != crate::gpu_error::PresentFailureClass::DeviceLost
+                {
+                    let _ = vulkan.device().wait_idle();
+                }
                 vulkan.release_command_buffers(self.command_buffers.drain(..));
                 vulkan.release_staging_many(self.staging.drain(..));
                 return Err(error);

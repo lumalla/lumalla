@@ -168,9 +168,10 @@ impl Device {
     /// Waits for the device to become idle.
     ///
     /// This is useful for cleanup and synchronization.
+    /// Preserves `vk::Result` in the error chain so callers can classify device loss.
     pub fn wait_idle(&self) -> anyhow::Result<()> {
-        unsafe { self.handle.device_wait_idle() }.context("Failed to wait for device idle")?;
-        Ok(())
+        unsafe { self.handle.device_wait_idle() }
+            .map_err(|err| anyhow::Error::new(err).context("Failed to wait for device idle"))
     }
 
     /// Submits command buffers to the graphics queue.
@@ -197,9 +198,7 @@ impl Device {
             self.handle
                 .queue_submit(self.graphics_queue, &[submit_info], fence)
         }
-        .context("Failed to submit to graphics queue")?;
-
-        Ok(())
+        .map_err(|err| anyhow::Error::new(err).context("Failed to submit to graphics queue"))
     }
 }
 
