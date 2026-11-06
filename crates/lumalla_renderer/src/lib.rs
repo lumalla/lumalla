@@ -17,6 +17,7 @@ use lumalla_shared::{
 use stumpalo::Arena;
 
 pub mod drm;
+pub mod gpu_error;
 pub mod vulkan;
 
 mod bitmap_font;
@@ -26,6 +27,10 @@ mod present_control;
 mod scanout_pool;
 mod scene_backing;
 pub mod scheduler;
+
+pub use crate::gpu_error::{
+    PresentFailureClass, PresentHaltReason, classify_gpu_error, is_unrecoverable_present_error,
+};
 
 use crate::drm::{
     CompletedPageFlip, ConnectedOutput, DrmDevices, DrmDispatchResult, FlipEventQueue, ModeBlob,
@@ -112,29 +117,6 @@ impl GpuRenderResources {
 pub const SOLID_CLEAR_COLOR: [f32; 4] = [0.0, 0.55, 0.65, 1.0];
 const WL_SHM_FORMAT_ARGB8888: u32 = 0;
 const WL_SHM_FORMAT_XRGB8888: u32 = 1;
-
-/// Whether a present/page-flip error means further presents will only spam logs.
-fn is_unrecoverable_present_error(err: &anyhow::Error) -> bool {
-    for cause in err.chain() {
-        if let Some(vk_err) = cause.downcast_ref::<vk::Result>()
-            && matches!(
-                *vk_err,
-                vk::Result::ERROR_DEVICE_LOST | vk::Result::ERROR_SURFACE_LOST_KHR
-            )
-        {
-            return true;
-        }
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
-            && io_err.kind() == std::io::ErrorKind::PermissionDenied
-        {
-            return true;
-        }
-    }
-    let msg = format!("{err:#}");
-    msg.contains("ERROR_DEVICE_LOST")
-        || msg.contains("device has been lost")
-        || msg.contains("Permission denied")
-}
 
 fn is_drm_permission_denied(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
@@ -416,8 +398,8 @@ pub struct RendererState {
     pending_pointer_damage: bool,
     dirty_surface_keys: HashSet<(u32, u32)>,
     cursor_buffer_dirty: bool,
-    /// When set, presents are skipped until DRM is reactivated (e.g. after VT return).
-    present_halted: Option<String>,
+    /// When set, presents are skipped until session DRM activate and/or GPU recreate.
+    present_halted: Option<PresentHaltReason>,
     /// Bumped when captured scene content may have changed (windows, cursor, guides…).
     screencast_content_serial: u64,
     /// DMA-BUF `wl_buffer.release` deferred until texture submit epochs complete.
@@ -2610,6 +2592,10 @@ impl RendererState {
     /// Open missing DRM devices via the seat (fresh open after VT resume).
     ///
     /// No-op when the seat backend cannot open devices (headless / no libseat).
+    ///
+    /// Clears a [`PresentHaltReason::SessionDenied`] halt. A
+    /// [`PresentHaltReason::DeviceLost`] halt is left in place — DRM activate
+    /// does not heal a lost Vulkan device.
     pub fn activate_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
         if !seat.can_open_devices() {
             return Ok(());
@@ -2617,8 +2603,17 @@ impl RendererState {
         self.drm_devices.activate(seat)?;
         self.refresh_topologies()?;
         self.invalidate_present_targets();
-        if self.present_halted.take().is_some() {
-            info!("Resuming presents after DRM activate");
+        match self.present_halted.as_ref() {
+            Some(PresentHaltReason::SessionDenied { .. }) => {
+                self.present_halted = None;
+                info!("Resuming presents after DRM activate (session denial cleared)");
+            }
+            Some(PresentHaltReason::DeviceLost { detail }) => {
+                info!(
+                    "DRM activate completed but presents remain halted (GPU device lost): {detail}"
+                );
+            }
+            None => {}
         }
         Ok(())
     }
@@ -2643,12 +2638,23 @@ impl RendererState {
         self.present_halted.is_some()
     }
 
+    /// Typed reason presents are halted, if any.
+    pub fn present_halt_reason(&self) -> Option<&PresentHaltReason> {
+        self.present_halted.as_ref()
+    }
+
     fn halt_presents(&mut self, err: &anyhow::Error) {
         if self.present_halted.is_some() {
             return;
         }
-        let reason = format!("{err:#}");
-        error!("Halting presents after unrecoverable failure: {reason}");
+        let Some(reason) = PresentHaltReason::from_error(err) else {
+            return;
+        };
+        error!(
+            "Halting presents after {:?}: {}",
+            reason.class(),
+            reason.detail()
+        );
         self.present_halted = Some(reason);
     }
 
