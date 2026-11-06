@@ -29,7 +29,8 @@ mod scene_backing;
 pub mod scheduler;
 
 pub use crate::gpu_error::{
-    PresentFailureClass, PresentHaltReason, classify_gpu_error, is_unrecoverable_present_error,
+    PresentFailureClass, PresentGuard, PresentHaltReason, classify_gpu_error,
+    device_lost_backoff, is_unrecoverable_present_error,
 };
 
 use crate::drm::{
@@ -398,8 +399,8 @@ pub struct RendererState {
     pending_pointer_damage: bool,
     dirty_surface_keys: HashSet<(u32, u32)>,
     cursor_buffer_dirty: bool,
-    /// When set, presents are skipped until session DRM activate and/or GPU recreate.
-    present_halted: Option<PresentHaltReason>,
+    /// Running, session-denied halt, or device-lost recovery with backoff.
+    present_guard: PresentGuard,
     /// Bumped when captured scene content may have changed (windows, cursor, guides…).
     screencast_content_serial: u64,
     /// DMA-BUF `wl_buffer.release` deferred until texture submit epochs complete.
@@ -507,7 +508,7 @@ impl RendererState {
             pending_pointer_damage: false,
             dirty_surface_keys: HashSet::new(),
             cursor_buffer_dirty: false,
-            present_halted: None,
+            present_guard: PresentGuard::Running,
             screencast_content_serial: 1,
             pending_dmabuf_releases: Vec::new(),
         })
@@ -2593,9 +2594,8 @@ impl RendererState {
     ///
     /// No-op when the seat backend cannot open devices (headless / no libseat).
     ///
-    /// Clears a [`PresentHaltReason::SessionDenied`] halt. A
-    /// [`PresentHaltReason::DeviceLost`] halt is left in place — DRM activate
-    /// does not heal a lost Vulkan device.
+    /// Clears a session-denied halt. Device-lost / recovering guards are left
+    /// in place — DRM activate does not heal a lost Vulkan device.
     pub fn activate_drm(&mut self, seat: &SeatState) -> anyhow::Result<()> {
         if !seat.can_open_devices() {
             return Ok(());
@@ -2603,17 +2603,18 @@ impl RendererState {
         self.drm_devices.activate(seat)?;
         self.refresh_topologies()?;
         self.invalidate_present_targets();
-        match self.present_halted.as_ref() {
-            Some(PresentHaltReason::SessionDenied { .. }) => {
-                self.present_halted = None;
+        match &self.present_guard {
+            PresentGuard::Halted(PresentHaltReason::SessionDenied { .. }) => {
+                self.present_guard = PresentGuard::Running;
                 info!("Resuming presents after DRM activate (session denial cleared)");
             }
-            Some(PresentHaltReason::DeviceLost { detail }) => {
+            PresentGuard::Halted(PresentHaltReason::DeviceLost { detail })
+            | PresentGuard::Recovering { detail, .. } => {
                 info!(
-                    "DRM activate completed but presents remain halted (GPU device lost): {detail}"
+                    "DRM activate completed but GPU recovery still required: {detail}"
                 );
             }
-            None => {}
+            PresentGuard::Running => {}
         }
         Ok(())
     }
@@ -2633,29 +2634,223 @@ impl RendererState {
         }
     }
 
-    /// Whether presents are halted after an unrecoverable GPU/DRM failure.
+    /// Whether presents are halted or waiting on GPU recovery.
     pub fn presents_halted(&self) -> bool {
-        self.present_halted.is_some()
+        self.present_guard.blocks_presents()
     }
 
-    /// Typed reason presents are halted, if any.
+    /// Current present guard (running / halted / recovering).
+    pub fn present_guard(&self) -> &PresentGuard {
+        &self.present_guard
+    }
+
+    /// Typed halt reason when presents are session-denied or device-lost (not recovering).
     pub fn present_halt_reason(&self) -> Option<&PresentHaltReason> {
-        self.present_halted.as_ref()
+        match &self.present_guard {
+            PresentGuard::Halted(reason) => Some(reason),
+            _ => None,
+        }
     }
 
-    fn halt_presents(&mut self, err: &anyhow::Error) {
-        if self.present_halted.is_some() {
+    /// Handle a present/GPU error: skip frame, halt for session denial, or start device recovery.
+    fn handle_present_failure(
+        &mut self,
+        err: &anyhow::Error,
+        event_loop: Option<&mut EventLoop>,
+    ) {
+        match classify_gpu_error(err) {
+            PresentFailureClass::Transient => {}
+            PresentFailureClass::SessionDenied => self.halt_presents_session_denied(err),
+            PresentFailureClass::DeviceLost => {
+                self.begin_device_lost_recovery(err, event_loop);
+            }
+        }
+    }
+
+    fn halt_presents_session_denied(&mut self, err: &anyhow::Error) {
+        if self.present_guard.blocks_presents() {
             return;
         }
-        let Some(reason) = PresentHaltReason::from_error(err) else {
-            return;
+        let reason = PresentHaltReason::SessionDenied {
+            detail: format!("{err:#}"),
         };
         error!(
             "Halting presents after {:?}: {}",
             reason.class(),
             reason.detail()
         );
-        self.present_halted = Some(reason);
+        self.present_guard = PresentGuard::Halted(reason);
+    }
+
+    /// Tear down the lost Vulkan device and attempt recreate (with backoff on failure).
+    fn begin_device_lost_recovery(
+        &mut self,
+        err: &anyhow::Error,
+        mut event_loop: Option<&mut EventLoop>,
+    ) {
+        if self.present_guard.is_recovering() {
+            return;
+        }
+        let detail = format!("{err:#}");
+        error!("GPU device lost; tearing down Vulkan for recreate: {detail}");
+        self.teardown_vulkan_after_device_lost(event_loop.as_deref_mut());
+        self.finish_or_schedule_device_lost_recreate(detail, 0, event_loop);
+    }
+
+    /// Drop GPU-owned resources after `VK_ERROR_DEVICE_LOST` without closing DRM.
+    fn teardown_vulkan_after_device_lost(&mut self, mut event_loop: Option<&mut EventLoop>) {
+        let names: Vec<String> = self.outputs.keys().cloned().collect();
+        for name in names {
+            let Some(output) = self.outputs.get_mut(&name) else {
+                continue;
+            };
+            match event_loop.as_deref_mut() {
+                Some(event_loop) => {
+                    if let Err(wake_err) = output.present.clear_wake(event_loop) {
+                        warn!(
+                            "Unable to clear present wake during device-lost teardown: {wake_err}"
+                        );
+                        output.present.abandon_wake();
+                    }
+                }
+                None => output.present.abandon_wake(),
+            }
+        }
+        let _ = self.flip_events.drain();
+
+        for output in self.outputs.values_mut() {
+            // Force a full modeset on the next successful present (old FBs are gone).
+            output.physical = None;
+            if let Some(planes) = output.planes.take() {
+                for buffer in planes.drain_buffers() {
+                    // Device is lost — do not wait; Drop tears Vulkan objects down.
+                    drop(buffer);
+                }
+            }
+        }
+
+        self.screencast_buffers.clear();
+        self.scanout_pool.clear();
+        self.pending_dmabuf_releases.clear();
+        self.gpu.clear(self.vulkan.as_mut());
+        self.vulkan = None;
+        self.invalidate_present_targets();
+        self.pending_full_redraw = true;
+        self.pending_damage.clear();
+        self.pending_surface_buffer_damage.clear();
+        self.pending_pointer_damage = true;
+        self.cursor_buffer_dirty = true;
+        self.dirty_surface_keys.clear();
+        for output in self.outputs.values_mut() {
+            output.present.content_dirty = true;
+            output.dirty.mark_all();
+        }
+        self.scene_dirty = !self.outputs.is_empty();
+    }
+
+    fn finish_or_schedule_device_lost_recreate(
+        &mut self,
+        detail: String,
+        attempt: u32,
+        event_loop: Option<&mut EventLoop>,
+    ) {
+        match self.recreate_vulkan_after_device_lost() {
+            Ok(()) => {
+                info!(
+                    "Vulkan recreated after device lost (attempt {})",
+                    attempt.max(1)
+                );
+                self.present_guard = PresentGuard::Running;
+                self.pending_full_redraw = true;
+                for output in self.outputs.values_mut() {
+                    output.present.content_dirty = true;
+                    output.dirty.mark_all();
+                }
+                self.scene_dirty = !self.outputs.is_empty();
+            }
+            Err(recreate_err) => {
+                let next_attempt = attempt.saturating_add(1).max(1);
+                let delay = device_lost_backoff(next_attempt);
+                let next_retry = Instant::now() + delay;
+                warn!(
+                    "Vulkan recreate failed after device lost (attempt {next_attempt}, retry in {delay:?}): {recreate_err:#}"
+                );
+                self.present_guard = PresentGuard::Recovering {
+                    detail,
+                    attempt: next_attempt,
+                    next_retry,
+                };
+                if let Some(event_loop) = event_loop {
+                    if let Err(wake_err) = self.arm_device_lost_recovery_wake(event_loop, next_retry)
+                    {
+                        warn!("Unable to arm device-lost recovery wake: {wake_err}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Arm one output wake so recreate is retried when backoff elapses.
+    pub(crate) fn arm_device_lost_recovery_wake(
+        &mut self,
+        event_loop: &mut EventLoop,
+        next_retry: Instant,
+    ) -> std::io::Result<()> {
+        let Some(name) = self.outputs.keys().next().cloned() else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        let remaining = next_retry.saturating_duration_since(now).max(Duration::from_millis(1));
+        let (sec, nsec) = lumalla_shared::monotonic_deadline_after(remaining)?;
+        if let Some(control) = self.outputs.get_mut(&name).map(|o| &mut o.present) {
+            control.set_wake(event_loop, sec, nsec)?;
+            debug!(
+                "Armed device-lost recovery wake on {name} in {remaining:?}"
+            );
+        }
+        Ok(())
+    }
+
+    fn recreate_vulkan_after_device_lost(&mut self) -> anyhow::Result<()> {
+        // Prefer the configured/seat DRM path; fall back to virtual-only init.
+        if let Some(path) = self.resolved_render_device_path() {
+            self.ensure_vulkan_forced(Some(&path))?;
+        } else if !self.virtual_outputs.is_empty() {
+            self.ensure_vulkan_forced(None)?;
+        } else {
+            // No outputs yet — still try a pathless context so recovery can complete.
+            self.ensure_vulkan_forced(None)?;
+        }
+        let vulkan = self
+            .vulkan
+            .as_mut()
+            .context("Vulkan missing after device-lost recreate")?;
+        self.gpu.ensure_compositor(vulkan)?;
+        Ok(())
+    }
+
+    /// If device-lost recovery is due, attempt Vulkan recreate.
+    pub fn try_recover_gpu_if_needed(&mut self, mut event_loop: Option<&mut EventLoop>) {
+        if !self.present_guard.recovery_due(Instant::now()) {
+            return;
+        }
+        let (detail, attempt, need_teardown) = match &self.present_guard {
+            PresentGuard::Recovering {
+                detail, attempt, ..
+            } => (detail.clone(), *attempt, false),
+            PresentGuard::Halted(PresentHaltReason::DeviceLost { detail }) => {
+                (detail.clone(), 0, true)
+            }
+            _ => return,
+        };
+        if need_teardown {
+            self.teardown_vulkan_after_device_lost(event_loop.as_deref_mut());
+        }
+        info!(
+            "Retrying Vulkan recreate after device lost (attempt {})",
+            attempt.saturating_add(1)
+        );
+        self.finish_or_schedule_device_lost_recreate(detail, attempt, event_loop);
     }
 
     /// Close removed / open newly discovered DRM devices while the seat is active.
@@ -2935,7 +3130,8 @@ impl RendererState {
         force: bool,
         event_loop: &mut EventLoop,
     ) -> anyhow::Result<PresentOutcome> {
-        if self.present_halted.is_some() {
+        self.try_recover_gpu_if_needed(Some(event_loop));
+        if self.presents_halted() {
             return Ok(PresentOutcome {
                 presented: false,
                 status: self.present_status(),
@@ -2956,7 +3152,7 @@ impl RendererState {
         let started = Instant::now();
         let status = self.present_enabled_outputs(color, event_loop)?;
         Ok(PresentOutcome {
-            presented: self.present_halted.is_none(),
+            presented: !self.presents_halted(),
             status,
             timings: Some(FrameTimings {
                 render_duration: started.elapsed(),
@@ -2972,7 +3168,8 @@ impl RendererState {
         force: bool,
         event_loop: &mut EventLoop,
     ) -> anyhow::Result<PresentOutcome> {
-        if self.present_halted.is_some() {
+        self.try_recover_gpu_if_needed(Some(event_loop));
+        if self.presents_halted() {
             return Ok(PresentOutcome {
                 presented: false,
                 status: self.present_status(),
@@ -3008,7 +3205,7 @@ impl RendererState {
         color: [f32; 4],
         event_loop: &mut EventLoop,
     ) -> anyhow::Result<bool> {
-        if self.present_halted.is_some() {
+        if self.presents_halted() {
             return Ok(false);
         }
         if !self.ensure_vulkan_ready(Some(event_loop))? {
@@ -3081,9 +3278,7 @@ impl RendererState {
                 } else {
                     error!("Failed to present virtual output {}: {err:#}", target.name);
                 }
-                if is_unrecoverable_present_error(&err) {
-                    self.halt_presents(&err);
-                }
+                self.handle_present_failure(&err, Some(event_loop));
             }
         }
 
@@ -3137,7 +3332,8 @@ impl RendererState {
         color: [f32; 4],
         event_loop: &mut EventLoop,
     ) -> anyhow::Result<PresentStatus> {
-        if self.present_halted.is_some() {
+        self.try_recover_gpu_if_needed(Some(event_loop));
+        if self.presents_halted() {
             return Ok(self.present_status());
         }
         if !self.ensure_vulkan_ready(Some(event_loop))? {
@@ -3191,8 +3387,8 @@ impl RendererState {
                     } else {
                         error!("Failed to present virtual output {}: {err:#}", target.name);
                     }
-                    if is_unrecoverable_present_error(&err) {
-                        self.halt_presents(&err);
+                    self.handle_present_failure(&err, Some(event_loop));
+                    if self.presents_halted() {
                         break;
                     }
                 }
@@ -4422,6 +4618,26 @@ impl RendererState {
             self.vulkan = Some(VulkanContext::new(preferred_drm_path)?);
         }
 
+        Ok(())
+    }
+
+    /// Recreate Vulkan even when an existing context matches `preferred_drm_path`.
+    ///
+    /// Used after device-lost teardown where GPU objects were already dropped and
+    /// DRM output identity must be preserved (no full `drain_scanouts`).
+    fn ensure_vulkan_forced(&mut self, preferred_drm_path: Option<&Path>) -> anyhow::Result<()> {
+        if self.vulkan.is_some() {
+            self.gpu.clear(self.vulkan.as_mut());
+            self.vulkan = None;
+        }
+        match preferred_drm_path {
+            Some(path) => info!(
+                "Force-initializing Vulkan for DRM device {}",
+                path.display()
+            ),
+            None => info!("Force-initializing Vulkan (no preferred DRM path)"),
+        }
+        self.vulkan = Some(VulkanContext::new(preferred_drm_path)?);
         Ok(())
     }
 }

@@ -114,6 +114,7 @@ impl RendererState {
         frame_time_msec: u32,
         arena: &Arena,
     ) -> io::Result<PresentTickResult> {
+        self.try_recover_gpu_if_needed(Some(event_loop));
         let pending_protocol_work = notify.pending_present_work();
         self.sync_output_present_controls(Some(event_loop), arena)?;
         let mut names = allocator_api2::vec::Vec::new_in(arena);
@@ -136,6 +137,8 @@ impl RendererState {
             }
         }
 
+        self.arm_device_lost_recovery_wake_if_needed(event_loop);
+
         let presented_without_pending_flip = presented_outputs
             .iter()
             .any(|name| self.output_flip_idle(name));
@@ -150,6 +153,18 @@ impl RendererState {
         Ok(result)
     }
 
+    fn arm_device_lost_recovery_wake_if_needed(&mut self, event_loop: &mut EventLoop) {
+        let Some(next_retry) = (match self.present_guard() {
+            crate::PresentGuard::Recovering { next_retry, .. } => Some(*next_retry),
+            _ => None,
+        }) else {
+            return;
+        };
+        if let Err(err) = self.arm_device_lost_recovery_wake(event_loop, next_retry) {
+            warn!("Unable to arm device-lost recovery wake: {err}");
+        }
+    }
+
     /// Handle a fired present-wake timeout for a single output.
     pub fn on_present_timeout(
         &mut self,
@@ -159,6 +174,7 @@ impl RendererState {
         seat_enabled: bool,
         frame_time_msec: u32,
     ) -> io::Result<PresentTickResult> {
+        self.try_recover_gpu_if_needed(Some(event_loop));
         let pending_protocol_work = notify.pending_present_work();
         let Some(name) = self
             .outputs
