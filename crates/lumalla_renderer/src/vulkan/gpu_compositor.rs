@@ -221,8 +221,13 @@ impl Drop for PendingGpuSubmit {
         // recycle via wait()/try_complete(); this is a safety net against UAF
         // when a ScanoutBuffer/slot is dropped with work still in flight.
         if let Some(fence) = self.fence.take() {
-            if fence.wait_default().is_err() {
-                let _ = unsafe { fence.device_handle().device_wait_idle() };
+            if let Err(err) = fence.wait_default() {
+                // Avoid wait_idle spam when the device is already gone.
+                if crate::gpu_error::classify_gpu_error(&err)
+                    != crate::gpu_error::PresentFailureClass::DeviceLost
+                {
+                    let _ = unsafe { fence.device_handle().device_wait_idle() };
+                }
             }
         }
         self.staging.clear();

@@ -401,6 +401,8 @@ pub struct RendererState {
     cursor_buffer_dirty: bool,
     /// Running, session-denied halt, or device-lost recovery with backoff.
     present_guard: PresentGuard,
+    /// Consecutive transient present failures (reset on success); used to rate-limit logs.
+    transient_present_failures: u32,
     /// Bumped when captured scene content may have changed (windows, cursor, guides…).
     screencast_content_serial: u64,
     /// DMA-BUF `wl_buffer.release` deferred until texture submit epochs complete.
@@ -509,6 +511,7 @@ impl RendererState {
             dirty_surface_keys: HashSet::new(),
             cursor_buffer_dirty: false,
             present_guard: PresentGuard::Running,
+            transient_present_failures: 0,
             screencast_content_serial: 1,
             pending_dmabuf_releases: Vec::new(),
         })
@@ -2678,11 +2681,30 @@ impl RendererState {
         event_loop: Option<&mut EventLoop>,
     ) {
         match classify_gpu_error(err) {
-            PresentFailureClass::Transient => {}
+            PresentFailureClass::Transient => self.note_transient_present_failure(err),
             PresentFailureClass::SessionDenied => self.halt_presents_session_denied(err),
             PresentFailureClass::DeviceLost => {
                 self.begin_device_lost_recovery(err, event_loop);
             }
+        }
+    }
+
+    fn note_transient_present_failure(&mut self, err: &anyhow::Error) {
+        self.transient_present_failures = self.transient_present_failures.saturating_add(1);
+        let count = self.transient_present_failures;
+        // Log the first failure, then every 60th, to avoid per-frame spam.
+        if count == 1 || count.is_multiple_of(60) {
+            warn!("Transient present failure ({count} consecutive): {err:#}");
+        }
+    }
+
+    fn note_present_success(&mut self) {
+        if self.transient_present_failures > 0 {
+            info!(
+                "Present recovered after {} transient failure(s)",
+                self.transient_present_failures
+            );
+            self.transient_present_failures = 0;
         }
     }
 
@@ -2780,10 +2802,14 @@ impl RendererState {
                     attempt.max(1)
                 );
                 self.present_guard = PresentGuard::Running;
+                self.transient_present_failures = 0;
                 self.pending_full_redraw = true;
+                self.cursor_buffer_dirty = true;
+                self.pending_pointer_damage = true;
                 for output in self.outputs.values_mut() {
                     output.present.content_dirty = true;
                     output.dirty.mark_all();
+                    output.damage_history.clear();
                 }
                 self.scene_dirty = !self.outputs.is_empty();
             }
@@ -3164,16 +3190,21 @@ impl RendererState {
                 timings: None,
             });
         }
-        self.scene_dirty = false;
-        for output in self.outputs.values_mut() {
-            output.present.content_dirty = false;
-        }
         let started = Instant::now();
-        let status = self.present_enabled_outputs(color, event_loop)?;
+        let (status, presented_count) = self.present_enabled_outputs(color, event_loop)?;
+        let presented = presented_count > 0 && !self.presents_halted();
+        if presented {
+            self.scene_dirty = false;
+            for output in self.outputs.values_mut() {
+                output.present.content_dirty = false;
+            }
+            self.note_present_success();
+        }
+        // Soft failures leave scene_dirty set so the next pass retries.
         Ok(PresentOutcome {
-            presented: !self.presents_halted(),
+            presented,
             status,
-            timings: Some(FrameTimings {
+            timings: presented.then_some(FrameTimings {
                 render_duration: started.elapsed(),
             }),
         })
@@ -3281,6 +3312,7 @@ impl RendererState {
         match self.present_one_output(&target, color) {
             Ok(()) => {
                 presented = true;
+                self.note_present_success();
                 if let Some(scanout) = self.outputs.get(&target.name) {
                     if let Some(physical) = scanout.physical.as_ref() {
                         debug!(
@@ -3301,14 +3333,18 @@ impl RendererState {
                 }
             }
             Err(err) => {
-                if let Some(physical) = target.physical.as_ref() {
-                    error!(
-                        "Failed to present {} on {}: {err:#}",
-                        target.name,
-                        physical.drm_path.display()
-                    );
-                } else {
-                    error!("Failed to present virtual output {}: {err:#}", target.name);
+                // Unrecoverable paths log once inside handle_present_failure /
+                // begin_device_lost_recovery; transient failures are rate-limited there.
+                if !matches!(classify_gpu_error(&err), PresentFailureClass::Transient) {
+                    if let Some(physical) = target.physical.as_ref() {
+                        error!(
+                            "Failed to present {} on {}: {err:#}",
+                            target.name,
+                            physical.drm_path.display()
+                        );
+                    } else {
+                        error!("Failed to present virtual output {}: {err:#}", target.name);
+                    }
                 }
                 self.handle_present_failure(&err, Some(event_loop));
             }
@@ -3363,25 +3399,25 @@ impl RendererState {
         &mut self,
         color: [f32; 4],
         event_loop: &mut EventLoop,
-    ) -> anyhow::Result<PresentStatus> {
+    ) -> anyhow::Result<(PresentStatus, usize)> {
         self.try_recover_gpu_if_needed(Some(event_loop));
         if self.presents_halted() {
-            return Ok(self.present_status());
+            return Ok((self.present_status(), 0));
         }
         match self.ensure_vulkan_ready(Some(event_loop)) {
-            Ok(false) => return Ok(self.present_status()),
+            Ok(false) => return Ok((self.present_status(), 0)),
             Ok(true) => {}
             Err(err) => {
                 error!("Unable to initialize Vulkan for present: {err:#}");
                 self.handle_present_failure(&err, Some(event_loop));
-                return Ok(self.present_status());
+                return Ok((self.present_status(), 0));
             }
         }
         if let Err(err) = self.flush_hw_cursors() {
             if is_unrecoverable_present_error(&err) {
                 error!("Hardware cursor flush failed: {err:#}");
                 self.handle_present_failure(&err, Some(event_loop));
-                return Ok(self.present_status());
+                return Ok((self.present_status(), 0));
             }
             warn!("Hardware cursor flush failed: {err:#}");
         }
@@ -3394,7 +3430,7 @@ impl RendererState {
             for name in stale {
                 self.disable_and_release_named_scanout(&name, event_loop);
             }
-            return Ok(self.present_status());
+            return Ok((self.present_status(), 0));
         }
 
         let keep: HashSet<String> = targets.iter().map(|t| t.name.clone()).collect();
@@ -3423,14 +3459,19 @@ impl RendererState {
                     presented += 1;
                 }
                 Err(err) => {
-                    if let Some(physical) = target.physical.as_ref() {
-                        error!(
-                            "Failed to present {} on {}: {err:#}",
-                            target.name,
-                            physical.drm_path.display()
-                        );
-                    } else {
-                        error!("Failed to present virtual output {}: {err:#}", target.name);
+                    if !matches!(classify_gpu_error(&err), PresentFailureClass::Transient) {
+                        if let Some(physical) = target.physical.as_ref() {
+                            error!(
+                                "Failed to present {} on {}: {err:#}",
+                                target.name,
+                                physical.drm_path.display()
+                            );
+                        } else {
+                            error!(
+                                "Failed to present virtual output {}: {err:#}",
+                                target.name
+                            );
+                        }
                     }
                     self.handle_present_failure(&err, Some(event_loop));
                     if self.presents_halted() {
@@ -3450,7 +3491,10 @@ impl RendererState {
             self.disable_and_release_named_scanout(&name, event_loop);
         }
         debug!("Presented {presented} output(s)");
-        Ok(self.present_status())
+        if presented > 0 {
+            self.note_present_success();
+        }
+        Ok((self.present_status(), presented))
     }
 
     fn invalidate_present_targets(&mut self) {
