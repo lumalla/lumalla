@@ -2674,6 +2674,40 @@ impl RendererState {
         }
     }
 
+    /// Consecutive transient present failures since the last successful present.
+    pub fn transient_present_failure_count(&self) -> u32 {
+        self.transient_present_failures
+    }
+
+    /// Short status line for logs / debug IPC (guard class + optional detail).
+    pub fn gpu_health_summary(&self) -> String {
+        match &self.present_guard {
+            PresentGuard::Running => {
+                if self.transient_present_failures == 0 {
+                    "gpu=running".into()
+                } else {
+                    format!(
+                        "gpu=running transient_failures={}",
+                        self.transient_present_failures
+                    )
+                }
+            }
+            PresentGuard::Halted(reason) => {
+                format!("gpu=halted class={:?} detail={}", reason.class(), reason.detail())
+            }
+            PresentGuard::Recovering {
+                detail,
+                attempt,
+                next_retry,
+            } => {
+                let retry_in = next_retry.saturating_duration_since(Instant::now());
+                format!(
+                    "gpu=recovering attempt={attempt} retry_in={retry_in:?} detail={detail}"
+                )
+            }
+        }
+    }
+
     /// Handle a present/GPU error: skip frame, halt for session denial, or start device recovery.
     pub(crate) fn handle_present_failure(
         &mut self,
@@ -4978,6 +5012,15 @@ impl RendererState {
 mod tests {
     use super::*;
     use crate::scene_backing::{composite_cursor_into, composite_surface_full};
+
+    #[test]
+    fn fresh_renderer_reports_running_gpu_health() {
+        let state = RendererState::new().unwrap();
+        assert!(!state.presents_halted());
+        assert_eq!(state.transient_present_failure_count(), 0);
+        assert_eq!(state.gpu_health_summary(), "gpu=running");
+        assert!(matches!(state.present_guard(), PresentGuard::Running));
+    }
 
     fn frame() -> SurfaceFrame {
         SurfaceFrame {

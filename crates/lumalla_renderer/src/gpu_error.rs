@@ -152,3 +152,118 @@ pub fn classify_gpu_error(err: &anyhow::Error) -> PresentFailureClass {
 pub fn is_unrecoverable_present_error(err: &anyhow::Error) -> bool {
     !matches!(classify_gpu_error(err), PresentFailureClass::Transient)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_vk_device_lost_through_context() {
+        let err = anyhow::Error::new(vk::Result::ERROR_DEVICE_LOST)
+            .context("Failed to submit to graphics queue");
+        assert_eq!(classify_gpu_error(&err), PresentFailureClass::DeviceLost);
+        assert!(is_unrecoverable_present_error(&err));
+        assert!(matches!(
+            PresentHaltReason::from_error(&err),
+            Some(PresentHaltReason::DeviceLost { .. })
+        ));
+    }
+
+    #[test]
+    fn classifies_permission_denied_as_session() {
+        let err = anyhow::Error::new(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "drmSetMaster",
+        ))
+        .context("Failed atomic page flip");
+        assert_eq!(classify_gpu_error(&err), PresentFailureClass::SessionDenied);
+        assert!(matches!(
+            PresentHaltReason::from_error(&err),
+            Some(PresentHaltReason::SessionDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn classifies_string_fallback_device_lost() {
+        let err = anyhow::anyhow!("driver reported ERROR_DEVICE_LOST during fence wait");
+        assert_eq!(classify_gpu_error(&err), PresentFailureClass::DeviceLost);
+    }
+
+    #[test]
+    fn classifies_string_fallback_permission_denied() {
+        let err = anyhow::anyhow!("ioctl failed: Permission denied");
+        assert_eq!(classify_gpu_error(&err), PresentFailureClass::SessionDenied);
+    }
+
+    #[test]
+    fn surface_lost_is_transient_without_wsi() {
+        let err = anyhow::Error::new(vk::Result::ERROR_SURFACE_LOST_KHR)
+            .context("unused WSI path");
+        assert_eq!(classify_gpu_error(&err), PresentFailureClass::Transient);
+        assert!(!is_unrecoverable_present_error(&err));
+        assert!(PresentHaltReason::from_error(&err).is_none());
+    }
+
+    #[test]
+    fn ordinary_errors_are_transient() {
+        let err = anyhow::anyhow!("EBUSY: plane commit");
+        assert_eq!(classify_gpu_error(&err), PresentFailureClass::Transient);
+        assert!(PresentHaltReason::from_error(&err).is_none());
+    }
+
+    #[test]
+    fn device_lost_backoff_grows_then_caps() {
+        assert_eq!(device_lost_backoff(1), DEVICE_LOST_RETRY_BASE);
+        assert_eq!(device_lost_backoff(2), Duration::from_secs(2));
+        assert_eq!(device_lost_backoff(3), Duration::from_secs(4));
+        assert_eq!(device_lost_backoff(6), DEVICE_LOST_RETRY_CAP);
+        assert_eq!(device_lost_backoff(100), DEVICE_LOST_RETRY_CAP);
+    }
+
+    #[test]
+    fn present_guard_recovery_due() {
+        let now = Instant::now();
+        assert!(!PresentGuard::Running.recovery_due(now));
+        assert!(!PresentGuard::Halted(PresentHaltReason::SessionDenied {
+            detail: "x".into(),
+        })
+        .recovery_due(now));
+        assert!(PresentGuard::Halted(PresentHaltReason::DeviceLost {
+            detail: "lost".into(),
+        })
+        .recovery_due(now));
+        assert!(
+            PresentGuard::Recovering {
+                detail: "lost".into(),
+                attempt: 1,
+                next_retry: now,
+            }
+            .recovery_due(now)
+        );
+        assert!(
+            !PresentGuard::Recovering {
+                detail: "lost".into(),
+                attempt: 1,
+                next_retry: now + Duration::from_secs(5),
+            }
+            .recovery_due(now)
+        );
+    }
+
+    #[test]
+    fn present_guard_blocks_presents() {
+        assert!(!PresentGuard::Running.blocks_presents());
+        assert!(PresentGuard::Halted(PresentHaltReason::SessionDenied {
+            detail: "x".into(),
+        })
+        .blocks_presents());
+        assert!(
+            PresentGuard::Recovering {
+                detail: "x".into(),
+                attempt: 1,
+                next_retry: Instant::now(),
+            }
+            .blocks_presents()
+        );
+    }
+}
